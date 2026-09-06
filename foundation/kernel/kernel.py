@@ -2,151 +2,68 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from threading import RLock
-from typing import Any, Callable
-
-
-class KernelError(RuntimeError):
-    """Base kernel failure."""
-
-
-class KernelNotRunningError(KernelError):
-    """Operation requires a running kernel."""
-
-
-KernelHandler = Callable[..., Any]
+from typing import Any
 
 
 @dataclass(frozen=True, slots=True)
-class KernelState:
-    name: str
+class KernelStatus:
+    initialized: bool
     running: bool
-    generation: int
 
 
-class Kernel:
-    """
-    Minimal ZYRA execution kernel.
+class FoundationKernel:
+    """Minimal deterministic kernel boundary for foundation services."""
 
-    The kernel coordinates registered handlers and exposes the
-    fundamental execution boundary. Network transports, storage,
-    messaging and applications remain outside this primitive.
-    """
-
-    def __init__(
-        self,
-        *,
-        name: str = "zyra-kernel",
-    ) -> None:
-        if not name.strip():
-            raise ValueError(
-                "Kernel name cannot be empty"
-            )
-
-        self._name = name
+    def __init__(self) -> None:
+        self._initialized = False
         self._running = False
-        self._generation = 0
-        self._handlers: dict[str, KernelHandler] = {}
+        self._services: dict[str, Any] = {}
         self._lock = RLock()
 
-    @property
-    def name(self) -> str:
-        return self._name
-
-    @property
-    def running(self) -> bool:
+    def initialize(self) -> None:
         with self._lock:
-            return self._running
+            if self._initialized:
+                return
+            self._initialized = True
 
-    @property
-    def generation(self) -> int:
+    def start(self) -> None:
         with self._lock:
-            return self._generation
-
-    def start(self) -> KernelState:
-        with self._lock:
-            if self._running:
-                return self.state()
-
-            self._generation += 1
+            if not self._initialized:
+                raise RuntimeError(
+                    "Kernel must be initialized before start"
+                )
             self._running = True
 
-            return self.state()
-
-    def stop(self) -> KernelState:
+    def stop(self) -> None:
         with self._lock:
-            if not self._running:
-                return self.state()
-
             self._running = False
 
-            return self.state()
+    def register_service(self, name: str, service: Any) -> None:
+        normalized = name.strip()
 
-    def state(self) -> KernelState:
-        return KernelState(
-            name=self._name,
-            running=self._running,
-            generation=self._generation,
-        )
+        if not normalized:
+            raise ValueError("Service name cannot be empty")
 
-    def register(
-        self,
-        name: str,
-        handler: KernelHandler,
-    ) -> None:
-        if not name.strip():
-            raise ValueError(
-                "Handler name cannot be empty"
-            )
-
-        if not callable(handler):
-            raise TypeError(
-                "Kernel handler must be callable"
-            )
+        if service is None:
+            raise ValueError("Service cannot be None")
 
         with self._lock:
-            if name in self._handlers:
-                raise KernelError(
-                    f"Handler already registered: {name}"
+            if normalized in self._services:
+                raise ValueError(
+                    f"Service already registered: {normalized}"
                 )
+            self._services[normalized] = service
 
-            self._handlers[name] = handler
-
-    def unregister(self, name: str) -> bool:
+    def get_service(self, name: str) -> Any:
         with self._lock:
-            return (
-                self._handlers.pop(
-                    name,
-                    None,
-                )
-                is not None
+            return self._services[name.strip()]
+
+    def status(self) -> KernelStatus:
+        with self._lock:
+            return KernelStatus(
+                initialized=self._initialized,
+                running=self._running,
             )
 
-    def execute(
-        self,
-        name: str,
-        *args: Any,
-        **kwargs: Any,
-    ) -> Any:
-        with self._lock:
-            if not self._running:
-                raise KernelNotRunningError(
-                    "Kernel is not running"
-                )
 
-            handler = self._handlers.get(name)
-
-            if handler is None:
-                raise KernelError(
-                    f"Unknown kernel handler: {name}"
-                )
-
-        return handler(
-            *args,
-            **kwargs,
-        )
-
-    def handlers(self) -> tuple[str, ...]:
-        with self._lock:
-            return tuple(
-                sorted(self._handlers)
-            )
+__all__ = ["FoundationKernel", "KernelStatus"]

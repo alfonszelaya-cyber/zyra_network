@@ -1,13 +1,3 @@
-from .version import (
-    Version,
-    FOUNDATION_VERSION,
-    NETWORK_VERSION,
-    PROTOCOL_VERSION,
-)
+from .version import NETWORK_VERSION, Version
 
-__all__ = [
-    "Version",
-    "FOUNDATION_VERSION",
-    "NETWORK_VERSION",
-    "PROTOCOL_VERSION",
-]
+__all__ = ["Version", "NETWORK_VERSION"]

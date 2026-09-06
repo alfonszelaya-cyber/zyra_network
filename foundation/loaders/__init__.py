@@ -1,15 +1,3 @@
-"""
-ZYRA Foundation module loading.
-"""
+from .loaders import ComponentLoader, LoaderError
 
-from .loader import (
-    LoadedModule,
-    LoaderError,
-    ModuleLoader,
-)
-
-__all__ = [
-    "LoadedModule",
-    "LoaderError",
-    "ModuleLoader",
-]
+__all__ = ["ComponentLoader", "LoaderError"]

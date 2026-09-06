@@ -1,65 +1,45 @@
 from __future__ import annotations
 
+import re
 from dataclasses import dataclass
+
+
+_SEMVER = re.compile(
+    r"^(0|[1-9]\d*)\."
+    r"(0|[1-9]\d*)\."
+    r"(0|[1-9]\d*)"
+    r"(?:-[0-9A-Za-z.-]+)?"
+    r"(?:\+[0-9A-Za-z.-]+)?$"
+)
 
 
 @dataclass(frozen=True, order=True, slots=True)
 class Version:
-    """
-    Semantic version representation.
-
-    Supports stable ordering and explicit compatibility checks.
-    """
-
     major: int
     minor: int
     patch: int
 
     def __post_init__(self) -> None:
-        if min(
-            self.major,
-            self.minor,
-            self.patch,
-        ) < 0:
-            raise ValueError(
-                "Version components cannot be negative"
-            )
-
-    def __str__(self) -> str:
-        return (
-            f"{self.major}."
-            f"{self.minor}."
-            f"{self.patch}"
-        )
+        if min(self.major, self.minor, self.patch) < 0:
+            raise ValueError("Version components cannot be negative")
 
     @classmethod
     def parse(cls, value: str) -> "Version":
-        parts = value.strip().split(".")
+        match = _SEMVER.match(value.strip())
 
-        if len(parts) != 3:
-            raise ValueError(
-                "Version must be MAJOR.MINOR.PATCH"
-            )
+        if not match:
+            raise ValueError(f"Invalid semantic version: {value}")
 
-        try:
-            numbers = tuple(
-                int(part)
-                for part in parts
-            )
-        except ValueError as exc:
-            raise ValueError(
-                "Version contains non-numeric components"
-            ) from exc
+        return cls(
+            int(match.group(1)),
+            int(match.group(2)),
+            int(match.group(3)),
+        )
 
-        return cls(*numbers)
-
-    def compatible_with(
-        self,
-        other: "Version",
-    ) -> bool:
-        return self.major == other.major
+    def __str__(self) -> str:
+        return f"{self.major}.{self.minor}.{self.patch}"
 
 
-FOUNDATION_VERSION = Version(1, 0, 0)
 NETWORK_VERSION = Version(1, 0, 0)
-PROTOCOL_VERSION = Version(1, 0, 0)
+
+__all__ = ["Version", "NETWORK_VERSION"]

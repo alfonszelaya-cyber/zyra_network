@@ -1,48 +1,72 @@
 from __future__ import annotations
 
 import json
-from typing import Any, Mapping
+from collections.abc import Mapping
+from typing import Any
 
 
-class ProtocolEncodingError(ValueError):
-    """Raised when protocol data cannot be encoded or decoded."""
+class ProtocolEncoder:
+    """
+    Canonical JSON encoder for ZYRA protocol messages.
 
-
-class JSONCodec:
-    """Canonical deterministic JSON codec for protocol messages."""
+    The encoding is deterministic:
+    - UTF-8
+    - sorted object keys
+    - compact separators
+    - no ASCII escaping
+    """
 
     @staticmethod
     def encode(value: Mapping[str, Any]) -> bytes:
+        if not isinstance(value, Mapping):
+            raise TypeError(
+                "Protocol payload must be a mapping"
+            )
+
         try:
-            return json.dumps(
-                value,
+            encoded = json.dumps(
+                dict(value),
                 sort_keys=True,
                 separators=(",", ":"),
                 ensure_ascii=False,
-            ).encode("utf-8")
+                allow_nan=False,
+            )
         except (TypeError, ValueError) as exc:
-            raise ProtocolEncodingError(
-                "Unable to encode protocol payload"
+            raise ValueError(
+                "Protocol payload is not JSON serializable"
             ) from exc
 
+        return encoded.encode("utf-8")
+
     @staticmethod
-    def decode(data: bytes) -> dict[str, Any]:
-        if not isinstance(data, bytes):
-            raise ProtocolEncodingError("Encoded data must be bytes")
+    def decode(payload: bytes) -> dict[str, Any]:
+        if not isinstance(payload, bytes):
+            raise TypeError(
+                "Protocol payload must be bytes"
+            )
+
+        if not payload:
+            raise ValueError(
+                "Protocol payload cannot be empty"
+            )
 
         try:
-            value = json.loads(data.decode("utf-8"))
-        except (UnicodeDecodeError, json.JSONDecodeError) as exc:
-            raise ProtocolEncodingError(
-                "Unable to decode protocol payload"
+            decoded = payload.decode("utf-8")
+            value = json.loads(decoded)
+        except (
+            UnicodeDecodeError,
+            json.JSONDecodeError,
+        ) as exc:
+            raise ValueError(
+                "Invalid protocol payload"
             ) from exc
 
         if not isinstance(value, dict):
-            raise ProtocolEncodingError(
-                "Protocol payload root must be an object"
+            raise ValueError(
+                "Protocol payload must decode to an object"
             )
 
         return value
 
 
-__all__ = ["JSONCodec", "ProtocolEncodingError"]
+__all__ = ["ProtocolEncoder"]

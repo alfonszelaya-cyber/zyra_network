@@ -1,3 +1,3 @@
-from .encoding import JSONCodec, ProtocolEncodingError
+from .encoding import ProtocolEncoder
 
-__all__ = ["JSONCodec", "ProtocolEncodingError"]
+__all__ = ["ProtocolEncoder"]

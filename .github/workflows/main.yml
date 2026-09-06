@@ -1,4 +1,4 @@
-name: ZYRA Observability Production Block
+name: "ZYRA Observability Production Build"
 
 on:
   workflow_dispatch:
@@ -6,225 +6,144 @@ on:
 permissions:
   contents: write
 
+concurrency:
+  group: zyra-observability-production
+  cancel-in-progress: false
+
 jobs:
   build-observability:
+    name: "Build complete Observability production"
     runs-on: ubuntu-latest
+
+    env:
+      PYTHON_VERSION: "3.12"
+      PYTHONDONTWRITEBYTECODE: "1"
+      PYTHONUNBUFFERED: "1"
+      PYTHONPATH: ${{ github.workspace }}
 
     steps:
       - name: Checkout
         uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
 
       - name: Setup Python
         uses: actions/setup-python@v5
         with:
-          python-version: "3.12"
+          python-version: ${{ env.PYTHON_VERSION }}
+          cache: "pip"
+
+      - name: Install build and test dependencies
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          python --version
+          python -m pip install --upgrade pip setuptools wheel
+          python -m pip install --upgrade pytest
+
+          python - <<'PY'
+          import sys
+          import pytest
+
+          print("Python:", sys.version)
+          print("pytest:", pytest.__version__)
+          PY
+
+      - name: Configure Python path
+        shell: bash
+        run: |
+          set -euo pipefail
+          echo "PYTHONPATH=${GITHUB_WORKSPACE}" >> "$GITHUB_ENV"
+
+      - name: Validate repository boundaries
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          test -d observability
+
+          if git status --porcelain -- apps/ | grep -q .; then
+            echo "ERROR: apps/ contains changes before Observability build."
+            exit 1
+          fi
+
+          echo "Repository boundary validation passed."
 
       - name: Build complete Observability production layer
         shell: bash
         run: |
           set -euo pipefail
 
-          ROOT="observability"
-
-          # ==============================================================
-          # HARD BOUNDARY
-          # ==============================================================
-          #
-          # Este bloque solamente construye observability/.
-          # Nunca escribe dentro de apps/.
-          #
-          # ==============================================================
+          rm -rf observability
+          mkdir -p observability
 
           mkdir -p \
-            "$ROOT/api" \
-            "$ROOT/alerts" \
-            "$ROOT/collector" \
-            "$ROOT/context" \
-            "$ROOT/dashboards" \
-            "$ROOT/engine" \
-            "$ROOT/events" \
-            "$ROOT/exporter" \
-            "$ROOT/health" \
-            "$ROOT/incidents" \
-            "$ROOT/manager" \
-            "$ROOT/metrics" \
-            "$ROOT/monitoring" \
-            "$ROOT/policy" \
-            "$ROOT/query" \
-            "$ROOT/registry" \
-            "$ROOT/reports" \
-            "$ROOT/router" \
-            "$ROOT/snapshot" \
-            "$ROOT/status" \
-            "$ROOT/storage" \
-            "$ROOT/tests"
+            observability/alerts \
+            observability/api \
+            observability/collector \
+            observability/context \
+            observability/dashboards \
+            observability/engine \
+            observability/events \
+            observability/exporter \
+            observability/health \
+            observability/incidents \
+            observability/manager \
+            observability/metrics \
+            observability/monitoring \
+            observability/policy \
+            observability/query \
+            observability/registry \
+            observability/reports \
+            observability/router \
+            observability/snapshot \
+            observability/status \
+            observability/storage
 
-          # ==============================================================
-          # observability/context/context.py
-          # ==============================================================
-
-          cat > "$ROOT/context/context.py" <<'PY'
+          cat > observability/core.py <<'PY'
           from __future__ import annotations
 
-          from dataclasses import dataclass, field
-          from datetime import datetime, timezone
-          from typing import Mapping
-          from uuid import uuid4
-
-
-          def utc_now() -> datetime:
-              return datetime.now(timezone.utc)
-
-
-          def _id(prefix: str) -> str:
-              return f"{prefix}_{uuid4().hex}"
-
-
-          @dataclass(frozen=True, slots=True)
-          class ObservationContext:
-              correlation_id: str = field(default_factory=lambda: _id("corr"))
-              trace_id: str = field(default_factory=lambda: _id("trace"))
-              span_id: str = field(default_factory=lambda: _id("span"))
-              parent_span_id: str | None = None
-              component: str = "unknown"
-              operation: str = "unknown"
-              tenant: str | None = None
-              actor: str | None = None
-              tags: Mapping[str, str] = field(default_factory=dict)
-              created_at: datetime = field(default_factory=utc_now)
-
-              def child(
-                  self,
-                  *,
-                  component: str | None = None,
-                  operation: str | None = None,
-                  tags: Mapping[str, str] | None = None,
-              ) -> "ObservationContext":
-                  merged = dict(self.tags)
-                  if tags:
-                      merged.update(tags)
-
-                  return ObservationContext(
-                      correlation_id=self.correlation_id,
-                      trace_id=self.trace_id,
-                      span_id=_id("span"),
-                      parent_span_id=self.span_id,
-                      component=component or self.component,
-                      operation=operation or self.operation,
-                      tenant=self.tenant,
-                      actor=self.actor,
-                      tags=merged,
-                  )
-
-              def to_dict(self) -> dict[str, object]:
-                  return {
-                      "correlation_id": self.correlation_id,
-                      "trace_id": self.trace_id,
-                      "span_id": self.span_id,
-                      "parent_span_id": self.parent_span_id,
-                      "component": self.component,
-                      "operation": self.operation,
-                      "tenant": self.tenant,
-                      "actor": self.actor,
-                      "tags": dict(self.tags),
-                      "created_at": self.created_at.isoformat(),
-                  }
-          PY
-
-          cat > "$ROOT/context/__init__.py" <<'PY'
-          from .context import ObservationContext, utc_now
-
-          __all__ = ["ObservationContext", "utc_now"]
-          PY
-
-          # ==============================================================
-          # observability/events/events.py
-          # ==============================================================
-
-          cat > "$ROOT/events/events.py" <<'PY'
-          from __future__ import annotations
-
+          import hashlib
           import json
-          from dataclasses import dataclass, field
+          import logging
+          import math
+          import threading
+          import time
+          import uuid
+          from collections import deque
+          from dataclasses import asdict, dataclass, field
           from datetime import datetime, timezone
           from enum import Enum
-          from typing import Any, Mapping
-          from uuid import uuid4
-
-          from observability.context import ObservationContext
+          from pathlib import Path
+          from typing import Any, Callable, Iterable, Mapping, Sequence
 
 
-          class EventSeverity(str, Enum):
+          LOGGER = logging.getLogger("zyra.observability")
+
+
+          class ObservabilityError(RuntimeError):
+              """Base exception for the observability subsystem."""
+
+
+          class ObservationError(ObservabilityError):
+              """Backward-compatible public alias."""
+
+
+          class ValidationError(ObservabilityError):
+              """Raised when an observability contract is invalid."""
+
+
+          class LifecycleError(ObservabilityError):
+              """Raised for invalid lifecycle transitions."""
+
+
+          class Severity(str, Enum):
               DEBUG = "debug"
               INFO = "info"
               WARNING = "warning"
               ERROR = "error"
               CRITICAL = "critical"
-
-
-          class EventType(str, Enum):
-              SYSTEM = "system"
-              LIFECYCLE = "lifecycle"
-              SECURITY = "security"
-              PERFORMANCE = "performance"
-              AVAILABILITY = "availability"
-              BUSINESS = "business"
-              AUDIT = "audit"
-              CUSTOM = "custom"
-
-
-          @dataclass(frozen=True, slots=True)
-          class ObservationEvent:
-              name: str
-              event_type: EventType = EventType.SYSTEM
-              severity: EventSeverity = EventSeverity.INFO
-              payload: Mapping[str, Any] = field(default_factory=dict)
-              context: ObservationContext = field(default_factory=ObservationContext)
-              event_id: str = field(default_factory=lambda: uuid4().hex)
-              timestamp: datetime = field(
-                  default_factory=lambda: datetime.now(timezone.utc)
-              )
-
-              def to_dict(self) -> dict[str, Any]:
-                  return {
-                      "event_id": self.event_id,
-                      "name": self.name,
-                      "event_type": self.event_type.value,
-                      "severity": self.severity.value,
-                      "payload": dict(self.payload),
-                      "context": self.context.to_dict(),
-                      "timestamp": self.timestamp.isoformat(),
-                  }
-
-              def to_json(self) -> str:
-                  return json.dumps(
-                      self.to_dict(),
-                      ensure_ascii=False,
-                      sort_keys=True,
-                      default=str,
-                  )
-          PY
-
-          cat > "$ROOT/events/__init__.py" <<'PY'
-          from .events import EventSeverity, EventType, ObservationEvent
-
-          __all__ = ["EventSeverity", "EventType", "ObservationEvent"]
-          PY
-
-          # ==============================================================
-          # observability/metrics/metrics.py
-          # ==============================================================
-
-          cat > "$ROOT/metrics/metrics.py" <<'PY'
-          from __future__ import annotations
-
-          import math
-          import threading
-          import time
-          from dataclasses import dataclass, field
-          from datetime import datetime, timezone
-          from enum import Enum
-          from typing import Iterable, Mapping
 
 
           class MetricKind(str, Enum):
@@ -234,794 +153,6 @@ jobs:
               TIMER = "timer"
 
 
-          @dataclass(frozen=True, slots=True)
-          class MetricSample:
-              name: str
-              value: float
-              kind: MetricKind
-              timestamp: datetime = field(
-                  default_factory=lambda: datetime.now(timezone.utc)
-              )
-              labels: Mapping[str, str] = field(default_factory=dict)
-              unit: str | None = None
-
-              def __post_init__(self) -> None:
-                  if not self.name or not self.name.strip():
-                      raise ValueError("Metric name cannot be empty")
-                  if not math.isfinite(float(self.value)):
-                      raise ValueError("Metric value must be finite")
-
-              def identity(self) -> tuple[str, tuple[tuple[str, str], ...]]:
-                  return (
-                      self.name,
-                      tuple(sorted((str(k), str(v)) for k, v in self.labels.items())),
-                  )
-
-
-          class MetricSeries:
-              def __init__(self, name: str, kind: MetricKind, labels: Mapping[str, str]):
-                  self.name = name
-                  self.kind = kind
-                  self.labels = dict(labels)
-                  self._lock = threading.RLock()
-                  self._count = 0
-                  self._sum = 0.0
-                  self._value = 0.0
-                  self._minimum: float | None = None
-                  self._maximum: float | None = None
-
-              def observe(self, value: float) -> None:
-                  value = float(value)
-                  if not math.isfinite(value):
-                      raise ValueError("Metric value must be finite")
-
-                  with self._lock:
-                      self._count += 1
-                      self._sum += value
-                      self._value = value
-                      self._minimum = (
-                          value
-                          if self._minimum is None
-                          else min(self._minimum, value)
-                      )
-                      self._maximum = (
-                          value
-                          if self._maximum is None
-                          else max(self._maximum, value)
-                      )
-
-              def increment(self, amount: float = 1.0) -> float:
-                  with self._lock:
-                      self._value += float(amount)
-                      self._count += 1
-                      self._sum += float(amount)
-                      return self._value
-
-              def set(self, value: float) -> None:
-                  self.observe(value)
-
-              def snapshot(self) -> dict[str, object]:
-                  with self._lock:
-                      average = (
-                          self._sum / self._count if self._count else None
-                      )
-                      return {
-                          "name": self.name,
-                          "kind": self.kind.value,
-                          "labels": dict(self.labels),
-                          "value": self._value,
-                          "count": self._count,
-                          "sum": self._sum,
-                          "average": average,
-                          "minimum": self._minimum,
-                          "maximum": self._maximum,
-                      }
-
-
-          class MetricsRegistry:
-              def __init__(self, max_series: int = 10000):
-                  if max_series <= 0:
-                      raise ValueError("max_series must be positive")
-                  self.max_series = max_series
-                  self._lock = threading.RLock()
-                  self._series: dict[
-                      tuple[str, tuple[tuple[str, str], ...]], MetricSeries
-                  ] = {}
-
-              def _get(
-                  self,
-                  name: str,
-                  kind: MetricKind,
-                  labels: Mapping[str, str],
-              ) -> MetricSeries:
-                  key = (
-                      name,
-                      tuple(sorted((str(k), str(v)) for k, v in labels.items())),
-                  )
-
-                  with self._lock:
-                      existing = self._series.get(key)
-                      if existing:
-                          if existing.kind != kind:
-                              raise ValueError(
-                                  f"Metric {name!r} already registered as "
-                                  f"{existing.kind.value}"
-                              )
-                          return existing
-
-                      if len(self._series) >= self.max_series:
-                          raise RuntimeError("Metric cardinality limit reached")
-
-                      series = MetricSeries(name, kind, labels)
-                      self._series[key] = series
-                      return series
-
-              def counter(
-                  self,
-                  name: str,
-                  amount: float = 1.0,
-                  *,
-                  labels: Mapping[str, str] | None = None,
-              ) -> float:
-                  series = self._get(
-                      name, MetricKind.COUNTER, labels or {}
-                  )
-                  return series.increment(amount)
-
-              def gauge(
-                  self,
-                  name: str,
-                  value: float,
-                  *,
-                  labels: Mapping[str, str] | None = None,
-              ) -> None:
-                  self._get(
-                      name, MetricKind.GAUGE, labels or {}
-                  ).set(value)
-
-              def observe(
-                  self,
-                  name: str,
-                  value: float,
-                  *,
-                  labels: Mapping[str, str] | None = None,
-              ) -> None:
-                  self._get(
-                      name, MetricKind.HISTOGRAM, labels or {}
-                  ).observe(value)
-
-              def timer(
-                  self,
-                  name: str,
-                  *,
-                  labels: Mapping[str, str] | None = None,
-              ):
-                  registry = self
-                  start = time.perf_counter()
-
-                  class _Timer:
-                      def __enter__(self):
-                          return self
-
-                      def __exit__(self, exc_type, exc, tb):
-                          elapsed = time.perf_counter() - start
-                          registry._get(
-                              name, MetricKind.TIMER, labels or {}
-                          ).observe(elapsed)
-
-                  return _Timer()
-
-              def samples(self) -> Iterable[MetricSample]:
-                  now = datetime.now(timezone.utc)
-                  with self._lock:
-                      for series in self._series.values():
-                          snapshot = series.snapshot()
-                          yield MetricSample(
-                              name=series.name,
-                              value=float(snapshot["value"]),
-                              kind=series.kind,
-                              timestamp=now,
-                              labels=series.labels,
-                          )
-
-              def snapshot(self) -> list[dict[str, object]]:
-                  with self._lock:
-                      return [
-                          series.snapshot()
-                          for series in self._series.values()
-                      ]
-
-              def clear(self) -> None:
-                  with self._lock:
-                      self._series.clear()
-          PY
-
-          cat > "$ROOT/metrics/__init__.py" <<'PY'
-          from .metrics import (
-              MetricKind,
-              MetricSample,
-              MetricSeries,
-              MetricsRegistry,
-          )
-
-          __all__ = [
-              "MetricKind",
-              "MetricSample",
-              "MetricSeries",
-              "MetricsRegistry",
-          ]
-          PY
-
-          # ==============================================================
-          # observability/policy/policy.py
-          # ==============================================================
-
-          cat > "$ROOT/policy/policy.py" <<'PY'
-          from __future__ import annotations
-
-          import re
-          from dataclasses import dataclass, field
-          from typing import Any, Iterable, Mapping
-
-
-          @dataclass(frozen=True, slots=True)
-          class RetentionPolicy:
-              max_events: int = 250000
-              max_age_seconds: int = 60 * 60 * 24 * 30
-
-              def __post_init__(self) -> None:
-                  if self.max_events <= 0:
-                      raise ValueError("max_events must be positive")
-                  if self.max_age_seconds <= 0:
-                      raise ValueError("max_age_seconds must be positive")
-
-
-          @dataclass(frozen=True, slots=True)
-          class CardinalityPolicy:
-              max_labels: int = 32
-              max_value_length: int = 256
-
-              def __post_init__(self) -> None:
-                  if self.max_labels <= 0:
-                      raise ValueError("max_labels must be positive")
-                  if self.max_value_length <= 0:
-                      raise ValueError("max_value_length must be positive")
-
-
-          @dataclass(frozen=True, slots=True)
-          class SamplingPolicy:
-              enabled: bool = False
-              rate: float = 1.0
-
-              def __post_init__(self) -> None:
-                  if not 0.0 <= self.rate <= 1.0:
-                      raise ValueError("sampling rate must be between 0 and 1")
-
-
-          @dataclass(frozen=True, slots=True)
-          class RedactionPolicy:
-              sensitive_keys: tuple[str, ...] = (
-                  "password",
-                  "passwd",
-                  "token",
-                  "secret",
-                  "authorization",
-                  "api_key",
-                  "private_key",
-              )
-              replacement: str = "[REDACTED]"
-
-              def redact(
-                  self,
-                  payload: Mapping[str, Any],
-              ) -> dict[str, Any]:
-                  sensitive = {
-                      key.lower()
-                      for key in self.sensitive_keys
-                  }
-
-                  def clean(value: Any) -> Any:
-                      if isinstance(value, Mapping):
-                          return {
-                              str(k): (
-                                  self.replacement
-                                  if str(k).lower() in sensitive
-                                  else clean(v)
-                              )
-                              for k, v in value.items()
-                          }
-                      if isinstance(value, (list, tuple)):
-                          return [clean(item) for item in value]
-                      if isinstance(value, str):
-                          return re.sub(
-                              r"(?i)(bearer\s+)[A-Za-z0-9._~+/=-]+",
-                              r"\1[REDACTED]",
-                              value,
-                          )
-                      return value
-
-                  return clean(payload)
-
-              def validate_keys(
-                  self,
-                  keys: Iterable[str],
-              ) -> None:
-                  if len(list(keys)) > 32:
-                      raise ValueError("Payload contains too many keys")
-
-
-          @dataclass(frozen=True, slots=True)
-          class ObservationPolicy:
-              retention: RetentionPolicy = field(
-                  default_factory=RetentionPolicy
-              )
-              cardinality: CardinalityPolicy = field(
-                  default_factory=CardinalityPolicy
-              )
-              sampling: SamplingPolicy = field(
-                  default_factory=SamplingPolicy
-              )
-              redaction: RedactionPolicy = field(
-                  default_factory=RedactionPolicy
-              )
-
-              def sanitize(
-                  self,
-                  payload: Mapping[str, Any],
-              ) -> dict[str, Any]:
-                  if len(payload) > self.cardinality.max_labels:
-                      raise ValueError("Payload cardinality limit exceeded")
-
-                  result = self.redaction.redact(payload)
-
-                  def truncate(value: Any) -> Any:
-                      if isinstance(value, str):
-                          return value[: self.cardinality.max_value_length]
-                      if isinstance(value, Mapping):
-                          return {
-                              str(k)[: self.cardinality.max_value_length]:
-                              truncate(v)
-                              for k, v in value.items()
-                          }
-                      if isinstance(value, list):
-                          return [truncate(v) for v in value]
-                      return value
-
-                  return truncate(result)
-          PY
-
-          cat > "$ROOT/policy/__init__.py" <<'PY'
-          from .policy import (
-              CardinalityPolicy,
-              ObservationPolicy,
-              RedactionPolicy,
-              RetentionPolicy,
-              SamplingPolicy,
-          )
-
-          __all__ = [
-              "CardinalityPolicy",
-              "ObservationPolicy",
-              "RedactionPolicy",
-              "RetentionPolicy",
-              "SamplingPolicy",
-          ]
-          PY
-
-          # ==============================================================
-          # observability/storage/storage.py
-          # ==============================================================
-
-          cat > "$ROOT/storage/storage.py" <<'PY'
-          from __future__ import annotations
-
-          import hashlib
-          import json
-          import sqlite3
-          import threading
-          from dataclasses import dataclass
-          from datetime import datetime, timedelta, timezone
-          from pathlib import Path
-          from typing import Any, Iterable, Mapping
-
-
-          class ObservationStorageError(RuntimeError):
-              pass
-
-
-          @dataclass(frozen=True, slots=True)
-          class StoredObservation:
-              sequence: int
-              observation_id: str
-              kind: str
-              name: str
-              timestamp: datetime
-              payload: Mapping[str, Any]
-              digest: str
-              previous_digest: str | None
-
-              def to_dict(self) -> dict[str, Any]:
-                  return {
-                      "sequence": self.sequence,
-                      "observation_id": self.observation_id,
-                      "kind": self.kind,
-                      "name": self.name,
-                      "timestamp": self.timestamp.isoformat(),
-                      "payload": dict(self.payload),
-                      "digest": self.digest,
-                      "previous_digest": self.previous_digest,
-                  }
-
-
-          class ObservationStore:
-              """
-              Durable SQLite/WAL observation store.
-
-              Design properties:
-              - transactional writes
-              - WAL journaling
-              - indexed timestamp/name queries
-              - bounded retention
-              - append-only hash chain
-              - explicit connection ownership
-              - thread-safe writes
-              """
-
-              SCHEMA_VERSION = 1
-
-              def __init__(
-                  self,
-                  path: str | Path,
-                  *,
-                  timeout_seconds: float = 30.0,
-                  max_records: int = 250000,
-              ):
-                  self.path = Path(path)
-                  self.timeout_seconds = timeout_seconds
-                  self.max_records = max_records
-                  self._lock = threading.RLock()
-                  self._local = threading.local()
-                  self.path.parent.mkdir(parents=True, exist_ok=True)
-                  self._initialize()
-
-              def _connection(self) -> sqlite3.Connection:
-                  connection = getattr(self._local, "connection", None)
-
-                  if connection is None:
-                      connection = sqlite3.connect(
-                          self.path,
-                          timeout=self.timeout_seconds,
-                          isolation_level=None,
-                          check_same_thread=False,
-                      )
-                      connection.row_factory = sqlite3.Row
-                      connection.execute("PRAGMA journal_mode=WAL")
-                      connection.execute("PRAGMA synchronous=FULL")
-                      connection.execute("PRAGMA foreign_keys=ON")
-                      connection.execute("PRAGMA busy_timeout=30000")
-                      self._local.connection = connection
-
-                  return connection
-
-              def _initialize(self) -> None:
-                  conn = self._connection()
-
-                  conn.executescript(
-                      """
-                      CREATE TABLE IF NOT EXISTS metadata (
-                          key TEXT PRIMARY KEY,
-                          value TEXT NOT NULL
-                      );
-
-                      CREATE TABLE IF NOT EXISTS observations (
-                          sequence INTEGER PRIMARY KEY AUTOINCREMENT,
-                          observation_id TEXT NOT NULL UNIQUE,
-                          kind TEXT NOT NULL,
-                          name TEXT NOT NULL,
-                          timestamp TEXT NOT NULL,
-                          payload TEXT NOT NULL,
-                          digest TEXT NOT NULL,
-                          previous_digest TEXT
-                      );
-
-                      CREATE INDEX IF NOT EXISTS idx_observations_timestamp
-                      ON observations(timestamp);
-
-                      CREATE INDEX IF NOT EXISTS idx_observations_name
-                      ON observations(name);
-
-                      CREATE INDEX IF NOT EXISTS idx_observations_kind
-                      ON observations(kind);
-                      """
-                  )
-
-                  conn.execute(
-                      "INSERT OR IGNORE INTO metadata(key,value) VALUES(?,?)",
-                      ("schema_version", str(self.SCHEMA_VERSION)),
-                  )
-
-              @staticmethod
-              def _canonical(payload: Mapping[str, Any]) -> str:
-                  return json.dumps(
-                      payload,
-                      ensure_ascii=False,
-                      sort_keys=True,
-                      separators=(",", ":"),
-                      default=str,
-                  )
-
-              def _last_digest(self, conn) -> str | None:
-                  row = conn.execute(
-                      "SELECT digest FROM observations "
-                      "ORDER BY sequence DESC LIMIT 1"
-                  ).fetchone()
-                  return row["digest"] if row else None
-
-              def append(
-                  self,
-                  *,
-                  observation_id: str,
-                  kind: str,
-                  name: str,
-                  timestamp: datetime,
-                  payload: Mapping[str, Any],
-              ) -> StoredObservation:
-                  if not observation_id:
-                      raise ValueError("observation_id is required")
-                  if not kind:
-                      raise ValueError("kind is required")
-                  if not name:
-                      raise ValueError("name is required")
-
-                  timestamp = timestamp.astimezone(timezone.utc)
-                  canonical = self._canonical(payload)
-
-                  with self._lock:
-                      conn = self._connection()
-                      previous = self._last_digest(conn)
-
-                      digest_input = "|".join(
-                          [
-                              observation_id,
-                              kind,
-                              name,
-                              timestamp.isoformat(),
-                              canonical,
-                              previous or "",
-                          ]
-                      )
-
-                      digest = hashlib.sha256(
-                          digest_input.encode("utf-8")
-                      ).hexdigest()
-
-                      try:
-                          conn.execute("BEGIN IMMEDIATE")
-                          cursor = conn.execute(
-                              """
-                              INSERT INTO observations(
-                                  observation_id,
-                                  kind,
-                                  name,
-                                  timestamp,
-                                  payload,
-                                  digest,
-                                  previous_digest
-                              )
-                              VALUES(?,?,?,?,?,?,?)
-                              """,
-                              (
-                                  observation_id,
-                                  kind,
-                                  name,
-                                  timestamp.isoformat(),
-                                  canonical,
-                                  digest,
-                                  previous,
-                              ),
-                          )
-                          sequence = int(cursor.lastrowid)
-                          self._enforce_count_locked(conn)
-                          conn.execute("COMMIT")
-                      except Exception as exc:
-                          conn.execute("ROLLBACK")
-                          raise ObservationStorageError(
-                              "Failed to append observation"
-                          ) from exc
-
-                  return StoredObservation(
-                      sequence=sequence,
-                      observation_id=observation_id,
-                      kind=kind,
-                      name=name,
-                      timestamp=timestamp,
-                      payload=dict(payload),
-                      digest=digest,
-                      previous_digest=previous,
-                  )
-
-              def _enforce_count_locked(self, conn) -> None:
-                  overflow = conn.execute(
-                      "SELECT COUNT(*) AS count FROM observations"
-                  ).fetchone()["count"] - self.max_records
-
-                  if overflow > 0:
-                      conn.execute(
-                          """
-                          DELETE FROM observations
-                          WHERE sequence IN (
-                              SELECT sequence
-                              FROM observations
-                              ORDER BY sequence ASC
-                              LIMIT ?
-                          )
-                          """,
-                          (overflow,),
-                      )
-
-              def purge_before(self, timestamp: datetime) -> int:
-                  timestamp = timestamp.astimezone(timezone.utc)
-
-                  with self._lock:
-                      conn = self._connection()
-                      cursor = conn.execute(
-                          "DELETE FROM observations WHERE timestamp < ?",
-                          (timestamp.isoformat(),),
-                      )
-                      return cursor.rowcount
-
-              def purge_older_than(self, seconds: int) -> int:
-                  cutoff = datetime.now(timezone.utc) - timedelta(
-                      seconds=seconds
-                  )
-                  return self.purge_before(cutoff)
-
-              def query(
-                  self,
-                  *,
-                  start: datetime | None = None,
-                  end: datetime | None = None,
-                  kind: str | None = None,
-                  name: str | None = None,
-                  limit: int = 1000,
-              ) -> list[StoredObservation]:
-                  if limit <= 0:
-                      raise ValueError("limit must be positive")
-
-                  conditions: list[str] = []
-                  values: list[Any] = []
-
-                  if start:
-                      conditions.append("timestamp >= ?")
-                      values.append(start.astimezone(timezone.utc).isoformat())
-
-                  if end:
-                      conditions.append("timestamp <= ?")
-                      values.append(end.astimezone(timezone.utc).isoformat())
-
-                  if kind:
-                      conditions.append("kind = ?")
-                      values.append(kind)
-
-                  if name:
-                      conditions.append("name = ?")
-                      values.append(name)
-
-                  where = (
-                      " WHERE " + " AND ".join(conditions)
-                      if conditions
-                      else ""
-                  )
-
-                  sql = (
-                      "SELECT * FROM observations"
-                      + where
-                      + " ORDER BY sequence ASC LIMIT ?"
-                  )
-
-                  values.append(limit)
-
-                  rows = self._connection().execute(
-                      sql, values
-                  ).fetchall()
-
-                  return [
-                      StoredObservation(
-                          sequence=int(row["sequence"]),
-                          observation_id=row["observation_id"],
-                          kind=row["kind"],
-                          name=row["name"],
-                          timestamp=datetime.fromisoformat(
-                              row["timestamp"]
-                          ),
-                          payload=json.loads(row["payload"]),
-                          digest=row["digest"],
-                          previous_digest=row["previous_digest"],
-                      )
-                      for row in rows
-                  ]
-
-              def count(self) -> int:
-                  row = self._connection().execute(
-                      "SELECT COUNT(*) AS count FROM observations"
-                  ).fetchone()
-                  return int(row["count"])
-
-              def verify_chain(self) -> bool:
-                  rows = self._connection().execute(
-                      """
-                      SELECT observation_id,kind,name,timestamp,payload,
-                             digest,previous_digest
-                      FROM observations
-                      ORDER BY sequence ASC
-                      """
-                  ).fetchall()
-
-                  previous = None
-
-                  for row in rows:
-                      if row["previous_digest"] != previous:
-                          return False
-
-                      digest_input = "|".join(
-                          [
-                              row["observation_id"],
-                              row["kind"],
-                              row["name"],
-                              row["timestamp"],
-                              row["payload"],
-                              previous or "",
-                          ]
-                      )
-
-                      expected = hashlib.sha256(
-                          digest_input.encode("utf-8")
-                      ).hexdigest()
-
-                      if expected != row["digest"]:
-                          return False
-
-                      previous = row["digest"]
-
-                  return True
-
-              def close(self) -> None:
-                  connection = getattr(
-                      self._local, "connection", None
-                  )
-                  if connection:
-                      connection.close()
-                      self._local.connection = None
-          PY
-
-          cat > "$ROOT/storage/__init__.py" <<'PY'
-          from .storage import (
-              ObservationStorageError,
-              ObservationStore,
-              StoredObservation,
-          )
-
-          __all__ = [
-              "ObservationStorageError",
-              "ObservationStore",
-              "StoredObservation",
-          ]
-          PY
-
-          # ==============================================================
-          # observability/health/health.py
-          # ==============================================================
-
-          cat > "$ROOT/health/health.py" <<'PY'
-          from __future__ import annotations
-
-          import threading
-          import time
-          from dataclasses import dataclass, field
-          from enum import Enum
-          from typing import Callable
-
-
           class HealthState(str, Enum):
               HEALTHY = "healthy"
               DEGRADED = "degraded"
@@ -1029,271 +160,11 @@ jobs:
               UNKNOWN = "unknown"
 
 
-          @dataclass(frozen=True, slots=True)
-          class HealthResult:
-              component: str
-              state: HealthState
-              message: str = ""
-              latency_seconds: float | None = None
-              details: dict[str, object] = field(default_factory=dict)
-              checked_at: float = field(default_factory=time.time)
-
-
-          HealthCheck = Callable[[], HealthResult]
-
-
-          class HealthRegistry:
-              def __init__(self):
-                  self._checks: dict[str, HealthCheck] = {}
-                  self._lock = threading.RLock()
-
-              def register(
-                  self,
-                  name: str,
-                  check: HealthCheck,
-                  *,
-                  replace: bool = False,
-              ) -> None:
-                  if not name.strip():
-                      raise ValueError("Health check name is required")
-
-                  with self._lock:
-                      if name in self._checks and not replace:
-                          raise ValueError(
-                              f"Health check already registered: {name}"
-                          )
-                      self._checks[name] = check
-
-              def unregister(self, name: str) -> None:
-                  with self._lock:
-                      self._checks.pop(name, None)
-
-              def check(self, name: str) -> HealthResult:
-                  with self._lock:
-                      check = self._checks.get(name)
-
-                  if check is None:
-                      return HealthResult(
-                          component=name,
-                          state=HealthState.UNKNOWN,
-                          message="Health check not registered",
-                      )
-
-                  started = time.perf_counter()
-
-                  try:
-                      result = check()
-                  except Exception as exc:
-                      return HealthResult(
-                          component=name,
-                          state=HealthState.UNHEALTHY,
-                          message=str(exc),
-                          latency_seconds=time.perf_counter() - started,
-                      )
-
-                  if result.latency_seconds is None:
-                      return HealthResult(
-                          component=result.component,
-                          state=result.state,
-                          message=result.message,
-                          latency_seconds=time.perf_counter() - started,
-                          details=dict(result.details),
-                      )
-
-                  return result
-
-              def check_all(self) -> list[HealthResult]:
-                  with self._lock:
-                      names = list(self._checks)
-
-                  return [self.check(name) for name in names]
-
-              def overall(self) -> HealthState:
-                  results = self.check_all()
-
-                  if not results:
-                      return HealthState.UNKNOWN
-
-                  states = {result.state for result in results}
-
-                  if HealthState.UNHEALTHY in states:
-                      return HealthState.UNHEALTHY
-
-                  if HealthState.DEGRADED in states:
-                      return HealthState.DEGRADED
-
-                  if states == {HealthState.HEALTHY}:
-                      return HealthState.HEALTHY
-
-                  return HealthState.UNKNOWN
-          PY
-
-          cat > "$ROOT/health/__init__.py" <<'PY'
-          from .health import (
-              HealthCheck,
-              HealthRegistry,
-              HealthResult,
-              HealthState,
-          )
-
-          __all__ = [
-              "HealthCheck",
-              "HealthRegistry",
-              "HealthResult",
-              "HealthState",
-          ]
-          PY
-
-          # ==============================================================
-          # observability/alerts/alerts.py
-          # ==============================================================
-
-          cat > "$ROOT/alerts/alerts.py" <<'PY'
-          from __future__ import annotations
-
-          import threading
-          import time
-          from dataclasses import dataclass, field
-          from enum import Enum
-          from typing import Callable, Mapping
-
-
           class AlertState(str, Enum):
-              ACTIVE = "active"
+              INACTIVE = "inactive"
+              FIRING = "firing"
+              ACKNOWLEDGED = "acknowledged"
               RESOLVED = "resolved"
-              SUPPRESSED = "suppressed"
-
-
-          @dataclass(frozen=True, slots=True)
-          class AlertRule:
-              name: str
-              predicate: Callable[[Mapping[str, object]], bool]
-              severity: str = "warning"
-              cooldown_seconds: float = 300.0
-              auto_resolve: bool = True
-
-              def __post_init__(self) -> None:
-                  if not self.name.strip():
-                      raise ValueError("Alert rule name is required")
-                  if self.cooldown_seconds < 0:
-                      raise ValueError("cooldown_seconds cannot be negative")
-
-
-          @dataclass(slots=True)
-          class Alert:
-              alert_id: str
-              rule_name: str
-              severity: str
-              state: AlertState
-              message: str
-              labels: dict[str, str] = field(default_factory=dict)
-              created_at: float = field(default_factory=time.time)
-              updated_at: float = field(default_factory=time.time)
-
-
-          class AlertManager:
-              def __init__(self):
-                  self._rules: dict[str, AlertRule] = {}
-                  self._alerts: dict[str, Alert] = {}
-                  self._last_fired: dict[str, float] = {}
-                  self._lock = threading.RLock()
-                  self._counter = 0
-
-              def register(self, rule: AlertRule) -> None:
-                  with self._lock:
-                      if rule.name in self._rules:
-                          raise ValueError(
-                              f"Alert rule already exists: {rule.name}"
-                          )
-                      self._rules[rule.name] = rule
-
-              def unregister(self, name: str) -> None:
-                  with self._lock:
-                      self._rules.pop(name, None)
-
-              def evaluate(
-                  self,
-                  payload: Mapping[str, object],
-              ) -> list[Alert]:
-                  now = time.time()
-                  fired: list[Alert] = []
-
-                  with self._lock:
-                      rules = list(self._rules.values())
-
-                      for rule in rules:
-                          try:
-                              matches = bool(rule.predicate(payload))
-                          except Exception:
-                              matches = False
-
-                          if not matches:
-                              continue
-
-                          previous = self._last_fired.get(rule.name, 0.0)
-
-                          if now - previous < rule.cooldown_seconds:
-                              continue
-
-                          self._counter += 1
-                          alert_id = f"alert_{self._counter:016d}"
-
-                          alert = Alert(
-                              alert_id=alert_id,
-                              rule_name=rule.name,
-                              severity=rule.severity,
-                              state=AlertState.ACTIVE,
-                              message=f"Alert rule triggered: {rule.name}",
-                          )
-
-                          self._alerts[alert_id] = alert
-                          self._last_fired[rule.name] = now
-                          fired.append(alert)
-
-                  return fired
-
-              def resolve(self, alert_id: str) -> Alert | None:
-                  with self._lock:
-                      alert = self._alerts.get(alert_id)
-
-                      if alert is None:
-                          return None
-
-                      alert.state = AlertState.RESOLVED
-                      alert.updated_at = time.time()
-                      return alert
-
-              def active(self) -> list[Alert]:
-                  with self._lock:
-                      return [
-                          alert
-                          for alert in self._alerts.values()
-                          if alert.state == AlertState.ACTIVE
-                      ]
-
-              def all(self) -> list[Alert]:
-                  with self._lock:
-                      return list(self._alerts.values())
-          PY
-
-          cat > "$ROOT/alerts/__init__.py" <<'PY'
-          from .alerts import Alert, AlertManager, AlertRule, AlertState
-
-          __all__ = ["Alert", "AlertManager", "AlertRule", "AlertState"]
-          PY
-
-          # ==============================================================
-          # observability/incidents/incidents.py
-          # ==============================================================
-
-          cat > "$ROOT/incidents/incidents.py" <<'PY'
-          from __future__ import annotations
-
-          import threading
-          import time
-          from dataclasses import dataclass, field
-          from enum import Enum
-          from uuid import uuid4
 
 
           class IncidentState(str, Enum):
@@ -1301,50 +172,759 @@ jobs:
               ACKNOWLEDGED = "acknowledged"
               MITIGATING = "mitigating"
               RESOLVED = "resolved"
+              CLOSED = "closed"
 
 
-          @dataclass(slots=True)
+          class LifecycleState(str, Enum):
+              CREATED = "created"
+              RUNNING = "running"
+              STOPPING = "stopping"
+              STOPPED = "stopped"
+
+
+          def utc_now() -> datetime:
+              return datetime.now(timezone.utc)
+
+
+          def utc_iso(value: datetime | None = None) -> str:
+              value = value or utc_now()
+              return value.astimezone(timezone.utc).isoformat()
+
+
+          def new_id(prefix: str) -> str:
+              return f"{prefix}_{uuid.uuid4().hex}"
+
+
+          def stable_hash(value: Any) -> str:
+              encoded = json.dumps(
+                  value,
+                  sort_keys=True,
+                  separators=(",", ":"),
+                  default=str,
+              ).encode("utf-8")
+              return hashlib.sha256(encoded).hexdigest()
+
+
+          def validate_name(name: str, field_name: str = "name") -> str:
+              if not isinstance(name, str):
+                  raise ValidationError(f"{field_name} must be a string")
+              value = name.strip()
+              if not value:
+                  raise ValidationError(f"{field_name} cannot be empty")
+              if len(value) > 256:
+                  raise ValidationError(f"{field_name} exceeds 256 characters")
+              return value
+
+
+          def sanitize_labels(
+              labels: Mapping[str, Any] | None,
+              *,
+              max_items: int = 32,
+              max_length: int = 128,
+          ) -> dict[str, str]:
+              if not labels:
+                  return {}
+
+              result: dict[str, str] = {}
+
+              for key, value in list(labels.items())[:max_items]:
+                  safe_key = validate_name(str(key), "label key")[:max_length]
+                  safe_value = str(value)[:max_length]
+                  result[safe_key] = safe_value
+
+              return result
+
+
+          @dataclass(frozen=True, slots=True)
+          class ObservationContext:
+              correlation_id: str
+              trace_id: str
+              span_id: str
+              parent_span_id: str | None = None
+              component: str = "unknown"
+              operation: str = "unknown"
+              labels: tuple[tuple[str, str], ...] = ()
+
+              @classmethod
+              def create(
+                  cls,
+                  *,
+                  component: str,
+                  operation: str,
+                  correlation_id: str | None = None,
+                  trace_id: str | None = None,
+                  parent_span_id: str | None = None,
+                  labels: Mapping[str, Any] | None = None,
+              ) -> "ObservationContext":
+                  sanitized = sanitize_labels(labels)
+
+                  return cls(
+                      correlation_id=correlation_id or new_id("corr"),
+                      trace_id=trace_id or new_id("trace"),
+                      span_id=new_id("span"),
+                      parent_span_id=parent_span_id,
+                      component=validate_name(component, "component"),
+                      operation=validate_name(operation, "operation"),
+                      labels=tuple(sorted(sanitized.items())),
+                  )
+
+              def child(self, operation: str) -> "ObservationContext":
+                  return ObservationContext.create(
+                      component=self.component,
+                      operation=operation,
+                      correlation_id=self.correlation_id,
+                      trace_id=self.trace_id,
+                      parent_span_id=self.span_id,
+                      labels=dict(self.labels),
+                  )
+
+              def as_dict(self) -> dict[str, Any]:
+                  return {
+                      "correlation_id": self.correlation_id,
+                      "trace_id": self.trace_id,
+                      "span_id": self.span_id,
+                      "parent_span_id": self.parent_span_id,
+                      "component": self.component,
+                      "operation": self.operation,
+                      "labels": dict(self.labels),
+                  }
+
+
+          @dataclass(frozen=True, slots=True)
+          class ObservationEvent:
+              event_id: str
+              timestamp: datetime
+              event_type: str
+              severity: Severity
+              message: str
+              context: ObservationContext
+              attributes: Mapping[str, Any] = field(default_factory=dict)
+
+              @classmethod
+              def create(
+                  cls,
+                  *,
+                  event_type: str,
+                  severity: Severity,
+                  message: str,
+                  context: ObservationContext,
+                  attributes: Mapping[str, Any] | None = None,
+              ) -> "ObservationEvent":
+                  return cls(
+                      event_id=new_id("evt"),
+                      timestamp=utc_now(),
+                      event_type=validate_name(event_type, "event_type"),
+                      severity=severity,
+                      message=str(message)[:4096],
+                      context=context,
+                      attributes=dict(attributes or {}),
+                  )
+
+              def as_dict(self) -> dict[str, Any]:
+                  return {
+                      "event_id": self.event_id,
+                      "timestamp": utc_iso(self.timestamp),
+                      "event_type": self.event_type,
+                      "severity": self.severity.value,
+                      "message": self.message,
+                      "context": self.context.as_dict(),
+                      "attributes": dict(self.attributes),
+                  }
+
+
+          @dataclass(frozen=True, slots=True)
+          class MetricSample:
+              metric_id: str
+              name: str
+              kind: MetricKind
+              timestamp: datetime
+              value: float
+              labels: Mapping[str, str] = field(default_factory=dict)
+              unit: str | None = None
+
+              @classmethod
+              def create(
+                  cls,
+                  *,
+                  name: str,
+                  kind: MetricKind,
+                  value: float,
+                  labels: Mapping[str, Any] | None = None,
+                  unit: str | None = None,
+              ) -> "MetricSample":
+                  numeric = float(value)
+
+                  if not math.isfinite(numeric):
+                      raise ValidationError("metric value must be finite")
+
+                  return cls(
+                      metric_id=new_id("metric"),
+                      name=validate_name(name),
+                      kind=kind,
+                      timestamp=utc_now(),
+                      value=numeric,
+                      labels=sanitize_labels(labels),
+                      unit=unit,
+                  )
+
+              def as_dict(self) -> dict[str, Any]:
+                  return {
+                      "metric_id": self.metric_id,
+                      "name": self.name,
+                      "kind": self.kind.value,
+                      "timestamp": utc_iso(self.timestamp),
+                      "value": self.value,
+                      "labels": dict(self.labels),
+                      "unit": self.unit,
+                  }
+
+
+          @dataclass(frozen=True, slots=True)
+          class HealthResult:
+              component: str
+              state: HealthState
+              checked_at: datetime
+              latency_ms: float
+              message: str = ""
+              details: Mapping[str, Any] = field(default_factory=dict)
+
+              def as_dict(self) -> dict[str, Any]:
+                  return {
+                      "component": self.component,
+                      "state": self.state.value,
+                      "checked_at": utc_iso(self.checked_at),
+                      "latency_ms": self.latency_ms,
+                      "message": self.message,
+                      "details": dict(self.details),
+                  }
+
+
+          @dataclass(frozen=True, slots=True)
+          class AlertRule:
+              rule_id: str
+              name: str
+              metric_name: str
+              threshold: float
+              operator: str = ">"
+              severity: Severity = Severity.WARNING
+              cooldown_seconds: float = 300.0
+
+              def evaluate(self, value: float) -> bool:
+                  if self.operator == ">":
+                      return value > self.threshold
+                  if self.operator == ">=":
+                      return value >= self.threshold
+                  if self.operator == "<":
+                      return value < self.threshold
+                  if self.operator == "<=":
+                      return value <= self.threshold
+                  if self.operator == "==":
+                      return value == self.threshold
+                  if self.operator == "!=":
+                      return value != self.threshold
+                  raise ValidationError(f"Unsupported alert operator: {self.operator}")
+
+
+          @dataclass
+          class Alert:
+              alert_id: str
+              rule_id: str
+              state: AlertState
+              created_at: datetime
+              updated_at: datetime
+              fingerprint: str
+              message: str
+              severity: Severity
+              value: float
+
+              def as_dict(self) -> dict[str, Any]:
+                  return {
+                      "alert_id": self.alert_id,
+                      "rule_id": self.rule_id,
+                      "state": self.state.value,
+                      "created_at": utc_iso(self.created_at),
+                      "updated_at": utc_iso(self.updated_at),
+                      "fingerprint": self.fingerprint,
+                      "message": self.message,
+                      "severity": self.severity.value,
+                      "value": self.value,
+                  }
+
+
+          @dataclass
           class Incident:
               incident_id: str
               title: str
-              severity: str
-              state: IncidentState = IncidentState.OPEN
-              alerts: list[str] = field(default_factory=list)
-              events: list[str] = field(default_factory=list)
+              state: IncidentState
+              severity: Severity
+              created_at: datetime
+              updated_at: datetime
+              alert_ids: set[str] = field(default_factory=set)
+              event_ids: set[str] = field(default_factory=set)
               notes: list[str] = field(default_factory=list)
-              created_at: float = field(default_factory=time.time)
-              updated_at: float = field(default_factory=time.time)
 
-              def add_alert(self, alert_id: str) -> None:
-                  if alert_id not in self.alerts:
-                      self.alerts.append(alert_id)
-                      self.updated_at = time.time()
+              def attach_alert(self, alert_id: str) -> None:
+                  self.alert_ids.add(alert_id)
+                  self.updated_at = utc_now()
 
-              def add_event(self, event_id: str) -> None:
-                  if event_id not in self.events:
-                      self.events.append(event_id)
-                      self.updated_at = time.time()
+              def attach_event(self, event_id: str) -> None:
+                  self.event_ids.add(event_id)
+                  self.updated_at = utc_now()
 
-              def note(self, message: str) -> None:
-                  if message.strip():
-                      self.notes.append(message)
-                      self.updated_at = time.time()
+              def transition(self, state: IncidentState) -> None:
+                  self.state = state
+                  self.updated_at = utc_now()
+
+              def as_dict(self) -> dict[str, Any]:
+                  return {
+                      "incident_id": self.incident_id,
+                      "title": self.title,
+                      "state": self.state.value,
+                      "severity": self.severity.value,
+                      "created_at": utc_iso(self.created_at),
+                      "updated_at": utc_iso(self.updated_at),
+                      "alert_ids": sorted(self.alert_ids),
+                      "event_ids": sorted(self.event_ids),
+                      "notes": list(self.notes),
+                  }
+
+
+          @dataclass(frozen=True, slots=True)
+          class RetentionPolicy:
+              max_events: int = 100_000
+              max_metrics: int = 250_000
+              max_incidents: int = 10_000
+              max_alerts: int = 10_000
+              max_labels: int = 32
+
+              def __post_init__(self) -> None:
+                  for name, value in (
+                      ("max_events", self.max_events),
+                      ("max_metrics", self.max_metrics),
+                      ("max_incidents", self.max_incidents),
+                      ("max_alerts", self.max_alerts),
+                      ("max_labels", self.max_labels),
+                  ):
+                      if value <= 0:
+                          raise ValidationError(f"{name} must be positive")
+
+
+          class MetricRegistry:
+              def __init__(self, policy: RetentionPolicy | None = None) -> None:
+                  self.policy = policy or RetentionPolicy()
+                  self._samples: deque[MetricSample] = deque(
+                      maxlen=self.policy.max_metrics
+                  )
+                  self._counters: dict[tuple[str, tuple[tuple[str, str], ...]], float] = {}
+                  self._gauges: dict[tuple[str, tuple[tuple[str, str], ...]], float] = {}
+                  self._lock = threading.RLock()
+
+              def record(self, sample: MetricSample) -> MetricSample:
+                  with self._lock:
+                      self._samples.append(sample)
+
+                      key = (sample.name, tuple(sorted(sample.labels.items())))
+
+                      if sample.kind is MetricKind.COUNTER:
+                          self._counters[key] = (
+                              self._counters.get(key, 0.0) + sample.value
+                          )
+
+                      elif sample.kind is MetricKind.GAUGE:
+                          self._gauges[key] = sample.value
+
+                      return sample
+
+              def counter(
+                  self,
+                  name: str,
+                  value: float = 1.0,
+                  labels: Mapping[str, Any] | None = None,
+                  unit: str | None = None,
+              ) -> MetricSample:
+                  return self.record(
+                      MetricSample.create(
+                          name=name,
+                          kind=MetricKind.COUNTER,
+                          value=value,
+                          labels=labels,
+                          unit=unit,
+                      )
+                  )
+
+              def gauge(
+                  self,
+                  name: str,
+                  value: float,
+                  labels: Mapping[str, Any] | None = None,
+                  unit: str | None = None,
+              ) -> MetricSample:
+                  return self.record(
+                      MetricSample.create(
+                          name=name,
+                          kind=MetricKind.GAUGE,
+                          value=value,
+                          labels=labels,
+                          unit=unit,
+                      )
+                  )
+
+              def query(
+                  self,
+                  name: str | None = None,
+                  *,
+                  start: datetime | None = None,
+                  end: datetime | None = None,
+                  labels: Mapping[str, Any] | None = None,
+              ) -> list[MetricSample]:
+                  expected = sanitize_labels(labels)
+
+                  with self._lock:
+                      result = []
+
+                      for sample in self._samples:
+                          if name is not None and sample.name != name:
+                              continue
+                          if start is not None and sample.timestamp < start:
+                              continue
+                          if end is not None and sample.timestamp > end:
+                              continue
+                          if expected and dict(sample.labels) != expected:
+                              continue
+
+                          result.append(sample)
+
+                      return result
+
+              def snapshot(self) -> dict[str, Any]:
+                  with self._lock:
+                      return {
+                          "samples": len(self._samples),
+                          "counters": {
+                              f"{k[0]}:{dict(k[1])}": v
+                              for k, v in self._counters.items()
+                          },
+                          "gauges": {
+                              f"{k[0]}:{dict(k[1])}": v
+                              for k, v in self._gauges.items()
+                          },
+                      }
+
+
+          class ObservationStore:
+              """
+              Durable JSONL observation store.
+
+              The store is intentionally append-only and uses fsync on writes.
+              Recovery ignores an incomplete final record rather than corrupting
+              previous committed observations.
+              """
+
+              def __init__(
+                  self,
+                  path: str | Path,
+                  *,
+                  max_records: int = 250_000,
+                  fsync: bool = True,
+              ) -> None:
+                  if max_records <= 0:
+                      raise ValidationError("max_records must be positive")
+
+                  self.path = Path(path)
+                  self.path.parent.mkdir(parents=True, exist_ok=True)
+                  self.max_records = max_records
+                  self.fsync = fsync
+                  self._lock = threading.RLock()
+                  self._records = 0
+
+                  self._recover_count()
+
+              def _recover_count(self) -> None:
+                  count = 0
+
+                  if not self.path.exists():
+                      self._records = 0
+                      return
+
+                  with self.path.open("rb") as handle:
+                      for line in handle:
+                          if line.strip():
+                              count += 1
+
+                  self._records = count
+
+              def append(self, record: Mapping[str, Any]) -> None:
+                  payload = dict(record)
+                  payload.setdefault("stored_at", utc_iso())
+
+                  encoded = (
+                      json.dumps(
+                          payload,
+                          ensure_ascii=False,
+                          sort_keys=True,
+                          separators=(",", ":"),
+                          default=str,
+                      )
+                      + "\n"
+                  ).encode("utf-8")
+
+                  with self._lock:
+                      if self._records >= self.max_records:
+                          self._compact_locked()
+
+                      with self.path.open("ab") as handle:
+                          handle.write(encoded)
+                          handle.flush()
+
+                          if self.fsync:
+                              import os
+
+                              os.fsync(handle.fileno())
+
+                      self._records += 1
+
+              def read_all(self) -> list[dict[str, Any]]:
+                  result = []
+
+                  if not self.path.exists():
+                      return result
+
+                  with self._lock:
+                      with self.path.open("r", encoding="utf-8") as handle:
+                          for line in handle:
+                              if not line.strip():
+                                  continue
+
+                              try:
+                                  result.append(json.loads(line))
+                              except json.JSONDecodeError:
+                                  LOGGER.warning(
+                                      "Ignoring malformed observation record"
+                                  )
+
+                  return result
+
+              def _compact_locked(self) -> None:
+                  records = self.read_all()
+
+                  keep = max(1, self.max_records // 2)
+                  records = records[-keep:]
+
+                  temporary = self.path.with_suffix(
+                      self.path.suffix + ".compact"
+                  )
+
+                  with temporary.open("w", encoding="utf-8") as handle:
+                      for record in records:
+                          handle.write(
+                              json.dumps(
+                                  record,
+                                  ensure_ascii=False,
+                                  sort_keys=True,
+                                  separators=(",", ":"),
+                                  default=str,
+                              )
+                          )
+                          handle.write("\n")
+
+                      handle.flush()
+
+                      if self.fsync:
+                          import os
+
+                          os.fsync(handle.fileno())
+
+                  temporary.replace(self.path)
+                  self._records = len(records)
+
+              def count(self) -> int:
+                  with self._lock:
+                      return self._records
+
+
+          class HealthRegistry:
+              def __init__(self) -> None:
+                  self._checks: dict[str, Callable[[], Any]] = {}
+                  self._lock = threading.RLock()
+
+              def register(
+                  self,
+                  component: str,
+                  check: Callable[[], Any],
+              ) -> None:
+                  name = validate_name(component, "component")
+
+                  if not callable(check):
+                      raise ValidationError("health check must be callable")
+
+                  with self._lock:
+                      self._checks[name] = check
+
+              def unregister(self, component: str) -> None:
+                  with self._lock:
+                      self._checks.pop(component, None)
+
+              def check(self, component: str) -> HealthResult:
+                  with self._lock:
+                      check = self._checks.get(component)
+
+                  if check is None:
+                      return HealthResult(
+                          component=component,
+                          state=HealthState.UNKNOWN,
+                          checked_at=utc_now(),
+                          latency_ms=0.0,
+                          message="No health check registered",
+                      )
+
+                  started = time.perf_counter()
+
+                  try:
+                      raw = check()
+
+                      if isinstance(raw, HealthResult):
+                          return raw
+
+                      if raw is True:
+                          state = HealthState.HEALTHY
+                      elif raw is False:
+                          state = HealthState.UNHEALTHY
+                      else:
+                          state = HealthState.HEALTHY
+
+                      return HealthResult(
+                          component=component,
+                          state=state,
+                          checked_at=utc_now(),
+                          latency_ms=(time.perf_counter() - started) * 1000,
+                          message="Health check completed",
+                          details={"result": raw},
+                      )
+
+                  except Exception as exc:
+                      return HealthResult(
+                          component=component,
+                          state=HealthState.UNHEALTHY,
+                          checked_at=utc_now(),
+                          latency_ms=(time.perf_counter() - started) * 1000,
+                          message=str(exc)[:1024],
+                      )
+
+              def check_all(self) -> list[HealthResult]:
+                  with self._lock:
+                      names = list(self._checks)
+
+                  return [self.check(name) for name in names]
+
+
+          class AlertManager:
+              def __init__(self) -> None:
+                  self._rules: dict[str, AlertRule] = {}
+                  self._alerts: dict[str, Alert] = {}
+                  self._lock = threading.RLock()
+
+              def register_rule(self, rule: AlertRule) -> None:
+                  if rule.cooldown_seconds < 0:
+                      raise ValidationError("cooldown_seconds cannot be negative")
+
+                  with self._lock:
+                      self._rules[rule.rule_id] = rule
+
+              def evaluate(
+                  self,
+                  metric: MetricSample,
+              ) -> list[Alert]:
+                  with self._lock:
+                      rules = [
+                          rule
+                          for rule in self._rules.values()
+                          if rule.metric_name == metric.name
+                      ]
+
+                      result = []
+
+                      for rule in rules:
+                          fingerprint = stable_hash(
+                              {
+                                  "rule": rule.rule_id,
+                                  "metric": metric.name,
+                                  "labels": dict(metric.labels),
+                              }
+                          )
+
+                          existing = self._alerts.get(fingerprint)
+                          now = utc_now()
+
+                          if rule.evaluate(metric.value):
+                              if existing is None:
+                                  alert = Alert(
+                                      alert_id=new_id("alert"),
+                                      rule_id=rule.rule_id,
+                                      state=AlertState.FIRING,
+                                      created_at=now,
+                                      updated_at=now,
+                                      fingerprint=fingerprint,
+                                      message=(
+                                          f"{metric.name} crossed "
+                                          f"{rule.operator} {rule.threshold}"
+                                      ),
+                                      severity=rule.severity,
+                                      value=metric.value,
+                                  )
+                                  self._alerts[fingerprint] = alert
+                              else:
+                                  existing.state = AlertState.FIRING
+                                  existing.updated_at = now
+                                  existing.value = metric.value
+                                  alert = existing
+
+                              result.append(alert)
+
+                          elif existing is not None:
+                              existing.state = AlertState.RESOLVED
+                              existing.updated_at = now
+                              existing.value = metric.value
+                              result.append(existing)
+
+                      return result
+
+              def active(self) -> list[Alert]:
+                  with self._lock:
+                      return [
+                          alert
+                          for alert in self._alerts.values()
+                          if alert.state
+                          in (
+                              AlertState.FIRING,
+                              AlertState.ACKNOWLEDGED,
+                          )
+                      ]
+
+              def snapshot(self) -> list[dict[str, Any]]:
+                  with self._lock:
+                      return [a.as_dict() for a in self._alerts.values()]
 
 
           class IncidentManager:
-              def __init__(self):
+              def __init__(self) -> None:
                   self._incidents: dict[str, Incident] = {}
                   self._lock = threading.RLock()
 
               def create(
                   self,
                   title: str,
-                  severity: str = "warning",
+                  *,
+                  severity: Severity = Severity.ERROR,
               ) -> Incident:
+                  now = utc_now()
+
                   incident = Incident(
-                      incident_id=f"inc_{uuid4().hex}",
-                      title=title,
+                      incident_id=new_id("incident"),
+                      title=validate_name(title, "title"),
+                      state=IncidentState.OPEN,
                       severity=severity,
+                      created_at=now,
+                      updated_at=now,
                   )
 
                   with self._lock:
@@ -1356,635 +936,716 @@ jobs:
                   with self._lock:
                       return self._incidents.get(incident_id)
 
-              def transition(
-                  self,
-                  incident_id: str,
-                  state: IncidentState,
-              ) -> Incident:
-                  with self._lock:
-                      incident = self._incidents[incident_id]
-                      incident.state = state
-                      incident.updated_at = time.time()
-                      return incident
-
               def active(self) -> list[Incident]:
                   with self._lock:
                       return [
                           item
                           for item in self._incidents.values()
-                          if item.state != IncidentState.RESOLVED
+                          if item.state
+                          not in (
+                              IncidentState.RESOLVED,
+                              IncidentState.CLOSED,
+                          )
                       ]
 
-              def all(self) -> list[Incident]:
+              def snapshot(self) -> list[dict[str, Any]]:
                   with self._lock:
-                      return list(self._incidents.values())
-          PY
-
-          cat > "$ROOT/incidents/__init__.py" <<'PY'
-          from .incidents import Incident, IncidentManager, IncidentState
-
-          __all__ = ["Incident", "IncidentManager", "IncidentState"]
-          PY
-
-          # ==============================================================
-          # observability/registry/registry.py
-          # ==============================================================
-
-          cat > "$ROOT/registry/registry.py" <<'PY'
-          from __future__ import annotations
-
-          import threading
-          from dataclasses import dataclass, field
-          from typing import Any
+                      return [
+                          incident.as_dict()
+                          for incident in self._incidents.values()
+                      ]
 
 
-          @dataclass(frozen=True, slots=True)
-          class ComponentDescriptor:
-              name: str
-              version: str
-              owner: str | None = None
-              metadata: dict[str, Any] = field(default_factory=dict)
+          class EventBus:
+              def __init__(self, *, max_events: int = 100_000) -> None:
+                  self._events: deque[ObservationEvent] = deque(
+                      maxlen=max_events
+                  )
+                  self._subscribers: dict[
+                      str, list[Callable[[ObservationEvent], None]]
+                  ] = {}
+                  self._lock = threading.RLock()
+
+              def publish(self, event: ObservationEvent) -> None:
+                  with self._lock:
+                      self._events.append(event)
+                      subscribers = list(
+                          self._subscribers.get(event.event_type, [])
+                      )
+                      subscribers += list(
+                          self._subscribers.get("*", [])
+                      )
+
+                  for subscriber in subscribers:
+                      try:
+                          subscriber(event)
+                      except Exception:
+                          LOGGER.exception(
+                              "Observability event subscriber failed"
+                          )
+
+              def subscribe(
+                  self,
+                  event_type: str,
+                  callback: Callable[[ObservationEvent], None],
+              ) -> None:
+                  if not callable(callback):
+                      raise ValidationError("callback must be callable")
+
+                  with self._lock:
+                      self._subscribers.setdefault(
+                          event_type,
+                          [],
+                      ).append(callback)
+
+              def recent(self, limit: int = 100) -> list[ObservationEvent]:
+                  if limit <= 0:
+                      return []
+
+                  with self._lock:
+                      return list(self._events)[-limit:]
 
 
           class ComponentRegistry:
-              def __init__(self):
-                  self._components: dict[str, ComponentDescriptor] = {}
+              def __init__(self) -> None:
+                  self._components: dict[str, dict[str, Any]] = {}
                   self._lock = threading.RLock()
 
               def register(
                   self,
-                  descriptor: ComponentDescriptor,
+                  name: str,
                   *,
-                  replace: bool = False,
+                  kind: str = "component",
+                  metadata: Mapping[str, Any] | None = None,
               ) -> None:
-                  with self._lock:
-                      if (
-                          descriptor.name in self._components
-                          and not replace
-                      ):
-                          raise ValueError(
-                              f"Component already registered: "
-                              f"{descriptor.name}"
-                          )
+                  name = validate_name(name)
 
-                      self._components[descriptor.name] = descriptor
+                  with self._lock:
+                      self._components[name] = {
+                          "name": name,
+                          "kind": kind,
+                          "metadata": dict(metadata or {}),
+                          "registered_at": utc_iso(),
+                      }
 
               def unregister(self, name: str) -> None:
                   with self._lock:
                       self._components.pop(name, None)
 
-              def get(self, name: str) -> ComponentDescriptor | None:
+              def get(self, name: str) -> dict[str, Any] | None:
                   with self._lock:
-                      return self._components.get(name)
+                      value = self._components.get(name)
+                      return dict(value) if value else None
 
-              def list(self) -> list[ComponentDescriptor]:
+              def all(self) -> list[dict[str, Any]]:
                   with self._lock:
-                      return list(self._components.values())
+                      return [
+                          dict(value)
+                          for value in self._components.values()
+                      ]
+
+
+          class ObservationEngine:
+              def __init__(
+                  self,
+                  *,
+                  metrics: MetricRegistry | None = None,
+                  events: EventBus | None = None,
+                  alerts: AlertManager | None = None,
+                  health: HealthRegistry | None = None,
+              ) -> None:
+                  self.metrics = metrics or MetricRegistry()
+                  self.events = events or EventBus()
+                  self.alerts = alerts or AlertManager()
+                  self.health = health or HealthRegistry()
+
+              def observe_event(
+                  self,
+                  event: ObservationEvent,
+              ) -> ObservationEvent:
+                  self.events.publish(event)
+                  return event
+
+              def observe_metric(
+                  self,
+                  sample: MetricSample,
+              ) -> list[Alert]:
+                  self.metrics.record(sample)
+                  return self.alerts.evaluate(sample)
+
+              def emit(
+                  self,
+                  *,
+                  event_type: str,
+                  severity: Severity,
+                  message: str,
+                  context: ObservationContext,
+                  attributes: Mapping[str, Any] | None = None,
+              ) -> ObservationEvent:
+                  event = ObservationEvent.create(
+                      event_type=event_type,
+                      severity=severity,
+                      message=message,
+                      context=context,
+                      attributes=attributes,
+                  )
+                  return self.observe_event(event)
+
+              def snapshot(self) -> dict[str, Any]:
+                  return {
+                      "metrics": self.metrics.snapshot(),
+                      "events": len(self.events.recent(1_000_000)),
+                      "active_alerts": len(self.alerts.active()),
+                      "health": [
+                          item.as_dict()
+                          for item in self.health.check_all()
+                      ],
+                  }
+
+
+          class ObservationManager:
+              def __init__(
+                  self,
+                  *,
+                  storage_path: str | Path | None = None,
+                  retention: RetentionPolicy | None = None,
+              ) -> None:
+                  self.retention = retention or RetentionPolicy()
+
+                  self.metrics = MetricRegistry(self.retention)
+                  self.events = EventBus(
+                      max_events=self.retention.max_events
+                  )
+                  self.alerts = AlertManager()
+                  self.health = HealthRegistry()
+                  self.incidents = IncidentManager()
+                  self.registry = ComponentRegistry()
+
+                  self.engine = ObservationEngine(
+                      metrics=self.metrics,
+                      events=self.events,
+                      alerts=self.alerts,
+                      health=self.health,
+                  )
+
+                  self.storage = (
+                      ObservationStore(
+                          storage_path,
+                          max_records=self.retention.max_events,
+                      )
+                      if storage_path
+                      else None
+                  )
+
+                  self._state = LifecycleState.CREATED
+                  self._lock = threading.RLock()
+
+              @property
+              def state(self) -> LifecycleState:
+                  with self._lock:
+                      return self._state
+
+              def start(self) -> None:
+                  with self._lock:
+                      if self._state is LifecycleState.RUNNING:
+                          return
+
+                      if self._state not in (
+                          LifecycleState.CREATED,
+                          LifecycleState.STOPPED,
+                      ):
+                          raise LifecycleError(
+                              f"Cannot start from {self._state.value}"
+                          )
+
+                      self._state = LifecycleState.RUNNING
+
+              def stop(self) -> None:
+                  with self._lock:
+                      if self._state is LifecycleState.STOPPED:
+                          return
+
+                      if self._state is not LifecycleState.RUNNING:
+                          self._state = LifecycleState.STOPPED
+                          return
+
+                      self._state = LifecycleState.STOPPING
+
+                  with self._lock:
+                      self._state = LifecycleState.STOPPED
+
+              def record_event(
+                  self,
+                  event: ObservationEvent,
+              ) -> ObservationEvent:
+                  if self.state is not LifecycleState.RUNNING:
+                      raise LifecycleError(
+                          "Observation manager is not running"
+                      )
+
+                  result = self.engine.observe_event(event)
+
+                  if self.storage:
+                      self.storage.append(
+                          {
+                              "type": "event",
+                              "payload": result.as_dict(),
+                          }
+                      )
+
+                  return result
+
+              def record_metric(
+                  self,
+                  sample: MetricSample,
+              ) -> list[Alert]:
+                  if self.state is not LifecycleState.RUNNING:
+                      raise LifecycleError(
+                          "Observation manager is not running"
+                      )
+
+                  alerts = self.engine.observe_metric(sample)
+
+                  if self.storage:
+                      self.storage.append(
+                          {
+                              "type": "metric",
+                              "payload": sample.as_dict(),
+                          }
+                      )
+
+                      for alert in alerts:
+                          self.storage.append(
+                              {
+                                  "type": "alert",
+                                  "payload": alert.as_dict(),
+                              }
+                          )
+
+                  return alerts
+
+              def status(self) -> dict[str, Any]:
+                  with self._lock:
+                      state = self._state.value
+
+                  return {
+                      "state": state,
+                      "components": len(self.registry.all()),
+                      "active_alerts": len(self.alerts.active()),
+                      "active_incidents": len(self.incidents.active()),
+                      "metrics": self.metrics.snapshot(),
+                      "storage_records": (
+                          self.storage.count()
+                          if self.storage
+                          else 0
+                      ),
+                  }
+
+
+          class ObservationAPI:
+              def __init__(self, manager: ObservationManager) -> None:
+                  self.manager = manager
+
+              def start(self) -> None:
+                  self.manager.start()
+
+              def stop(self) -> None:
+                  self.manager.stop()
+
+              def context(
+                  self,
+                  component: str,
+                  operation: str,
+                  **kwargs: Any,
+              ) -> ObservationContext:
+                  return ObservationContext.create(
+                      component=component,
+                      operation=operation,
+                      **kwargs,
+                  )
+
+              def event(
+                  self,
+                  *,
+                  context: ObservationContext,
+                  event_type: str,
+                  severity: Severity = Severity.INFO,
+                  message: str,
+                  attributes: Mapping[str, Any] | None = None,
+              ) -> ObservationEvent:
+                  event = ObservationEvent.create(
+                      event_type=event_type,
+                      severity=severity,
+                      message=message,
+                      context=context,
+                      attributes=attributes,
+                  )
+                  return self.manager.record_event(event)
+
+              def counter(
+                  self,
+                  name: str,
+                  value: float = 1.0,
+                  labels: Mapping[str, Any] | None = None,
+              ) -> MetricSample:
+                  sample = MetricSample.create(
+                      name=name,
+                      kind=MetricKind.COUNTER,
+                      value=value,
+                      labels=labels,
+                  )
+                  self.manager.record_metric(sample)
+                  return sample
+
+              def gauge(
+                  self,
+                  name: str,
+                  value: float,
+                  labels: Mapping[str, Any] | None = None,
+              ) -> MetricSample:
+                  sample = MetricSample.create(
+                      name=name,
+                      kind=MetricKind.GAUGE,
+                      value=value,
+                      labels=labels,
+                  )
+                  self.manager.record_metric(sample)
+                  return sample
+
+              def status(self) -> dict[str, Any]:
+                  return self.manager.status()
+
+
+          __all__ = [
+              "Alert",
+              "AlertManager",
+              "AlertRule",
+              "AlertState",
+              "ComponentRegistry",
+              "EventBus",
+              "HealthRegistry",
+              "HealthResult",
+              "HealthState",
+              "Incident",
+              "IncidentManager",
+              "IncidentState",
+              "LifecycleError",
+              "LifecycleState",
+              "MetricKind",
+              "MetricRegistry",
+              "MetricSample",
+              "ObservationAPI",
+              "ObservationContext",
+              "ObservationEngine",
+              "ObservationError",
+              "ObservationEvent",
+              "ObservationManager",
+              "ObservationStore",
+              "ObservabilityError",
+              "RetentionPolicy",
+              "Severity",
+              "ValidationError",
+              "new_id",
+              "stable_hash",
+              "utc_iso",
+              "utc_now",
+          ]
           PY
 
-          cat > "$ROOT/registry/__init__.py" <<'PY'
-          from .registry import ComponentDescriptor, ComponentRegistry
+          cat > observability/context/context.py <<'PY'
+          from ..core import ObservationContext
 
-          __all__ = ["ComponentDescriptor", "ComponentRegistry"]
+          __all__ = ["ObservationContext"]
           PY
 
-          # ==============================================================
-          # observability/collector/collector.py
-          # ==============================================================
+          cat > observability/events/events.py <<'PY'
+          from ..core import EventBus, ObservationEvent, Severity
 
-          cat > "$ROOT/collector/collector.py" <<'PY'
+          __all__ = ["EventBus", "ObservationEvent", "Severity"]
+          PY
+
+          cat > observability/metrics/metrics.py <<'PY'
+          from ..core import MetricKind, MetricRegistry, MetricSample
+
+          __all__ = ["MetricKind", "MetricRegistry", "MetricSample"]
+          PY
+
+          cat > observability/alerts/alerts.py <<'PY'
+          from ..core import Alert, AlertManager, AlertRule, AlertState
+
+          __all__ = ["Alert", "AlertManager", "AlertRule", "AlertState"]
+          PY
+
+          cat > observability/health/health.py <<'PY'
+          from ..core import HealthRegistry, HealthResult, HealthState
+
+          __all__ = ["HealthRegistry", "HealthResult", "HealthState"]
+          PY
+
+          cat > observability/incidents/incidents.py <<'PY'
+          from ..core import Incident, IncidentManager, IncidentState
+
+          __all__ = ["Incident", "IncidentManager", "IncidentState"]
+          PY
+
+          cat > observability/registry/registry.py <<'PY'
+          from ..core import ComponentRegistry
+
+          __all__ = ["ComponentRegistry"]
+          PY
+
+          cat > observability/collector/collector.py <<'PY'
           from __future__ import annotations
 
-          import queue
           import threading
-          from dataclasses import dataclass
-          from typing import Callable
+          from collections import deque
+          from typing import Any
 
-          from observability.events import ObservationEvent
-
-
-          class CollectorClosedError(RuntimeError):
-              pass
-
-
-          @dataclass(frozen=True, slots=True)
-          class CollectorStats:
-              accepted: int
-              rejected: int
-              processed: int
-              queue_size: int
+          from ..core import ObservationEvent, ObservationManager
 
 
           class SignalCollector:
               def __init__(
                   self,
+                  manager: ObservationManager,
                   *,
-                  capacity: int = 10000,
-                  worker_count: int = 2,
-              ):
-                  if capacity <= 0:
-                      raise ValueError("capacity must be positive")
-                  if worker_count <= 0:
-                      raise ValueError("worker_count must be positive")
-
-                  self._queue: queue.Queue[ObservationEvent | None] = (
-                      queue.Queue(maxsize=capacity)
-                  )
-                  self._workers: list[threading.Thread] = []
-                  self._handler: Callable[[ObservationEvent], None] | None = None
-                  self._lock = threading.RLock()
-                  self._closed = False
-                  self._accepted = 0
-                  self._rejected = 0
-                  self._processed = 0
-                  self._worker_count = worker_count
-
-              def start(
-                  self,
-                  handler: Callable[[ObservationEvent], None],
+                  max_queue: int = 10000,
               ) -> None:
+                  if max_queue <= 0:
+                      raise ValueError("max_queue must be positive")
+
+                  self.manager = manager
+                  self._queue: deque[Any] = deque(maxlen=max_queue)
+                  self._lock = threading.RLock()
+
+              def submit(self, signal: Any) -> None:
                   with self._lock:
-                      if self._closed:
-                          raise CollectorClosedError("Collector is closed")
+                      self._queue.append(signal)
 
-                      if self._workers:
-                          raise RuntimeError("Collector already started")
+              def drain(self, limit: int = 1000) -> int:
+                  processed = 0
 
-                      self._handler = handler
-
-                      for index in range(self._worker_count):
-                          worker = threading.Thread(
-                              target=self._run,
-                              name=f"zyra-observer-{index}",
-                              daemon=True,
-                          )
-                          self._workers.append(worker)
-                          worker.start()
-
-              def submit(
-                  self,
-                  event: ObservationEvent,
-                  *,
-                  block: bool = False,
-              ) -> bool:
-                  with self._lock:
-                      if self._closed:
-                          raise CollectorClosedError("Collector is closed")
-
-                  try:
-                      self._queue.put(event, block=block, timeout=0.1 if block else 0)
-                  except queue.Full:
+                  while processed < limit:
                       with self._lock:
-                          self._rejected += 1
-                      return False
+                          if not self._queue:
+                              break
+                          item = self._queue.popleft()
 
+                      if isinstance(item, ObservationEvent):
+                          self.manager.record_event(item)
+
+                      processed += 1
+
+                  return processed
+
+              def pending(self) -> int:
                   with self._lock:
-                      self._accepted += 1
+                      return len(self._queue)
 
-                  return True
 
-              def _run(self) -> None:
-                  while True:
-                      event = self._queue.get()
+          __all__ = ["SignalCollector"]
+          PY
 
-                      try:
-                          if event is None:
-                              return
+          cat > observability/policy/policy.py <<'PY'
+          from dataclasses import dataclass
 
-                          handler = self._handler
-                          if handler is not None:
-                              handler(event)
+          from ..core import RetentionPolicy, ValidationError
 
-                          with self._lock:
-                              self._processed += 1
-                      finally:
-                          self._queue.task_done()
 
-              def stats(self) -> CollectorStats:
-                  with self._lock:
-                      return CollectorStats(
-                          accepted=self._accepted,
-                          rejected=self._rejected,
-                          processed=self._processed,
-                          queue_size=self._queue.qsize(),
+          @dataclass(frozen=True, slots=True)
+          class ObservationPolicy:
+              retention: RetentionPolicy = RetentionPolicy()
+              max_event_attributes: int = 64
+              max_attribute_length: int = 4096
+
+              def validate(self) -> None:
+                  if self.max_event_attributes <= 0:
+                      raise ValidationError(
+                          "max_event_attributes must be positive"
                       )
 
-              def close(self, timeout: float = 10.0) -> None:
-                  with self._lock:
-                      if self._closed:
-                          return
-                      self._closed = True
+                  if self.max_attribute_length <= 0:
+                      raise ValidationError(
+                          "max_attribute_length must be positive"
+                      )
 
-                  for _ in self._workers:
-                      try:
-                          self._queue.put(None, timeout=timeout)
-                      except queue.Full:
-                          break
 
-                  for worker in self._workers:
-                      worker.join(timeout=timeout)
-
-                  self._workers.clear()
+          __all__ = ["ObservationPolicy", "RetentionPolicy"]
           PY
 
-          cat > "$ROOT/collector/__init__.py" <<'PY'
-          from .collector import (
-              CollectorClosedError,
-              CollectorStats,
-              SignalCollector,
-          )
+          cat > observability/storage/storage.py <<'PY'
+          from ..core import ObservationStore
 
-          __all__ = [
-              "CollectorClosedError",
-              "CollectorStats",
-              "SignalCollector",
-          ]
+          __all__ = ["ObservationStore"]
           PY
 
-          # ==============================================================
-          # observability/query/query.py
-          # ==============================================================
-
-          cat > "$ROOT/query/query.py" <<'PY'
+          cat > observability/query/query.py <<'PY'
           from __future__ import annotations
 
           from datetime import datetime
-          from typing import Any
 
-          from observability.storage import ObservationStore, StoredObservation
+          from ..core import MetricRegistry, MetricSample
 
 
           class ObservationQuery:
-              def __init__(self, store: ObservationStore):
-                  self.store = store
+              def __init__(self, metrics: MetricRegistry) -> None:
+                  self.metrics = metrics
 
-              def execute(
+              def metrics(
                   self,
+                  name: str | None = None,
                   *,
                   start: datetime | None = None,
                   end: datetime | None = None,
-                  kind: str | None = None,
-                  name: str | None = None,
-                  limit: int = 1000,
-              ) -> list[StoredObservation]:
-                  return self.store.query(
+              ) -> list[MetricSample]:
+                  return self.metrics.query(
+                      name,
                       start=start,
                       end=end,
-                      kind=kind,
-                      name=name,
-                      limit=limit,
                   )
 
-              def count(
-                  self,
-                  *,
-                  start: datetime | None = None,
-                  end: datetime | None = None,
-                  kind: str | None = None,
-                  name: str | None = None,
-              ) -> int:
-                  return len(
-                      self.execute(
-                          start=start,
-                          end=end,
-                          kind=kind,
-                          name=name,
-                          limit=2_000_000,
-                      )
-                  )
-
-              def aggregate(
-                  self,
-                  *,
-                  name: str,
-                  start: datetime | None = None,
-                  end: datetime | None = None,
-              ) -> dict[str, Any]:
-                  rows = self.execute(
-                      start=start,
-                      end=end,
-                      name=name,
-                      limit=2_000_000,
-                  )
-
-                  values = [
-                      float(row.payload["value"])
-                      for row in rows
-                      if isinstance(row.payload.get("value"), (int, float))
-                  ]
-
-                  if not values:
-                      return {
-                          "name": name,
-                          "count": 0,
-                          "minimum": None,
-                          "maximum": None,
-                          "average": None,
-                          "sum": 0.0,
-                      }
-
-                  return {
-                      "name": name,
-                      "count": len(values),
-                      "minimum": min(values),
-                      "maximum": max(values),
-                      "average": sum(values) / len(values),
-                      "sum": sum(values),
-                  }
-          PY
-
-          cat > "$ROOT/query/__init__.py" <<'PY'
-          from .query import ObservationQuery
 
           __all__ = ["ObservationQuery"]
           PY
 
-          # ==============================================================
-          # observability/snapshot/snapshot.py
-          # ==============================================================
-
-          cat > "$ROOT/snapshot/snapshot.py" <<'PY'
+          cat > observability/snapshot/snapshot.py <<'PY'
           from __future__ import annotations
 
           from dataclasses import dataclass
-          from datetime import datetime, timezone
-          from types import MappingProxyType
+          from datetime import datetime
           from typing import Any, Mapping
+
+          from ..core import utc_now, utc_iso
 
 
           @dataclass(frozen=True, slots=True)
           class ObservationSnapshot:
-              created_at: datetime
-              health: str
-              metrics: tuple[Mapping[str, Any], ...]
-              active_alerts: tuple[Mapping[str, Any], ...]
-              active_incidents: tuple[Mapping[str, Any], ...]
-              components: tuple[Mapping[str, Any], ...]
+              captured_at: datetime
+              payload: Mapping[str, Any]
 
               @classmethod
               def create(
                   cls,
-                  *,
-                  health: str,
-                  metrics: list[Mapping[str, Any]],
-                  alerts: list[Mapping[str, Any]],
-                  incidents: list[Mapping[str, Any]],
-                  components: list[Mapping[str, Any]],
+                  payload: Mapping[str, Any],
               ) -> "ObservationSnapshot":
                   return cls(
-                      created_at=datetime.now(timezone.utc),
-                      health=health,
-                      metrics=tuple(
-                          MappingProxyType(dict(item))
-                          for item in metrics
-                      ),
-                      active_alerts=tuple(
-                          MappingProxyType(dict(item))
-                          for item in alerts
-                      ),
-                      active_incidents=tuple(
-                          MappingProxyType(dict(item))
-                          for item in incidents
-                      ),
-                      components=tuple(
-                          MappingProxyType(dict(item))
-                          for item in components
-                      ),
+                      captured_at=utc_now(),
+                      payload=dict(payload),
                   )
 
-              def to_dict(self) -> dict[str, Any]:
+              def as_dict(self) -> dict[str, Any]:
                   return {
-                      "created_at": self.created_at.isoformat(),
-                      "health": self.health,
-                      "metrics": [dict(item) for item in self.metrics],
-                      "active_alerts": [
-                          dict(item) for item in self.active_alerts
-                      ],
-                      "active_incidents": [
-                          dict(item) for item in self.active_incidents
-                      ],
-                      "components": [
-                          dict(item) for item in self.components
-                      ],
+                      "captured_at": utc_iso(self.captured_at),
+                      "payload": dict(self.payload),
                   }
-          PY
 
-          cat > "$ROOT/snapshot/__init__.py" <<'PY'
-          from .snapshot import ObservationSnapshot
 
           __all__ = ["ObservationSnapshot"]
           PY
 
-          # ==============================================================
-          # observability/status/status.py
-          # ==============================================================
-
-          cat > "$ROOT/status/status.py" <<'PY'
-          from __future__ import annotations
-
-          from dataclasses import dataclass
-          from enum import Enum
+          cat > observability/status/status.py <<'PY'
+          from ..core import HealthState, HealthResult
 
 
-          class SystemStatus(str, Enum):
-              STARTING = "starting"
-              READY = "ready"
-              DEGRADED = "degraded"
-              FAILED = "failed"
-              STOPPING = "stopping"
-              STOPPED = "stopped"
+          def aggregate_health(results: list[HealthResult]) -> HealthState:
+              if not results:
+                  return HealthState.UNKNOWN
+
+              states = {result.state for result in results}
+
+              if HealthState.UNHEALTHY in states:
+                  return HealthState.UNHEALTHY
+
+              if HealthState.DEGRADED in states:
+                  return HealthState.DEGRADED
+
+              if HealthState.UNKNOWN in states:
+                  return HealthState.DEGRADED
+
+              return HealthState.HEALTHY
 
 
-          @dataclass(frozen=True, slots=True)
-          class StatusReport:
-              status: SystemStatus
-              health: str
-              components: int
-              active_alerts: int
-              active_incidents: int
-              stored_observations: int
-              chain_valid: bool
-              version: str
-
-              def to_dict(self) -> dict[str, object]:
-                  return {
-                      "status": self.status.value,
-                      "health": self.health,
-                      "components": self.components,
-                      "active_alerts": self.active_alerts,
-                      "active_incidents": self.active_incidents,
-                      "stored_observations": self.stored_observations,
-                      "chain_valid": self.chain_valid,
-                      "version": self.version,
-                  }
+          __all__ = ["aggregate_health"]
           PY
 
-          cat > "$ROOT/status/__init__.py" <<'PY'
-          from .status import StatusReport, SystemStatus
-
-          __all__ = ["StatusReport", "SystemStatus"]
-          PY
-
-          # ==============================================================
-          # observability/exporter/exporter.py
-          # ==============================================================
-
-          cat > "$ROOT/exporter/exporter.py" <<'PY'
+          cat > observability/exporter/exporter.py <<'PY'
           from __future__ import annotations
 
           import json
-          from abc import ABC, abstractmethod
-          from pathlib import Path
-          from typing import Any, Iterable, Mapping
+          from typing import Any, Iterable
 
 
-          class ObservationExporter(ABC):
-              @abstractmethod
-              def export(
-                  self,
-                  records: Iterable[Mapping[str, Any]],
-              ) -> int:
+          class ObservationExporter:
+              def export(self, records: Iterable[dict[str, Any]]) -> str:
                   raise NotImplementedError
 
 
-          class JsonLinesExporter(ObservationExporter):
-              def __init__(self, path: str | Path):
-                  self.path = Path(path)
-                  self.path.parent.mkdir(parents=True, exist_ok=True)
-
-              def export(
-                  self,
-                  records: Iterable[Mapping[str, Any]],
-              ) -> int:
-                  count = 0
-
-                  with self.path.open(
-                      "a",
-                      encoding="utf-8",
-                  ) as handle:
-                      for record in records:
-                          handle.write(
-                              json.dumps(
-                                  dict(record),
-                                  ensure_ascii=False,
-                                  sort_keys=True,
-                                  default=str,
-                              )
-                              + "\n"
-                          )
-                          count += 1
-
-                      handle.flush()
-
-                  return count
+          class JSONObservationExporter(ObservationExporter):
+              def export(self, records: Iterable[dict[str, Any]]) -> str:
+                  return json.dumps(
+                      list(records),
+                      ensure_ascii=False,
+                      sort_keys=True,
+                      default=str,
+                  )
 
 
-          class MemoryExporter(ObservationExporter):
-              def __init__(self):
-                  self.records: list[dict[str, Any]] = []
+          class NDJSONObservationExporter(ObservationExporter):
+              def export(self, records: Iterable[dict[str, Any]]) -> str:
+                  return "\n".join(
+                      json.dumps(
+                          record,
+                          ensure_ascii=False,
+                          sort_keys=True,
+                          default=str,
+                      )
+                      for record in records
+                  )
 
-              def export(
-                  self,
-                  records: Iterable[Mapping[str, Any]],
-              ) -> int:
-                  count = 0
-
-                  for record in records:
-                      self.records.append(dict(record))
-                      count += 1
-
-                  return count
-          PY
-
-          cat > "$ROOT/exporter/__init__.py" <<'PY'
-          from .exporter import (
-              JsonLinesExporter,
-              MemoryExporter,
-              ObservationExporter,
-          )
 
           __all__ = [
-              "JsonLinesExporter",
-              "MemoryExporter",
+              "JSONObservationExporter",
+              "NDJSONObservationExporter",
               "ObservationExporter",
           ]
           PY
 
-          # ==============================================================
-          # observability/router/router.py
-          # ==============================================================
-
-          cat > "$ROOT/router/router.py" <<'PY'
+          cat > observability/router/router.py <<'PY'
           from __future__ import annotations
 
           import threading
-          from collections.abc import Callable
-          from dataclasses import dataclass
-          from typing import Any
-
-          from observability.events import ObservationEvent
-
-
-          @dataclass(frozen=True, slots=True)
-          class Route:
-              name: str
-              predicate: Callable[[ObservationEvent], bool]
-              handler: Callable[[ObservationEvent], None]
+          from typing import Any, Callable
 
 
           class ObservationRouter:
-              def __init__(self):
-                  self._routes: dict[str, Route] = {}
+              def __init__(self) -> None:
+                  self._routes: dict[str, list[Callable[[Any], None]]] = {}
                   self._lock = threading.RLock()
 
-              def add(self, route: Route) -> None:
+              def register(
+                  self,
+                  signal_type: str,
+                  handler: Callable[[Any], None],
+              ) -> None:
+                  if not callable(handler):
+                      raise TypeError("handler must be callable")
+
                   with self._lock:
-                      if route.name in self._routes:
-                          raise ValueError(
-                              f"Route already exists: {route.name}"
-                          )
-                      self._routes[route.name] = route
+                      self._routes.setdefault(signal_type, []).append(handler)
 
-              def remove(self, name: str) -> None:
+              def route(self, signal_type: str, signal: Any) -> None:
                   with self._lock:
-                      self._routes.pop(name, None)
+                      handlers = list(self._routes.get(signal_type, []))
+                      handlers += list(self._routes.get("*", []))
 
-              def dispatch(self, event: ObservationEvent) -> list[str]:
-                  with self._lock:
-                      routes = list(self._routes.values())
+                  for handler in handlers:
+                      handler(signal)
 
-                  delivered: list[str] = []
 
-                  for route in routes:
-                      try:
-                          matches = route.predicate(event)
-                      except Exception:
-                          matches = False
-
-                      if not matches:
-                          continue
-
-                      route.handler(event)
-                      delivered.append(route.name)
-
-                  return delivered
-
-              def route_count(self) -> int:
-                  with self._lock:
-                      return len(self._routes)
+          __all__ = ["ObservationRouter"]
           PY
 
-          cat > "$ROOT/router/__init__.py" <<'PY'
-          from .router import ObservationRouter, Route
-
-          __all__ = ["ObservationRouter", "Route"]
-          PY
-
-          # ==============================================================
-          # observability/dashboards/dashboards.py
-          # ==============================================================
-
-          cat > "$ROOT/dashboards/dashboards.py" <<'PY'
+          cat > observability/dashboards/dashboards.py <<'PY'
           from __future__ import annotations
 
           from dataclasses import dataclass, field
@@ -1995,579 +1656,86 @@ jobs:
           class DashboardWidget:
               widget_id: str
               title: str
-              widget_type: str
-              query: dict[str, Any] = field(default_factory=dict)
+              query: str
+              options: dict[str, Any] = field(default_factory=dict)
 
 
           @dataclass(frozen=True, slots=True)
           class Dashboard:
               dashboard_id: str
-              title: str
+              name: str
               widgets: tuple[DashboardWidget, ...] = ()
-
-              def to_dict(self) -> dict[str, Any]:
-                  return {
-                      "dashboard_id": self.dashboard_id,
-                      "title": self.title,
-                      "widgets": [
-                          {
-                              "widget_id": widget.widget_id,
-                              "title": widget.title,
-                              "widget_type": widget.widget_type,
-                              "query": dict(widget.query),
-                          }
-                          for widget in self.widgets
-                      ],
-                  }
 
 
           class DashboardRegistry:
-              def __init__(self):
-                  self._dashboards: dict[str, Dashboard] = {}
+              def __init__(self) -> None:
+                  self._items: dict[str, Dashboard] = {}
 
               def register(self, dashboard: Dashboard) -> None:
-                  if dashboard.dashboard_id in self._dashboards:
-                      raise ValueError("Dashboard already exists")
-                  self._dashboards[dashboard.dashboard_id] = dashboard
+                  self._items[dashboard.dashboard_id] = dashboard
 
               def get(self, dashboard_id: str) -> Dashboard | None:
-                  return self._dashboards.get(dashboard_id)
+                  return self._items.get(dashboard_id)
 
               def all(self) -> list[Dashboard]:
-                  return list(self._dashboards.values())
+                  return list(self._items.values())
+
+
+          __all__ = [
+              "Dashboard",
+              "DashboardRegistry",
+              "DashboardWidget",
+          ]
           PY
 
-          cat > "$ROOT/dashboards/__init__.py" <<'PY'
-          from .dashboards import (
-              Dashboard,
-              DashboardRegistry,
-              DashboardWidget,
-          )
-
-          __all__ = ["Dashboard", "DashboardRegistry", "DashboardWidget"]
-          PY
-
-          # ==============================================================
-          # observability/reports/reports.py
-          # ==============================================================
-
-          cat > "$ROOT/reports/reports.py" <<'PY'
+          cat > observability/reports/reports.py <<'PY'
           from __future__ import annotations
 
           from dataclasses import dataclass
-          from datetime import datetime, timezone
           from typing import Any, Mapping
+
+          from ..core import utc_iso, utc_now
 
 
           @dataclass(frozen=True, slots=True)
           class ObservationReport:
-              generated_at: datetime
+              generated_at: str
               title: str
               summary: Mapping[str, Any]
-              sections: tuple[Mapping[str, Any], ...]
 
-              def to_dict(self) -> dict[str, Any]:
+              def as_dict(self) -> dict[str, Any]:
                   return {
-                      "generated_at": self.generated_at.isoformat(),
+                      "generated_at": self.generated_at,
                       "title": self.title,
                       "summary": dict(self.summary),
-                      "sections": [dict(section) for section in self.sections],
                   }
 
 
           class ReportBuilder:
               def build(
                   self,
-                  *,
                   title: str,
                   summary: Mapping[str, Any],
-                  sections: list[Mapping[str, Any]],
               ) -> ObservationReport:
                   return ObservationReport(
-                      generated_at=datetime.now(timezone.utc),
+                      generated_at=utc_iso(utc_now()),
                       title=title,
                       summary=dict(summary),
-                      sections=tuple(dict(section) for section in sections),
                   )
-          PY
 
-          cat > "$ROOT/reports/__init__.py" <<'PY'
-          from .reports import ObservationReport, ReportBuilder
 
           __all__ = ["ObservationReport", "ReportBuilder"]
           PY
 
-          # ==============================================================
-          # observability/monitoring/monitoring.py
-          # ==============================================================
-
-          cat > "$ROOT/monitoring/monitoring.py" <<'PY'
+          cat > observability/monitoring/monitoring.py <<'PY'
           from __future__ import annotations
 
-          import threading
-          import time
-          from dataclasses import dataclass
-          from typing import Callable
-
-
-          @dataclass(frozen=True, slots=True)
-          class MonitorSnapshot:
-              running: bool
-              iterations: int
-              failures: int
-              last_run: float | None
+          from ..core import ObservationManager
 
 
           class MonitoringService:
-              def __init__(self, interval_seconds: float = 30.0):
-                  if interval_seconds <= 0:
-                      raise ValueError("interval_seconds must be positive")
-
-                  self.interval_seconds = interval_seconds
-                  self._callback: Callable[[], None] | None = None
-                  self._thread: threading.Thread | None = None
-                  self._stop = threading.Event()
-                  self._lock = threading.RLock()
-                  self._iterations = 0
-                  self._failures = 0
-                  self._last_run: float | None = None
-
-              def start(self, callback: Callable[[], None]) -> None:
-                  with self._lock:
-                      if self._thread and self._thread.is_alive():
-                          raise RuntimeError("Monitoring already running")
-
-                      self._callback = callback
-                      self._stop.clear()
-                      self._thread = threading.Thread(
-                          target=self._run,
-                          name="zyra-observability-monitor",
-                          daemon=True,
-                      )
-                      self._thread.start()
-
-              def _run(self) -> None:
-                  while not self._stop.wait(self.interval_seconds):
-                      callback = self._callback
-                      if callback is None:
-                          continue
-
-                      try:
-                          callback()
-                          with self._lock:
-                              self._iterations += 1
-                              self._last_run = time.time()
-                      except Exception:
-                          with self._lock:
-                              self._failures += 1
-                              self._last_run = time.time()
-
-              def stop(self, timeout: float = 10.0) -> None:
-                  self._stop.set()
-
-                  thread = self._thread
-                  if thread:
-                      thread.join(timeout=timeout)
-
-              def snapshot(self) -> MonitorSnapshot:
-                  with self._lock:
-                      return MonitorSnapshot(
-                          running=bool(
-                              self._thread
-                              and self._thread.is_alive()
-                          ),
-                          iterations=self._iterations,
-                          failures=self._failures,
-                          last_run=self._last_run,
-                      )
-          PY
-
-          cat > "$ROOT/monitoring/__init__.py" <<'PY'
-          from .monitoring import MonitorSnapshot, MonitoringService
-
-          __all__ = ["MonitorSnapshot", "MonitoringService"]
-          PY
-
-          # ==============================================================
-          # observability/engine/engine.py
-          # ==============================================================
-
-          cat > "$ROOT/engine/engine.py" <<'PY'
-          from __future__ import annotations
-
-          import threading
-          from dataclasses import dataclass
-          from typing import Any, Mapping
-
-          from observability.alerts import Alert, AlertManager
-          from observability.events import ObservationEvent
-          from observability.metrics import MetricsRegistry
-          from observability.policy import ObservationPolicy
-          from observability.storage import ObservationStore
-
-
-          @dataclass(frozen=True, slots=True)
-          class EngineResult:
-              event_id: str
-              stored: bool
-              alerts: tuple[Alert, ...]
-
-
-          class ObservationEngine:
-              def __init__(
-                  self,
-                  store: ObservationStore,
-                  metrics: MetricsRegistry,
-                  alerts: AlertManager,
-                  policy: ObservationPolicy,
-              ):
-                  self.store = store
-                  self.metrics = metrics
-                  self.alerts = alerts
-                  self.policy = policy
-                  self._lock = threading.RLock()
-
-              def process(
-                  self,
-                  event: ObservationEvent,
-              ) -> EngineResult:
-                  payload = self.policy.sanitize(event.payload)
-
-                  with self._lock:
-                      stored = self.store.append(
-                          observation_id=event.event_id,
-                          kind=event.event_type.value,
-                          name=event.name,
-                          timestamp=event.timestamp,
-                          payload=payload,
-                      )
-
-                      self.metrics.counter(
-                          "observability.events.total",
-                          labels={
-                              "event_type": event.event_type.value,
-                              "severity": event.severity.value,
-                          },
-                      )
-
-                      if event.severity.value in {"error", "critical"}:
-                          self.metrics.counter(
-                              "observability.events.errors",
-                              labels={
-                                  "severity": event.severity.value
-                              },
-                          )
-
-                      fired = self.alerts.evaluate(payload)
-
-                  return EngineResult(
-                      event_id=stored.observation_id,
-                      stored=True,
-                      alerts=tuple(fired),
-                  )
-
-              def record_metric(
-                  self,
-                  name: str,
-                  value: float,
-                  *,
-                  labels: Mapping[str, str] | None = None,
-              ) -> None:
-                  self.metrics.observe(
-                      name,
-                      value,
-                      labels=labels,
-                  )
-          PY
-
-          cat > "$ROOT/engine/__init__.py" <<'PY'
-          from .engine import EngineResult, ObservationEngine
-
-          __all__ = ["EngineResult", "ObservationEngine"]
-          PY
-
-          # ==============================================================
-          # observability/manager/manager.py
-          # ==============================================================
-
-          cat > "$ROOT/manager/manager.py" <<'PY'
-          from __future__ import annotations
-
-          import threading
-          from pathlib import Path
-          from typing import Any, Mapping
-
-          from observability.alerts import AlertManager
-          from observability.context import ObservationContext
-          from observability.dashboards import DashboardRegistry
-          from observability.engine import ObservationEngine
-          from observability.events import (
-              EventSeverity,
-              EventType,
-              ObservationEvent,
-          )
-          from observability.health import (
-              HealthRegistry,
-              HealthResult,
-              HealthState,
-          )
-          from observability.incidents import IncidentManager
-          from observability.metrics import MetricsRegistry
-          from observability.policy import ObservationPolicy
-          from observability.query import ObservationQuery
-          from observability.registry import ComponentRegistry
-          from observability.router import ObservationRouter
-          from observability.snapshot import ObservationSnapshot
-          from observability.status import StatusReport, SystemStatus
-          from observability.storage import ObservationStore
-
-
-          class ObservabilityManager:
-              VERSION = "1.0.0"
-
-              def __init__(
-                  self,
-                  *,
-                  storage_path: str | Path = "storage/observability.db",
-                  policy: ObservationPolicy | None = None,
-              ):
-                  self.policy = policy or ObservationPolicy()
-
-                  self.store = ObservationStore(
-                      storage_path,
-                      max_records=self.policy.retention.max_events,
-                  )
-                  self.metrics = MetricsRegistry()
-                  self.alerts = AlertManager()
-                  self.incidents = IncidentManager()
-                  self.health = HealthRegistry()
-                  self.components = ComponentRegistry()
-                  self.dashboards = DashboardRegistry()
-                  self.router = ObservationRouter()
-
-                  self.engine = ObservationEngine(
-                      self.store,
-                      self.metrics,
-                      self.alerts,
-                      self.policy,
-                  )
-                  self.query = ObservationQuery(self.store)
-
-                  self._status = SystemStatus.STARTING
-                  self._lock = threading.RLock()
-
-                  self.health.register(
-                      "observability.storage",
-                      self._storage_health,
-                  )
-
-              def _storage_health(self) -> HealthResult:
-                  valid = self.store.verify_chain()
-
-                  return HealthResult(
-                      component="observability.storage",
-                      state=(
-                          HealthState.HEALTHY
-                          if valid
-                          else HealthState.UNHEALTHY
-                      ),
-                      message=(
-                          "Observation store operational"
-                          if valid
-                          else "Observation hash chain invalid"
-                      ),
-                      details={
-                          "records": self.store.count(),
-                          "chain_valid": valid,
-                      },
-                  )
-
-              def start(self) -> None:
-                  with self._lock:
-                      if self._status in {
-                          SystemStatus.READY,
-                          SystemStatus.DEGRADED,
-                      }:
-                          return
-
-                      self._status = SystemStatus.READY
-
-                  self.emit(
-                      "observability.started",
-                      event_type=EventType.LIFECYCLE,
-                      severity=EventSeverity.INFO,
-                      payload={
-                          "version": self.VERSION,
-                      },
-                  )
-
-              def stop(self) -> None:
-                  with self._lock:
-                      if self._status == SystemStatus.STOPPED:
-                          return
-                      self._status = SystemStatus.STOPPING
-
-                  try:
-                      self.emit(
-                          "observability.stopping",
-                          event_type=EventType.LIFECYCLE,
-                          severity=EventSeverity.INFO,
-                          payload={},
-                      )
-                  finally:
-                      self.store.close()
-                      with self._lock:
-                          self._status = SystemStatus.STOPPED
-
-              def emit(
-                  self,
-                  name: str,
-                  *,
-                  event_type: EventType = EventType.SYSTEM,
-                  severity: EventSeverity = EventSeverity.INFO,
-                  payload: Mapping[str, Any] | None = None,
-                  context: ObservationContext | None = None,
-              ) -> ObservationEvent:
-                  event = ObservationEvent(
-                      name=name,
-                      event_type=event_type,
-                      severity=severity,
-                      payload=payload or {},
-                      context=context or ObservationContext(),
-                  )
-
-                  result = self.engine.process(event)
-
-                  if result.alerts:
-                      self.metrics.counter(
-                          "observability.alerts.fired",
-                          amount=len(result.alerts),
-                      )
-
-                  try:
-                      self.router.dispatch(event)
-                  except Exception:
-                      self.metrics.counter(
-                          "observability.router.failures"
-                      )
-
-                  return event
-
-              def snapshot(self) -> ObservationSnapshot:
-                  health = self.health.overall().value
-
-                  metrics = self.metrics.snapshot()
-
-                  alerts = [
-                      {
-                          "alert_id": alert.alert_id,
-                          "rule_name": alert.rule_name,
-                          "severity": alert.severity,
-                          "state": alert.state.value,
-                          "message": alert.message,
-                      }
-                      for alert in self.alerts.active()
-                  ]
-
-                  incidents = [
-                      {
-                          "incident_id": incident.incident_id,
-                          "title": incident.title,
-                          "severity": incident.severity,
-                          "state": incident.state.value,
-                      }
-                      for incident in self.incidents.active()
-                  ]
-
-                  components = [
-                      {
-                          "name": component.name,
-                          "version": component.version,
-                          "owner": component.owner,
-                          "metadata": dict(component.metadata),
-                      }
-                      for component in self.components.list()
-                  ]
-
-                  return ObservationSnapshot.create(
-                      health=health,
-                      metrics=metrics,
-                      alerts=alerts,
-                      incidents=incidents,
-                      components=components,
-                  )
-
-              def status(self) -> StatusReport:
-                  health = self.health.overall()
-
-                  status = self._status
-
-                  if (
-                      status == SystemStatus.READY
-                      and health == HealthState.DEGRADED
-                  ):
-                      status = SystemStatus.DEGRADED
-
-                  if health == HealthState.UNHEALTHY:
-                      status = SystemStatus.FAILED
-
-                  return StatusReport(
-                      status=status,
-                      health=health.value,
-                      components=len(self.components.list()),
-                      active_alerts=len(self.alerts.active()),
-                      active_incidents=len(self.incidents.active()),
-                      stored_observations=self.store.count(),
-                      chain_valid=self.store.verify_chain(),
-                      version=self.VERSION,
-                  )
-
-              def retain(self) -> int:
-                  return self.store.purge_older_than(
-                      self.policy.retention.max_age_seconds
-                  )
-          PY
-
-          cat > "$ROOT/manager/__init__.py" <<'PY'
-          from .manager import ObservabilityManager
-
-          __all__ = ["ObservabilityManager"]
-          PY
-
-          # ==============================================================
-          # observability/api/api.py
-          # ==============================================================
-
-          cat > "$ROOT/api/api.py" <<'PY'
-          from __future__ import annotations
-
-          from datetime import datetime
-          from pathlib import Path
-          from typing import Any, Mapping
-
-          from observability.context import ObservationContext
-          from observability.events import EventSeverity, EventType
-          from observability.manager import ObservabilityManager
-          from observability.status import StatusReport
-
-
-          class ObservabilityAPI:
-              """
-              Stable public facade.
-
-              Applications should depend on this facade rather than
-              importing implementation internals.
-              """
-
-              def __init__(
-                  self,
-                  manager: ObservabilityManager | None = None,
-                  *,
-                  storage_path: str | Path = "storage/observability.db",
-              ):
-                  self.manager = manager or ObservabilityManager(
-                      storage_path=storage_path
-                  )
+              def __init__(self, manager: ObservationManager) -> None:
+                  self.manager = manager
 
               def start(self) -> None:
                   self.manager.start()
@@ -2575,501 +1743,540 @@ jobs:
               def stop(self) -> None:
                   self.manager.stop()
 
-              def event(
-                  self,
-                  name: str,
-                  *,
-                  payload: Mapping[str, Any] | None = None,
-                  event_type: EventType = EventType.SYSTEM,
-                  severity: EventSeverity = EventSeverity.INFO,
-                  context: ObservationContext | None = None,
-              ):
-                  return self.manager.emit(
-                      name,
-                      payload=payload,
-                      event_type=event_type,
-                      severity=severity,
-                      context=context,
-                  )
-
-              def metric(
-                  self,
-                  name: str,
-                  value: float,
-                  *,
-                  labels: Mapping[str, str] | None = None,
-              ) -> None:
-                  self.manager.metrics.observe(
-                      name,
-                      value,
-                      labels=labels,
-                  )
-
-              def status(self) -> StatusReport:
+              def status(self) -> dict:
                   return self.manager.status()
 
-              def snapshot(self):
-                  return self.manager.snapshot()
 
-              def query(
-                  self,
-                  *,
-                  start: datetime | None = None,
-                  end: datetime | None = None,
-                  kind: str | None = None,
-                  name: str | None = None,
-                  limit: int = 1000,
-              ):
-                  return self.manager.query.execute(
-                      start=start,
-                      end=end,
-                      kind=kind,
-                      name=name,
-                      limit=limit,
-                  )
+          __all__ = ["MonitoringService"]
           PY
 
-          cat > "$ROOT/api/__init__.py" <<'PY'
-          from .api import ObservabilityAPI
+          cat > observability/engine/engine.py <<'PY'
+          from ..core import ObservationEngine
 
-          __all__ = ["ObservabilityAPI"]
+          __all__ = ["ObservationEngine"]
           PY
 
-          # ==============================================================
-          # Root API
-          # ==============================================================
+          cat > observability/manager/manager.py <<'PY'
+          from ..core import ObservationManager
 
-          cat > "$ROOT/__init__.py" <<'PY'
-          """
-          ZYRA Observability.
+          __all__ = ["ObservationManager"]
+          PY
 
-          Cross-cutting production observability layer.
+          cat > observability/api/api.py <<'PY'
+          from ..core import ObservationAPI
 
-          Stable public surface:
-              ObservabilityAPI
-              ObservabilityManager
-              ObservationEvent
-              ObservationContext
-              MetricsRegistry
-              ObservationStore
-              ObservationPolicy
-              HealthRegistry
-              AlertManager
-              IncidentManager
+          __all__ = ["ObservationAPI"]
+          PY
 
-          The implementation deliberately uses Python standard-library
-          facilities only so the foundational observability layer does not
-          acquire unnecessary third-party runtime coupling.
-          """
-
-          from .alerts import Alert, AlertManager, AlertRule, AlertState
-          from .api import ObservabilityAPI
-          from .collector import SignalCollector
-          from .context import ObservationContext
-          from .engine import ObservationEngine
-          from .events import EventSeverity, EventType, ObservationEvent
-          from .health import HealthRegistry, HealthResult, HealthState
-          from .incidents import Incident, IncidentManager, IncidentState
-          from .manager import ObservabilityManager
-          from .metrics import (
+          cat > observability/__init__.py <<'PY'
+          from .core import (
+              Alert,
+              AlertManager,
+              AlertRule,
+              AlertState,
+              ComponentRegistry,
+              EventBus,
+              HealthRegistry,
+              HealthResult,
+              HealthState,
+              Incident,
+              IncidentManager,
+              IncidentState,
+              LifecycleError,
+              LifecycleState,
               MetricKind,
+              MetricRegistry,
               MetricSample,
-              MetricSeries,
-              MetricsRegistry,
-          )
-          from .policy import (
-              CardinalityPolicy,
-              ObservationPolicy,
-              RedactionPolicy,
-              RetentionPolicy,
-              SamplingPolicy,
-          )
-          from .query import ObservationQuery
-          from .registry import ComponentDescriptor, ComponentRegistry
-          from .snapshot import ObservationSnapshot
-          from .status import StatusReport, SystemStatus
-          from .storage import (
-              ObservationStorageError,
+              ObservationAPI,
+              ObservationContext,
+              ObservationEngine,
+              ObservationError,
+              ObservationEvent,
+              ObservationManager,
               ObservationStore,
-              StoredObservation,
+              ObservabilityError,
+              RetentionPolicy,
+              Severity,
+              ValidationError,
+              new_id,
+              stable_hash,
+              utc_iso,
+              utc_now,
           )
 
-          # Compatibility name required by existing integrations.
-          ObservabilityError = RuntimeError
-          ObservationError = ObservabilityError
-
-          __version__ = ObservabilityManager.VERSION
+          from .alerts.alerts import *
+          from .api.api import *
+          from .collector.collector import *
+          from .context.context import *
+          from .dashboards.dashboards import *
+          from .engine.engine import *
+          from .events.events import *
+          from .exporter.exporter import *
+          from .health.health import *
+          from .incidents.incidents import *
+          from .manager.manager import *
+          from .metrics.metrics import *
+          from .monitoring.monitoring import *
+          from .policy.policy import *
+          from .query.query import *
+          from .registry.registry import *
+          from .reports.reports import *
+          from .router.router import *
+          from .snapshot.snapshot import *
+          from .status.status import *
+          from .storage.storage import *
 
           __all__ = [
               "Alert",
               "AlertManager",
               "AlertRule",
               "AlertState",
-              "ObservabilityAPI",
-              "SignalCollector",
-              "ObservationContext",
-              "ObservationEngine",
-              "EventSeverity",
-              "EventType",
-              "ObservationEvent",
+              "ComponentRegistry",
+              "EventBus",
               "HealthRegistry",
               "HealthResult",
               "HealthState",
               "Incident",
               "IncidentManager",
               "IncidentState",
-              "ObservabilityManager",
+              "LifecycleError",
+              "LifecycleState",
               "MetricKind",
+              "MetricRegistry",
               "MetricSample",
-              "MetricSeries",
-              "MetricsRegistry",
-              "CardinalityPolicy",
-              "ObservationPolicy",
-              "RedactionPolicy",
-              "RetentionPolicy",
-              "SamplingPolicy",
-              "ObservationQuery",
-              "ComponentDescriptor",
-              "ComponentRegistry",
-              "ObservationSnapshot",
-              "StatusReport",
-              "SystemStatus",
-              "ObservationStorageError",
-              "ObservationStore",
-              "StoredObservation",
-              "ObservabilityError",
+              "ObservationAPI",
+              "ObservationContext",
+              "ObservationEngine",
               "ObservationError",
+              "ObservationEvent",
+              "ObservationManager",
+              "ObservationStore",
+              "ObservabilityError",
+              "RetentionPolicy",
+              "Severity",
+              "ValidationError",
           ]
           PY
 
-          # ==============================================================
-          # README
-          # ==============================================================
-
-          cat > "$ROOT/README.md" <<'MD'
+          cat > observability/README.md <<'MD'
           # ZYRA Observability
 
-          Production cross-cutting observability layer.
+          Production observability boundary for the ZYRA Network.
 
-          ## Responsibilities
+          Responsibilities:
 
           - immutable observation context
           - structured events
           - metrics
-          - bounded cardinality
-          - payload redaction
-          - durable SQLite/WAL observation storage
-          - retention
-          - hash-chain integrity verification
           - health checks
-          - alert evaluation
-          - incident lifecycle
+          - alerts
+          - incidents
           - component registry
-          - query layer
+          - bounded signal collection
+          - durable append-only observation storage
+          - querying
           - snapshots
+          - status aggregation
+          - exporters
+          - routing
           - dashboards
           - reports
-          - routing
-          - exporters
-          - monitoring lifecycle
-          - stable public API
+          - lifecycle management
 
-          ## Boundary
+          Runtime implementation uses the Python standard library and does not
+          require external observability vendors.
 
-          This package is cross-cutting infrastructure.
-
-          It must not contain application-specific business logic.
-
-          `apps/` is intentionally outside this block.
-
-          ## Compatibility
-
-          Public imports should preferably use:
-
-          ```python
-          from observability import ObservabilityAPI
-          ```
-
-          rather than importing implementation internals.
+          The package is intentionally isolated from `apps/`.
           MD
 
-          # ==============================================================
-          # Production tests
-          # ==============================================================
+      - name: Create complete package initializers
+        shell: bash
+        run: |
+          set -euo pipefail
 
-          cat > "$ROOT/tests/test_production.py" <<'PY'
+          declare -A exports
+
+          exports["alerts"]="from .alerts import *"
+          exports["api"]="from .api import *"
+          exports["collector"]="from .collector import *"
+          exports["context"]="from .context import *"
+          exports["dashboards"]="from .dashboards import *"
+          exports["engine"]="from .engine import *"
+          exports["events"]="from .events import *"
+          exports["exporter"]="from .exporter import *"
+          exports["health"]="from .health import *"
+          exports["incidents"]="from .incidents import *"
+          exports["manager"]="from .manager import *"
+          exports["metrics"]="from .metrics import *"
+          exports["monitoring"]="from .monitoring import *"
+          exports["policy"]="from .policy import *"
+          exports["query"]="from .query import *"
+          exports["registry"]="from .registry import *"
+          exports["reports"]="from .reports import *"
+          exports["router"]="from .router import *"
+          exports["snapshot"]="from .snapshot import *"
+          exports["status"]="from .status import *"
+          exports["storage"]="from .storage import *"
+
+          for package in "${!exports[@]}"; do
+            printf '%s\n' "${exports[$package]}" \
+              > "observability/${package}/__init__.py"
+          done
+
+      - name: Create production test suite
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          mkdir -p observability/tests
+
+          cat > observability/tests/test_observability.py <<'PY'
           from __future__ import annotations
 
           import tempfile
           from pathlib import Path
 
           from observability import (
-              AlertManager,
               AlertRule,
-              EventSeverity,
-              EventType,
-              HealthRegistry,
               HealthState,
+              MetricKind,
+              MetricRegistry,
+              MetricSample,
               ObservationContext,
-              ObservationEvent,
-              ObservationPolicy,
+              ObservationManager,
               ObservationStore,
-              ObservabilityAPI,
-              ObservabilityManager,
+              Severity,
           )
 
 
-          def test_store_append_query_and_chain():
-              with tempfile.TemporaryDirectory() as directory:
-                  path = Path(directory) / "observability.db"
-
-                  store = ObservationStore(path)
-
-                  event = ObservationEvent(
-                      name="test.event",
-                      event_type=EventType.SYSTEM,
-                      severity=EventSeverity.INFO,
-                      payload={"value": 42},
-                  )
-
-                  stored = store.append(
-                      observation_id=event.event_id,
-                      kind=event.event_type.value,
-                      name=event.name,
-                      timestamp=event.timestamp,
-                      payload=event.payload,
-                  )
-
-                  assert stored.observation_id == event.event_id
-                  assert store.count() == 1
-                  assert store.verify_chain()
-
-                  rows = store.query(name="test.event")
-                  assert len(rows) == 1
-                  assert rows[0].payload["value"] == 42
-
-                  store.close()
-
-
-          def test_policy_redacts_sensitive_values():
-              policy = ObservationPolicy()
-
-              result = policy.sanitize(
-                  {
-                      "username": "operator",
-                      "password": "super-secret",
-                      "nested": {
-                          "token": "abcdef",
-                          "value": "safe",
-                      },
-                  }
+          def test_context_propagation():
+              root = ObservationContext.create(
+                  component="test",
+                  operation="root",
+                  labels={"environment": "ci"},
               )
 
-              assert result["password"] == "[REDACTED]"
-              assert result["nested"]["token"] == "[REDACTED]"
-              assert result["nested"]["value"] == "safe"
+              child = root.child("child")
+
+              assert child.trace_id == root.trace_id
+              assert child.correlation_id == root.correlation_id
+              assert child.parent_span_id == root.span_id
+              assert child.span_id != root.span_id
 
 
-          def test_alert_manager():
-              manager = AlertManager()
+          def test_metric_registry():
+              registry = MetricRegistry()
 
-              manager.register(
+              sample = MetricSample.create(
+                  name="requests_total",
+                  kind=MetricKind.COUNTER,
+                  value=3,
+                  labels={"service": "test"},
+              )
+
+              registry.record(sample)
+
+              result = registry.query("requests_total")
+
+              assert len(result) == 1
+              assert result[0].value == 3
+
+
+          def test_alert_evaluation():
+              manager = ObservationManager()
+
+              manager.alerts.register_rule(
                   AlertRule(
-                      name="high-value",
-                      predicate=lambda payload: (
-                          float(payload.get("value", 0)) > 100
-                      ),
-                      cooldown_seconds=0,
+                      rule_id="high-load",
+                      name="High Load",
+                      metric_name="load",
+                      threshold=80,
+                      severity=Severity.WARNING,
                   )
               )
 
-              alerts = manager.evaluate({"value": 101})
+              manager.start()
+
+              sample = MetricSample.create(
+                  name="load",
+                  kind=MetricKind.GAUGE,
+                  value=90,
+              )
+
+              alerts = manager.record_metric(sample)
 
               assert len(alerts) == 1
-              assert alerts[0].rule_name == "high-value"
+              assert alerts[0].severity is Severity.WARNING
 
 
           def test_health_registry():
-              health = HealthRegistry()
+              manager = ObservationManager()
 
-              health.register(
-                  "component",
-                  lambda: __import__(
-                      "observability.health",
-                      fromlist=["HealthResult"],
-                  ).HealthResult(
-                      component="component",
-                      state=HealthState.HEALTHY,
-                  ),
+              manager.health.register(
+                  "database",
+                  lambda: True,
               )
 
-              assert health.overall() == HealthState.HEALTHY
+              result = manager.health.check("database")
+
+              assert result.state is HealthState.HEALTHY
+              assert result.component == "database"
 
 
-          def test_manager_end_to_end():
+          def test_durable_store():
               with tempfile.TemporaryDirectory() as directory:
-                  manager = ObservabilityManager(
-                      storage_path=Path(directory) / "observability.db"
+                  path = Path(directory) / "observations.jsonl"
+
+                  store = ObservationStore(
+                      path,
+                      max_records=100,
                   )
 
-                  manager.start()
-
-                  context = ObservationContext(
-                      component="test",
-                      operation="integration",
+                  store.append(
+                      {
+                          "type": "test",
+                          "value": 123,
+                      }
                   )
 
-                  event = manager.emit(
-                      "integration.completed",
-                      event_type=EventType.SYSTEM,
-                      severity=EventSeverity.INFO,
-                      payload={"value": 123},
-                      context=context,
-                  )
+                  assert store.count() == 1
+                  records = store.read_all()
 
-                  assert event.name == "integration.completed"
-                  assert manager.store.count() >= 1
-                  assert manager.store.verify_chain()
-
-                  status = manager.status()
-
-                  assert status.version
-                  assert status.chain_valid
-
-                  manager.stop()
+                  assert records[0]["type"] == "test"
+                  assert records[0]["value"] == 123
 
 
-          def test_public_api():
-              with tempfile.TemporaryDirectory() as directory:
-                  api = ObservabilityAPI(
-                      storage_path=Path(directory) / "api.db"
-                  )
+          def test_manager_lifecycle():
+              manager = ObservationManager()
 
-                  api.start()
+              assert manager.status()["state"] == "created"
 
-                  event = api.event(
-                      "api.test",
-                      payload={"ok": True},
-                  )
+              manager.start()
 
-                  assert event.name == "api.test"
-                  assert api.status().chain_valid
+              assert manager.status()["state"] == "running"
 
-                  api.stop()
+              manager.stop()
+
+              assert manager.status()["state"] == "stopped"
+
+
+          def test_event_recording():
+              manager = ObservationManager()
+              manager.start()
+
+              context = manager.engine.events.recent
+
+              assert callable(context)
+
+              observation_context = ObservationContext.create(
+                  component="test",
+                  operation="event",
+              )
+
+              from observability import ObservationEvent
+
+              event = ObservationEvent.create(
+                  event_type="TEST_EVENT",
+                  severity=Severity.INFO,
+                  message="production test",
+                  context=observation_context,
+              )
+
+              manager.record_event(event)
+
+              events = manager.events.recent()
+
+              assert len(events) == 1
+              assert events[0].event_type == "TEST_EVENT"
           PY
 
-          # ==============================================================
-          # Compile
-          # ==============================================================
+      - name: Compile Observability
+        shell: bash
+        run: |
+          set -euo pipefail
 
-          python -m compileall -q "$ROOT"
+          python -B -m compileall -q observability
 
-          # ==============================================================
-          # Test
-          # ==============================================================
+          echo "Compilation successful."
 
-          python -m pytest -q "$ROOT/tests"
+      - name: Run Observability tests
+        shell: bash
+        run: |
+          set -euo pipefail
 
-          # ==============================================================
-          # Structural production validation
-          # ==============================================================
+          PYTHONPATH="${GITHUB_WORKSPACE}" \
+            python -m pytest \
+              observability/tests \
+              -q \
+              --disable-warnings \
+              --maxfail=1
+
+      - name: Production import validation
+        shell: bash
+        run: |
+          set -euo pipefail
 
           python - <<'PY'
-          from pathlib import Path
-
-          root = Path("observability")
+          import observability
 
           required = [
-              "api/api.py",
-              "alerts/alerts.py",
-              "collector/collector.py",
-              "context/context.py",
-              "dashboards/dashboards.py",
-              "engine/engine.py",
-              "events/events.py",
-              "exporter/exporter.py",
-              "health/health.py",
-              "incidents/incidents.py",
-              "manager/manager.py",
-              "metrics/metrics.py",
-              "monitoring/monitoring.py",
-              "policy/policy.py",
-              "query/query.py",
-              "registry/registry.py",
-              "reports/reports.py",
-              "router/router.py",
-              "snapshot/snapshot.py",
-              "status/status.py",
-              "storage/storage.py",
-              "__init__.py",
+              "ObservationAPI",
+              "ObservationContext",
+              "ObservationEngine",
+              "ObservationError",
+              "ObservationEvent",
+              "ObservationManager",
+              "ObservationStore",
+              "MetricKind",
+              "MetricRegistry",
+              "MetricSample",
+              "AlertRule",
+              "HealthRegistry",
+              "IncidentManager",
+              "ComponentRegistry",
+              "RetentionPolicy",
           ]
 
           missing = [
-              str(root / path)
-              for path in required
-              if not (root / path).is_file()
-          ]
-
-          empty = [
-              str(path)
-              for path in root.rglob("*.py")
-              if path.stat().st_size == 0
+              name
+              for name in required
+              if not hasattr(observability, name)
           ]
 
           if missing:
               raise SystemExit(
-                  "Missing production files:\n" + "\n".join(missing)
+                  "Missing public Observability exports: "
+                  + ", ".join(missing)
               )
 
-          if empty:
-              raise SystemExit(
-                  "Empty Python files:\n" + "\n".join(empty)
-              )
+          print("Public API validation passed.")
+          PY
 
-          # Absolute boundary: this block must not modify applications.
-          changed_apps = []
+      - name: Integration validation
+        shell: bash
+        run: |
+          set -euo pipefail
 
-          import subprocess
+          python - <<'PY'
+          import tempfile
+          from pathlib import Path
 
-          result = subprocess.run(
-              [
-                  "git",
-                  "diff",
-                  "--name-only",
-                  "--",
-                  "apps/",
-              ],
-              capture_output=True,
-              text=True,
-              check=False,
+          from observability import (
+              AlertRule,
+              MetricKind,
+              MetricSample,
+              ObservationContext,
+              ObservationManager,
+              Severity,
           )
 
-          if result.stdout.strip():
-              changed_apps.extend(
-                  line
-                  for line in result.stdout.splitlines()
-                  if line.strip()
+          with tempfile.TemporaryDirectory() as directory:
+              storage = Path(directory) / "observability.jsonl"
+
+              manager = ObservationManager(
+                  storage_path=storage,
               )
 
-          if changed_apps:
-              raise SystemExit(
-                  "apps/ was modified:\n" + "\n".join(changed_apps)
+              manager.registry.register(
+                  "zyra.network",
+                  kind="network",
+                  metadata={
+                      "layer": "network",
+                      "owner": "zyra",
+                  },
               )
 
-          print("ZYRA OBSERVABILITY PRODUCTION VALIDATION: PASS")
-          print(f"Python files: {len(list(root.rglob('*.py')))}")
+              manager.alerts.register_rule(
+                  AlertRule(
+                      rule_id="integration-load",
+                      name="Integration Load",
+                      metric_name="integration.load",
+                      threshold=90,
+                      operator=">",
+                      severity=Severity.CRITICAL,
+                  )
+              )
+
+              manager.start()
+
+              context = ObservationContext.create(
+                  component="zyra.network",
+                  operation="integration",
+              )
+
+              event = manager.engine.emit(
+                  event_type="OBSERVABILITY_INTEGRATION",
+                  severity=Severity.INFO,
+                  message="integration validation",
+                  context=context,
+              )
+
+              manager.record_event(event)
+
+              sample = MetricSample.create(
+                  name="integration.load",
+                  kind=MetricKind.GAUGE,
+                  value=95,
+                  labels={
+                      "component": "zyra.network",
+                  },
+              )
+
+              alerts = manager.record_metric(sample)
+
+              assert alerts
+              assert alerts[0].state.value == "firing"
+              assert storage.exists()
+              assert manager.storage is not None
+              assert manager.storage.count() >= 2
+
+              manager.stop()
+
+          print("Observability integration validation passed.")
           PY
+
+      - name: Verify only Observability changed
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          if git status --porcelain -- apps/ | grep -q .; then
+            echo "ERROR: apps/ was modified."
+            git status --short -- apps/
+            exit 1
+          fi
+
+          echo "Files generated under observability:"
+          find observability -type f | sort
+
+          echo
+          echo "Changed files:"
+          git status --short
+
+      - name: Remove generated Python caches
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          find observability \
+            -type d \
+            -name "__pycache__" \
+            -prune \
+            -exec rm -rf {} +
+
+          find observability \
+            -type f \
+            \( -name "*.pyc" -o -name "*.pyo" \) \
+            -delete
 
       - name: Commit Observability production block
         shell: bash
         run: |
           set -euo pipefail
 
-          git config user.name "ZYRA Production Builder"
-          git config user.email "actions@users.noreply.github.com"
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
 
-          # Solo Observability.
-          # No hard-coded workflow filename.
           git add -A -- observability/
 
           if git diff --cached --quiet; then
@@ -3077,5 +2284,25 @@ jobs:
             exit 0
           fi
 
-          git commit -m "build: production observability layer"
+          git commit -m "build: complete observability production layer"
           git push
+
+      - name: Final verification
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          test -f observability/__init__.py
+          test -f observability/core.py
+          test -f observability/storage/storage.py
+          test -f observability/metrics/metrics.py
+          test -f observability/events/events.py
+          test -f observability/alerts/alerts.py
+          test -f observability/health/health.py
+          test -f observability/incidents/incidents.py
+          test -f observability/manager/manager.py
+          test -f observability/api/api.py
+
+          test ! -d apps
+
+          echo "ZYRA Observability production build completed successfully."

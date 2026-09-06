@@ -1,13 +1,3 @@
-"""
-ZYRA Foundation metadata primitives.
-"""
+from .metadata import ComponentMetadata
 
-from .metadata import (
-    Metadata,
-    MetadataError,
-)
-
-__all__ = [
-    "Metadata",
-    "MetadataError",
-]
+__all__ = ["ComponentMetadata"]

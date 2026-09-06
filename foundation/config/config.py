@@ -1,383 +1,88 @@
 from __future__ import annotations
 
 import os
-from dataclasses import dataclass, field
-from pathlib import Path
-from types import MappingProxyType
+from dataclasses import dataclass
 from typing import Mapping
 
 
-class ConfigurationError(RuntimeError):
-    """Raised when ZYRA configuration is invalid."""
+class ConfigurationError(ValueError):
+    """Raised when required configuration is invalid."""
 
 
-def _string(
-    name: str,
-    default: str,
-) -> str:
-    value = os.getenv(name, default).strip()
-
-    if not value:
-        raise ConfigurationError(
-            f"{name} cannot be empty"
-        )
-
-    return value
+def _required(env: Mapping[str, str], name: str) -> str:
+    value = env.get(name)
+    if value is None or not value.strip():
+        raise ConfigurationError(f"Required configuration is missing: {name}")
+    return value.strip()
 
 
-def _boolean(
-    name: str,
-    default: bool,
-) -> bool:
-    value = os.getenv(name)
-
-    if value is None:
-        return default
-
-    normalized = value.strip().lower()
-
-    if normalized in {
-        "1", "true", "yes", "on"
-    }:
-        return True
-
-    if normalized in {
-        "0", "false", "no", "off"
-    }:
-        return False
-
-    raise ConfigurationError(
-        f"Invalid boolean for {name}: {value}"
-    )
-
-
-def _integer(
-    name: str,
-    default: int,
-    minimum: int,
-    maximum: int | None = None,
-) -> int:
-    raw = os.getenv(name)
-
+def _positive_int(value: str, name: str) -> int:
     try:
-        value = (
-            default
-            if raw is None
-            else int(raw)
-        )
+        parsed = int(value)
     except ValueError as exc:
         raise ConfigurationError(
-            f"Invalid integer for {name}: {raw}"
+            f"{name} must be an integer"
         ) from exc
 
-    if value < minimum:
-        raise ConfigurationError(
-            f"{name} must be >= {minimum}"
-        )
+    if parsed <= 0:
+        raise ConfigurationError(f"{name} must be greater than zero")
 
-    if (
-        maximum is not None
-        and value > maximum
-    ):
-        raise ConfigurationError(
-            f"{name} must be <= {maximum}"
-        )
-
-    return value
-
-
-def _float(
-    name: str,
-    default: float,
-    minimum: float,
-) -> float:
-    raw = os.getenv(name)
-
-    try:
-        value = (
-            default
-            if raw is None
-            else float(raw)
-        )
-    except ValueError as exc:
-        raise ConfigurationError(
-            f"Invalid number for {name}: {raw}"
-        ) from exc
-
-    if value < minimum:
-        raise ConfigurationError(
-            f"{name} must be >= {minimum}"
-        )
-
-    return value
+    return parsed
 
 
 @dataclass(frozen=True, slots=True)
 class NetworkConfig:
-    """Immutable configuration for the ZYRA Network."""
-
-    environment: str = "development"
-    service_name: str = "zyra-network"
-    node_id: str = "local-node"
-
-    host: str = "0.0.0.0"
-    port: int = 8000
-
-    log_level: str = "INFO"
-    debug: bool = False
-
-    request_timeout: float = 30.0
-    shutdown_timeout: float = 30.0
-
-    heartbeat_interval: float = 5.0
-    heartbeat_timeout: float = 15.0
-
-    max_connections: int = 1000
-    workers: int = 1
-
-    data_dir: Path = Path("./data")
-    log_dir: Path = Path("./logs")
-
-    security_enabled: bool = True
-    audit_enabled: bool = True
-    telemetry_enabled: bool = True
-
-    extra: Mapping[str, str] = field(
-        default_factory=dict
-    )
-
-    def __post_init__(self) -> None:
-        environments = {
-            "development",
-            "testing",
-            "staging",
-            "production",
-        }
-
-        if self.environment not in environments:
-            raise ConfigurationError(
-                "Invalid environment"
-            )
-
-        if not self.service_name.strip():
-            raise ConfigurationError(
-                "service_name cannot be empty"
-            )
-
-        if not self.node_id.strip():
-            raise ConfigurationError(
-                "node_id cannot be empty"
-            )
-
-        if not 1 <= self.port <= 65535:
-            raise ConfigurationError(
-                "port must be between 1 and 65535"
-            )
-
-        if self.request_timeout <= 0:
-            raise ConfigurationError(
-                "request_timeout must be positive"
-            )
-
-        if self.shutdown_timeout <= 0:
-            raise ConfigurationError(
-                "shutdown_timeout must be positive"
-            )
-
-        if self.heartbeat_interval <= 0:
-            raise ConfigurationError(
-                "heartbeat_interval must be positive"
-            )
-
-        if self.heartbeat_timeout <= 0:
-            raise ConfigurationError(
-                "heartbeat_timeout must be positive"
-            )
-
-        if self.max_connections < 1:
-            raise ConfigurationError(
-                "max_connections must be >= 1"
-            )
-
-        if self.workers < 1:
-            raise ConfigurationError(
-                "workers must be >= 1"
-            )
-
-        object.__setattr__(
-            self,
-            "data_dir",
-            Path(self.data_dir),
-        )
-
-        object.__setattr__(
-            self,
-            "log_dir",
-            Path(self.log_dir),
-        )
-
-        object.__setattr__(
-            self,
-            "extra",
-            MappingProxyType(
-                dict(self.extra)
-            ),
-        )
+    environment: str
+    service_name: str
+    node_id: str | None
+    host: str
+    port: int
+    log_level: str
 
     @classmethod
-    def from_environment(
-        cls,
-    ) -> "NetworkConfig":
-        environment = _string(
-            "ZYRA_ENVIRONMENT",
-            "development",
-        ).lower()
+    def from_env(cls, env: Mapping[str, str] | None = None) -> "NetworkConfig":
+        source = os.environ if env is None else env
 
-        log_level = _string(
-            "ZYRA_LOG_LEVEL",
-            "INFO",
-        ).upper()
+        environment = source.get("ZYRA_ENV", "production").strip().lower()
+        if environment not in {"development", "testing", "staging", "production"}:
+            raise ConfigurationError(
+                "ZYRA_ENV must be development, testing, staging, or production"
+            )
 
-        allowed_levels = {
-            "DEBUG",
-            "INFO",
-            "WARNING",
-            "ERROR",
-            "CRITICAL",
-        }
+        service_name = source.get(
+            "ZYRA_SERVICE_NAME",
+            "zyra-network",
+        ).strip()
+
+        if not service_name:
+            raise ConfigurationError("ZYRA_SERVICE_NAME cannot be empty")
+
+        host = source.get("ZYRA_HOST", "0.0.0.0").strip()
+        port = _positive_int(
+            source.get("ZYRA_PORT", "8000"),
+            "ZYRA_PORT",
+        )
+
+        log_level = source.get("ZYRA_LOG_LEVEL", "INFO").strip().upper()
+        allowed_levels = {"DEBUG", "INFO", "WARNING", "ERROR", "CRITICAL"}
 
         if log_level not in allowed_levels:
             raise ConfigurationError(
-                "Invalid ZYRA_LOG_LEVEL"
+                "ZYRA_LOG_LEVEL must be DEBUG, INFO, WARNING, ERROR, or CRITICAL"
             )
+
+        node_id = source.get("ZYRA_NODE_ID")
+        if node_id is not None:
+            node_id = node_id.strip() or None
 
         return cls(
             environment=environment,
-            service_name=_string(
-                "ZYRA_SERVICE_NAME",
-                "zyra-network",
-            ),
-            node_id=_string(
-                "ZYRA_NODE_ID",
-                "local-node",
-            ),
-            host=_string(
-                "ZYRA_HOST",
-                "0.0.0.0",
-            ),
-            port=_integer(
-                "ZYRA_PORT",
-                8000,
-                1,
-                65535,
-            ),
+            service_name=service_name,
+            node_id=node_id,
+            host=host,
+            port=port,
             log_level=log_level,
-            debug=_boolean(
-                "ZYRA_DEBUG",
-                False,
-            ),
-            request_timeout=_float(
-                "ZYRA_REQUEST_TIMEOUT",
-                30.0,
-                0.001,
-            ),
-            shutdown_timeout=_float(
-                "ZYRA_SHUTDOWN_TIMEOUT",
-                30.0,
-                0.001,
-            ),
-            heartbeat_interval=_float(
-                "ZYRA_HEARTBEAT_INTERVAL",
-                5.0,
-                0.001,
-            ),
-            heartbeat_timeout=_float(
-                "ZYRA_HEARTBEAT_TIMEOUT",
-                15.0,
-                0.001,
-            ),
-            max_connections=_integer(
-                "ZYRA_MAX_CONNECTIONS",
-                1000,
-                1,
-            ),
-            workers=_integer(
-                "ZYRA_WORKERS",
-                1,
-                1,
-            ),
-            data_dir=Path(
-                _string(
-                    "ZYRA_DATA_DIR",
-                    "./data",
-                )
-            ),
-            log_dir=Path(
-                _string(
-                    "ZYRA_LOG_DIR",
-                    "./logs",
-                )
-            ),
-            security_enabled=_boolean(
-                "ZYRA_SECURITY_ENABLED",
-                True,
-            ),
-            audit_enabled=_boolean(
-                "ZYRA_AUDIT_ENABLED",
-                True,
-            ),
-            telemetry_enabled=_boolean(
-                "ZYRA_TELEMETRY_ENABLED",
-                True,
-            ),
         )
 
-    @property
-    def production(self) -> bool:
-        return self.environment == "production"
 
-    def ensure_directories(self) -> None:
-        self.data_dir.mkdir(
-            parents=True,
-            exist_ok=True,
-        )
-
-        self.log_dir.mkdir(
-            parents=True,
-            exist_ok=True,
-        )
-
-    def to_dict(self) -> dict[str, object]:
-        return {
-            "environment": self.environment,
-            "service_name": self.service_name,
-            "node_id": self.node_id,
-            "host": self.host,
-            "port": self.port,
-            "log_level": self.log_level,
-            "debug": self.debug,
-            "request_timeout":
-                self.request_timeout,
-            "shutdown_timeout":
-                self.shutdown_timeout,
-            "heartbeat_interval":
-                self.heartbeat_interval,
-            "heartbeat_timeout":
-                self.heartbeat_timeout,
-            "max_connections":
-                self.max_connections,
-            "workers": self.workers,
-            "data_dir": str(self.data_dir),
-            "log_dir": str(self.log_dir),
-            "security_enabled":
-                self.security_enabled,
-            "audit_enabled":
-                self.audit_enabled,
-            "telemetry_enabled":
-                self.telemetry_enabled,
-        }
-
-
-def load_config() -> NetworkConfig:
-    """Load the active validated Network configuration."""
-    return NetworkConfig.from_environment()
+__all__ = ["ConfigurationError", "NetworkConfig"]

@@ -46,11 +46,7 @@ jobs:
           # ============================================================
 
           cat > infrastructure/bootstrap/api/__init__.py <<'PY'
-          """
-          Bootstrap API package.
-
-          Stable public interface for infrastructure bootstrap operations.
-          """
+          """Public bootstrap API contracts."""
 
           from .bootstrap_api import (
               BootstrapRequest,
@@ -66,74 +62,83 @@ jobs:
           PY
 
           cat > infrastructure/bootstrap/api/bootstrap_api.py <<'PY'
-          """
-          Infrastructure bootstrap API.
-
-          This module contains the application-independent bootstrap contract.
-          It deliberately uses only standard-library primitives so the base
-          infrastructure remains deployable before optional providers exist.
-          """
+          """Stable API facade over the Infrastructure composition root."""
 
           from __future__ import annotations
 
           from dataclasses import dataclass, field
-          from datetime import datetime, timezone
-          from threading import RLock
           from typing import Mapping
 
-          from ...bootstrap import BootstrapManager
+          from ..bootstrap import InfrastructureBootstrap
+          from ...config import Configuration
 
 
-          @dataclass(frozen=True)
+          @dataclass(frozen=True, slots=True)
           class BootstrapRequest:
-              environment: str
-              node_id: str
+              configuration: Configuration
               metadata: Mapping[str, str] = field(default_factory=dict)
 
 
-          @dataclass(frozen=True)
+          @dataclass(frozen=True, slots=True)
           class BootstrapResponse:
               accepted: bool
-              node_id: str
               environment: str
-              started_at: str
+              service_name: str
+              node_id: str
               message: str
 
 
           class BootstrapService:
               """
-              Stable service facade for infrastructure initialization.
+              Public service facade for starting and stopping Infrastructure.
 
-              The service is idempotent at the API level and serializes
-              concurrent bootstrap requests for the same process.
+              The composition root remains InfrastructureBootstrap. This
+              service provides a stable API boundary without introducing
+              provider-specific dependencies.
               """
 
-              def __init__(self, manager: BootstrapManager | None = None) -> None:
-                  self._manager = manager or BootstrapManager()
-                  self._lock = RLock()
+              def __init__(self) -> None:
+                  self._bootstrap: InfrastructureBootstrap | None = None
 
-              def start(self, request: BootstrapRequest) -> BootstrapResponse:
-                  if not request.environment.strip():
-                      raise ValueError("environment is required")
-                  if not request.node_id.strip():
-                      raise ValueError("node_id is required")
-
-                  now = datetime.now(timezone.utc).isoformat()
-
-                  with self._lock:
-                      self._manager.initialize(
-                          environment=request.environment,
-                          node_id=request.node_id,
-                          metadata=dict(request.metadata),
+              def start(
+                  self,
+                  request: BootstrapRequest,
+              ) -> BootstrapResponse:
+                  if not isinstance(
+                      request.configuration,
+                      Configuration,
+                  ):
+                      raise TypeError(
+                          "request.configuration must be Configuration"
                       )
+
+                  configuration = request.configuration
+
+                  self._bootstrap = InfrastructureBootstrap(
+                      configuration
+                  )
+
+                  self._bootstrap.initialize()
 
                   return BootstrapResponse(
                       accepted=True,
-                      node_id=request.node_id,
-                      environment=request.environment,
-                      started_at=now,
-                      message="Infrastructure bootstrap accepted",
+                      environment=configuration.environment.value,
+                      service_name=configuration.service_name,
+                      node_id=configuration.node_id,
+                      message="Infrastructure initialized",
                   )
+
+              def stop(self) -> None:
+                  if self._bootstrap is not None:
+                      self._bootstrap.shutdown()
+                      self._bootstrap = None
+
+
+          __all__ = [
+              "BootstrapRequest",
+              "BootstrapResponse",
+              "BootstrapService",
+          ]
           PY
 
           # ============================================================
@@ -141,9 +146,7 @@ jobs:
           # ============================================================
 
           cat > infrastructure/cluster/__init__.py <<'PY'
-          """
-          Cluster coordination primitives.
-          """
+          """Cluster coordination primitives."""
 
           from .cluster_manager import (
               ClusterManager,
@@ -162,11 +165,11 @@ jobs:
 
           cat > infrastructure/cluster/cluster_manager.py <<'PY'
           """
-          In-process cluster membership and health coordination.
+          Thread-safe cluster membership and heartbeat registry.
 
-          This is the infrastructure contract. Network-specific discovery,
-          consensus and orchestration providers can be attached above it
-          without changing the public model.
+          This module owns local cluster state. Distributed consensus,
+          service discovery transports and cloud orchestration remain
+          separate adapters.
           """
 
           from __future__ import annotations
@@ -186,17 +189,19 @@ jobs:
               OFFLINE = "offline"
 
 
-          @dataclass
+          @dataclass(slots=True)
           class ClusterMember:
               node_id: str
               endpoint: str
               status: MemberStatus = MemberStatus.JOINING
               metadata: dict[str, str] = field(default_factory=dict)
-              last_heartbeat: float = field(default_factory=monotonic)
+              last_heartbeat: float = field(
+                  default_factory=monotonic
+              )
               generation: int = 0
 
 
-          @dataclass(frozen=True)
+          @dataclass(frozen=True, slots=True)
           class ClusterState:
               cluster_id: str
               generation: int
@@ -204,13 +209,23 @@ jobs:
 
 
           class ClusterManager:
-              def __init__(self, cluster_id: str) -> None:
+              """Thread-safe cluster membership manager."""
+
+              def __init__(
+                  self,
+                  cluster_id: str,
+              ) -> None:
                   if not cluster_id.strip():
-                      raise ValueError("cluster_id is required")
+                      raise ValueError(
+                          "cluster_id is required"
+                      )
 
                   self._cluster_id = cluster_id
                   self._generation = 0
-                  self._members: dict[str, ClusterMember] = {}
+                  self._members: dict[
+                      str,
+                      ClusterMember,
+                  ] = {}
                   self._lock = RLock()
 
               def register(
@@ -220,9 +235,14 @@ jobs:
                   metadata: Mapping[str, str] | None = None,
               ) -> ClusterMember:
                   if not node_id.strip():
-                      raise ValueError("node_id is required")
+                      raise ValueError(
+                          "node_id is required"
+                      )
+
                   if not endpoint.strip():
-                      raise ValueError("endpoint is required")
+                      raise ValueError(
+                          "endpoint is required"
+                      )
 
                   with self._lock:
                       self._generation += 1
@@ -231,57 +251,94 @@ jobs:
                           node_id=node_id,
                           endpoint=endpoint,
                           status=MemberStatus.READY,
-                          metadata=dict(metadata or {}),
+                          metadata=dict(
+                              metadata or {}
+                          ),
+                          last_heartbeat=monotonic(),
                           generation=self._generation,
                       )
 
                       self._members[node_id] = member
+
                       return member
 
-              def heartbeat(self, node_id: str) -> None:
+              def heartbeat(
+                  self,
+                  node_id: str,
+              ) -> None:
                   with self._lock:
-                      member = self._members.get(node_id)
+                      member = self._members.get(
+                          node_id
+                      )
+
                       if member is None:
-                          raise KeyError(f"unknown cluster member: {node_id}")
+                          raise KeyError(
+                              f"unknown cluster member: {node_id}"
+                          )
 
                       member.last_heartbeat = monotonic()
-                      if member.status in {
-                          MemberStatus.DEGRADED,
-                          MemberStatus.OFFLINE,
-                      }:
-                          member.status = MemberStatus.READY
+                      member.status = MemberStatus.READY
 
               def set_status(
                   self,
                   node_id: str,
                   status: MemberStatus,
               ) -> None:
+                  if not isinstance(
+                      status,
+                      MemberStatus,
+                  ):
+                      raise TypeError(
+                          "status must be MemberStatus"
+                      )
+
                   with self._lock:
-                      member = self._members.get(node_id)
+                      member = self._members.get(
+                          node_id
+                      )
+
                       if member is None:
-                          raise KeyError(f"unknown cluster member: {node_id}")
-                      member.status = status
+                          raise KeyError(
+                              f"unknown cluster member: {node_id}"
+                          )
+
                       self._generation += 1
+                      member.status = status
                       member.generation = self._generation
 
-              def remove(self, node_id: str) -> None:
+              def remove(
+                  self,
+                  node_id: str,
+              ) -> None:
                   with self._lock:
-                      if node_id in self._members:
-                          del self._members[node_id]
+                      if (
+                          self._members.pop(
+                              node_id,
+                              None,
+                          )
+                          is not None
+                      ):
                           self._generation += 1
 
-              def snapshot(self) -> ClusterState:
+              def snapshot(
+                  self,
+              ) -> ClusterState:
                   with self._lock:
                       members = tuple(
                           ClusterMember(
-                              node_id=m.node_id,
-                              endpoint=m.endpoint,
-                              status=m.status,
-                              metadata=dict(m.metadata),
-                              last_heartbeat=m.last_heartbeat,
-                              generation=m.generation,
+                              node_id=member.node_id,
+                              endpoint=member.endpoint,
+                              status=member.status,
+                              metadata=dict(
+                                  member.metadata
+                              ),
+                              last_heartbeat=(
+                                  member.last_heartbeat
+                              ),
+                              generation=member.generation,
                           )
-                          for m in self._members.values()
+                          for member
+                          in self._members.values()
                       )
 
                       return ClusterState(
@@ -289,6 +346,14 @@ jobs:
                           generation=self._generation,
                           members=members,
                       )
+
+
+          __all__ = [
+              "ClusterManager",
+              "ClusterMember",
+              "ClusterState",
+              "MemberStatus",
+          ]
           PY
 
           # ============================================================
@@ -296,9 +361,7 @@ jobs:
           # ============================================================
 
           cat > infrastructure/deployment/__init__.py <<'PY'
-          """
-          Deployment lifecycle primitives.
-          """
+          """Deployment lifecycle primitives."""
 
           from .deployment_manager import (
               Deployment,
@@ -315,10 +378,7 @@ jobs:
 
           cat > infrastructure/deployment/deployment_manager.py <<'PY'
           """
-          Deployment state machine.
-
-          Infrastructure owns lifecycle state; actual cloud/container
-          execution remains an adapter concern.
+          Provider-neutral deployment lifecycle state machine.
           """
 
           from __future__ import annotations
@@ -338,22 +398,32 @@ jobs:
               ROLLED_BACK = "rolled_back"
 
 
-          @dataclass
+          @dataclass(slots=True)
           class Deployment:
               deployment_id: str
               version: str
               environment: str
-              state: DeploymentState = DeploymentState.PENDING
+              state: DeploymentState = (
+                  DeploymentState.PENDING
+              )
               created_at: str = field(
-                  default_factory=lambda: datetime.now(timezone.utc).isoformat()
+                  default_factory=lambda:
+                  datetime.now(
+                      timezone.utc
+                  ).isoformat()
               )
               updated_at: str = field(
-                  default_factory=lambda: datetime.now(timezone.utc).isoformat()
+                  default_factory=lambda:
+                  datetime.now(
+                      timezone.utc
+                  ).isoformat()
               )
               error: str | None = None
 
 
           class DeploymentManager:
+              """Thread-safe deployment state manager."""
+
               _ALLOWED = {
                   DeploymentState.PENDING: {
                       DeploymentState.VALIDATING,
@@ -377,7 +447,10 @@ jobs:
               }
 
               def __init__(self) -> None:
-                  self._deployments: dict[str, Deployment] = {}
+                  self._deployments: dict[
+                      str,
+                      Deployment,
+                  ] = {}
                   self._lock = RLock()
 
               def create(
@@ -387,16 +460,25 @@ jobs:
                   environment: str,
               ) -> Deployment:
                   if not deployment_id.strip():
-                      raise ValueError("deployment_id is required")
+                      raise ValueError(
+                          "deployment_id is required"
+                      )
+
                   if not version.strip():
-                      raise ValueError("version is required")
+                      raise ValueError(
+                          "version is required"
+                      )
+
                   if not environment.strip():
-                      raise ValueError("environment is required")
+                      raise ValueError(
+                          "environment is required"
+                      )
 
                   with self._lock:
                       if deployment_id in self._deployments:
                           raise ValueError(
-                              f"deployment already exists: {deployment_id}"
+                              f"deployment already exists: "
+                              f"{deployment_id}"
                           )
 
                       deployment = Deployment(
@@ -404,7 +486,11 @@ jobs:
                           version=version,
                           environment=environment,
                       )
-                      self._deployments[deployment_id] = deployment
+
+                      self._deployments[
+                          deployment_id
+                      ] = deployment
+
                       return deployment
 
               def transition(
@@ -414,29 +500,52 @@ jobs:
                   error: str | None = None,
               ) -> Deployment:
                   with self._lock:
-                      deployment = self._deployments[deployment_id]
+                      deployment = self._deployments[
+                          deployment_id
+                      ]
 
-                      if target not in self._ALLOWED[deployment.state]:
+                      if target not in self._ALLOWED[
+                          deployment.state
+                      ]:
                           raise ValueError(
-                              f"invalid deployment transition: "
-                              f"{deployment.state.value} -> {target.value}"
+                              "invalid deployment transition: "
+                              f"{deployment.state.value} -> "
+                              f"{target.value}"
                           )
 
                       deployment.state = target
                       deployment.error = error
-                      deployment.updated_at = datetime.now(
-                          timezone.utc
-                      ).isoformat()
+                      deployment.updated_at = (
+                          datetime.now(
+                              timezone.utc
+                          ).isoformat()
+                      )
 
                       return deployment
 
-              def get(self, deployment_id: str) -> Deployment | None:
+              def get(
+                  self,
+                  deployment_id: str,
+              ) -> Deployment | None:
                   with self._lock:
-                      return self._deployments.get(deployment_id)
+                      return self._deployments.get(
+                          deployment_id
+                      )
 
-              def list(self) -> tuple[Deployment, ...]:
+              def snapshot(
+                  self,
+              ) -> tuple[Deployment, ...]:
                   with self._lock:
-                      return tuple(self._deployments.values())
+                      return tuple(
+                          self._deployments.values()
+                      )
+
+
+          __all__ = [
+              "Deployment",
+              "DeploymentManager",
+              "DeploymentState",
+          ]
           PY
 
           # ============================================================
@@ -444,9 +553,7 @@ jobs:
           # ============================================================
 
           cat > infrastructure/diagnostics/__init__.py <<'PY'
-          """
-          Infrastructure diagnostics.
-          """
+          """Infrastructure diagnostic checks."""
 
           from .diagnostics import (
               DiagnosticCheck,
@@ -462,9 +569,7 @@ jobs:
           PY
 
           cat > infrastructure/diagnostics/diagnostics.py <<'PY'
-          """
-          Deterministic infrastructure diagnostics engine.
-          """
+          """Deterministic infrastructure diagnostic engine."""
 
           from __future__ import annotations
 
@@ -473,7 +578,7 @@ jobs:
           from typing import Callable
 
 
-          @dataclass(frozen=True)
+          @dataclass(frozen=True, slots=True)
           class DiagnosticCheck:
               name: str
               passed: bool
@@ -481,19 +586,30 @@ jobs:
               message: str
 
 
-          @dataclass(frozen=True)
+          @dataclass(frozen=True, slots=True)
           class DiagnosticReport:
               checks: tuple[DiagnosticCheck, ...]
               passed: bool
 
               @property
-              def failures(self) -> tuple[DiagnosticCheck, ...]:
-                  return tuple(c for c in self.checks if not c.passed)
+              def failures(
+                  self,
+              ) -> tuple[DiagnosticCheck, ...]:
+                  return tuple(
+                      check
+                      for check in self.checks
+                      if not check.passed
+                  )
 
 
           class DiagnosticsEngine:
+              """Registry and executor for infrastructure health checks."""
+
               def __init__(self) -> None:
-                  self._checks: dict[str, Callable[[], object]] = {}
+                  self._checks: dict[
+                      str,
+                      Callable[[], object],
+                  ] = {}
 
               def register(
                   self,
@@ -501,42 +617,79 @@ jobs:
                   check: Callable[[], object],
               ) -> None:
                   if not name.strip():
-                      raise ValueError("diagnostic name is required")
+                      raise ValueError(
+                          "diagnostic name is required"
+                      )
+
                   if not callable(check):
-                      raise TypeError("diagnostic check must be callable")
+                      raise TypeError(
+                          "diagnostic check must be callable"
+                      )
 
                   self._checks[name] = check
 
-              def run(self) -> DiagnosticReport:
-                  results: list[DiagnosticCheck] = []
+              def run(
+                  self,
+              ) -> DiagnosticReport:
+                  results: list[
+                      DiagnosticCheck
+                  ] = []
 
-                  for name, check in self._checks.items():
+                  for name, check in (
+                      self._checks.items()
+                  ):
                       started = monotonic()
 
                       try:
                           value = check()
+
                           passed = bool(value)
-                          message = "ok" if passed else "check returned false"
+
+                          message = (
+                              "ok"
+                              if passed
+                              else "check returned false"
+                          )
+
                       except Exception as exc:
                           passed = False
-                          message = f"{type(exc).__name__}: {exc}"
+                          message = (
+                              f"{type(exc).__name__}: "
+                              f"{exc}"
+                          )
 
-                      duration = (monotonic() - started) * 1000.0
+                      duration = (
+                          monotonic() - started
+                      ) * 1000.0
 
                       results.append(
                           DiagnosticCheck(
                               name=name,
                               passed=passed,
-                              duration_ms=round(duration, 3),
+                              duration_ms=round(
+                                  duration,
+                                  3,
+                              ),
                               message=message,
                           )
                       )
 
                   checks = tuple(results)
+
                   return DiagnosticReport(
                       checks=checks,
-                      passed=all(c.passed for c in checks),
+                      passed=all(
+                          check.passed
+                          for check in checks
+                      ),
                   )
+
+
+          __all__ = [
+              "DiagnosticCheck",
+              "DiagnosticReport",
+              "DiagnosticsEngine",
+          ]
           PY
 
           # ============================================================
@@ -544,9 +697,7 @@ jobs:
           # ============================================================
 
           cat > infrastructure/discovery/__init__.py <<'PY'
-          """
-          Service discovery primitives.
-          """
+          """Service discovery primitives."""
 
           from .service_discovery import (
               ServiceEndpoint,
@@ -562,9 +713,7 @@ jobs:
           PY
 
           cat > infrastructure/discovery/service_discovery.py <<'PY'
-          """
-          Thread-safe service discovery registry.
-          """
+          """Thread-safe provider-neutral service registry."""
 
           from __future__ import annotations
 
@@ -581,19 +730,31 @@ jobs:
               OFFLINE = "offline"
 
 
-          @dataclass
+          @dataclass(slots=True)
           class ServiceEndpoint:
               service: str
               endpoint: str
               weight: int = 1
-              status: ServiceStatus = ServiceStatus.ACTIVE
-              metadata: dict[str, str] = field(default_factory=dict)
-              last_seen: float = field(default_factory=monotonic)
+              status: ServiceStatus = (
+                  ServiceStatus.ACTIVE
+              )
+              metadata: dict[str, str] = field(
+                  default_factory=dict
+              )
+              last_seen: float = field(
+                  default_factory=monotonic
+              )
 
 
           class ServiceRegistry:
+              """Thread-safe service endpoint registry."""
+
               def __init__(self) -> None:
-                  self._services: dict[str, dict[str, ServiceEndpoint]] = {}
+                  self._services: dict[
+                      str,
+                      dict[str, ServiceEndpoint],
+                  ] = {}
+
                   self._lock = RLock()
 
               def register(
@@ -605,29 +766,60 @@ jobs:
                   metadata: dict[str, str] | None = None,
               ) -> ServiceEndpoint:
                   if not service.strip():
-                      raise ValueError("service is required")
+                      raise ValueError(
+                          "service is required"
+                      )
+
                   if not endpoint.strip():
-                      raise ValueError("endpoint is required")
+                      raise ValueError(
+                          "endpoint is required"
+                      )
+
                   if weight <= 0:
-                      raise ValueError("weight must be greater than zero")
+                      raise ValueError(
+                          "weight must be greater than zero"
+                      )
 
                   item = ServiceEndpoint(
                       service=service,
                       endpoint=endpoint,
                       weight=weight,
-                      metadata=dict(metadata or {}),
+                      status=ServiceStatus.ACTIVE,
+                      metadata=dict(
+                          metadata or {}
+                      ),
+                      last_seen=monotonic(),
                   )
 
                   with self._lock:
-                      self._services.setdefault(service, {})[endpoint] = item
+                      self._services.setdefault(
+                          service,
+                          {},
+                      )[endpoint] = item
 
                   return item
 
-              def heartbeat(self, service: str, endpoint: str) -> None:
+              def heartbeat(
+                  self,
+                  service: str,
+                  endpoint: str,
+              ) -> None:
                   with self._lock:
-                      item = self._services[service][endpoint]
+                      item = self._services.get(
+                          service,
+                          {},
+                      ).get(endpoint)
+
+                      if item is None:
+                          raise KeyError(
+                              f"unknown endpoint: "
+                              f"{service}/{endpoint}"
+                          )
+
                       item.last_seen = monotonic()
-                      item.status = ServiceStatus.ACTIVE
+                      item.status = (
+                          ServiceStatus.ACTIVE
+                      )
 
               def set_status(
                   self,
@@ -636,18 +828,26 @@ jobs:
                   status: ServiceStatus,
               ) -> None:
                   with self._lock:
-                      self._services[service][endpoint].status = status
+                      item = self._services[
+                          service
+                      ][endpoint]
+
+                      item.status = status
 
               def resolve(
                   self,
                   service: str,
-              ) -> tuple[ServiceEndpoint, ...]:
+              ) -> tuple[
+                  ServiceEndpoint,
+                  ...,
+              ]:
                   with self._lock:
-                      entries = self._services.get(service, {})
-
                       return tuple(
                           item
-                          for item in entries.values()
+                          for item in self._services.get(
+                              service,
+                              {},
+                          ).values()
                           if item.status
                           in {
                               ServiceStatus.ACTIVE,
@@ -655,16 +855,36 @@ jobs:
                           }
                       )
 
-              def remove(self, service: str, endpoint: str) -> None:
+              def remove(
+                  self,
+                  service: str,
+                  endpoint: str,
+              ) -> None:
                   with self._lock:
-                      endpoints = self._services.get(service)
+                      endpoints = self._services.get(
+                          service
+                      )
+
                       if not endpoints:
                           return
 
-                      endpoints.pop(endpoint, None)
+                      endpoints.pop(
+                          endpoint,
+                          None,
+                      )
 
                       if not endpoints:
-                          self._services.pop(service, None)
+                          self._services.pop(
+                              service,
+                              None,
+                          )
+
+
+          __all__ = [
+              "ServiceEndpoint",
+              "ServiceRegistry",
+              "ServiceStatus",
+          ]
           PY
 
           # ============================================================
@@ -672,9 +892,7 @@ jobs:
           # ============================================================
 
           cat > infrastructure/gateway/__init__.py <<'PY'
-          """
-          Infrastructure gateway primitives.
-          """
+          """Infrastructure gateway routing primitives."""
 
           from .gateway import (
               Gateway,
@@ -693,10 +911,10 @@ jobs:
 
           cat > infrastructure/gateway/gateway.py <<'PY'
           """
-          Protocol-neutral infrastructure gateway.
+          Protocol-neutral request gateway.
 
-          Routing is explicit and deterministic. Authentication, authorization
-          and transport concerns remain delegated to their respective layers.
+          Authentication, authorization and transport are intentionally kept
+          outside this routing primitive.
           """
 
           from __future__ import annotations
@@ -706,54 +924,82 @@ jobs:
           from typing import Callable, Mapping
 
 
-          @dataclass(frozen=True)
+          @dataclass(frozen=True, slots=True)
           class GatewayRequest:
               method: str
               path: str
-              headers: Mapping[str, str] = field(default_factory=dict)
+              headers: Mapping[str, str] = field(
+                  default_factory=dict
+              )
               body: bytes = b""
 
 
-          @dataclass(frozen=True)
+          @dataclass(frozen=True, slots=True)
           class GatewayResponse:
               status_code: int
-              headers: Mapping[str, str] = field(default_factory=dict)
+              headers: Mapping[str, str] = field(
+                  default_factory=dict
+              )
               body: bytes = b""
 
 
-          @dataclass(frozen=True)
+          @dataclass(frozen=True, slots=True)
           class Route:
               method: str
               path: str
-              handler: Callable[[GatewayRequest], GatewayResponse]
+              handler: Callable[
+                  [GatewayRequest],
+                  GatewayResponse,
+              ]
 
 
           class Gateway:
+              """Thread-safe exact-match request gateway."""
+
               def __init__(self) -> None:
-                  self._routes: dict[tuple[str, str], Route] = {}
+                  self._routes: dict[
+                      tuple[str, str],
+                      Route,
+                  ] = {}
+
                   self._lock = RLock()
 
               def register(
                   self,
                   method: str,
                   path: str,
-                  handler: Callable[[GatewayRequest], GatewayResponse],
+                  handler: Callable[
+                      [GatewayRequest],
+                      GatewayResponse,
+                  ],
               ) -> None:
-                  method = method.upper().strip()
+                  method = method.strip().upper()
 
                   if not method:
-                      raise ValueError("method is required")
-                  if not path.startswith("/"):
-                      raise ValueError("path must start with '/'")
-                  if not callable(handler):
-                      raise TypeError("handler must be callable")
+                      raise ValueError(
+                          "method is required"
+                      )
 
-                  key = (method, path)
+                  if not path.startswith("/"):
+                      raise ValueError(
+                          "path must start with '/'"
+                      )
+
+                  if not callable(handler):
+                      raise TypeError(
+                          "handler must be callable"
+                      )
+
+                  key = (
+                      method,
+                      path,
+                  )
 
                   with self._lock:
                       if key in self._routes:
                           raise ValueError(
-                              f"route already registered: {method} {path}"
+                              f"route already registered: "
+                              f"{method} {path}"
                           )
 
                       self._routes[key] = Route(
@@ -766,24 +1012,45 @@ jobs:
                   self,
                   request: GatewayRequest,
               ) -> GatewayResponse:
-                  key = (request.method.upper(), request.path)
+                  key = (
+                      request.method.upper(),
+                      request.path,
+                  )
 
                   with self._lock:
-                      route = self._routes.get(key)
+                      route = self._routes.get(
+                          key
+                      )
 
                   if route is None:
                       return GatewayResponse(
                           status_code=404,
-                          body=b'{"error":"route_not_found"}',
+                          body=(
+                              b'{"error":"route_not_found"}'
+                          ),
                       )
 
                   try:
-                      return route.handler(request)
+                      return route.handler(
+                          request
+                      )
+
                   except Exception:
                       return GatewayResponse(
                           status_code=500,
-                          body=b'{"error":"internal_gateway_error"}',
+                          body=(
+                              b'{"error":'
+                              b'"internal_gateway_error"}'
+                          ),
                       )
+
+
+          __all__ = [
+              "Gateway",
+              "GatewayRequest",
+              "GatewayResponse",
+              "Route",
+          ]
           PY
 
           # ============================================================
@@ -791,9 +1058,7 @@ jobs:
           # ============================================================
 
           cat > infrastructure/load_balancer/__init__.py <<'PY'
-          """
-          Load-balancing primitives.
-          """
+          """Load balancing primitives."""
 
           from .load_balancer import (
               Backend,
@@ -809,9 +1074,7 @@ jobs:
           PY
 
           cat > infrastructure/load_balancer/load_balancer.py <<'PY'
-          """
-          Deterministic weighted round-robin load balancer.
-          """
+          """Weighted round-robin backend selection."""
 
           from __future__ import annotations
 
@@ -826,18 +1089,26 @@ jobs:
               OFFLINE = "offline"
 
 
-          @dataclass
+          @dataclass(slots=True)
           class Backend:
               backend_id: str
               endpoint: str
               weight: int = 1
-              status: BackendStatus = BackendStatus.ACTIVE
+              status: BackendStatus = (
+                  BackendStatus.ACTIVE
+              )
               failures: int = 0
 
 
           class LoadBalancer:
+              """Thread-safe weighted backend selector."""
+
               def __init__(self) -> None:
-                  self._backends: dict[str, Backend] = {}
+                  self._backends: dict[
+                      str,
+                      Backend,
+                  ] = {}
+
                   self._cursor = 0
                   self._lock = RLock()
 
@@ -849,11 +1120,19 @@ jobs:
                   weight: int = 1,
               ) -> Backend:
                   if not backend_id.strip():
-                      raise ValueError("backend_id is required")
+                      raise ValueError(
+                          "backend_id is required"
+                      )
+
                   if not endpoint.strip():
-                      raise ValueError("endpoint is required")
+                      raise ValueError(
+                          "endpoint is required"
+                      )
+
                   if weight <= 0:
-                      raise ValueError("weight must be greater than zero")
+                      raise ValueError(
+                          "weight must be greater than zero"
+                      )
 
                   backend = Backend(
                       backend_id=backend_id,
@@ -862,7 +1141,9 @@ jobs:
                   )
 
                   with self._lock:
-                      self._backends[backend_id] = backend
+                      self._backends[
+                          backend_id
+                      ] = backend
 
                   return backend
 
@@ -872,26 +1153,65 @@ jobs:
                   status: BackendStatus,
               ) -> None:
                   with self._lock:
-                      self._backends[backend_id].status = status
+                      self._backends[
+                          backend_id
+                      ].status = status
 
-              def record_failure(self, backend_id: str) -> None:
+              def record_failure(
+                  self,
+                  backend_id: str,
+              ) -> None:
                   with self._lock:
-                      self._backends[backend_id].failures += 1
+                      self._backends[
+                          backend_id
+                      ].failures += 1
 
               def choose(self) -> Backend:
                   with self._lock:
-                      active: list[Backend] = []
+                      active: list[
+                          Backend
+                      ] = []
 
-                      for backend in self._backends.values():
-                          if backend.status == BackendStatus.ACTIVE:
-                              active.extend([backend] * backend.weight)
+                      for backend in (
+                          self._backends.values()
+                      ):
+                          if (
+                              backend.status
+                              is BackendStatus.ACTIVE
+                          ):
+                              active.extend(
+                                  [backend]
+                                  * backend.weight
+                              )
 
                       if not active:
-                          raise RuntimeError("no active backend available")
+                          raise RuntimeError(
+                              "no active backend available"
+                          )
 
-                      backend = active[self._cursor % len(active)]
+                      backend = active[
+                          self._cursor
+                          % len(active)
+                      ]
+
                       self._cursor += 1
+
                       return backend
+
+              def snapshot(
+                  self,
+              ) -> tuple[Backend, ...]:
+                  with self._lock:
+                      return tuple(
+                          self._backends.values()
+                      )
+
+
+          __all__ = [
+              "Backend",
+              "BackendStatus",
+              "LoadBalancer",
+          ]
           PY
 
           # ============================================================
@@ -899,9 +1219,7 @@ jobs:
           # ============================================================
 
           cat > infrastructure/monitoring_adapters/__init__.py <<'PY'
-          """
-          Monitoring provider-neutral adapters.
-          """
+          """Provider-neutral monitoring primitives."""
 
           from .monitoring import (
               HealthStatus,
@@ -917,12 +1235,7 @@ jobs:
           PY
 
           cat > infrastructure/monitoring_adapters/monitoring.py <<'PY'
-          """
-          Provider-neutral monitoring interface.
-
-          External telemetry systems can implement this contract without
-          coupling the Infrastructure layer to a vendor.
-          """
+          """Provider-neutral in-process monitoring boundary."""
 
           from __future__ import annotations
 
@@ -939,29 +1252,56 @@ jobs:
               UNHEALTHY = "unhealthy"
 
 
-          @dataclass(frozen=True)
+          @dataclass(frozen=True, slots=True)
           class Metric:
               name: str
               value: float
               timestamp: float
-              labels: Mapping[str, str] = field(default_factory=dict)
+              labels: Mapping[str, str] = field(
+                  default_factory=dict
+              )
 
 
           class MonitoringAdapter:
-              def __init__(self, service_name: str) -> None:
+              """Thread-safe metric and health state adapter."""
+
+              def __init__(
+                  self,
+                  service_name: str,
+              ) -> None:
                   if not service_name.strip():
-                      raise ValueError("service_name is required")
+                      raise ValueError(
+                          "service_name is required"
+                      )
 
                   self.service_name = service_name
-                  self._metrics: list[Metric] = []
-                  self._health = HealthStatus.HEALTHY
+                  self._health = (
+                      HealthStatus.HEALTHY
+                  )
+                  self._metrics: list[
+                      Metric
+                  ] = []
+
                   self._lock = RLock()
 
-              def set_health(self, status: HealthStatus) -> None:
+              def set_health(
+                  self,
+                  status: HealthStatus,
+              ) -> None:
+                  if not isinstance(
+                      status,
+                      HealthStatus,
+                  ):
+                      raise TypeError(
+                          "status must be HealthStatus"
+                      )
+
                   with self._lock:
                       self._health = status
 
-              def health(self) -> HealthStatus:
+              def health(
+                  self,
+              ) -> HealthStatus:
                   with self._lock:
                       return self._health
 
@@ -972,23 +1312,40 @@ jobs:
                   labels: Mapping[str, str] | None = None,
               ) -> Metric:
                   if not name.strip():
-                      raise ValueError("metric name is required")
+                      raise ValueError(
+                          "metric name is required"
+                      )
 
                   metric = Metric(
                       name=name,
                       value=float(value),
                       timestamp=time(),
-                      labels=dict(labels or {}),
+                      labels=dict(
+                          labels or {}
+                      ),
                   )
 
                   with self._lock:
-                      self._metrics.append(metric)
+                      self._metrics.append(
+                          metric
+                      )
 
                   return metric
 
-              def snapshot(self) -> tuple[Metric, ...]:
+              def snapshot(
+                  self,
+              ) -> tuple[Metric, ...]:
                   with self._lock:
-                      return tuple(self._metrics)
+                      return tuple(
+                          self._metrics
+                      )
+
+
+          __all__ = [
+              "HealthStatus",
+              "Metric",
+              "MonitoringAdapter",
+          ]
           PY
 
           # ============================================================
@@ -996,9 +1353,7 @@ jobs:
           # ============================================================
 
           cat > infrastructure/network/__init__.py <<'PY'
-          """
-          Network transport-neutral primitives.
-          """
+          """Network endpoint and lifecycle primitives."""
 
           from .network_manager import (
               NetworkAddress,
@@ -1014,12 +1369,7 @@ jobs:
           PY
 
           cat > infrastructure/network/network_manager.py <<'PY'
-          """
-          Core network endpoint management.
-
-          This layer owns endpoint validation and lifecycle metadata; actual
-          sockets, HTTP clients and cloud networking belong to adapters.
-          """
+          """Transport-neutral network endpoint registry."""
 
           from __future__ import annotations
 
@@ -1036,7 +1386,7 @@ jobs:
               STOPPING = "stopping"
 
 
-          @dataclass(frozen=True)
+          @dataclass(frozen=True, slots=True)
           class NetworkAddress:
               host: str
               port: int
@@ -1044,30 +1394,61 @@ jobs:
 
               def __post_init__(self) -> None:
                   if not self.host.strip():
-                      raise ValueError("host is required")
+                      raise ValueError(
+                          "host is required"
+                      )
+
                   if not 1 <= self.port <= 65535:
-                      raise ValueError("port must be between 1 and 65535")
+                      raise ValueError(
+                          "port must be between 1 and 65535"
+                      )
+
                   if not self.protocol.strip():
-                      raise ValueError("protocol is required")
+                      raise ValueError(
+                          "protocol is required"
+                      )
 
 
           class NetworkManager:
+              """Thread-safe endpoint lifecycle manager."""
+
               def __init__(self) -> None:
-                  self._state = NetworkState.DOWN
-                  self._addresses: dict[str, NetworkAddress] = {}
+                  self._state = (
+                      NetworkState.DOWN
+                  )
+
+                  self._addresses: dict[
+                      str,
+                      NetworkAddress,
+                  ] = {}
+
                   self._lock = RLock()
 
               def start(self) -> None:
                   with self._lock:
-                      if self._state == NetworkState.READY:
+                      if (
+                          self._state
+                          is NetworkState.READY
+                      ):
                           return
-                      self._state = NetworkState.STARTING
-                      self._state = NetworkState.READY
+
+                      self._state = (
+                          NetworkState.STARTING
+                      )
+
+                      self._state = (
+                          NetworkState.READY
+                      )
 
               def stop(self) -> None:
                   with self._lock:
-                      self._state = NetworkState.STOPPING
-                      self._state = NetworkState.DOWN
+                      self._state = (
+                          NetworkState.STOPPING
+                      )
+
+                      self._state = (
+                          NetworkState.DOWN
+                      )
 
               def register(
                   self,
@@ -1075,18 +1456,43 @@ jobs:
                   address: NetworkAddress,
               ) -> None:
                   if not name.strip():
-                      raise ValueError("address name is required")
+                      raise ValueError(
+                          "address name is required"
+                      )
+
+                  if not isinstance(
+                      address,
+                      NetworkAddress,
+                  ):
+                      raise TypeError(
+                          "address must be NetworkAddress"
+                      )
 
                   with self._lock:
-                      self._addresses[name] = address
+                      self._addresses[
+                          name
+                      ] = address
 
-              def resolve(self, name: str) -> NetworkAddress | None:
+              def resolve(
+                  self,
+                  name: str,
+              ) -> NetworkAddress | None:
                   with self._lock:
-                      return self._addresses.get(name)
+                      return self._addresses.get(
+                          name
+                      )
 
+              @property
               def state(self) -> NetworkState:
                   with self._lock:
                       return self._state
+
+
+          __all__ = [
+              "NetworkAddress",
+              "NetworkManager",
+              "NetworkState",
+          ]
           PY
 
           # ============================================================
@@ -1094,9 +1500,7 @@ jobs:
           # ============================================================
 
           cat > infrastructure/node/__init__.py <<'PY'
-          """
-          Node lifecycle and identity primitives.
-          """
+          """Infrastructure node lifecycle primitives."""
 
           from .node_manager import (
               Node,
@@ -1112,9 +1516,7 @@ jobs:
           PY
 
           cat > infrastructure/node/node_manager.py <<'PY'
-          """
-          Infrastructure node registry.
-          """
+          """Thread-safe infrastructure node registry."""
 
           from __future__ import annotations
 
@@ -1132,19 +1534,33 @@ jobs:
               OFFLINE = "offline"
 
 
-          @dataclass
+          @dataclass(slots=True)
           class Node:
               node_id: str
               hostname: str
-              status: NodeStatus = NodeStatus.PROVISIONING
-              labels: dict[str, str] = field(default_factory=dict)
-              registered_at: float = field(default_factory=time)
-              last_heartbeat: float = field(default_factory=time)
+              status: NodeStatus = (
+                  NodeStatus.PROVISIONING
+              )
+              labels: dict[str, str] = field(
+                  default_factory=dict
+              )
+              registered_at: float = field(
+                  default_factory=time
+              )
+              last_heartbeat: float = field(
+                  default_factory=time
+              )
 
 
           class NodeManager:
+              """Thread-safe node lifecycle manager."""
+
               def __init__(self) -> None:
-                  self._nodes: dict[str, Node] = {}
+                  self._nodes: dict[
+                      str,
+                      Node,
+                  ] = {}
+
                   self._lock = RLock()
 
               def register(
@@ -1154,47 +1570,94 @@ jobs:
                   labels: dict[str, str] | None = None,
               ) -> Node:
                   if not node_id.strip():
-                      raise ValueError("node_id is required")
+                      raise ValueError(
+                          "node_id is required"
+                      )
+
                   if not hostname.strip():
-                      raise ValueError("hostname is required")
+                      raise ValueError(
+                          "hostname is required"
+                      )
 
                   node = Node(
                       node_id=node_id,
                       hostname=hostname,
-                      labels=dict(labels or {}),
+                      labels=dict(
+                          labels or {}
+                      ),
                   )
 
                   with self._lock:
-                      self._nodes[node_id] = node
+                      self._nodes[
+                          node_id
+                      ] = node
 
                   return node
 
-              def ready(self, node_id: str) -> None:
+              def ready(
+                  self,
+                  node_id: str,
+              ) -> None:
                   with self._lock:
-                      node = self._nodes[node_id]
-                      node.status = NodeStatus.READY
+                      node = self._nodes[
+                          node_id
+                      ]
+
+                      node.status = (
+                          NodeStatus.READY
+                      )
                       node.last_heartbeat = time()
 
-              def heartbeat(self, node_id: str) -> None:
+              def heartbeat(
+                  self,
+                  node_id: str,
+              ) -> None:
                   with self._lock:
-                      node = self._nodes[node_id]
-                      node.last_heartbeat = time()
+                      self._nodes[
+                          node_id
+                      ].last_heartbeat = time()
 
               def set_status(
                   self,
                   node_id: str,
                   status: NodeStatus,
               ) -> None:
-                  with self._lock:
-                      self._nodes[node_id].status = status
+                  if not isinstance(
+                      status,
+                      NodeStatus,
+                  ):
+                      raise TypeError(
+                          "status must be NodeStatus"
+                      )
 
-              def get(self, node_id: str) -> Node | None:
                   with self._lock:
-                      return self._nodes.get(node_id)
+                      self._nodes[
+                          node_id
+                      ].status = status
 
-              def snapshot(self) -> tuple[Node, ...]:
+              def get(
+                  self,
+                  node_id: str,
+              ) -> Node | None:
                   with self._lock:
-                      return tuple(self._nodes.values())
+                      return self._nodes.get(
+                          node_id
+                      )
+
+              def snapshot(
+                  self,
+              ) -> tuple[Node, ...]:
+                  with self._lock:
+                      return tuple(
+                          self._nodes.values()
+                      )
+
+
+          __all__ = [
+              "Node",
+              "NodeManager",
+              "NodeStatus",
+          ]
           PY
 
           # ============================================================
@@ -1202,9 +1665,7 @@ jobs:
           # ============================================================
 
           cat > infrastructure/security/__init__.py <<'PY'
-          """
-          Infrastructure security primitives.
-          """
+          """Infrastructure security boundary primitives."""
 
           from .security_manager import (
               AccessDecision,
@@ -1221,11 +1682,10 @@ jobs:
 
           cat > infrastructure/security/security_manager.py <<'PY'
           """
-          Provider-neutral infrastructure security boundary.
+          Provider-neutral infrastructure authorization boundary.
 
-          This module does not implement identity itself. It provides the
-          immutable security context and authorization decision contract
-          consumed by infrastructure services.
+          Identity issuance and external authentication remain in their
+          dedicated protocol/security layers.
           """
 
           from __future__ import annotations
@@ -1241,21 +1701,32 @@ jobs:
               DENY = "deny"
 
 
-          @dataclass(frozen=True)
+          @dataclass(frozen=True, slots=True)
           class SecurityContext:
               principal: str
               roles: FrozenSet[str] = frozenset()
-              claims: Mapping[str, str] = field(default_factory=dict)
-              issued_at: float = field(default_factory=time)
+              claims: Mapping[str, str] = field(
+                  default_factory=dict
+              )
+              issued_at: float = field(
+                  default_factory=time
+              )
 
               def __post_init__(self) -> None:
                   if not self.principal.strip():
-                      raise ValueError("principal is required")
+                      raise ValueError(
+                          "principal is required"
+                      )
 
 
           class SecurityManager:
+              """Minimal deterministic role authorization boundary."""
+
               def __init__(self) -> None:
-                  self._policies: dict[str, frozenset[str]] = {}
+                  self._policies: dict[
+                      str,
+                      frozenset[str],
+                  ] = {}
 
               def require_role(
                   self,
@@ -1263,19 +1734,41 @@ jobs:
                   role: str,
               ) -> None:
                   if not resource.strip():
-                      raise ValueError("resource is required")
-                  if not role.strip():
-                      raise ValueError("role is required")
+                      raise ValueError(
+                          "resource is required"
+                      )
 
-                  current = set(self._policies.get(resource, frozenset()))
+                  if not role.strip():
+                      raise ValueError(
+                          "role is required"
+                      )
+
+                  current = set(
+                      self._policies.get(
+                          resource,
+                          frozenset(),
+                      )
+                  )
+
                   current.add(role)
-                  self._policies[resource] = frozenset(current)
+
+                  self._policies[
+                      resource
+                  ] = frozenset(current)
 
               def authorize(
                   self,
                   context: SecurityContext,
                   resource: str,
               ) -> AccessDecision:
+                  if not isinstance(
+                      context,
+                      SecurityContext,
+                  ):
+                      raise TypeError(
+                          "context must be SecurityContext"
+                      )
+
                   required = self._policies.get(
                       resource,
                       frozenset(),
@@ -1284,10 +1777,19 @@ jobs:
                   if not required:
                       return AccessDecision.ALLOW
 
-                  if required.intersection(context.roles):
+                  if required.intersection(
+                      context.roles
+                  ):
                       return AccessDecision.ALLOW
 
                   return AccessDecision.DENY
+
+
+          __all__ = [
+              "AccessDecision",
+              "SecurityContext",
+              "SecurityManager",
+          ]
           PY
 
           # ============================================================
@@ -1295,9 +1797,7 @@ jobs:
           # ============================================================
 
           cat > infrastructure/security/scheduler/__init__.py <<'PY'
-          """
-          Security scheduling primitives.
-          """
+          """Security task scheduling boundary."""
 
           from .security_scheduler import (
               SecuritySchedule,
@@ -1312,12 +1812,11 @@ jobs:
 
           cat > infrastructure/security/scheduler/security_scheduler.py <<'PY'
           """
-          Lightweight security task scheduler.
+          Deterministic due-task scheduler.
 
-          The scheduler stores immutable task metadata. Execution remains
-          deliberately separated from scheduling so a future distributed
-          scheduler can replace the execution adapter without changing the
-          Infrastructure API.
+          Execution is deliberately delegated to callbacks so this layer
+          can later be backed by a distributed scheduler without changing
+          its public contract.
           """
 
           from __future__ import annotations
@@ -1328,32 +1827,54 @@ jobs:
           from typing import Callable
 
 
-          @dataclass(frozen=True)
+          @dataclass(frozen=True, slots=True)
           class SecuritySchedule:
               task_id: str
               run_at: datetime
-              callback: Callable[[], object]
+              callback: Callable[
+                  [],
+                  object,
+              ]
               enabled: bool = True
 
               def __post_init__(self) -> None:
                   if not self.task_id.strip():
-                      raise ValueError("task_id is required")
+                      raise ValueError(
+                          "task_id is required"
+                      )
+
                   if self.run_at.tzinfo is None:
-                      raise ValueError("run_at must be timezone-aware")
-                  if not callable(self.callback):
-                      raise TypeError("callback must be callable")
+                      raise ValueError(
+                          "run_at must be timezone-aware"
+                      )
+
+                  if not callable(
+                      self.callback
+                  ):
+                      raise TypeError(
+                          "callback must be callable"
+                      )
 
 
           class SecurityScheduler:
+              """Thread-safe one-shot security task scheduler."""
+
               def __init__(self) -> None:
-                  self._tasks: dict[str, SecuritySchedule] = {}
+                  self._tasks: dict[
+                      str,
+                      SecuritySchedule,
+                  ] = {}
+
                   self._lock = RLock()
 
               def schedule(
                   self,
                   task_id: str,
                   run_at: datetime,
-                  callback: Callable[[], object],
+                  callback: Callable[
+                      [],
+                      object,
+                  ],
               ) -> SecuritySchedule:
                   item = SecuritySchedule(
                       task_id=task_id,
@@ -1364,39 +1885,78 @@ jobs:
                   with self._lock:
                       if task_id in self._tasks:
                           raise ValueError(
-                              f"security task already exists: {task_id}"
+                              f"security task already exists: "
+                              f"{task_id}"
                           )
-                      self._tasks[task_id] = item
+
+                      self._tasks[
+                          task_id
+                      ] = item
 
                   return item
 
-              def cancel(self, task_id: str) -> None:
+              def cancel(
+                  self,
+                  task_id: str,
+              ) -> None:
                   with self._lock:
-                      self._tasks.pop(task_id, None)
+                      self._tasks.pop(
+                          task_id,
+                          None,
+                      )
 
-              def due(self, now: datetime | None = None) -> tuple[SecuritySchedule, ...]:
-                  current = now or datetime.now(timezone.utc)
+              def due(
+                  self,
+                  now: datetime | None = None,
+              ) -> tuple[
+                  SecuritySchedule,
+                  ...,
+              ]:
+                  current = (
+                      now
+                      or datetime.now(
+                          timezone.utc
+                      )
+                  )
 
                   if current.tzinfo is None:
-                      raise ValueError("now must be timezone-aware")
+                      raise ValueError(
+                          "now must be timezone-aware"
+                      )
 
                   with self._lock:
                       return tuple(
                           task
-                          for task in self._tasks.values()
-                          if task.enabled and task.run_at <= current
+                          for task
+                          in self._tasks.values()
+                          if (
+                              task.enabled
+                              and task.run_at
+                              <= current
+                          )
                       )
 
-              def run_due(self, now: datetime | None = None) -> int:
+              def run_due(
+                  self,
+                  now: datetime | None = None,
+              ) -> int:
                   tasks = self.due(now)
                   executed = 0
 
                   for task in tasks:
                       task.callback()
                       executed += 1
-                      self.cancel(task.task_id)
+                      self.cancel(
+                          task.task_id
+                      )
 
                   return executed
+
+
+          __all__ = [
+              "SecuritySchedule",
+              "SecurityScheduler",
+          ]
           PY
 
           # ============================================================
@@ -1404,9 +1964,7 @@ jobs:
           # ============================================================
 
           cat > infrastructure/template/__init__.py <<'PY'
-          """
-          Infrastructure template/rendering primitives.
-          """
+          """Safe infrastructure template rendering."""
 
           from .template_engine import (
               TemplateEngine,
@@ -1421,10 +1979,10 @@ jobs:
 
           cat > infrastructure/template/template_engine.py <<'PY'
           """
-          Minimal deterministic template engine.
+          Non-evaluating template renderer.
 
-          Only explicit ``{{ name }}`` substitutions are supported. No code
-          execution, imports, expressions or evaluation are performed.
+          Only explicit ``{{ variable }}`` substitution is supported.
+          No Python evaluation or arbitrary code execution is performed.
           """
 
           from __future__ import annotations
@@ -1438,22 +1996,37 @@ jobs:
 
 
           class TemplateEngine:
-              _TOKEN = re.compile(r"{{\s*([A-Za-z_][A-Za-z0-9_.-]*)\s*}}")
+              _TOKEN = re.compile(
+                  r"{{\s*"
+                  r"([A-Za-z_][A-Za-z0-9_.-]*)"
+                  r"\s*}}"
+              )
 
               def render(
                   self,
                   template: str,
-                  values: Mapping[str, object],
+                  values: Mapping[
+                      str,
+                      object,
+                  ],
               ) -> str:
-                  if not isinstance(template, str):
-                      raise TypeError("template must be a string")
+                  if not isinstance(
+                      template,
+                      str,
+                  ):
+                      raise TypeError(
+                          "template must be a string"
+                      )
 
-                  def replace(match: re.Match[str]) -> str:
+                  def replace(
+                      match: re.Match[str],
+                  ) -> str:
                       key = match.group(1)
 
                       if key not in values:
                           raise TemplateError(
-                              f"missing template variable: {key}"
+                              f"missing template variable: "
+                              f"{key}"
                           )
 
                       value = values[key]
@@ -1463,22 +2036,71 @@ jobs:
 
                       return str(value)
 
-                  return self._TOKEN.sub(replace, template)
+                  return self._TOKEN.sub(
+                      replace,
+                      template,
+                  )
+
+
+          __all__ = [
+              "TemplateEngine",
+              "TemplateError",
+          ]
           PY
 
           # ============================================================
-          # ROOT PACKAGE EXPORTS — preserve existing public API and add
-          # the completed infrastructure services.
+          # ROOT INFRASTRUCTURE PUBLIC API
           # ============================================================
 
-          cat > infrastructure/_production_exports.py <<'PY'
+          cat > infrastructure/__init__.py <<'PY'
           """
-          Production Infrastructure aggregate exports.
+          ZYRA Network Infrastructure.
 
-          Kept separate from infrastructure/__init__.py generation so the
-          existing public contracts remain intact.
+          Stable public aggregation layer for the foundational runtime,
+          persistence, cache, lifecycle, networking, discovery, security,
+          deployment and operational primitives.
           """
 
+          from .cache import (
+              Cache,
+              CacheEntry,
+              CacheStats,
+          )
+          from .config import (
+              Configuration,
+              ConfigurationError,
+              Environment,
+          )
+          from .container import (
+              Container,
+              DependencyError,
+              Lifetime,
+          )
+          from .database import (
+              Database,
+              DatabaseError,
+              Transaction,
+          )
+          from .runtime import (
+              Runtime,
+              RuntimeErrorState,
+              RuntimeSnapshot,
+              RuntimeState,
+          )
+          from .storage_adapter import (
+              StorageAdapter,
+              StorageError,
+          )
+          from .bootstrap import (
+              InfrastructureBootstrap,
+              InfrastructureContext,
+              create_infrastructure,
+          )
+          from .bootstrap.api import (
+              BootstrapRequest,
+              BootstrapResponse,
+              BootstrapService,
+          )
           from .cluster import (
               ClusterManager,
               ClusterMember,
@@ -1541,6 +2163,30 @@ jobs:
           )
 
           __all__ = [
+              "Cache",
+              "CacheEntry",
+              "CacheStats",
+              "Configuration",
+              "ConfigurationError",
+              "Environment",
+              "Container",
+              "DependencyError",
+              "Lifetime",
+              "Database",
+              "DatabaseError",
+              "Transaction",
+              "Runtime",
+              "RuntimeErrorState",
+              "RuntimeSnapshot",
+              "RuntimeState",
+              "StorageAdapter",
+              "StorageError",
+              "InfrastructureBootstrap",
+              "InfrastructureContext",
+              "create_infrastructure",
+              "BootstrapRequest",
+              "BootstrapResponse",
+              "BootstrapService",
               "ClusterManager",
               "ClusterMember",
               "ClusterState",
@@ -1581,109 +2227,262 @@ jobs:
           PY
 
           # ============================================================
-          # PRODUCTION VALIDATION
+          # VALIDATION AGAINST THE REAL INFRASTRUCTURE CONTRACT
           # ============================================================
 
           python -m compileall -q infrastructure
 
           python - <<'PY'
+          from datetime import datetime, timezone
+
           import infrastructure
 
-          from infrastructure.cluster import ClusterManager, MemberStatus
-          from infrastructure.deployment import DeploymentManager, DeploymentState
-          from infrastructure.diagnostics import DiagnosticsEngine
-          from infrastructure.discovery import ServiceRegistry, ServiceStatus
-          from infrastructure.gateway import Gateway, GatewayRequest, GatewayResponse
-          from infrastructure.load_balancer import LoadBalancer
+          from infrastructure import (
+              Cache,
+              CacheEntry,
+              CacheStats,
+              Configuration,
+              Container,
+              Database,
+              Runtime,
+              StorageAdapter,
+              InfrastructureBootstrap,
+          )
+
+          from infrastructure.cluster import (
+              ClusterManager,
+              MemberStatus,
+          )
+
+          from infrastructure.deployment import (
+              DeploymentManager,
+              DeploymentState,
+          )
+
+          from infrastructure.diagnostics import (
+              DiagnosticsEngine,
+          )
+
+          from infrastructure.discovery import (
+              ServiceRegistry,
+          )
+
+          from infrastructure.gateway import (
+              Gateway,
+              GatewayRequest,
+              GatewayResponse,
+          )
+
+          from infrastructure.load_balancer import (
+              LoadBalancer,
+          )
+
           from infrastructure.monitoring_adapters import (
               HealthStatus,
               MonitoringAdapter,
           )
-          from infrastructure.network import NetworkAddress, NetworkManager
-          from infrastructure.node import NodeManager, NodeStatus
+
+          from infrastructure.network import (
+              NetworkAddress,
+              NetworkManager,
+          )
+
+          from infrastructure.node import (
+              NodeManager,
+              NodeStatus,
+          )
+
           from infrastructure.security import (
               AccessDecision,
               SecurityContext,
               SecurityManager,
           )
-          from infrastructure.security.scheduler import SecurityScheduler
-          from infrastructure.template import TemplateEngine
 
-          # Existing Infrastructure public API must remain intact.
-          from infrastructure import Cache, CacheEntry, CacheStats
-          from infrastructure import Configuration
-          from infrastructure import Container
-          from infrastructure import Database
-          from infrastructure import Runtime
-          from infrastructure import StorageAdapter
+          from infrastructure.security.scheduler import (
+              SecurityScheduler,
+          )
 
-          cache = Cache()
-          cache.set("production", "ok")
-          assert cache.get("production") == "ok"
+          from infrastructure.template import (
+              TemplateEngine,
+          )
 
-          configuration = Configuration()
-          assert configuration is not None
+          # ------------------------------------------------------------
+          # Existing public contracts from the supplied ZIP
+          # ------------------------------------------------------------
 
-          container = Container()
-          assert container is not None
+          assert Cache is not None
+          assert CacheEntry is not None
+          assert CacheStats is not None
+          assert Container is not None
+          assert Database is not None
+          assert Runtime is not None
+          assert StorageAdapter is not None
 
-          database = Database()
-          assert database is not None
+          # Configuration MUST be constructed through its real contract.
+          configuration = Configuration.from_mapping(
+              {
+                  "ZYRA_ENVIRONMENT": "testing",
+                  "ZYRA_SERVICE_NAME": "zyra-network-test",
+                  "ZYRA_NODE_ID": "ci-node",
+                  "ZYRA_DATA_DIRECTORY": (
+                      "/tmp/zyra-ci-data"
+                  ),
+                  "ZYRA_DATABASE_PATH": (
+                      "/tmp/zyra-ci-data/zyra.db"
+                  ),
+                  "ZYRA_CACHE_CAPACITY": "4096",
+                  "ZYRA_CACHE_DEFAULT_TTL_SECONDS": "300",
+                  "ZYRA_DATABASE_TIMEOUT_SECONDS": "30",
+                  "ZYRA_DATABASE_WAL": "true",
+                  "ZYRA_SHUTDOWN_TIMEOUT_SECONDS": "30",
+                  "ZYRA_STRICT_CONFIGURATION": "true",
+              }
+          )
 
-          runtime = Runtime()
-          assert runtime is not None
+          infrastructure_bootstrap = (
+              InfrastructureBootstrap(
+                  configuration
+              )
+          )
 
-          storage = StorageAdapter()
-          assert storage is not None
+          context = (
+              infrastructure_bootstrap.initialize()
+          )
 
-          cluster = ClusterManager("zyra-production")
+          assert context.configuration is configuration
+          assert context.database is not None
+          assert context.cache is not None
+          assert context.runtime is not None
+          assert context.storage is not None
+          assert context.container is not None
+
+          context.cache.set(
+              "integration",
+              "ok",
+          )
+
+          assert (
+              context.cache.get(
+                  "integration"
+              )
+              == "ok"
+          )
+
+          # ------------------------------------------------------------
+          # Cluster
+          # ------------------------------------------------------------
+
+          cluster = ClusterManager(
+              "zyra-production"
+          )
+
           member = cluster.register(
               "node-001",
               "https://node-001.internal",
           )
-          assert member.status == MemberStatus.READY
-          cluster.heartbeat("node-001")
-          assert len(cluster.snapshot().members) == 1
+
+          assert (
+              member.status
+              is MemberStatus.READY
+          )
+
+          cluster.heartbeat(
+              "node-001"
+          )
+
+          assert (
+              len(
+                  cluster.snapshot().members
+              )
+              == 1
+          )
+
+          # ------------------------------------------------------------
+          # Deployment
+          # ------------------------------------------------------------
 
           deployments = DeploymentManager()
-          deployments.create("deploy-001", "1.0.0", "production")
+
+          deployments.create(
+              "deploy-001",
+              "1.0.0",
+              "testing",
+          )
+
           deployments.transition(
               "deploy-001",
               DeploymentState.VALIDATING,
           )
+
           deployments.transition(
               "deploy-001",
               DeploymentState.DEPLOYING,
           )
-          deployments.transition(
+
+          deployment = deployments.transition(
               "deploy-001",
               DeploymentState.ACTIVE,
           )
 
+          assert (
+              deployment.state
+              is DeploymentState.ACTIVE
+          )
+
+          # ------------------------------------------------------------
+          # Diagnostics
+          # ------------------------------------------------------------
+
           diagnostics = DiagnosticsEngine()
-          diagnostics.register("runtime", lambda: True)
-          assert diagnostics.run().passed is True
+
+          diagnostics.register(
+              "runtime",
+              lambda: True,
+          )
+
+          report = diagnostics.run()
+
+          assert report.passed is True
+
+          # ------------------------------------------------------------
+          # Discovery
+          # ------------------------------------------------------------
 
           discovery = ServiceRegistry()
+
           discovery.register(
               "zyra-core",
               "https://core.internal",
           )
+
           discovery.heartbeat(
               "zyra-core",
               "https://core.internal",
           )
-          assert discovery.resolve("zyra-core")
+
+          assert discovery.resolve(
+              "zyra-core"
+          )
+
+          # ------------------------------------------------------------
+          # Gateway
+          # ------------------------------------------------------------
 
           gateway = Gateway()
 
-          def health_handler(request):
+          def health_handler(
+              request,
+          ):
               return GatewayResponse(
                   status_code=200,
                   body=b'{"status":"ok"}',
               )
 
-          gateway.register("GET", "/health", health_handler)
+          gateway.register(
+              "GET",
+              "/health",
+              health_handler,
+          )
 
           response = gateway.dispatch(
               GatewayRequest(
@@ -1694,77 +2493,172 @@ jobs:
 
           assert response.status_code == 200
 
+          # ------------------------------------------------------------
+          # Load balancer
+          # ------------------------------------------------------------
+
           load_balancer = LoadBalancer()
+
           load_balancer.register(
               "backend-001",
               "https://backend-001.internal",
           )
-          assert load_balancer.choose().backend_id == "backend-001"
 
-          monitoring = MonitoringAdapter("zyra-network")
-          monitoring.set_health(HealthStatus.HEALTHY)
-          monitoring.record("requests.total", 1)
-          assert monitoring.health() == HealthStatus.HEALTHY
-          assert len(monitoring.snapshot()) == 1
+          assert (
+              load_balancer.choose().backend_id
+              == "backend-001"
+          )
+
+          # ------------------------------------------------------------
+          # Monitoring
+          # ------------------------------------------------------------
+
+          monitoring = MonitoringAdapter(
+              "zyra-network"
+          )
+
+          monitoring.set_health(
+              HealthStatus.HEALTHY
+          )
+
+          monitoring.record(
+              "requests.total",
+              1,
+          )
+
+          assert (
+              monitoring.health()
+              is HealthStatus.HEALTHY
+          )
+
+          assert len(
+              monitoring.snapshot()
+          ) == 1
+
+          # ------------------------------------------------------------
+          # Network
+          # ------------------------------------------------------------
 
           network = NetworkManager()
+
           network.start()
+
           network.register(
               "api",
-              NetworkAddress("127.0.0.1", 8080),
+              NetworkAddress(
+                  "127.0.0.1",
+                  8080,
+              ),
           )
-          assert network.resolve("api").port == 8080
+
+          address = network.resolve(
+              "api"
+          )
+
+          assert address is not None
+          assert address.port == 8080
+
+          # ------------------------------------------------------------
+          # Nodes
+          # ------------------------------------------------------------
 
           nodes = NodeManager()
-          nodes.register("node-a", "host-a")
-          nodes.ready("node-a")
-          nodes.heartbeat("node-a")
-          assert nodes.get("node-a").status == NodeStatus.READY
+
+          nodes.register(
+              "node-a",
+              "host-a",
+          )
+
+          nodes.ready(
+              "node-a"
+          )
+
+          nodes.heartbeat(
+              "node-a"
+          )
+
+          assert (
+              nodes.get(
+                  "node-a"
+              ).status
+              is NodeStatus.READY
+          )
+
+          # ------------------------------------------------------------
+          # Security
+          # ------------------------------------------------------------
 
           security = SecurityManager()
-          security.require_role("network.admin", "admin")
 
-          context = SecurityContext(
+          security.require_role(
+              "network.admin",
+              "admin",
+          )
+
+          security_context = SecurityContext(
               principal="system",
-              roles=frozenset({"admin"}),
+              roles=frozenset(
+                  {"admin"}
+              ),
           )
 
           assert (
               security.authorize(
-                  context,
+                  security_context,
                   "network.admin",
               )
-              == AccessDecision.ALLOW
+              is AccessDecision.ALLOW
           )
 
-          scheduler = SecurityScheduler()
-          executed = []
+          # ------------------------------------------------------------
+          # Security scheduler
+          # ------------------------------------------------------------
 
-          from datetime import datetime, timezone
+          scheduler = SecurityScheduler()
+
+          executed = []
 
           scheduler.schedule(
               "security-check",
-              datetime.now(timezone.utc),
+              datetime.now(
+                  timezone.utc
+              ),
               lambda: executed.append(True),
           )
 
           assert scheduler.run_due() == 1
           assert executed == [True]
 
+          # ------------------------------------------------------------
+          # Template
+          # ------------------------------------------------------------
+
           template = TemplateEngine()
+
           assert (
               template.render(
                   "ZYRA {{ environment }}",
-                  {"environment": "production"},
+                  {
+                      "environment": "testing"
+                  },
               )
-              == "ZYRA production"
+              == "ZYRA testing"
           )
 
-          print("INFRASTRUCTURE PRODUCTION SMOKE TEST: PASS")
+          # ------------------------------------------------------------
+          # Proper Infrastructure shutdown
+          # ------------------------------------------------------------
+
+          infrastructure_bootstrap.shutdown()
+
+          print(
+              "INFRASTRUCTURE PRODUCTION "
+              "INTEGRATION: PASS"
+          )
           PY
 
           # ============================================================
-          # VERIFY NO EMPTY PYTHON FILES IN ROOT INFRASTRUCTURE
+          # NO EMPTY PYTHON FILES
           # ============================================================
 
           empty_files=0
@@ -1774,15 +2668,20 @@ jobs:
               echo "EMPTY INFRASTRUCTURE FILE: $file"
               empty_files=$((empty_files + 1))
             fi
-          done < <(find infrastructure -type f -name '*.py' -print0)
+          done < <(
+            find infrastructure \
+              -type f \
+              -name '*.py' \
+              -print0
+          )
 
           if [ "$empty_files" -ne 0 ]; then
-            echo "ERROR: $empty_files empty Python files remain in infrastructure/"
+            echo "ERROR: empty Python files remain."
             exit 1
           fi
 
           # ============================================================
-          # VERIFY APPS BOUNDARY
+          # APPS BOUNDARY
           # ============================================================
 
           if git status --porcelain -- apps | grep -q .; then
@@ -1791,7 +2690,7 @@ jobs:
             exit 1
           fi
 
-          echo "Infrastructure build completed successfully."
+          echo "Infrastructure build: PASS"
 
       - name: Compile Infrastructure
         shell: bash
@@ -1799,22 +2698,72 @@ jobs:
         run: |
           set -euo pipefail
           python -m compileall -q infrastructure
+          echo "Infrastructure compilation: PASS"
 
       - name: Integration checks
         shell: bash
         working-directory: ${{ github.workspace }}
         run: |
           set -euo pipefail
+
           python - <<'PY'
           import infrastructure
-          from infrastructure import Cache, CacheEntry, CacheStats
+
+          from infrastructure import (
+              Cache,
+              CacheEntry,
+              CacheStats,
+              Configuration,
+              InfrastructureBootstrap,
+          )
 
           assert infrastructure is not None
           assert Cache is not None
           assert CacheEntry is not None
           assert CacheStats is not None
+          assert Configuration is not None
+          assert InfrastructureBootstrap is not None
 
-          print("Infrastructure imports: PASS")
+          configuration = Configuration.from_mapping(
+              {
+                  "ZYRA_ENVIRONMENT": "testing",
+                  "ZYRA_SERVICE_NAME": "zyra-network-test",
+                  "ZYRA_NODE_ID": "ci-node",
+                  "ZYRA_DATA_DIRECTORY": "/tmp/zyra-ci-data-2",
+                  "ZYRA_DATABASE_PATH": "/tmp/zyra-ci-data-2/zyra.db",
+                  "ZYRA_CACHE_CAPACITY": "4096",
+                  "ZYRA_CACHE_DEFAULT_TTL_SECONDS": "300",
+                  "ZYRA_DATABASE_TIMEOUT_SECONDS": "30",
+                  "ZYRA_DATABASE_WAL": "true",
+                  "ZYRA_SHUTDOWN_TIMEOUT_SECONDS": "30",
+                  "ZYRA_STRICT_CONFIGURATION": "true",
+              }
+          )
+
+          bootstrap = InfrastructureBootstrap(
+              configuration
+          )
+
+          context = bootstrap.initialize()
+
+          context.cache.set(
+              "integration",
+              "pass",
+          )
+
+          assert (
+              context.cache.get(
+                  "integration"
+              )
+              == "pass"
+          )
+
+          bootstrap.shutdown()
+
+          print(
+              "Infrastructure imports and "
+              "composition root: PASS"
+          )
           PY
 
       - name: Verify apps boundary
@@ -1843,27 +2792,65 @@ jobs:
           root = Path("infrastructure")
 
           required = [
+              "bootstrap/api/__init__.py",
               "bootstrap/api/bootstrap_api.py",
+              "cluster/__init__.py",
               "cluster/cluster_manager.py",
+              "deployment/__init__.py",
               "deployment/deployment_manager.py",
+              "diagnostics/__init__.py",
               "diagnostics/diagnostics.py",
+              "discovery/__init__.py",
               "discovery/service_discovery.py",
+              "gateway/__init__.py",
               "gateway/gateway.py",
+              "load_balancer/__init__.py",
               "load_balancer/load_balancer.py",
+              "monitoring_adapters/__init__.py",
               "monitoring_adapters/monitoring.py",
+              "network/__init__.py",
               "network/network_manager.py",
+              "node/__init__.py",
               "node/node_manager.py",
+              "security/__init__.py",
               "security/security_manager.py",
+              "security/scheduler/__init__.py",
               "security/scheduler/security_scheduler.py",
+              "template/__init__.py",
               "template/template_engine.py",
           ]
 
           for relative in required:
               path = root / relative
-              assert path.exists(), f"Missing: {path}"
-              assert path.stat().st_size > 0, f"Empty: {path}"
 
-          print("Infrastructure required modules: PASS")
+              assert path.exists(), (
+                  f"Missing Infrastructure file: {path}"
+              )
+
+              assert path.stat().st_size > 0, (
+                  f"Empty Infrastructure file: {path}"
+              )
+
+          python_files = tuple(
+              root.rglob("*.py")
+          )
+
+          assert python_files, (
+              "Infrastructure contains no Python files"
+          )
+
+          for path in python_files:
+              assert path.stat().st_size > 0, (
+                  f"Empty Python file: {path}"
+              )
+
+          print(
+              f"Infrastructure files verified: "
+              f"{len(python_files)}"
+          )
+          print(
+              "Infrastructure completeness: PASS"
+          )
           PY
 
       - name: Commit and push
@@ -1873,7 +2860,8 @@ jobs:
           set -euo pipefail
 
           git config user.name "github-actions[bot]"
-          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git config user.email \
+            "41898282+github-actions[bot]@users.noreply.github.com"
 
           git add infrastructure
 
@@ -1882,5 +2870,7 @@ jobs:
             exit 0
           fi
 
-          git commit -m "build: complete production infrastructure foundation"
+          git commit \
+            -m "build: complete production infrastructure foundation"
+
           git push origin "${GITHUB_REF_NAME}"

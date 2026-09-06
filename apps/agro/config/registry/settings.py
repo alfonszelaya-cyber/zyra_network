@@ -1,0 +1,3 @@
+
+REGISTRY_ENABLED = True
+

@@ -1,0 +1,4 @@
+
+AUTHENTICATED = "authenticated"
+VERIFIED = "verified"
+

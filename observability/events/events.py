@@ -1,11 +1,7 @@
-from ..core import (
-    EventType,
-    ObservationEvent,
-    Severity,
-)
+from ..core import EventBus, ObservationEvent, Severity
 
 __all__ = [
-    "EventType",
+    "EventBus",
     "ObservationEvent",
     "Severity",
 ]

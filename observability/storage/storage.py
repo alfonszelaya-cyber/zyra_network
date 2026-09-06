@@ -1,3 +1,9 @@
-from ..core import ObservationStore
+from ..core import (
+    ObservationStore,
+    StorageError,
+)
 
-__all__ = ["ObservationStore"]
+__all__ = [
+    "ObservationStore",
+    "StorageError",
+]

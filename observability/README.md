@@ -1,36 +1,29 @@
 # ZYRA Observability
 
-Production observability subsystem.
+Production observability boundary of ZYRA Network.
 
-Provides:
+The subsystem provides stable contracts for:
 
-- events
-- structured context
-- correlation IDs
-- trace IDs
-- span IDs
+- correlation and trace context
+- structured events
 - metrics
-- counters
-- gauges
-- histograms
-- timers
-- bounded cardinality
-- bounded storage
-- retention
-- collector backpressure
 - health checks
 - alert rules
-- alert deduplication
-- incident lifecycle
-- component registry
+- alert state
+- incidents
+- component registration
+- bounded collection
 - query
 - snapshots
+- status aggregation
 - dashboards
 - reports
 - routing
-- exporter abstraction
-- monitoring
-- stable public API
+- exporters
+- lifecycle management
+- durable observation storage
 
-The implementation uses the Python standard library and does not
-couple the core to applications or a specific observability vendor.
+The implementation is intentionally isolated from `apps/`.
+
+Runtime dependencies are Python standard-library based.
+`pytest` is installed by CI only for validation.

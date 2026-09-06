@@ -1,3 +1,3 @@
-from ..core import ObservabilityAPI
+from ..core import ObservationAPI
 
-__all__ = ["ObservabilityAPI"]
+__all__ = ["ObservationAPI"]

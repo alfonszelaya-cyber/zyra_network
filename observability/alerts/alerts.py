@@ -1,7 +1,13 @@
-from ..core import Alert, AlertManager, AlertRule
+from ..core import (
+    Alert,
+    AlertManager,
+    AlertRule,
+    AlertState,
+)
 
 __all__ = [
     "Alert",
     "AlertManager",
     "AlertRule",
+    "AlertState",
 ]

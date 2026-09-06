@@ -1,9 +1,3 @@
-from ..core import (
-    ObservationManager,
-    ObservabilityManager,
-)
+from ..core import ObservationManager
 
-__all__ = [
-    "ObservationManager",
-    "ObservabilityManager",
-]
+__all__ = ["ObservationManager"]

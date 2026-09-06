@@ -1,0 +1,2336 @@
+from __future__ import annotations
+
+import hashlib
+import json
+import threading
+import time
+import uuid
+
+from collections import deque
+from dataclasses import dataclass, field, replace
+from datetime import datetime, timezone
+from enum import Enum
+from typing import Any, Callable, Deque, Iterable, Mapping, Protocol
+
+
+# ============================================================
+# BASE
+# ============================================================
+
+def utc_now() -> datetime:
+    return datetime.now(timezone.utc)
+
+
+def utc_timestamp() -> float:
+    return time.time()
+
+
+def new_id(prefix: str) -> str:
+    return f"{prefix}_{uuid.uuid4().hex}"
+
+
+def stable_fingerprint(*parts: object) -> str:
+    value = "|".join(str(part) for part in parts)
+    return hashlib.sha256(
+        value.encode("utf-8")
+    ).hexdigest()
+
+
+class ObservabilityError(RuntimeError):
+    """Base observability exception."""
+
+
+# Compatibility name kept intentionally.
+ObservationError = ObservabilityError
+
+
+class CapacityExceeded(ObservabilityError):
+    """Bounded resource reached its configured capacity."""
+
+
+class InvalidConfiguration(ObservabilityError):
+    """Invalid observability configuration."""
+
+
+class ComponentState(str, Enum):
+    STARTING = "starting"
+    READY = "ready"
+    DEGRADED = "degraded"
+    FAILED = "failed"
+    STOPPING = "stopping"
+    STOPPED = "stopped"
+
+
+class Severity(str, Enum):
+    DEBUG = "debug"
+    INFO = "info"
+    WARNING = "warning"
+    ERROR = "error"
+    CRITICAL = "critical"
+
+
+class HealthState(str, Enum):
+    UNKNOWN = "unknown"
+    HEALTHY = "healthy"
+    DEGRADED = "degraded"
+    UNHEALTHY = "unhealthy"
+
+
+class EventType(str, Enum):
+    SYSTEM = "system"
+    METRIC = "metric"
+    LOG = "log"
+    TRACE = "trace"
+    HEALTH = "health"
+    ALERT = "alert"
+    INCIDENT = "incident"
+    SECURITY = "security"
+    CUSTOM = "custom"
+
+
+class MetricKind(str, Enum):
+    COUNTER = "counter"
+    GAUGE = "gauge"
+    HISTOGRAM = "histogram"
+    TIMER = "timer"
+
+
+class IncidentState(str, Enum):
+    OPEN = "open"
+    ACKNOWLEDGED = "acknowledged"
+    RESOLVED = "resolved"
+
+
+def _mapping(
+    value: Mapping[str, Any] | None,
+) -> Mapping[str, Any]:
+    return dict(value or {})
+
+
+# ============================================================
+# CONTEXT
+# ============================================================
+
+@dataclass(frozen=True, slots=True)
+class ObservationContext:
+    correlation_id: str
+    trace_id: str
+    span_id: str
+    parent_span_id: str | None = None
+    service: str = "unknown"
+    component: str = "unknown"
+    environment: str = "production"
+    attributes: Mapping[str, Any] = field(
+        default_factory=dict
+    )
+
+    @classmethod
+    def create(
+        cls,
+        *,
+        service: str = "unknown",
+        component: str = "unknown",
+        environment: str = "production",
+        correlation_id: str | None = None,
+        trace_id: str | None = None,
+        parent_span_id: str | None = None,
+        attributes: Mapping[str, Any] | None = None,
+    ) -> "ObservationContext":
+        return cls(
+            correlation_id=(
+                correlation_id or new_id("corr")
+            ),
+            trace_id=trace_id or new_id("trace"),
+            span_id=new_id("span"),
+            parent_span_id=parent_span_id,
+            service=service,
+            component=component,
+            environment=environment,
+            attributes=_mapping(attributes),
+        )
+
+    def child(
+        self,
+        **attributes: Any,
+    ) -> "ObservationContext":
+        merged = dict(self.attributes)
+        merged.update(attributes)
+
+        return ObservationContext(
+            correlation_id=self.correlation_id,
+            trace_id=self.trace_id,
+            span_id=new_id("span"),
+            parent_span_id=self.span_id,
+            service=self.service,
+            component=self.component,
+            environment=self.environment,
+            attributes=merged,
+        )
+
+
+# ============================================================
+# EVENTS
+# ============================================================
+
+@dataclass(frozen=True, slots=True)
+class ObservationEvent:
+    event_id: str
+    timestamp: datetime
+    event_type: EventType
+    severity: Severity
+    name: str
+    message: str
+    context: ObservationContext
+    attributes: Mapping[str, Any] = field(
+        default_factory=dict
+    )
+
+    @classmethod
+    def create(
+        cls,
+        *,
+        name: str,
+        message: str = "",
+        event_type: EventType = EventType.CUSTOM,
+        severity: Severity = Severity.INFO,
+        context: ObservationContext | None = None,
+        attributes: Mapping[str, Any] | None = None,
+    ) -> "ObservationEvent":
+        if not name:
+            raise InvalidConfiguration(
+                "event name is required"
+            )
+
+        return cls(
+            event_id=new_id("evt"),
+            timestamp=utc_now(),
+            event_type=event_type,
+            severity=severity,
+            name=name,
+            message=message,
+            context=(
+                context
+                or ObservationContext.create()
+            ),
+            attributes=_mapping(attributes),
+        )
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "event_id": self.event_id,
+            "timestamp": (
+                self.timestamp.isoformat()
+            ),
+            "event_type": self.event_type.value,
+            "severity": self.severity.value,
+            "name": self.name,
+            "message": self.message,
+            "context": {
+                "correlation_id": (
+                    self.context.correlation_id
+                ),
+                "trace_id": self.context.trace_id,
+                "span_id": self.context.span_id,
+                "parent_span_id": (
+                    self.context.parent_span_id
+                ),
+                "service": self.context.service,
+                "component": (
+                    self.context.component
+                ),
+                "environment": (
+                    self.context.environment
+                ),
+                "attributes": dict(
+                    self.context.attributes
+                ),
+            },
+            "attributes": dict(self.attributes),
+        }
+
+
+# ============================================================
+# METRICS
+# ============================================================
+
+@dataclass(frozen=True, slots=True)
+class MetricSample:
+    metric_id: str
+    name: str
+    kind: MetricKind
+    value: float
+    timestamp: float
+    labels: Mapping[str, str] = field(
+        default_factory=dict
+    )
+    unit: str = ""
+    description: str = ""
+
+    def identity(self) -> str:
+        labels = json.dumps(
+            dict(sorted(self.labels.items())),
+            sort_keys=True,
+            separators=(",", ":"),
+        )
+
+        return stable_fingerprint(
+            self.name,
+            self.kind.value,
+            labels,
+        )
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "metric_id": self.metric_id,
+            "name": self.name,
+            "kind": self.kind.value,
+            "value": self.value,
+            "timestamp": self.timestamp,
+            "labels": dict(self.labels),
+            "unit": self.unit,
+            "description": self.description,
+        }
+
+
+class MetricRegistry:
+    def __init__(
+        self,
+        *,
+        max_series: int = 10_000,
+        max_samples_per_series: int = 1_000,
+    ) -> None:
+        if max_series <= 0:
+            raise InvalidConfiguration(
+                "max_series must be positive"
+            )
+
+        if max_samples_per_series <= 0:
+            raise InvalidConfiguration(
+                "max_samples_per_series must be positive"
+            )
+
+        self.max_series = max_series
+        self.max_samples_per_series = (
+            max_samples_per_series
+        )
+
+        self._series: dict[
+            str,
+            Deque[MetricSample],
+        ] = {}
+
+        self._lock = threading.RLock()
+
+    def record(
+        self,
+        sample: MetricSample,
+    ) -> None:
+        key = sample.identity()
+
+        with self._lock:
+            if key not in self._series:
+                if (
+                    len(self._series)
+                    >= self.max_series
+                ):
+                    raise CapacityExceeded(
+                        "metric series limit reached"
+                    )
+
+                self._series[key] = deque(
+                    maxlen=(
+                        self.max_samples_per_series
+                    )
+                )
+
+            self._series[key].append(sample)
+
+    def _create(
+        self,
+        name: str,
+        kind: MetricKind,
+        value: float,
+        labels: Mapping[str, str] | None,
+        unit: str,
+        description: str,
+    ) -> MetricSample:
+        sample = MetricSample(
+            metric_id=new_id("metric"),
+            name=name,
+            kind=kind,
+            value=float(value),
+            timestamp=utc_timestamp(),
+            labels=dict(labels or {}),
+            unit=unit,
+            description=description,
+        )
+
+        self.record(sample)
+        return sample
+
+    def counter(
+        self,
+        name: str,
+        value: float = 1.0,
+        *,
+        labels: Mapping[str, str] | None = None,
+        unit: str = "",
+        description: str = "",
+    ) -> MetricSample:
+        return self._create(
+            name,
+            MetricKind.COUNTER,
+            value,
+            labels,
+            unit,
+            description,
+        )
+
+    def gauge(
+        self,
+        name: str,
+        value: float,
+        *,
+        labels: Mapping[str, str] | None = None,
+        unit: str = "",
+        description: str = "",
+    ) -> MetricSample:
+        return self._create(
+            name,
+            MetricKind.GAUGE,
+            value,
+            labels,
+            unit,
+            description,
+        )
+
+    def histogram(
+        self,
+        name: str,
+        value: float,
+        *,
+        labels: Mapping[str, str] | None = None,
+        unit: str = "",
+        description: str = "",
+    ) -> MetricSample:
+        return self._create(
+            name,
+            MetricKind.HISTOGRAM,
+            value,
+            labels,
+            unit,
+            description,
+        )
+
+    def timer(
+        self,
+        name: str,
+        seconds: float,
+        *,
+        labels: Mapping[str, str] | None = None,
+        description: str = "",
+    ) -> MetricSample:
+        return self._create(
+            name,
+            MetricKind.TIMER,
+            seconds,
+            labels,
+            "s",
+            description,
+        )
+
+    def query(
+        self,
+        *,
+        name: str | None = None,
+        start: float | None = None,
+        end: float | None = None,
+        labels: Mapping[str, str] | None = None,
+        limit: int = 1_000,
+    ) -> list[MetricSample]:
+        if limit <= 0:
+            return []
+
+        wanted = dict(labels or {})
+        result: list[MetricSample] = []
+
+        with self._lock:
+            series = list(
+                self._series.values()
+            )
+
+        for samples in series:
+            for sample in samples:
+                if (
+                    name is not None
+                    and sample.name != name
+                ):
+                    continue
+
+                if (
+                    start is not None
+                    and sample.timestamp < start
+                ):
+                    continue
+
+                if (
+                    end is not None
+                    and sample.timestamp > end
+                ):
+                    continue
+
+                if any(
+                    sample.labels.get(key)
+                    != value
+                    for key, value
+                    in wanted.items()
+                ):
+                    continue
+
+                result.append(sample)
+
+                if len(result) >= limit:
+                    return sorted(
+                        result,
+                        key=lambda x: x.timestamp,
+                    )
+
+        return sorted(
+            result,
+            key=lambda x: x.timestamp,
+        )
+
+    def snapshot(
+        self,
+    ) -> list[MetricSample]:
+        with self._lock:
+            return [
+                sample
+                for samples
+                in self._series.values()
+                for sample in samples
+            ]
+
+    def series_count(self) -> int:
+        with self._lock:
+            return len(self._series)
+
+
+# ============================================================
+# STORE
+# ============================================================
+
+class ObservationStore:
+    def __init__(
+        self,
+        *,
+        max_events: int = 50_000,
+        max_metrics: int = 50_000,
+        retention_seconds: float = 604800,
+    ) -> None:
+        if max_events <= 0:
+            raise InvalidConfiguration(
+                "max_events must be positive"
+            )
+
+        if max_metrics <= 0:
+            raise InvalidConfiguration(
+                "max_metrics must be positive"
+            )
+
+        if retention_seconds <= 0:
+            raise InvalidConfiguration(
+                "retention must be positive"
+            )
+
+        self.max_events = max_events
+        self.max_metrics = max_metrics
+        self.retention_seconds = (
+            retention_seconds
+        )
+
+        self._events: Deque[
+            ObservationEvent
+        ] = deque(maxlen=max_events)
+
+        self._metrics: Deque[
+            MetricSample
+        ] = deque(maxlen=max_metrics)
+
+        self._lock = threading.RLock()
+
+    def _purge(self) -> None:
+        cutoff = (
+            utc_timestamp()
+            - self.retention_seconds
+        )
+
+        while self._events:
+            if (
+                self._events[0]
+                .timestamp
+                .timestamp()
+                >= cutoff
+            ):
+                break
+
+            self._events.popleft()
+
+        while self._metrics:
+            if (
+                self._metrics[0].timestamp
+                >= cutoff
+            ):
+                break
+
+            self._metrics.popleft()
+
+    def add_event(
+        self,
+        event: ObservationEvent,
+    ) -> None:
+        with self._lock:
+            self._events.append(event)
+            self._purge()
+
+    def add_metric(
+        self,
+        metric: MetricSample,
+    ) -> None:
+        with self._lock:
+            self._metrics.append(metric)
+            self._purge()
+
+    def events(
+        self,
+        *,
+        start: float | None = None,
+        end: float | None = None,
+        severity: Severity | None = None,
+        limit: int = 1_000,
+    ) -> list[ObservationEvent]:
+        if limit <= 0:
+            return []
+
+        with self._lock:
+            self._purge()
+            items = list(self._events)
+
+        result: list[ObservationEvent] = []
+
+        for event in reversed(items):
+            timestamp = (
+                event.timestamp.timestamp()
+            )
+
+            if (
+                start is not None
+                and timestamp < start
+            ):
+                continue
+
+            if (
+                end is not None
+                and timestamp > end
+            ):
+                continue
+
+            if (
+                severity is not None
+                and event.severity != severity
+            ):
+                continue
+
+            result.append(event)
+
+            if len(result) >= limit:
+                break
+
+        return list(reversed(result))
+
+    def metrics(
+        self,
+        *,
+        start: float | None = None,
+        end: float | None = None,
+        name: str | None = None,
+        limit: int = 1_000,
+    ) -> list[MetricSample]:
+        if limit <= 0:
+            return []
+
+        with self._lock:
+            self._purge()
+            items = list(self._metrics)
+
+        result: list[MetricSample] = []
+
+        for metric in reversed(items):
+            if (
+                start is not None
+                and metric.timestamp < start
+            ):
+                continue
+
+            if (
+                end is not None
+                and metric.timestamp > end
+            ):
+                continue
+
+            if (
+                name is not None
+                and metric.name != name
+            ):
+                continue
+
+            result.append(metric)
+
+            if len(result) >= limit:
+                break
+
+        return list(reversed(result))
+
+    def counts(self) -> dict[str, int]:
+        with self._lock:
+            self._purge()
+
+            return {
+                "events": len(self._events),
+                "metrics": len(self._metrics),
+            }
+
+
+# ============================================================
+# HEALTH
+# ============================================================
+
+@dataclass(frozen=True, slots=True)
+class HealthResult:
+    component: str
+    state: HealthState
+    latency_ms: float
+    message: str = ""
+    details: Mapping[str, Any] = field(
+        default_factory=dict
+    )
+    timestamp: datetime = field(
+        default_factory=utc_now
+    )
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "component": self.component,
+            "state": self.state.value,
+            "latency_ms": self.latency_ms,
+            "message": self.message,
+            "details": dict(self.details),
+            "timestamp": (
+                self.timestamp.isoformat()
+            ),
+        }
+
+
+HealthCheck = Callable[[], HealthResult]
+
+
+class HealthRegistry:
+    def __init__(self) -> None:
+        self._checks: dict[
+            str,
+            HealthCheck,
+        ] = {}
+
+        self._last: dict[
+            str,
+            HealthResult,
+        ] = {}
+
+        self._lock = threading.RLock()
+
+    def register(
+        self,
+        name: str,
+        check: HealthCheck,
+    ) -> None:
+        if not name:
+            raise InvalidConfiguration(
+                "health check name required"
+            )
+
+        with self._lock:
+            self._checks[name] = check
+
+    def unregister(
+        self,
+        name: str,
+    ) -> None:
+        with self._lock:
+            self._checks.pop(name, None)
+            self._last.pop(name, None)
+
+    def run(
+        self,
+    ) -> list[HealthResult]:
+        with self._lock:
+            checks = list(
+                self._checks.items()
+            )
+
+        results: list[HealthResult] = []
+
+        for name, check in checks:
+            started = time.perf_counter()
+
+            try:
+                result = check()
+
+                if result.component != name:
+                    result = replace(
+                        result,
+                        component=name,
+                    )
+
+            except Exception as exc:
+                result = HealthResult(
+                    component=name,
+                    state=HealthState.UNHEALTHY,
+                    latency_ms=0.0,
+                    message=(
+                        f"{type(exc).__name__}: "
+                        f"{exc}"
+                    ),
+                )
+
+            result = replace(
+                result,
+                latency_ms=(
+                    time.perf_counter()
+                    - started
+                ) * 1000.0,
+            )
+
+            with self._lock:
+                self._last[name] = result
+
+            results.append(result)
+
+        return results
+
+    def last(
+        self,
+    ) -> list[HealthResult]:
+        with self._lock:
+            return list(
+                self._last.values()
+            )
+
+
+# ============================================================
+# ALERTS
+# ============================================================
+
+@dataclass(frozen=True, slots=True)
+class AlertRule:
+    name: str
+    severity: Severity
+    condition: Callable[
+        [MetricSample | ObservationEvent],
+        bool,
+    ]
+    cooldown_seconds: float = 300.0
+
+
+@dataclass(frozen=True, slots=True)
+class Alert:
+    alert_id: str
+    fingerprint: str
+    rule: str
+    severity: Severity
+    message: str
+    created_at: datetime
+    context: ObservationContext
+    attributes: Mapping[str, Any] = field(
+        default_factory=dict
+    )
+
+
+class AlertManager:
+    def __init__(
+        self,
+        *,
+        max_alerts: int = 10_000,
+    ) -> None:
+        if max_alerts <= 0:
+            raise InvalidConfiguration(
+                "max_alerts must be positive"
+            )
+
+        self._rules: dict[
+            str,
+            AlertRule,
+        ] = {}
+
+        self._alerts: Deque[
+            Alert
+        ] = deque(maxlen=max_alerts)
+
+        self._last_fired: dict[
+            str,
+            float,
+        ] = {}
+
+        self._lock = threading.RLock()
+
+    def register(
+        self,
+        rule: AlertRule,
+    ) -> None:
+        if not rule.name:
+            raise InvalidConfiguration(
+                "alert rule name required"
+            )
+
+        if rule.cooldown_seconds < 0:
+            raise InvalidConfiguration(
+                "negative cooldown"
+            )
+
+        with self._lock:
+            self._rules[rule.name] = rule
+
+    def evaluate(
+        self,
+        signal: MetricSample | ObservationEvent,
+    ) -> list[Alert]:
+        with self._lock:
+            rules = list(
+                self._rules.values()
+            )
+
+        fired: list[Alert] = []
+        now = utc_timestamp()
+
+        for rule in rules:
+            try:
+                matched = bool(
+                    rule.condition(signal)
+                )
+            except Exception:
+                matched = False
+
+            if not matched:
+                continue
+
+            signal_name = getattr(
+                signal,
+                "name",
+                "",
+            )
+
+            fingerprint = stable_fingerprint(
+                rule.name,
+                signal_name,
+            )
+
+            with self._lock:
+                previous = (
+                    self._last_fired.get(
+                        fingerprint
+                    )
+                )
+
+                if (
+                    previous is not None
+                    and (
+                        now - previous
+                        < rule.cooldown_seconds
+                    )
+                ):
+                    continue
+
+                if isinstance(
+                    signal,
+                    ObservationEvent,
+                ):
+                    context = signal.context
+                else:
+                    context = (
+                        ObservationContext.create()
+                    )
+
+                alert = Alert(
+                    alert_id=new_id("alert"),
+                    fingerprint=fingerprint,
+                    rule=rule.name,
+                    severity=rule.severity,
+                    message=(
+                        "Alert rule triggered: "
+                        f"{rule.name}"
+                    ),
+                    created_at=utc_now(),
+                    context=context,
+                    attributes={
+                        "signal": signal_name
+                    },
+                )
+
+                self._last_fired[
+                    fingerprint
+                ] = now
+
+                self._alerts.append(alert)
+
+            fired.append(alert)
+
+        return fired
+
+    def list_alerts(
+        self,
+        limit: int = 1_000,
+    ) -> list[Alert]:
+        if limit <= 0:
+            return []
+
+        with self._lock:
+            return list(
+                self._alerts
+            )[-limit:]
+
+
+# ============================================================
+# INCIDENTS
+# ============================================================
+
+@dataclass(frozen=True, slots=True)
+class Incident:
+    incident_id: str
+    fingerprint: str
+    title: str
+    severity: Severity
+    state: IncidentState
+    created_at: datetime
+    updated_at: datetime
+    alert_ids: tuple[str, ...] = ()
+    event_ids: tuple[str, ...] = ()
+    attributes: Mapping[str, Any] = field(
+        default_factory=dict
+    )
+
+
+class IncidentManager:
+    def __init__(
+        self,
+        *,
+        max_incidents: int = 5_000,
+    ) -> None:
+        if max_incidents <= 0:
+            raise InvalidConfiguration(
+                "max_incidents must be positive"
+            )
+
+        self._items: dict[
+            str,
+            Incident,
+        ] = {}
+
+        self._order: Deque[str] = deque(
+            maxlen=max_incidents
+        )
+
+        self._lock = threading.RLock()
+
+    def open_from_alert(
+        self,
+        alert: Alert,
+    ) -> Incident:
+        with self._lock:
+            existing = self._items.get(
+                alert.fingerprint
+            )
+
+            if (
+                existing
+                and existing.state
+                != IncidentState.RESOLVED
+            ):
+                updated = replace(
+                    existing,
+                    updated_at=utc_now(),
+                    alert_ids=tuple(
+                        dict.fromkeys(
+                            (
+                                *existing.alert_ids,
+                                alert.alert_id,
+                            )
+                        )
+                    ),
+                )
+
+                self._items[
+                    alert.fingerprint
+                ] = updated
+
+                return updated
+
+            incident = Incident(
+                incident_id=new_id("inc"),
+                fingerprint=(
+                    alert.fingerprint
+                ),
+                title=alert.message,
+                severity=alert.severity,
+                state=IncidentState.OPEN,
+                created_at=utc_now(),
+                updated_at=utc_now(),
+                alert_ids=(alert.alert_id,),
+            )
+
+            self._items[
+                alert.fingerprint
+            ] = incident
+
+            self._order.append(
+                alert.fingerprint
+            )
+
+            return incident
+
+    def _transition(
+        self,
+        incident_id: str,
+        state: IncidentState,
+    ) -> Incident:
+        with self._lock:
+            for key, item in self._items.items():
+                if (
+                    item.incident_id
+                    == incident_id
+                ):
+                    updated = replace(
+                        item,
+                        state=state,
+                        updated_at=utc_now(),
+                    )
+
+                    self._items[key] = updated
+                    return updated
+
+        raise KeyError(
+            f"incident not found: {incident_id}"
+        )
+
+    def acknowledge(
+        self,
+        incident_id: str,
+    ) -> Incident:
+        return self._transition(
+            incident_id,
+            IncidentState.ACKNOWLEDGED,
+        )
+
+    def resolve(
+        self,
+        incident_id: str,
+    ) -> Incident:
+        return self._transition(
+            incident_id,
+            IncidentState.RESOLVED,
+        )
+
+    def list(
+        self,
+        limit: int = 1_000,
+    ) -> list[Incident]:
+        if limit <= 0:
+            return []
+
+        with self._lock:
+            keys = list(self._order)[-limit:]
+
+            return [
+                self._items[key]
+                for key in keys
+                if key in self._items
+            ]
+
+
+# ============================================================
+# REGISTRY
+# ============================================================
+
+@dataclass(frozen=True, slots=True)
+class ComponentRecord:
+    name: str
+    version: str
+    state: ComponentState
+    registered_at: datetime
+    metadata: Mapping[str, Any] = field(
+        default_factory=dict
+    )
+
+
+class ComponentRegistry:
+    def __init__(self) -> None:
+        self._items: dict[
+            str,
+            ComponentRecord,
+        ] = {}
+
+        self._lock = threading.RLock()
+
+    def register(
+        self,
+        name: str,
+        *,
+        version: str = "1.0.0",
+        state: ComponentState = (
+            ComponentState.READY
+        ),
+        metadata: Mapping[
+            str,
+            Any,
+        ] | None = None,
+    ) -> ComponentRecord:
+        if not name:
+            raise InvalidConfiguration(
+                "component name required"
+            )
+
+        item = ComponentRecord(
+            name=name,
+            version=version,
+            state=state,
+            registered_at=utc_now(),
+            metadata=_mapping(metadata),
+        )
+
+        with self._lock:
+            self._items[name] = item
+
+        return item
+
+    def update_state(
+        self,
+        name: str,
+        state: ComponentState,
+    ) -> ComponentRecord:
+        with self._lock:
+            current = self._items[name]
+            updated = replace(
+                current,
+                state=state,
+            )
+            self._items[name] = updated
+            return updated
+
+    def list(
+        self,
+    ) -> list[ComponentRecord]:
+        with self._lock:
+            return list(
+                self._items.values()
+            )
+
+
+# ============================================================
+# POLICY
+# ============================================================
+
+@dataclass(frozen=True, slots=True)
+class ObservationPolicy:
+    retention_seconds: float = 604800
+    max_events: int = 50_000
+    max_metrics: int = 50_000
+    max_metric_series: int = 10_000
+    max_samples_per_series: int = 1_000
+    max_queue_size: int = 10_000
+    max_alerts: int = 10_000
+    max_incidents: int = 5_000
+
+    def validate(self) -> None:
+        values = (
+            self.retention_seconds,
+            self.max_events,
+            self.max_metrics,
+            self.max_metric_series,
+            self.max_samples_per_series,
+            self.max_queue_size,
+            self.max_alerts,
+            self.max_incidents,
+        )
+
+        if any(
+            value <= 0
+            for value in values
+        ):
+            raise InvalidConfiguration(
+                "policy values must be positive"
+            )
+
+
+# ============================================================
+# COLLECTOR
+# ============================================================
+
+class SignalSink(Protocol):
+    def accept(
+        self,
+        signal: MetricSample | ObservationEvent,
+    ) -> None:
+        ...
+
+
+class SignalCollector:
+    def __init__(
+        self,
+        *,
+        max_queue_size: int = 10_000,
+        drop_on_full: bool = True,
+    ) -> None:
+        if max_queue_size <= 0:
+            raise InvalidConfiguration(
+                "queue size must be positive"
+            )
+
+        self.max_queue_size = max_queue_size
+        self.drop_on_full = drop_on_full
+
+        self._queue: Deque[
+            MetricSample | ObservationEvent
+        ] = deque(
+            maxlen=max_queue_size
+        )
+
+        self._accepted = 0
+        self._dropped = 0
+        self._lock = threading.RLock()
+
+    def submit(
+        self,
+        signal: MetricSample | ObservationEvent,
+    ) -> bool:
+        with self._lock:
+            if (
+                len(self._queue)
+                >= self.max_queue_size
+            ):
+                if self.drop_on_full:
+                    self._dropped += 1
+                    return False
+
+                raise CapacityExceeded(
+                    "collector queue full"
+                )
+
+            self._queue.append(signal)
+            self._accepted += 1
+            return True
+
+    def drain(
+        self,
+        limit: int = 1_000,
+    ) -> list[
+        MetricSample | ObservationEvent
+    ]:
+        if limit <= 0:
+            return []
+
+        with self._lock:
+            result = []
+
+            while (
+                self._queue
+                and len(result) < limit
+            ):
+                result.append(
+                    self._queue.popleft()
+                )
+
+            return result
+
+    def stats(self) -> dict[str, int]:
+        with self._lock:
+            return {
+                "queued": len(self._queue),
+                "accepted": self._accepted,
+                "dropped": self._dropped,
+            }
+
+
+# ============================================================
+# ROUTER / EXPORTER
+# ============================================================
+
+class SignalRouter:
+    def __init__(self) -> None:
+        self._sinks: list[SignalSink] = []
+        self._lock = threading.RLock()
+
+    def add_sink(
+        self,
+        sink: SignalSink,
+    ) -> None:
+        with self._lock:
+            self._sinks.append(sink)
+
+    def route(
+        self,
+        signal: MetricSample | ObservationEvent,
+    ) -> int:
+        with self._lock:
+            sinks = list(self._sinks)
+
+        delivered = 0
+
+        for sink in sinks:
+            try:
+                sink.accept(signal)
+                delivered += 1
+            except Exception:
+                continue
+
+        return delivered
+
+
+class MemoryExporter:
+    def __init__(
+        self,
+        *,
+        max_items: int = 10_000,
+    ) -> None:
+        if max_items <= 0:
+            raise InvalidConfiguration(
+                "max_items must be positive"
+            )
+
+        self._items: Deque[
+            MetricSample | ObservationEvent
+        ] = deque(
+            maxlen=max_items
+        )
+
+        self._lock = threading.RLock()
+
+    def accept(
+        self,
+        signal: MetricSample | ObservationEvent,
+    ) -> None:
+        with self._lock:
+            self._items.append(signal)
+
+    def snapshot(
+        self,
+    ) -> list[dict[str, Any]]:
+        with self._lock:
+            return [
+                item.to_dict()
+                for item in self._items
+            ]
+
+    def to_ndjson(self) -> str:
+        return "\n".join(
+            json.dumps(
+                item,
+                sort_keys=True,
+                default=str,
+            )
+            for item in self.snapshot()
+        )
+
+
+# ============================================================
+# QUERY
+# ============================================================
+
+class ObservationQuery:
+    def __init__(
+        self,
+        store: ObservationStore,
+    ) -> None:
+        self.store = store
+
+    def events(
+        self,
+        *,
+        start: float | None = None,
+        end: float | None = None,
+        severity: Severity | None = None,
+        limit: int = 1_000,
+    ) -> list[ObservationEvent]:
+        return self.store.events(
+            start=start,
+            end=end,
+            severity=severity,
+            limit=limit,
+        )
+
+    def metrics(
+        self,
+        *,
+        name: str | None = None,
+        start: float | None = None,
+        end: float | None = None,
+        limit: int = 1_000,
+    ) -> list[MetricSample]:
+        return self.store.metrics(
+            name=name,
+            start=start,
+            end=end,
+            limit=limit,
+        )
+
+
+# ============================================================
+# DASHBOARDS
+# ============================================================
+
+@dataclass(frozen=True, slots=True)
+class DashboardWidget:
+    widget_id: str
+    title: str
+    metric_name: str | None = None
+    event_name: str | None = None
+    limit: int = 100
+
+
+@dataclass(frozen=True, slots=True)
+class Dashboard:
+    name: str
+    widgets: tuple[
+        DashboardWidget,
+        ...
+    ]
+
+
+class DashboardRegistry:
+    def __init__(self) -> None:
+        self._items: dict[
+            str,
+            Dashboard,
+        ] = {}
+
+        self._lock = threading.RLock()
+
+    def register(
+        self,
+        dashboard: Dashboard,
+    ) -> None:
+        if not dashboard.name:
+            raise InvalidConfiguration(
+                "dashboard name required"
+            )
+
+        with self._lock:
+            self._items[
+                dashboard.name
+            ] = dashboard
+
+    def get(
+        self,
+        name: str,
+    ) -> Dashboard:
+        with self._lock:
+            return self._items[name]
+
+    def list(
+        self,
+    ) -> list[Dashboard]:
+        with self._lock:
+            return list(
+                self._items.values()
+            )
+
+
+# ============================================================
+# SNAPSHOT
+# ============================================================
+
+@dataclass(frozen=True, slots=True)
+class ObservationSnapshot:
+    snapshot_id: str
+    timestamp: datetime
+    components: tuple[
+        ComponentRecord,
+        ...
+    ]
+    health: tuple[
+        HealthResult,
+        ...
+    ]
+    metrics: tuple[
+        MetricSample,
+        ...
+    ]
+    alerts: tuple[
+        Alert,
+        ...
+    ]
+    incidents: tuple[
+        Incident,
+        ...
+    ]
+    storage_counts: Mapping[str, int]
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "snapshot_id": self.snapshot_id,
+            "timestamp": (
+                self.timestamp.isoformat()
+            ),
+            "components": [
+                {
+                    "name": item.name,
+                    "version": item.version,
+                    "state": item.state.value,
+                    "registered_at": (
+                        item.registered_at
+                        .isoformat()
+                    ),
+                    "metadata": dict(
+                        item.metadata
+                    ),
+                }
+                for item in self.components
+            ],
+            "health": [
+                item.to_dict()
+                for item in self.health
+            ],
+            "metrics": [
+                item.to_dict()
+                for item in self.metrics
+            ],
+            "alerts": [
+                {
+                    "alert_id": item.alert_id,
+                    "fingerprint": (
+                        item.fingerprint
+                    ),
+                    "rule": item.rule,
+                    "severity": (
+                        item.severity.value
+                    ),
+                    "message": item.message,
+                    "created_at": (
+                        item.created_at
+                        .isoformat()
+                    ),
+                }
+                for item in self.alerts
+            ],
+            "incidents": [
+                {
+                    "incident_id": (
+                        item.incident_id
+                    ),
+                    "fingerprint": (
+                        item.fingerprint
+                    ),
+                    "title": item.title,
+                    "severity": (
+                        item.severity.value
+                    ),
+                    "state": item.state.value,
+                    "created_at": (
+                        item.created_at
+                        .isoformat()
+                    ),
+                    "updated_at": (
+                        item.updated_at
+                        .isoformat()
+                    ),
+                }
+                for item in self.incidents
+            ],
+            "storage_counts": dict(
+                self.storage_counts
+            ),
+        }
+
+
+# ============================================================
+# STATUS / REPORT
+# ============================================================
+
+class StatusService:
+    def __init__(
+        self,
+        components: ComponentRegistry,
+        health: HealthRegistry,
+        store: ObservationStore,
+    ) -> None:
+        self.components = components
+        self.health = health
+        self.store = store
+
+    def status(self) -> dict[str, Any]:
+        checks = self.health.last()
+
+        if any(
+            item.state
+            == HealthState.UNHEALTHY
+            for item in checks
+        ):
+            state = HealthState.UNHEALTHY
+
+        elif any(
+            item.state
+            == HealthState.DEGRADED
+            for item in checks
+        ):
+            state = HealthState.DEGRADED
+
+        else:
+            state = HealthState.HEALTHY
+
+        return {
+            "state": state.value,
+            "timestamp": utc_now().isoformat(),
+            "components": len(
+                self.components.list()
+            ),
+            "health_checks": len(checks),
+            "storage": self.store.counts(),
+        }
+
+
+class ReportService:
+    def __init__(
+        self,
+        store: ObservationStore,
+        components: ComponentRegistry,
+        health: HealthRegistry,
+    ) -> None:
+        self.store = store
+        self.components = components
+        self.health = health
+
+    def summary(self) -> dict[str, Any]:
+        checks = self.health.last()
+
+        return {
+            "generated_at": (
+                utc_now().isoformat()
+            ),
+            "components": len(
+                self.components.list()
+            ),
+            "health": {
+                "healthy": sum(
+                    x.state
+                    == HealthState.HEALTHY
+                    for x in checks
+                ),
+                "degraded": sum(
+                    x.state
+                    == HealthState.DEGRADED
+                    for x in checks
+                ),
+                "unhealthy": sum(
+                    x.state
+                    == HealthState.UNHEALTHY
+                    for x in checks
+                ),
+            },
+            "storage": self.store.counts(),
+        }
+
+
+# ============================================================
+# ENGINE
+# ============================================================
+
+class ObservationEngine:
+    def __init__(
+        self,
+        *,
+        store: ObservationStore,
+        metrics: MetricRegistry,
+        alerts: AlertManager,
+        incidents: IncidentManager,
+        router: SignalRouter,
+    ) -> None:
+        self.store = store
+        self.metrics = metrics
+        self.alerts = alerts
+        self.incidents = incidents
+        self.router = router
+
+    def process(
+        self,
+        signal: MetricSample | ObservationEvent,
+    ) -> list[Alert]:
+        if isinstance(
+            signal,
+            MetricSample,
+        ):
+            self.store.add_metric(signal)
+
+            try:
+                self.metrics.record(signal)
+            except CapacityExceeded:
+                pass
+
+        else:
+            self.store.add_event(signal)
+
+        fired = self.alerts.evaluate(
+            signal
+        )
+
+        for alert in fired:
+            self.incidents.open_from_alert(
+                alert
+            )
+
+        self.router.route(signal)
+
+        return fired
+
+    def process_batch(
+        self,
+        signals: Iterable[
+            MetricSample | ObservationEvent
+        ],
+    ) -> int:
+        count = 0
+
+        for signal in signals:
+            self.process(signal)
+            count += 1
+
+        return count
+
+
+# ============================================================
+# MONITORING
+# ============================================================
+
+class MonitoringService:
+    def __init__(
+        self,
+        health: HealthRegistry,
+        status: StatusService,
+    ) -> None:
+        self.health = health
+        self.status_service = status
+
+    def check(
+        self,
+    ) -> list[HealthResult]:
+        return self.health.run()
+
+    def status(
+        self,
+    ) -> dict[str, Any]:
+        return self.status_service.status()
+
+
+# ============================================================
+# MANAGER
+# ============================================================
+
+class ObservabilityManager:
+    VERSION = "1.0.0"
+
+    def __init__(
+        self,
+        *,
+        policy: ObservationPolicy | None = None,
+    ) -> None:
+        self.policy = (
+            policy
+            or ObservationPolicy()
+        )
+
+        self.policy.validate()
+
+        self.context = (
+            ObservationContext.create(
+                service="zyra",
+                component="observability",
+                environment="production",
+            )
+        )
+
+        self.components = (
+            ComponentRegistry()
+        )
+
+        self.health = HealthRegistry()
+
+        self.metrics = MetricRegistry(
+            max_series=(
+                self.policy.max_metric_series
+            ),
+            max_samples_per_series=(
+                self.policy
+                .max_samples_per_series
+            ),
+        )
+
+        self.store = ObservationStore(
+            max_events=self.policy.max_events,
+            max_metrics=self.policy.max_metrics,
+            retention_seconds=(
+                self.policy.retention_seconds
+            ),
+        )
+
+        self.collector = SignalCollector(
+            max_queue_size=(
+                self.policy.max_queue_size
+            )
+        )
+
+        self.alerts = AlertManager(
+            max_alerts=(
+                self.policy.max_alerts
+            )
+        )
+
+        self.incidents = IncidentManager(
+            max_incidents=(
+                self.policy.max_incidents
+            )
+        )
+
+        self.router = SignalRouter()
+        self.exporter = MemoryExporter()
+
+        self.router.add_sink(
+            self.exporter
+        )
+
+        self.engine = ObservationEngine(
+            store=self.store,
+            metrics=self.metrics,
+            alerts=self.alerts,
+            incidents=self.incidents,
+            router=self.router,
+        )
+
+        self.query = ObservationQuery(
+            self.store
+        )
+
+        self.dashboards = (
+            DashboardRegistry()
+        )
+
+        self.status_service = (
+            StatusService(
+                self.components,
+                self.health,
+                self.store,
+            )
+        )
+
+        self.monitoring = (
+            MonitoringService(
+                self.health,
+                self.status_service,
+            )
+        )
+
+        self.reports = ReportService(
+            self.store,
+            self.components,
+            self.health,
+        )
+
+        self._state = (
+            ComponentState.STOPPED
+        )
+
+        self._lock = threading.RLock()
+
+    @property
+    def state(
+        self,
+    ) -> ComponentState:
+        with self._lock:
+            return self._state
+
+    def start(self) -> None:
+        with self._lock:
+            if self._state in (
+                ComponentState.READY,
+                ComponentState.STARTING,
+            ):
+                return
+
+            self._state = (
+                ComponentState.STARTING
+            )
+
+            self.components.register(
+                "observability",
+                version=self.VERSION,
+                state=(
+                    ComponentState.READY
+                ),
+                metadata={
+                    "runtime": "python",
+                    "implementation": (
+                        "stdlib"
+                    ),
+                },
+            )
+
+            self._state = (
+                ComponentState.READY
+            )
+
+    def stop(self) -> None:
+        with self._lock:
+            if (
+                self._state
+                == ComponentState.STOPPED
+            ):
+                return
+
+            self._state = (
+                ComponentState.STOPPING
+            )
+
+            self._state = (
+                ComponentState.STOPPED
+            )
+
+    def emit(
+        self,
+        *,
+        name: str,
+        message: str = "",
+        severity: Severity = Severity.INFO,
+        event_type: EventType = (
+            EventType.CUSTOM
+        ),
+        context: ObservationContext | None = None,
+        attributes: Mapping[
+            str,
+            Any,
+        ] | None = None,
+    ) -> ObservationEvent:
+        event = ObservationEvent.create(
+            name=name,
+            message=message,
+            event_type=event_type,
+            severity=severity,
+            context=(
+                context
+                or self.context
+            ),
+            attributes=attributes,
+        )
+
+        self.engine.process(event)
+        return event
+
+    def _metric(
+        self,
+        name: str,
+        kind: MetricKind,
+        value: float,
+        *,
+        labels: Mapping[
+            str,
+            str,
+        ] | None = None,
+        unit: str = "",
+        description: str = "",
+    ) -> MetricSample:
+        if kind == MetricKind.COUNTER:
+            sample = self.metrics.counter(
+                name,
+                value,
+                labels=labels,
+                unit=unit,
+                description=description,
+            )
+
+        elif kind == MetricKind.GAUGE:
+            sample = self.metrics.gauge(
+                name,
+                value,
+                labels=labels,
+                unit=unit,
+                description=description,
+            )
+
+        elif kind == MetricKind.HISTOGRAM:
+            sample = self.metrics.histogram(
+                name,
+                value,
+                labels=labels,
+                unit=unit,
+                description=description,
+            )
+
+        else:
+            sample = self.metrics.timer(
+                name,
+                value,
+                labels=labels,
+                description=description,
+            )
+
+        self.store.add_metric(sample)
+
+        fired = self.alerts.evaluate(
+            sample
+        )
+
+        for alert in fired:
+            self.incidents.open_from_alert(
+                alert
+            )
+
+        self.router.route(sample)
+
+        return sample
+
+    def counter(
+        self,
+        name: str,
+        value: float = 1.0,
+        *,
+        labels: Mapping[
+            str,
+            str,
+        ] | None = None,
+        unit: str = "",
+        description: str = "",
+    ) -> MetricSample:
+        return self._metric(
+            name,
+            MetricKind.COUNTER,
+            value,
+            labels=labels,
+            unit=unit,
+            description=description,
+        )
+
+    def gauge(
+        self,
+        name: str,
+        value: float,
+        *,
+        labels: Mapping[
+            str,
+            str,
+        ] | None = None,
+        unit: str = "",
+        description: str = "",
+    ) -> MetricSample:
+        return self._metric(
+            name,
+            MetricKind.GAUGE,
+            value,
+            labels=labels,
+            unit=unit,
+            description=description,
+        )
+
+    def histogram(
+        self,
+        name: str,
+        value: float,
+        *,
+        labels: Mapping[
+            str,
+            str,
+        ] | None = None,
+        unit: str = "",
+        description: str = "",
+    ) -> MetricSample:
+        return self._metric(
+            name,
+            MetricKind.HISTOGRAM,
+            value,
+            labels=labels,
+            unit=unit,
+            description=description,
+        )
+
+    def timer(
+        self,
+        name: str,
+        seconds: float,
+        *,
+        labels: Mapping[
+            str,
+            str,
+        ] | None = None,
+        description: str = "",
+    ) -> MetricSample:
+        return self._metric(
+            name,
+            MetricKind.TIMER,
+            seconds,
+            labels=labels,
+            unit="s",
+            description=description,
+        )
+
+    def health_check(
+        self,
+        name: str,
+        check: HealthCheck,
+    ) -> None:
+        self.health.register(
+            name,
+            check,
+        )
+
+    def run_health(
+        self,
+    ) -> list[HealthResult]:
+        return self.health.run()
+
+    def status(
+        self,
+    ) -> dict[str, Any]:
+        return self.status_service.status()
+
+    def report(
+        self,
+    ) -> dict[str, Any]:
+        return self.reports.summary()
+
+    def snapshot(
+        self,
+    ) -> ObservationSnapshot:
+        return ObservationSnapshot(
+            snapshot_id=new_id(
+                "snapshot"
+            ),
+            timestamp=utc_now(),
+            components=tuple(
+                self.components.list()
+            ),
+            health=tuple(
+                self.health.last()
+            ),
+            metrics=tuple(
+                self.metrics.snapshot()
+            ),
+            alerts=tuple(
+                self.alerts.list_alerts()
+            ),
+            incidents=tuple(
+                self.incidents.list()
+            ),
+            storage_counts=(
+                self.store.counts()
+            ),
+        )
+
+
+# Stable compatibility alias.
+ObservationManager = ObservabilityManager
+
+
+# ============================================================
+# PUBLIC API
+# ============================================================
+
+class ObservabilityAPI:
+    def __init__(
+        self,
+        manager: ObservabilityManager | None = None,
+    ) -> None:
+        self.manager = (
+            manager
+            or ObservabilityManager()
+        )
+
+    def start(self) -> None:
+        self.manager.start()
+
+    def stop(self) -> None:
+        self.manager.stop()
+
+    def emit(
+        self,
+        name: str,
+        message: str = "",
+        *,
+        severity: Severity = Severity.INFO,
+        event_type: EventType = (
+            EventType.CUSTOM
+        ),
+        context: ObservationContext | None = None,
+        attributes: dict | None = None,
+    ):
+        return self.manager.emit(
+            name=name,
+            message=message,
+            severity=severity,
+            event_type=event_type,
+            context=context,
+            attributes=attributes,
+        )
+
+    def status(self) -> dict[str, Any]:
+        return self.manager.status()
+
+    def snapshot(
+        self,
+    ) -> ObservationSnapshot:
+        return self.manager.snapshot()
+
+    def report(self) -> dict[str, Any]:
+        return self.manager.report()
+
+
+__all__ = [
+    "Alert",
+    "AlertManager",
+    "AlertRule",
+    "CapacityExceeded",
+    "ComponentRecord",
+    "ComponentRegistry",
+    "ComponentState",
+    "Dashboard",
+    "DashboardRegistry",
+    "DashboardWidget",
+    "EventType",
+    "HealthCheck",
+    "HealthRegistry",
+    "HealthResult",
+    "HealthState",
+    "Incident",
+    "IncidentManager",
+    "IncidentState",
+    "InvalidConfiguration",
+    "MemoryExporter",
+    "MetricKind",
+    "MetricRegistry",
+    "MetricSample",
+    "ObservationContext",
+    "ObservationEngine",
+    "ObservationError",
+    "ObservationEvent",
+    "ObservationManager",
+    "ObservationPolicy",
+    "ObservationQuery",
+    "ObservationSnapshot",
+    "ObservationStore",
+    "ObservabilityAPI",
+    "ObservabilityError",
+    "ObservabilityManager",
+    "MonitoringService",
+    "ReportService",
+    "Severity",
+    "SignalCollector",
+    "SignalRouter",
+    "SignalSink",
+    "StatusService",
+    "new_id",
+    "stable_fingerprint",
+    "utc_now",
+    "utc_timestamp",
+]

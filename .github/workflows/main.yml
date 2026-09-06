@@ -36,19 +36,6 @@ jobs:
           cat > infrastructure/__init__.py <<'PY'
           """
           ZYRA Network infrastructure layer.
-
-          This package contains platform-level infrastructure primitives
-          shared by the network runtime and higher application layers.
-
-          Design principles:
-          - explicit lifecycle management
-          - deterministic configuration
-          - dependency inversion
-          - thread-safe shared infrastructure
-          - transactional persistence
-          - atomic storage operations
-          - bounded in-memory caching
-          - clean shutdown semantics
           """
 
           from .cache import Cache, CacheEntry, CacheStats
@@ -69,6 +56,8 @@ jobs:
           )
           from .runtime import (
               Runtime,
+              RuntimeErrorState,
+              RuntimeSnapshot,
               RuntimeState,
           )
           from .storage_adapter import (
@@ -90,6 +79,8 @@ jobs:
               "DatabaseError",
               "Transaction",
               "Runtime",
+              "RuntimeErrorState",
+              "RuntimeSnapshot",
               "RuntimeState",
               "StorageAdapter",
               "StorageError",
@@ -143,7 +134,10 @@ jobs:
                       ) from exc
 
 
-          def _parse_bool(value: str, name: str) -> bool:
+          def _parse_bool(
+              value: str,
+              name: str,
+          ) -> bool:
               normalized = value.strip().lower()
 
               if normalized in {
@@ -207,14 +201,6 @@ jobs:
 
           @dataclass(frozen=True, slots=True)
           class Configuration:
-              """
-              Immutable infrastructure configuration.
-
-              Values are intentionally represented using standard Python
-              types so the infrastructure layer does not depend on a
-              specific configuration framework.
-              """
-
               environment: Environment
               service_name: str
               node_id: str
@@ -342,20 +328,17 @@ jobs:
 
                   if not self.strict_configuration:
                       raise ConfigurationError(
-                          "Strict configuration must be enabled "
-                          "in production"
+                          "Strict configuration must be enabled in production"
                       )
 
                   if self.node_id == "node-default":
                       raise ConfigurationError(
-                          "ZYRA_NODE_ID must be explicitly configured "
-                          "in production"
+                          "ZYRA_NODE_ID must be explicitly configured in production"
                       )
 
                   if self.service_name == "zyra-network":
                       raise ConfigurationError(
-                          "ZYRA_SERVICE_NAME must be explicitly configured "
-                          "in production"
+                          "ZYRA_SERVICE_NAME must be explicitly configured in production"
                       )
 
 
@@ -391,10 +374,7 @@ jobs:
           from dataclasses import dataclass
           from enum import Enum
           from threading import RLock
-          from typing import Any, Callable, TypeVar
-
-
-          T = TypeVar("T")
+          from typing import Any, Callable
 
 
           class DependencyError(RuntimeError):
@@ -420,10 +400,6 @@ jobs:
           class Container:
               """
               Thread-safe dependency injection container.
-
-              The container intentionally owns lifecycle only for objects
-              registered as singletons. Transient instances are returned
-              directly to the caller.
               """
 
               def __init__(self) -> None:
@@ -486,27 +462,28 @@ jobs:
                   ) -> Any:
                       return instance
 
-                  with self._lock:
-                      self.register(
-                          key,
-                          factory,
-                          lifetime=Lifetime.SINGLETON,
-                          replace=replace,
-                      )
+                  self.register(
+                      key,
+                      factory,
+                      lifetime=Lifetime.SINGLETON,
+                      replace=replace,
+                  )
 
               def resolve(
                   self,
                   key: object,
               ) -> Any:
 
-                  if self._closed:
-                      raise DependencyError(
-                          "Container is closed"
-                      )
-
                   with self._lock:
+                      if self._closed:
+                          raise DependencyError(
+                              "Container is closed"
+                          )
+
                       try:
-                          registration = self._registrations[key]
+                          registration = (
+                              self._registrations[key]
+                          )
                       except KeyError as exc:
                           raise DependencyError(
                               f"Dependency not registered: {key!r}"
@@ -517,7 +494,9 @@ jobs:
                           is Lifetime.SINGLETON
                       ):
                           if not registration.initialized:
-                              instance = registration.factory(self)
+                              instance = registration.factory(
+                                  self
+                              )
 
                               if instance is None:
                                   raise DependencyError(
@@ -529,7 +508,9 @@ jobs:
 
                           return registration.instance
 
-                      instance = registration.factory(self)
+                      instance = registration.factory(
+                          self
+                      )
 
                       if instance is None:
                           raise DependencyError(
@@ -538,15 +519,25 @@ jobs:
 
                       return instance
 
-              def contains(self, key: object) -> bool:
+              def contains(
+                  self,
+                  key: object,
+              ) -> bool:
+
                   with self._lock:
                       return key in self._registrations
 
-              def remove(self, key: object) -> bool:
+              def remove(
+                  self,
+                  key: object,
+              ) -> bool:
+
                   with self._lock:
-                      registration = self._registrations.pop(
-                          key,
-                          None,
+                      registration = (
+                          self._registrations.pop(
+                              key,
+                              None,
+                          )
                       )
 
                   if registration is None:
@@ -586,7 +577,9 @@ jobs:
 
                   errors: list[BaseException] = []
 
-                  for registration in reversed(registrations):
+                  for registration in reversed(
+                      registrations
+                  ):
                       instance = registration.instance
 
                       if instance is None:
@@ -661,8 +654,8 @@ jobs:
               """
               Explicit transaction boundary.
 
-              Transactions are committed only when the context exits
-              successfully. Any exception causes a rollback.
+              The connection uses autocommit mode, therefore explicit
+              BEGIN/COMMIT/ROLLBACK statements are used for transactions.
               """
 
               def __init__(
@@ -686,9 +679,12 @@ jobs:
                       )
                       self._entered = True
                       return self._connection
-                  except Exception:
+                  except sqlite3.Error as exc:
                       self._lock.release()
-                      raise
+
+                      raise DatabaseError(
+                          "Unable to begin transaction"
+                      ) from exc
 
               def __exit__(
                   self,
@@ -699,9 +695,24 @@ jobs:
 
                   try:
                       if exc_type is None:
-                          self._connection.commit()
+                          self._connection.execute(
+                              "COMMIT"
+                          )
                       else:
-                          self._connection.rollback()
+                          self._connection.execute(
+                              "ROLLBACK"
+                          )
+                  except sqlite3.Error as exc:
+                      try:
+                          self._connection.execute(
+                              "ROLLBACK"
+                          )
+                      except sqlite3.Error:
+                          pass
+
+                      raise DatabaseError(
+                          "Transaction finalization failed"
+                      ) from exc
                   finally:
                       self._entered = False
                       self._lock.release()
@@ -711,12 +722,10 @@ jobs:
 
           class Database:
               """
-              SQLite infrastructure backend.
+              Durable SQLite infrastructure backend.
 
-              SQLite is used here as the durable local persistence
-              boundary. The class isolates database behavior behind a
-              stable interface so the upper network layers do not depend
-              directly on sqlite3.
+              SQLite remains isolated behind this adapter so higher
+              layers do not depend directly on sqlite3.
               """
 
               def __init__(
@@ -732,7 +741,9 @@ jobs:
                           "timeout_seconds must be positive"
                       )
 
-                  self.path = Path(path).expanduser()
+                  self.path = Path(
+                      path
+                  ).expanduser()
 
                   if str(self.path) != ":memory:":
                       self.path.parent.mkdir(
@@ -746,7 +757,9 @@ jobs:
 
                   self._wal = wal
                   self._lock = RLock()
-                  self._connection: sqlite3.Connection | None = None
+                  self._connection: (
+                      sqlite3.Connection | None
+                  ) = None
                   self._closed = False
 
                   self.open()
@@ -777,11 +790,15 @@ jobs:
                               "PRAGMA foreign_keys = ON"
                           )
 
+                          # SQLite does not support parameter
+                          # placeholders inside PRAGMA assignments.
+                          busy_timeout_ms = (
+                              self._timeout_seconds * 1000
+                          )
+
                           connection.execute(
-                              "PRAGMA busy_timeout = ?",
-                              (
-                                  self._timeout_seconds * 1000,
-                              ),
+                              f"PRAGMA busy_timeout = "
+                              f"{busy_timeout_ms}"
                           )
 
                           if self._wal:
@@ -800,6 +817,15 @@ jobs:
                           self._connection = connection
 
                       except sqlite3.Error as exc:
+                          if self._connection is None:
+                              try:
+                                  connection.close()
+                              except (
+                                  UnboundLocalError,
+                                  sqlite3.Error,
+                              ):
+                                  pass
+
                           raise DatabaseError(
                               "Unable to open database"
                           ) from exc
@@ -905,10 +931,12 @@ jobs:
 
               def transaction(self) -> Transaction:
                   with self._lock:
-                      self._require_connection()
+                      connection = (
+                          self._require_connection()
+                      )
 
                   return Transaction(
-                      self._require_connection(),
+                      connection,
                       self._lock,
                   )
 
@@ -1045,10 +1073,9 @@ jobs:
 
           class Cache(Generic[T]):
               """
-              Thread-safe bounded LRU cache with TTL support.
+              Thread-safe bounded LRU cache with TTL.
 
-              The cache is an optimization layer only. It never becomes
-              the source of truth for durable application state.
+              Cache is never the source of truth for durable state.
               """
 
               def __init__(
@@ -1143,12 +1170,16 @@ jobs:
                           None,
                       )
 
+                      ttl = (
+                          self._default_ttl
+                          if ttl_seconds is None
+                          else ttl_seconds
+                      )
+
                       self._entries[key] = CacheEntry(
                           value=value,
                           expires_at=self._expiration(
-                              self._default_ttl
-                              if ttl_seconds is None
-                              else ttl_seconds
+                              ttl
                           ),
                       )
 
@@ -1371,8 +1402,7 @@ jobs:
               """
               Durable filesystem storage boundary.
 
-              Writes are performed through a temporary file followed by
-              an atomic replace operation on the same filesystem.
+              Writes use a temporary file, fsync and atomic replace.
               """
 
               def __init__(
@@ -1455,6 +1485,7 @@ jobs:
 
                               temporary.write(data)
                               temporary.flush()
+
                               os.fsync(
                                   temporary.fileno()
                               )
@@ -1547,12 +1578,10 @@ jobs:
                   relative_path: str | Path,
               ) -> str:
 
-                  data = self.read_bytes(
-                      relative_path
-                  )
-
                   return hashlib.sha256(
-                      data
+                      self.read_bytes(
+                          relative_path
+                      )
                   ).hexdigest()
 
               def list(
@@ -1659,9 +1688,6 @@ jobs:
           class Runtime:
               """
               Process lifecycle coordinator.
-
-              The runtime owns lifecycle callbacks but does not impose
-              a specific server framework on the infrastructure layer.
               """
 
               def __init__(
@@ -1672,8 +1698,7 @@ jobs:
 
                   if shutdown_timeout_seconds < 0:
                       raise ValueError(
-                          "shutdown_timeout_seconds "
-                          "cannot be negative"
+                          "shutdown_timeout_seconds cannot be negative"
                       )
 
                   self.shutdown_timeout_seconds = (
@@ -1690,13 +1715,8 @@ jobs:
                   self._stop_event = Event()
                   self._lock = RLock()
 
-                  self._startup_hooks: list[
-                      callable
-                  ] = []
-
-                  self._shutdown_hooks: list[
-                      callable
-                  ] = []
+                  self._startup_hooks: list = []
+                  self._shutdown_hooks: list = []
 
                   self._signals_installed = False
 
@@ -1759,6 +1779,7 @@ jobs:
                   self.request_shutdown()
 
               def start(self) -> None:
+
                   with self._lock:
                       if self._state is RuntimeState.RUNNING:
                           return
@@ -1786,6 +1807,7 @@ jobs:
                           self._started_at = monotonic()
                           self._stopped_at = None
                           self._stop_event.clear()
+
                           self._state = (
                               RuntimeState.RUNNING
                           )
@@ -1811,6 +1833,7 @@ jobs:
                   )
 
               def stop(self) -> None:
+
                   with self._lock:
                       if self._state is RuntimeState.STOPPED:
                           return
@@ -1888,9 +1911,9 @@ jobs:
 
           __all__ = [
               "Runtime",
-              "RuntimeState",
-              "RuntimeSnapshot",
               "RuntimeErrorState",
+              "RuntimeSnapshot",
+              "RuntimeState",
           ]
           PY
 
@@ -1904,9 +1927,9 @@ jobs:
 
           __all__ = [
               "Runtime",
-              "RuntimeState",
-              "RuntimeSnapshot",
               "RuntimeErrorState",
+              "RuntimeSnapshot",
+              "RuntimeState",
           ]
           PY
 
@@ -1923,15 +1946,10 @@ jobs:
 
           from infrastructure.cache import Cache
           from infrastructure.config import Configuration
-          from infrastructure.container import (
-              Container,
-              Lifetime,
-          )
+          from infrastructure.container import Container
           from infrastructure.database import Database
           from infrastructure.runtime import Runtime
-          from infrastructure.storage_adapter import (
-              StorageAdapter,
-          )
+          from infrastructure.storage_adapter import StorageAdapter
 
 
           @dataclass(frozen=True, slots=True)
@@ -1946,15 +1964,7 @@ jobs:
 
           class InfrastructureBootstrap:
               """
-              Composition root for infrastructure services.
-
-              Construction order:
-                  configuration
-                  storage
-                  database
-                  cache
-                  runtime
-                  dependency container
+              Infrastructure composition root.
               """
 
               def __init__(
@@ -1981,89 +1991,97 @@ jobs:
                           self.configuration.data_directory
                       )
 
-                      database = Database(
-                          self.configuration.database_path,
-                          timeout_seconds=(
-                              self.configuration
-                              .database_timeout_seconds
-                          ),
-                          wal=(
-                              self.configuration
-                              .database_wal
-                          ),
-                      )
-
-                      cache = Cache(
-                          capacity=(
-                              self.configuration
-                              .cache_capacity
-                          ),
-                          default_ttl_seconds=(
-                              self.configuration
-                              .cache_default_ttl_seconds
-                          ),
-                      )
-
-                      runtime = Runtime(
-                          shutdown_timeout_seconds=(
-                              self.configuration
-                              .shutdown_timeout_seconds
+                      try:
+                          database = Database(
+                              self.configuration.database_path,
+                              timeout_seconds=(
+                                  self.configuration
+                                  .database_timeout_seconds
+                              ),
+                              wal=(
+                                  self.configuration
+                                  .database_wal
+                              ),
                           )
-                      )
 
-                      container = Container()
+                          cache = Cache(
+                              capacity=(
+                                  self.configuration
+                                  .cache_capacity
+                              ),
+                              default_ttl_seconds=(
+                                  self.configuration
+                                  .cache_default_ttl_seconds
+                              ),
+                          )
 
-                      container.register_instance(
-                          Configuration,
-                          self.configuration,
-                      )
+                          runtime = Runtime(
+                              shutdown_timeout_seconds=(
+                                  self.configuration
+                                  .shutdown_timeout_seconds
+                              )
+                          )
 
-                      container.register_instance(
-                          Database,
-                          database,
-                      )
+                          container = Container()
 
-                      container.register_instance(
-                          Cache,
-                          cache,
-                      )
+                          container.register_instance(
+                              Configuration,
+                              self.configuration,
+                          )
 
-                      container.register_instance(
-                          StorageAdapter,
-                          storage,
-                      )
+                          container.register_instance(
+                              Database,
+                              database,
+                          )
 
-                      container.register_instance(
-                          Runtime,
-                          runtime,
-                      )
+                          container.register_instance(
+                              Cache,
+                              cache,
+                          )
 
-                      context = InfrastructureContext(
-                          configuration=self.configuration,
-                          container=container,
-                          runtime=runtime,
-                          database=database,
-                          cache=cache,
-                          storage=storage,
-                      )
+                          container.register_instance(
+                              StorageAdapter,
+                              storage,
+                          )
 
-                      runtime.on_shutdown(
-                          cache.close
-                      )
+                          container.register_instance(
+                              Runtime,
+                              runtime,
+                          )
 
-                      runtime.on_shutdown(
-                          storage.close
-                      )
+                          context = InfrastructureContext(
+                              configuration=self.configuration,
+                              container=container,
+                              runtime=runtime,
+                              database=database,
+                              cache=cache,
+                              storage=storage,
+                          )
 
-                      runtime.on_shutdown(
-                          database.close
-                      )
+                          runtime.on_shutdown(
+                              cache.close
+                          )
 
-                      self._context = context
+                          runtime.on_shutdown(
+                              storage.close
+                          )
 
-                      return context
+                          runtime.on_shutdown(
+                              database.close
+                          )
+
+                          self._context = context
+
+                          return context
+
+                      except BaseException:
+                          try:
+                              storage.close()
+                          finally:
+                              raise
 
               def shutdown(self) -> None:
+
                   with self._lock:
                       context = self._context
 
@@ -2122,19 +2140,34 @@ jobs:
           ]
           PY
 
-      - name: Validate infrastructure imports
+      - name: Validate imports and compilation
         shell: bash
         run: |
           set -euo pipefail
 
           python -m compileall -q \
-            infrastructure/config \
-            infrastructure/container \
-            infrastructure/database \
-            infrastructure/cache \
-            infrastructure/runtime \
-            infrastructure/storage_adapter \
-            infrastructure/bootstrap
+            infrastructure
+
+          python - <<'PY'
+          import infrastructure
+
+          from infrastructure.cache import Cache
+          from infrastructure.config import Configuration
+          from infrastructure.container import Container
+          from infrastructure.database import Database
+          from infrastructure.runtime import Runtime
+          from infrastructure.storage_adapter import StorageAdapter
+
+          assert infrastructure is not None
+          assert Cache is not None
+          assert Configuration is not None
+          assert Container is not None
+          assert Database is not None
+          assert Runtime is not None
+          assert StorageAdapter is not None
+
+          print("Infrastructure imports: OK")
+          PY
 
       - name: Validate configuration
         shell: bash
@@ -2200,17 +2233,22 @@ jobs:
 
           container.register(
               "transient",
-              lambda c: object(),
+              lambda _container: object(),
           )
 
           container.register(
               "singleton",
-              lambda c: Service(),
+              lambda _container: Service(),
               lifetime=Lifetime.SINGLETON,
           )
 
-          first = container.resolve("singleton")
-          second = container.resolve("singleton")
+          first = container.resolve(
+              "singleton"
+          )
+
+          second = container.resolve(
+              "singleton"
+          )
 
           assert first is second
 
@@ -2250,7 +2288,9 @@ jobs:
           import tempfile
           from pathlib import Path
 
-          from infrastructure.database import Database
+          from infrastructure.database import (
+              Database,
+          )
 
           with tempfile.TemporaryDirectory() as directory:
               path = Path(directory) / "test.db"
@@ -2295,9 +2335,75 @@ jobs:
               assert rows[0]["value"] == "alpha"
 
               database.close()
+
               assert database.closed is True
 
           print("Infrastructure database: OK")
+          PY
+
+      - name: Validate database rollback
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          python - <<'PY'
+          import tempfile
+          from pathlib import Path
+
+          from infrastructure.database import (
+              Database,
+              DatabaseError,
+          )
+
+          with tempfile.TemporaryDirectory() as directory:
+              database = Database(
+                  Path(directory) / "rollback.db",
+                  timeout_seconds=10,
+                  wal=True,
+              )
+
+              database.create_schema(
+                  [
+                      """
+                      CREATE TABLE rollback_test (
+                          id INTEGER PRIMARY KEY,
+                          value TEXT NOT NULL
+                      )
+                      """
+                  ]
+              )
+
+              try:
+                  with database.transaction() as connection:
+                      connection.execute(
+                          """
+                          INSERT INTO rollback_test (
+                              value
+                          )
+                          VALUES (?)
+                          """,
+                          ("must-rollback",),
+                      )
+
+                      raise RuntimeError(
+                          "intentional rollback"
+                      )
+
+              except RuntimeError:
+                  pass
+
+              rows = database.query(
+                  """
+                  SELECT value
+                  FROM rollback_test
+                  """
+              )
+
+              assert rows == []
+
+              database.close()
+
+          print("Infrastructure database rollback: OK")
           PY
 
       - name: Validate cache
@@ -2313,25 +2419,36 @@ jobs:
               default_ttl_seconds=60,
           )
 
-          cache.set("a", "alpha")
-          cache.set("b", "beta")
+          cache.set(
+              "a",
+              "alpha",
+          )
+
+          cache.set(
+              "b",
+              "beta",
+          )
 
           assert cache.get("a") == "alpha"
           assert cache.get("b") == "beta"
 
-          cache.set("c", "gamma")
+          cache.set(
+              "c",
+              "gamma",
+          )
 
           assert cache.get("c") == "gamma"
 
           stats = cache.stats()
 
-          assert stats.hits >= 2
+          assert stats.hits >= 3
           assert stats.evictions == 1
 
           assert cache.delete("b") is True
           assert cache.delete("missing") is False
 
           cache.close()
+
           assert cache.closed is True
 
           print("Infrastructure cache: OK")
@@ -2392,6 +2509,43 @@ jobs:
           print("Infrastructure storage: OK")
           PY
 
+      - name: Validate storage traversal protection
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          python - <<'PY'
+          import tempfile
+
+          from infrastructure.storage_adapter import (
+              StorageAdapter,
+              StorageError,
+          )
+
+          with tempfile.TemporaryDirectory() as directory:
+              storage = StorageAdapter(
+                  directory
+              )
+
+              try:
+                  storage.write_bytes(
+                      "../outside.txt",
+                      b"blocked",
+                  )
+              except StorageError:
+                  pass
+              else:
+                  raise AssertionError(
+                      "Path traversal was not blocked"
+                  )
+
+              storage.close()
+
+          print(
+              "Infrastructure storage security: OK"
+          )
+          PY
+
       - name: Validate runtime
         shell: bash
         run: |
@@ -2419,9 +2573,16 @@ jobs:
 
           runtime.start()
 
-          assert runtime.state is RuntimeState.RUNNING
+          assert (
+              runtime.state
+              is RuntimeState.RUNNING
+          )
+
           assert runtime.running is True
-          assert events == ["start"]
+
+          assert events == [
+              "start",
+          ]
 
           runtime.request_shutdown()
 
@@ -2431,7 +2592,11 @@ jobs:
 
           runtime.stop()
 
-          assert runtime.state is RuntimeState.STOPPED
+          assert (
+              runtime.state
+              is RuntimeState.STOPPED
+          )
+
           assert events == [
               "start",
               "stop",
@@ -2452,10 +2617,10 @@ jobs:
           from infrastructure.bootstrap import (
               InfrastructureBootstrap,
           )
+          from infrastructure.cache import Cache
           from infrastructure.config import (
               Configuration,
           )
-          from infrastructure.cache import Cache
           from infrastructure.database import Database
           from infrastructure.runtime import Runtime
           from infrastructure.storage_adapter import (
@@ -2465,30 +2630,38 @@ jobs:
           with tempfile.TemporaryDirectory() as directory:
               root = Path(directory)
 
-              configuration = Configuration.from_mapping(
-                  {
-                      "ZYRA_ENVIRONMENT": "testing",
-                      "ZYRA_SERVICE_NAME": (
-                          "zyra-network-test"
-                      ),
-                      "ZYRA_NODE_ID": "node-bootstrap",
-                      "ZYRA_DATA_DIRECTORY": str(
-                          root / "data"
-                      ),
-                      "ZYRA_DATABASE_PATH": str(
-                          root / "data" / "network.db"
-                      ),
-                      "ZYRA_CACHE_CAPACITY": "128",
-                      "ZYRA_CACHE_DEFAULT_TTL_SECONDS": "60",
-                      "ZYRA_DATABASE_TIMEOUT_SECONDS": "10",
-                      "ZYRA_DATABASE_WAL": "true",
-                      "ZYRA_SHUTDOWN_TIMEOUT_SECONDS": "10",
-                      "ZYRA_STRICT_CONFIGURATION": "true",
-                  }
+              configuration = (
+                  Configuration.from_mapping(
+                      {
+                          "ZYRA_ENVIRONMENT": "testing",
+                          "ZYRA_SERVICE_NAME": (
+                              "zyra-network-test"
+                          ),
+                          "ZYRA_NODE_ID": (
+                              "node-bootstrap"
+                          ),
+                          "ZYRA_DATA_DIRECTORY": str(
+                              root / "data"
+                          ),
+                          "ZYRA_DATABASE_PATH": str(
+                              root
+                              / "data"
+                              / "network.db"
+                          ),
+                          "ZYRA_CACHE_CAPACITY": "128",
+                          "ZYRA_CACHE_DEFAULT_TTL_SECONDS": "60",
+                          "ZYRA_DATABASE_TIMEOUT_SECONDS": "10",
+                          "ZYRA_DATABASE_WAL": "true",
+                          "ZYRA_SHUTDOWN_TIMEOUT_SECONDS": "10",
+                          "ZYRA_STRICT_CONFIGURATION": "true",
+                      }
+                  )
               )
 
-              bootstrap = InfrastructureBootstrap(
-                  configuration
+              bootstrap = (
+                  InfrastructureBootstrap(
+                      configuration
+                  )
               )
 
               context = bootstrap.initialize()
@@ -2583,35 +2756,42 @@ jobs:
           from infrastructure.config import (
               Configuration,
           )
-          from infrastructure.verification import (
-              ProtocolVerifier,
-          ) if False else (None)
 
           with tempfile.TemporaryDirectory() as directory:
               root = Path(directory)
 
-              config = Configuration.from_mapping(
-                  {
-                      "ZYRA_ENVIRONMENT": "testing",
-                      "ZYRA_SERVICE_NAME": "zyra-network",
-                      "ZYRA_NODE_ID": "infra-node-01",
-                      "ZYRA_DATA_DIRECTORY": str(
-                          root / "data"
-                      ),
-                      "ZYRA_DATABASE_PATH": str(
-                          root / "data" / "zyra.db"
-                      ),
-                      "ZYRA_CACHE_CAPACITY": "256",
-                      "ZYRA_CACHE_DEFAULT_TTL_SECONDS": "300",
-                      "ZYRA_DATABASE_TIMEOUT_SECONDS": "15",
-                      "ZYRA_DATABASE_WAL": "true",
-                      "ZYRA_SHUTDOWN_TIMEOUT_SECONDS": "15",
-                      "ZYRA_STRICT_CONFIGURATION": "true",
-                  }
+              configuration = (
+                  Configuration.from_mapping(
+                      {
+                          "ZYRA_ENVIRONMENT": "testing",
+                          "ZYRA_SERVICE_NAME": (
+                              "zyra-network"
+                          ),
+                          "ZYRA_NODE_ID": (
+                              "infra-node-01"
+                          ),
+                          "ZYRA_DATA_DIRECTORY": str(
+                              root / "data"
+                          ),
+                          "ZYRA_DATABASE_PATH": str(
+                              root
+                              / "data"
+                              / "zyra.db"
+                          ),
+                          "ZYRA_CACHE_CAPACITY": "256",
+                          "ZYRA_CACHE_DEFAULT_TTL_SECONDS": "300",
+                          "ZYRA_DATABASE_TIMEOUT_SECONDS": "15",
+                          "ZYRA_DATABASE_WAL": "true",
+                          "ZYRA_SHUTDOWN_TIMEOUT_SECONDS": "15",
+                          "ZYRA_STRICT_CONFIGURATION": "true",
+                      }
+                  )
               )
 
-              bootstrap = InfrastructureBootstrap(
-                  config
+              bootstrap = (
+                  InfrastructureBootstrap(
+                      configuration
+                  )
               )
 
               context = bootstrap.initialize()
@@ -2637,6 +2817,17 @@ jobs:
                       """,
                       ("healthy",),
                   )
+
+              rows = context.database.query(
+                  """
+                  SELECT status
+                  FROM infrastructure_health
+                  ORDER BY id
+                  """
+              )
+
+              assert len(rows) == 1
+              assert rows[0]["status"] == "healthy"
 
               context.cache.set(
                   "infrastructure:health",
@@ -2664,7 +2855,7 @@ jobs:
 
               context.runtime.start()
 
-              assert context.runtime.running
+              assert context.runtime.running is True
 
               bootstrap.shutdown()
 
@@ -2672,6 +2863,33 @@ jobs:
               "Infrastructure block 01 full smoke test: OK"
           )
           PY
+
+      - name: Remove generated test artifacts
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          rm -rf \
+            .test-data \
+            data \
+            .pytest_cache
+
+          find infrastructure \
+            -type d \
+            -name "__pycache__" \
+            -prune \
+            -exec rm -rf {} +
+
+      - name: Final repository validation
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          python -m compileall -q infrastructure
+
+          git diff --check
+
+          echo "Infrastructure block 01 final validation: OK"
 
       - name: Commit and push
         shell: bash
@@ -2683,21 +2901,7 @@ jobs:
             "41898282+github-actions[bot]@users.noreply.github.com"
 
           git add \
-            infrastructure/__init__.py \
-            infrastructure/bootstrap/__init__.py \
-            infrastructure/bootstrap/bootstrap.py \
-            infrastructure/cache/__init__.py \
-            infrastructure/cache/cache.py \
-            infrastructure/config/__init__.py \
-            infrastructure/config/config.py \
-            infrastructure/container/__init__.py \
-            infrastructure/container/container.py \
-            infrastructure/database/__init__.py \
-            infrastructure/database/database.py \
-            infrastructure/runtime/__init__.py \
-            infrastructure/runtime/runtime.py \
-            infrastructure/storage_adapter/__init__.py \
-            infrastructure/storage_adapter/storage.py
+            infrastructure
 
           if git diff --cached --quiet; then
             echo "No changes to commit."

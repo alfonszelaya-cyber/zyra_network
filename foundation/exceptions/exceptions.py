@@ -1,8 +1,15 @@
 from __future__ import annotations
 
+from typing import Any
+
 
 class ZyraError(Exception):
-    """Base exception for all controlled ZYRA failures."""
+    """
+    Base exception for controlled ZYRA failures.
+
+    Every Network exception has a stable machine-readable code
+    and optional structured diagnostic details.
+    """
 
     code = "ZYRA_ERROR"
 
@@ -10,13 +17,19 @@ class ZyraError(Exception):
         self,
         message: str,
         *,
-        details: dict[str, object] | None = None,
+        details: dict[str, Any] | None = None,
     ) -> None:
         super().__init__(message)
-        self.message = message
-        self.details = details or {}
 
-    def to_dict(self) -> dict[str, object]:
+        if not isinstance(message, str) or not message.strip():
+            raise ValueError(
+                "Exception message cannot be empty"
+            )
+
+        self.message = message
+        self.details = dict(details or {})
+
+    def to_dict(self) -> dict[str, Any]:
         return {
             "code": self.code,
             "message": self.message,
@@ -38,6 +51,18 @@ class AuthenticationError(ZyraError):
 
 class AuthorizationError(ZyraError):
     code = "AUTHORIZATION_ERROR"
+
+
+class IdentityError(ZyraError):
+    code = "IDENTITY_ERROR"
+
+
+class CredentialError(ZyraError):
+    code = "CREDENTIAL_ERROR"
+
+
+class CertificateError(ZyraError):
+    code = "CERTIFICATE_ERROR"
 
 
 class NotFoundError(ZyraError):
@@ -64,6 +89,14 @@ class TimeoutError(NetworkError):
     code = "TIMEOUT"
 
 
+class RoutingError(NetworkError):
+    code = "ROUTING_ERROR"
+
+
+class DiscoveryError(NetworkError):
+    code = "DISCOVERY_ERROR"
+
+
 class StorageError(ZyraError):
     code = "STORAGE_ERROR"
 
@@ -86,3 +119,19 @@ class RateLimitError(ZyraError):
 
 class ServiceUnavailableError(ZyraError):
     code = "SERVICE_UNAVAILABLE"
+
+
+class ConsensusError(NetworkError):
+    code = "CONSENSUS_ERROR"
+
+
+class ReplicationError(NetworkError):
+    code = "REPLICATION_ERROR"
+
+
+class SerializationError(ZyraError):
+    code = "SERIALIZATION_ERROR"
+
+
+class ProtocolError(NetworkError):
+    code = "PROTOCOL_ERROR"

@@ -8,12 +8,17 @@ from typing import Any, Callable
 Hook = Callable[..., Any]
 
 
+class HookError(RuntimeError):
+    """Raised when a hook operation fails."""
+
+
 class HookRegistry:
     """
-    Thread-safe lifecycle/event hook registry.
+    Thread-safe local hook registry.
 
-    Hooks are intentionally synchronous at this foundation layer.
-    Async orchestration belongs to the Network event subsystem.
+    Foundation hooks provide synchronous lifecycle extension
+    points. Distributed/asynchronous events belong to protocol
+    and Network event infrastructure.
     """
 
     def __init__(self) -> None:
@@ -25,32 +30,42 @@ class HookRegistry:
         event: str,
         callback: Hook,
     ) -> None:
-        if not event.strip():
-            raise ValueError("event cannot be empty")
+        if not isinstance(event, str) or not event.strip():
+            raise ValueError(
+                "Hook event cannot be empty"
+            )
 
         if not callable(callback):
-            raise TypeError("callback must be callable")
+            raise TypeError(
+                "Hook callback must be callable"
+            )
 
         with self._lock:
-            if callback not in self._hooks[event]:
-                self._hooks[event].append(callback)
+            callbacks = self._hooks[event]
+
+            if callback not in callbacks:
+                callbacks.append(callback)
 
     def unregister(
         self,
         event: str,
         callback: Hook,
-    ) -> None:
+    ) -> bool:
         with self._lock:
             callbacks = self._hooks.get(event)
 
             if not callbacks:
-                return
+                return False
 
-            if callback in callbacks:
-                callbacks.remove(callback)
+            if callback not in callbacks:
+                return False
+
+            callbacks.remove(callback)
 
             if not callbacks:
                 self._hooks.pop(event, None)
+
+            return True
 
     def emit(
         self,
@@ -65,14 +80,42 @@ class HookRegistry:
         results: list[Any] = []
 
         for callback in callbacks:
-            results.append(callback(**payload))
+            results.append(
+                callback(**payload)
+            )
 
         return results
 
+    def has(
+        self,
+        event: str,
+    ) -> bool:
+        with self._lock:
+            return bool(
+                self._hooks.get(event)
+            )
+
     def events(self) -> tuple[str, ...]:
         with self._lock:
-            return tuple(sorted(self._hooks))
+            return tuple(
+                sorted(self._hooks)
+            )
 
-    def clear(self) -> None:
+    def callback_count(
+        self,
+        event: str,
+    ) -> int:
         with self._lock:
-            self._hooks.clear()
+            return len(
+                self._hooks.get(event, ())
+            )
+
+    def clear(
+        self,
+        event: str | None = None,
+    ) -> None:
+        with self._lock:
+            if event is None:
+                self._hooks.clear()
+            else:
+                self._hooks.pop(event, None)

@@ -18,7 +18,7 @@ env:
 
 jobs:
   observability:
-    name: Build / Validate / Commit Observability
+    name: Build / Validate / Confirm Observability
     runs-on: ubuntu-latest
     timeout-minutes: 45
 
@@ -42,14 +42,22 @@ jobs:
           python -m pip install --upgrade pip
           python -m pip install --upgrade pytest
 
-      - name: Record repository boundary
+      - name: Establish repository boundary
         shell: bash
         run: |
           set -Eeuo pipefail
+          cd "${GITHUB_WORKSPACE}"
 
           git status --porcelain=v1 > /tmp/zyra_observability_before.status
 
-          git ls-files apps/ > /tmp/zyra_observability_apps_before.files
+          echo "Repository:"
+          git remote -v || true
+
+          echo "Branch:"
+          git branch --show-current
+
+          echo "Observability boundary:"
+          find observability -maxdepth 2 -type f 2>/dev/null | sort || true
 
       - name: Build observability production implementation
         shell: bash
@@ -58,8 +66,10 @@ jobs:
 
           cd "${GITHUB_WORKSPACE}"
 
-          rm -rf observability
-
+          # IMPORTANT:
+          # Never delete observability/.
+          # Existing files outside the explicitly maintained implementation
+          # are preserved.
           mkdir -p \
             observability/alerts \
             observability/api \
@@ -87,7 +97,6 @@ jobs:
           cat > observability/core.py <<'PY'
           from __future__ import annotations
 
-          import copy
           import hashlib
           import json
           import math
@@ -99,20 +108,26 @@ jobs:
           from dataclasses import dataclass, field, replace
           from datetime import datetime, timezone
           from enum import Enum
-          from typing import Any, Callable, Iterable, Mapping, Sequence
+          from typing import Any, Callable, Mapping, Sequence
 
 
           CONTRACT_VERSION = "1.0"
           SCHEMA_VERSION = 1
 
-          _NAME_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.:/-]{0,127}$")
-          _ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.:/-]{0,255}$")
+          _NAME_RE = re.compile(
+              r"^[A-Za-z0-9][A-Za-z0-9_.:/-]{0,127}$"
+          )
+
+          _ID_RE = re.compile(
+              r"^[A-Za-z0-9][A-Za-z0-9_.:/-]{0,255}$"
+          )
 
 
           class ObservabilityError(Exception):
-              """Root exception for the observability subsystem."""
+              """Base exception for the observability subsystem."""
 
 
+          # Backward-compatible public alias.
           ObservationError = ObservabilityError
 
 
@@ -185,35 +200,61 @@ jobs:
 
 
           def iso_time(timestamp_ns: int | None = None) -> str:
-              ns = timestamp_ns if timestamp_ns is not None else now_ns()
+              value = timestamp_ns or now_ns()
+
               return datetime.fromtimestamp(
-                  ns / 1_000_000_000,
+                  value / 1_000_000_000,
                   tz=timezone.utc,
               ).isoformat()
 
 
+          def validate_name(
+              value: str,
+              field_name: str = "name",
+          ) -> str:
+              if not isinstance(value, str):
+                  raise ValidationError(
+                      f"{field_name} must be a string"
+                  )
+
+              if not _NAME_RE.fullmatch(value):
+                  raise ValidationError(
+                      f"invalid {field_name}: {value!r}"
+                  )
+
+              return value
+
+
+          def validate_id(
+              value: str,
+              field_name: str = "id",
+          ) -> str:
+              if not isinstance(value, str):
+                  raise ValidationError(
+                      f"{field_name} must be a string"
+                  )
+
+              if not _ID_RE.fullmatch(value):
+                  raise ValidationError(
+                      f"invalid {field_name}: {value!r}"
+                  )
+
+              return value
+
+
           def new_id(prefix: str) -> str:
-              validate_name(prefix, "identifier prefix")
+              validate_name(
+                  prefix,
+                  "identifier prefix",
+              )
+
               return f"{prefix}-{uuid.uuid4().hex}"
 
 
-          def validate_name(value: str, field_name: str = "name") -> str:
-              if not isinstance(value, str):
-                  raise ValidationError(f"{field_name} must be a string")
-              if not _NAME_RE.fullmatch(value):
-                  raise ValidationError(f"invalid {field_name}: {value!r}")
-              return value
-
-
-          def validate_id(value: str, field_name: str = "id") -> str:
-              if not isinstance(value, str):
-                  raise ValidationError(f"{field_name} must be a string")
-              if not _ID_RE.fullmatch(value):
-                  raise ValidationError(f"invalid {field_name}: {value!r}")
-              return value
-
-
-          def finite_float(value: Any, field_name: str = "value") -> float:
+          def finite_float(
+              value: Any,
+              field_name: str = "value",
+          ) -> float:
               try:
                   result = float(value)
               except (TypeError, ValueError) as exc:
@@ -236,10 +277,12 @@ jobs:
               field_name: str,
           ) -> str:
               result = str(value)
+
               if len(result) > maximum:
                   raise CapacityError(
                       f"{field_name} exceeds maximum length"
                   )
+
               return result
 
 
@@ -254,14 +297,16 @@ jobs:
                   return {}
 
               if not isinstance(labels, Mapping):
-                  raise ValidationError("labels must be a mapping")
+                  raise ValidationError(
+                      "labels must be a mapping"
+                  )
 
               if len(labels) > max_keys:
                   raise CapacityError(
                       "maximum label cardinality exceeded"
                   )
 
-              result: dict[str, str] = {}
+              normalized: dict[str, str] = {}
 
               for key, value in labels.items():
                   key_text = bounded_text(
@@ -276,10 +321,16 @@ jobs:
                       field_name="label value",
                   )
 
-                  validate_name(key_text, "label key")
-                  result[key_text] = value_text
+                  validate_name(
+                      key_text,
+                      "label key",
+                  )
 
-              return dict(sorted(result.items()))
+                  normalized[key_text] = value_text
+
+              return dict(
+                  sorted(normalized.items())
+              )
 
 
           def sanitize(
@@ -296,7 +347,10 @@ jobs:
               if value is None:
                   return None
 
-              if isinstance(value, (str, bool, int)):
+              if isinstance(
+                  value,
+                  (str, bool, int),
+              ):
                   return value
 
               if isinstance(value, float):
@@ -304,6 +358,7 @@ jobs:
                       raise SerializationError(
                           "non-finite float cannot be serialized"
                       )
+
                   return value
 
               if isinstance(value, Enum):
@@ -337,23 +392,18 @@ jobs:
                   )
 
               raise SerializationError(
-                  f"unsupported serialization type: "
+                  "unsupported serialization type: "
                   f"{type(value).__name__}"
               )
 
 
           def stable_json(value: Any) -> str:
-              try:
-                  return json.dumps(
-                      sanitize(value),
-                      ensure_ascii=False,
-                      sort_keys=True,
-                      separators=(",", ":"),
-                  )
-              except (TypeError, ValueError) as exc:
-                  raise SerializationError(
-                      "value cannot be serialized"
-                  ) from exc
+              return json.dumps(
+                  sanitize(value),
+                  ensure_ascii=False,
+                  sort_keys=True,
+                  separators=(",", ":"),
+              )
 
 
           def digest(value: Any) -> str:
@@ -373,17 +423,35 @@ jobs:
               labels: Mapping[str, str] = field(
                   default_factory=dict
               )
-              created_at_ns: int = field(default_factory=now_ns)
+              created_at_ns: int = field(
+                  default_factory=now_ns
+              )
 
               def __post_init__(self) -> None:
                   validate_id(
                       self.correlation_id,
                       "correlation_id",
                   )
-                  validate_id(self.trace_id, "trace_id")
-                  validate_id(self.span_id, "span_id")
-                  validate_name(self.component, "component")
-                  validate_name(self.operation, "operation")
+
+                  validate_id(
+                      self.trace_id,
+                      "trace_id",
+                  )
+
+                  validate_id(
+                      self.span_id,
+                      "span_id",
+                  )
+
+                  validate_name(
+                      self.component,
+                      "component",
+                  )
+
+                  validate_name(
+                      self.operation,
+                      "operation",
+                  )
 
                   if self.parent_span_id:
                       validate_id(
@@ -394,7 +462,9 @@ jobs:
                   object.__setattr__(
                       self,
                       "labels",
-                      normalize_labels(self.labels),
+                      normalize_labels(
+                          self.labels
+                      ),
                   )
 
               @classmethod
@@ -410,14 +480,20 @@ jobs:
               ) -> "ObservationContext":
                   return cls(
                       correlation_id=(
-                          correlation_id or new_id("corr")
+                          correlation_id
+                          or new_id("corr")
                       ),
-                      trace_id=trace_id or new_id("trace"),
+                      trace_id=(
+                          trace_id
+                          or new_id("trace")
+                      ),
                       span_id=new_id("span"),
                       component=component,
                       operation=operation,
                       parent_span_id=parent_span_id,
-                      labels=normalize_labels(labels),
+                      labels=normalize_labels(
+                          labels
+                      ),
                   )
 
               def child(
@@ -436,7 +512,9 @@ jobs:
                   return ObservationContext.create(
                       self.component,
                       operation,
-                      correlation_id=self.correlation_id,
+                      correlation_id=(
+                          self.correlation_id
+                      ),
                       trace_id=self.trace_id,
                       parent_span_id=self.span_id,
                       labels=merged,
@@ -444,16 +522,26 @@ jobs:
 
               def to_dict(self) -> dict[str, Any]:
                   return {
-                      "contract_version": CONTRACT_VERSION,
-                      "schema_version": SCHEMA_VERSION,
-                      "correlation_id": self.correlation_id,
-                      "trace_id": self.trace_id,
-                      "span_id": self.span_id,
-                      "parent_span_id": self.parent_span_id,
-                      "component": self.component,
-                      "operation": self.operation,
-                      "labels": dict(self.labels),
-                      "created_at_ns": self.created_at_ns,
+                      "contract_version":
+                          CONTRACT_VERSION,
+                      "schema_version":
+                          SCHEMA_VERSION,
+                      "correlation_id":
+                          self.correlation_id,
+                      "trace_id":
+                          self.trace_id,
+                      "span_id":
+                          self.span_id,
+                      "parent_span_id":
+                          self.parent_span_id,
+                      "component":
+                          self.component,
+                      "operation":
+                          self.operation,
+                      "labels":
+                          dict(self.labels),
+                      "created_at_ns":
+                          self.created_at_ns,
                   }
 
 
@@ -472,6 +560,7 @@ jobs:
                       self.event_id,
                       "event_id",
                   )
+
                   validate_name(
                       self.event_type,
                       "event_type",
@@ -523,16 +612,28 @@ jobs:
 
               def to_dict(self) -> dict[str, Any]:
                   return {
-                      "contract_version": CONTRACT_VERSION,
-                      "schema_version": SCHEMA_VERSION,
-                      "event_id": self.event_id,
-                      "event_type": self.event_type,
-                      "timestamp_ns": self.timestamp_ns,
-                      "timestamp": iso_time(self.timestamp_ns),
-                      "severity": self.severity,
-                      "sequence": self.sequence,
-                      "context": self.context.to_dict(),
-                      "payload": sanitize(self.payload),
+                      "contract_version":
+                          CONTRACT_VERSION,
+                      "schema_version":
+                          SCHEMA_VERSION,
+                      "event_id":
+                          self.event_id,
+                      "event_type":
+                          self.event_type,
+                      "timestamp_ns":
+                          self.timestamp_ns,
+                      "timestamp":
+                          iso_time(
+                              self.timestamp_ns
+                          ),
+                      "severity":
+                          self.severity,
+                      "sequence":
+                          self.sequence,
+                      "context":
+                          self.context.to_dict(),
+                      "payload":
+                          sanitize(self.payload),
                   }
 
 
@@ -549,7 +650,10 @@ jobs:
               description: str | None = None
 
               def __post_init__(self) -> None:
-                  validate_name(self.name, "metric name")
+                  validate_name(
+                      self.name,
+                      "metric name",
+                  )
 
                   object.__setattr__(
                       self,
@@ -560,42 +664,39 @@ jobs:
                   object.__setattr__(
                       self,
                       "labels",
-                      normalize_labels(self.labels),
+                      normalize_labels(
+                          self.labels
+                      ),
                   )
 
-                  if self.unit is not None:
-                      bounded_text(
-                          self.unit,
-                          maximum=64,
-                          field_name="metric unit",
-                      )
-
-                  if self.description is not None:
-                      bounded_text(
-                          self.description,
-                          maximum=1024,
-                          field_name="metric description",
-                      )
-
-              def series_key(
-                  self,
-              ) -> tuple[str, tuple[tuple[str, str], ...]]:
+              def series_key(self):
                   return (
                       self.name,
-                      tuple(self.labels.items()),
+                      tuple(
+                          self.labels.items()
+                      ),
                   )
 
-              def to_dict(self) -> dict[str, Any]:
+              def to_dict(self):
                   return {
-                      "contract_version": CONTRACT_VERSION,
-                      "schema_version": SCHEMA_VERSION,
-                      "name": self.name,
-                      "kind": self.kind.value,
-                      "value": self.value,
-                      "timestamp_ns": self.timestamp_ns,
-                      "labels": dict(self.labels),
-                      "unit": self.unit,
-                      "description": self.description,
+                      "contract_version":
+                          CONTRACT_VERSION,
+                      "schema_version":
+                          SCHEMA_VERSION,
+                      "name":
+                          self.name,
+                      "kind":
+                          self.kind.value,
+                      "value":
+                          self.value,
+                      "timestamp_ns":
+                          self.timestamp_ns,
+                      "labels":
+                          dict(self.labels),
+                      "unit":
+                          self.unit,
+                      "description":
+                          self.description,
                   }
 
 
@@ -610,16 +711,24 @@ jobs:
                   default_factory=dict
               )
 
-              def to_dict(self) -> dict[str, Any]:
+              def to_dict(self):
                   return {
-                      "contract_version": CONTRACT_VERSION,
-                      "schema_version": SCHEMA_VERSION,
-                      "component": self.component,
-                      "state": self.state.value,
-                      "latency_ms": self.latency_ms,
-                      "checked_at_ns": self.checked_at_ns,
-                      "message": self.message,
-                      "details": sanitize(self.details),
+                      "contract_version":
+                          CONTRACT_VERSION,
+                      "schema_version":
+                          SCHEMA_VERSION,
+                      "component":
+                          self.component,
+                      "state":
+                          self.state.value,
+                      "latency_ms":
+                          self.latency_ms,
+                      "checked_at_ns":
+                          self.checked_at_ns,
+                      "message":
+                          self.message,
+                      "details":
+                          sanitize(self.details),
                   }
 
 
@@ -637,19 +746,30 @@ jobs:
               )
               occurrence_count: int = 1
 
-              def to_dict(self) -> dict[str, Any]:
+              def to_dict(self):
                   return {
-                      "contract_version": CONTRACT_VERSION,
-                      "schema_version": SCHEMA_VERSION,
-                      "alert_id": self.alert_id,
-                      "rule_id": self.rule_id,
-                      "state": self.state.value,
-                      "fingerprint": self.fingerprint,
-                      "first_seen_ns": self.first_seen_ns,
-                      "last_seen_ns": self.last_seen_ns,
-                      "message": self.message,
-                      "labels": dict(self.labels),
-                      "occurrence_count": self.occurrence_count,
+                      "contract_version":
+                          CONTRACT_VERSION,
+                      "schema_version":
+                          SCHEMA_VERSION,
+                      "alert_id":
+                          self.alert_id,
+                      "rule_id":
+                          self.rule_id,
+                      "state":
+                          self.state.value,
+                      "fingerprint":
+                          self.fingerprint,
+                      "first_seen_ns":
+                          self.first_seen_ns,
+                      "last_seen_ns":
+                          self.last_seen_ns,
+                      "message":
+                          self.message,
+                      "labels":
+                          dict(self.labels),
+                      "occurrence_count":
+                          self.occurrence_count,
                   }
 
 
@@ -667,21 +787,30 @@ jobs:
                   default_factory=dict
               )
 
-              def to_dict(self) -> dict[str, Any]:
+              def to_dict(self):
                   return {
-                      "contract_version": CONTRACT_VERSION,
-                      "schema_version": SCHEMA_VERSION,
-                      "incident_id": self.incident_id,
-                      "title": self.title,
-                      "state": self.state.value,
-                      "severity": self.severity,
-                      "created_at_ns": self.created_at_ns,
-                      "updated_at_ns": self.updated_at_ns,
-                      "correlation_ids": list(
-                          self.correlation_ids
-                      ),
-                      "alert_ids": list(self.alert_ids),
-                      "metadata": sanitize(self.metadata),
+                      "contract_version":
+                          CONTRACT_VERSION,
+                      "schema_version":
+                          SCHEMA_VERSION,
+                      "incident_id":
+                          self.incident_id,
+                      "title":
+                          self.title,
+                      "state":
+                          self.state.value,
+                      "severity":
+                          self.severity,
+                      "created_at_ns":
+                          self.created_at_ns,
+                      "updated_at_ns":
+                          self.updated_at_ns,
+                      "correlation_ids":
+                          list(self.correlation_ids),
+                      "alert_ids":
+                          list(self.alert_ids),
+                      "metadata":
+                          sanitize(self.metadata),
                   }
 
 
@@ -704,7 +833,7 @@ jobs:
                   "credential",
               )
 
-              def __post_init__(self) -> None:
+              def __post_init__(self):
                   if self.retention_seconds < 60:
                       raise ConfigurationError(
                           "retention_seconds must be >= 60"
@@ -725,16 +854,18 @@ jobs:
                           "max_queue_size must be positive"
                       )
 
-                  if not 0 < self.sample_rate <= 1:
+                  if not (
+                      0 < self.sample_rate <= 1
+                  ):
                       raise ConfigurationError(
                           "sample_rate must be > 0 and <= 1"
                       )
 
-              def validate(self) -> "ObservationPolicy":
+              def validate(self):
                   self.__post_init__()
                   return self
 
-              def redact(self, value: Any) -> Any:
+              def redact(self, value):
                   if isinstance(value, Mapping):
                       return {
                           str(key): (
@@ -773,11 +904,12 @@ jobs:
               sample_rate: float = 1.0
               shutdown_timeout_seconds: float = 30.0
 
-              def __post_init__(self) -> None:
+              def __post_init__(self):
                   validate_name(
                       self.service_name,
                       "service_name",
                   )
+
                   bounded_text(
                       self.environment,
                       maximum=128,
@@ -789,41 +921,47 @@ jobs:
                           "worker_count must be positive"
                       )
 
-                  if self.shutdown_timeout_seconds <= 0:
+                  if (
+                      self.shutdown_timeout_seconds
+                      <= 0
+                  ):
                       raise ConfigurationError(
                           "shutdown timeout must be positive"
                       )
 
-              def policy(self) -> ObservationPolicy:
+              def policy(self):
                   return ObservationPolicy(
-                      retention_seconds=self.retention_seconds,
-                      max_queue_size=self.queue_size,
-                      max_labels=self.max_labels,
-                      sample_rate=self.sample_rate,
+                      retention_seconds=(
+                          self.retention_seconds
+                      ),
+                      max_queue_size=(
+                          self.queue_size
+                      ),
+                      max_labels=(
+                          self.max_labels
+                      ),
+                      sample_rate=(
+                          self.sample_rate
+                      ),
                   )
 
 
           class AtomicCounter:
-              def __init__(self, initial: int = 0):
+              def __init__(self, initial=0):
                   self._value = initial
                   self._lock = threading.Lock()
 
-              def increment(self, amount: int = 1) -> int:
+              def increment(self, amount=1):
                   with self._lock:
                       self._value += amount
                       return self._value
 
-              def value(self) -> int:
+              def value(self):
                   with self._lock:
                       return self._value
 
 
           class BoundedQueue:
-              """
-              Thread-safe bounded queue with explicit non-blocking and
-              bounded-blocking semantics. Never grows without a hard limit.
-              """
-
               def __init__(self, capacity: int):
                   if capacity < 1:
                       raise ConfigurationError(
@@ -831,28 +969,33 @@ jobs:
                       )
 
                   self.capacity = capacity
-                  self._items: deque[Any] = deque()
-                  self._condition = threading.Condition()
+                  self._items = deque()
+                  self._condition = (
+                      threading.Condition()
+                  )
                   self._closed = False
+
                   self.accepted = AtomicCounter()
                   self.dropped = AtomicCounter()
 
               def put(
                   self,
-                  item: Any,
+                  item,
                   *,
-                  block: bool = False,
-                  timeout: float | None = None,
-              ) -> bool:
+                  block=False,
+                  timeout=None,
+              ):
                   deadline = (
                       None
                       if timeout is None
-                      else time.monotonic() + timeout
+                      else time.monotonic()
+                      + timeout
                   )
 
                   with self._condition:
                       while (
-                          len(self._items) >= self.capacity
+                          len(self._items)
+                          >= self.capacity
                           and not self._closed
                       ):
                           if not block:
@@ -862,7 +1005,8 @@ jobs:
                           remaining = (
                               None
                               if deadline is None
-                              else deadline - time.monotonic()
+                              else deadline
+                              - time.monotonic()
                           )
 
                           if (
@@ -872,7 +1016,9 @@ jobs:
                               self.dropped.increment()
                               return False
 
-                          self._condition.wait(remaining)
+                          self._condition.wait(
+                              remaining
+                          )
 
                       if self._closed:
                           self.dropped.increment()
@@ -881,16 +1027,15 @@ jobs:
                       self._items.append(item)
                       self.accepted.increment()
                       self._condition.notify_all()
+
                       return True
 
-              def get(
-                  self,
-                  timeout: float | None = None,
-              ) -> Any | None:
+              def get(self, timeout=None):
                   deadline = (
                       None
                       if timeout is None
-                      else time.monotonic() + timeout
+                      else time.monotonic()
+                      + timeout
                   )
 
                   with self._condition:
@@ -901,7 +1046,8 @@ jobs:
                           remaining = (
                               None
                               if deadline is None
-                              else deadline - time.monotonic()
+                              else deadline
+                              - time.monotonic()
                           )
 
                           if (
@@ -910,7 +1056,9 @@ jobs:
                           ):
                               return None
 
-                          self._condition.wait(remaining)
+                          self._condition.wait(
+                              remaining
+                          )
 
                       if self._items:
                           item = self._items.popleft()
@@ -919,16 +1067,16 @@ jobs:
 
                       return None
 
-              def close(self) -> None:
+              def close(self):
                   with self._condition:
                       self._closed = True
                       self._condition.notify_all()
 
-              def qsize(self) -> int:
+              def qsize(self):
                   with self._condition:
                       return len(self._items)
 
-              def drain(self) -> list[Any]:
+              def drain(self):
                   with self._condition:
                       items = list(self._items)
                       self._items.clear()
@@ -936,7 +1084,7 @@ jobs:
                       return items
 
               @property
-              def closed(self) -> bool:
+              def closed(self):
                   with self._condition:
                       return self._closed
 
@@ -945,7 +1093,7 @@ jobs:
               def __init__(
                   self,
                   *,
-                  max_series: int = 100_000,
+                  max_series=100_000,
               ):
                   if max_series < 1:
                       raise ConfigurationError(
@@ -954,19 +1102,15 @@ jobs:
 
                   self.max_series = max_series
                   self._lock = threading.RLock()
-                  self._values: dict[
-                      tuple[str, tuple[tuple[str, str], ...]],
-                      MetricSample,
-                  ] = {}
+                  self._values = {}
 
-              def record(
-                  self,
-                  sample: MetricSample,
-              ) -> MetricSample:
+              def record(self, sample):
                   key = sample.series_key()
 
                   with self._lock:
-                      previous = self._values.get(key)
+                      previous = self._values.get(
+                          key
+                      )
 
                       if (
                           previous is None
@@ -991,32 +1135,37 @@ jobs:
                           )
 
                       self._values[key] = sample
+
                       return sample
 
               def get(
                   self,
-                  name: str,
-                  labels: Mapping[str, Any] | None = None,
-              ) -> MetricSample | None:
+                  name,
+                  labels=None,
+              ):
                   key = (
                       name,
                       tuple(
-                          normalize_labels(labels).items()
+                          normalize_labels(
+                              labels
+                          ).items()
                       ),
                   )
 
                   with self._lock:
                       return self._values.get(key)
 
-              def snapshot(self) -> list[MetricSample]:
+              def snapshot(self):
                   with self._lock:
-                      return list(self._values.values())
+                      return list(
+                          self._values.values()
+                      )
 
-              def clear(self) -> None:
+              def clear(self):
                   with self._lock:
                       self._values.clear()
 
-              def count(self) -> int:
+              def count(self):
                   with self._lock:
                       return len(self._values)
 
@@ -1025,23 +1174,19 @@ jobs:
               def __init__(
                   self,
                   *,
-                  max_subscribers: int = 256,
+                  max_subscribers=256,
               ):
-                  self.max_subscribers = max_subscribers
+                  self.max_subscribers = (
+                      max_subscribers
+                  )
                   self._lock = threading.RLock()
-                  self._subscriptions: dict[
-                      str,
-                      list[Callable[[ObservationEvent], Any]],
-                  ] = {}
+                  self._subscriptions = {}
 
               def subscribe(
                   self,
-                  event_type: str,
-                  callback: Callable[
-                      [ObservationEvent],
-                      Any,
-                  ],
-              ) -> None:
+                  event_type,
+                  callback,
+              ):
                   validate_name(
                       event_type,
                       "event_type",
@@ -1054,12 +1199,15 @@ jobs:
 
                   with self._lock:
                       total = sum(
-                          len(value)
-                          for value in
-                          self._subscriptions.values()
+                          len(items)
+                          for items
+                          in self._subscriptions.values()
                       )
 
-                      if total >= self.max_subscribers:
+                      if (
+                          total
+                          >= self.max_subscribers
+                      ):
                           raise CapacityError(
                               "subscriber capacity exceeded"
                           )
@@ -1071,25 +1219,23 @@ jobs:
 
               def unsubscribe(
                   self,
-                  event_type: str,
-                  callback: Callable[
-                      [ObservationEvent],
-                      Any,
-                  ],
-              ) -> None:
+                  event_type,
+                  callback,
+              ):
                   with self._lock:
-                      subscribers = self._subscriptions.get(
-                          event_type,
-                          [],
+                      subscribers = (
+                          self._subscriptions.get(
+                              event_type,
+                              [],
+                          )
                       )
 
                       if callback in subscribers:
-                          subscribers.remove(callback)
+                          subscribers.remove(
+                              callback
+                          )
 
-              def publish(
-                  self,
-                  event: ObservationEvent,
-              ) -> int:
+              def publish(self, event):
                   with self._lock:
                       callbacks = list(
                           self._subscriptions.get(
@@ -1097,8 +1243,12 @@ jobs:
                               [],
                           )
                       )
+
                       callbacks.extend(
-                          self._subscriptions.get("*", [])
+                          self._subscriptions.get(
+                              "*",
+                              [],
+                          )
                       )
 
                   delivered = 0
@@ -1108,6 +1258,7 @@ jobs:
                           callback(event)
                       except Exception:
                           continue
+
                       delivered += 1
 
                   return delivered
@@ -1116,11 +1267,12 @@ jobs:
           def quantiles(
               values: Sequence[float],
               probabilities: Sequence[float],
-          ) -> dict[float, float]:
+          ):
               if not values:
                   return {
                       probability: 0.0
-                      for probability in probabilities
+                      for probability
+                      in probabilities
                   }
 
               ordered = sorted(
@@ -1128,10 +1280,12 @@ jobs:
                   for value in values
               )
 
-              result: dict[float, float] = {}
+              result = {}
 
               for probability in probabilities:
-                  if not 0 <= probability <= 1:
+                  if not (
+                      0 <= probability <= 1
+                  ):
                       raise ValidationError(
                           "quantile probability out of range"
                       )
@@ -1144,9 +1298,12 @@ jobs:
                   upper = math.ceil(index)
 
                   if lower == upper:
-                      result[probability] = ordered[lower]
+                      result[probability] = (
+                          ordered[lower]
+                      )
                   else:
                       fraction = index - lower
+
                       result[probability] = (
                           ordered[lower]
                           + (
@@ -1218,34 +1375,46 @@ jobs:
           class Histogram:
               def __init__(
                   self,
-                  name: str,
+                  name,
                   labels=None,
                   *,
-                  max_observations: int = 100_000,
+                  max_observations=100_000,
               ):
                   self.name = name
-                  self.labels = normalize_labels(labels)
-                  self.max_observations = max_observations
-                  self._values: list[float] = []
+                  self.labels = normalize_labels(
+                      labels
+                  )
+                  self.max_observations = (
+                      max_observations
+                  )
+                  self._values = []
                   self._lock = threading.RLock()
 
-              def observe(self, value: float) -> None:
+              def observe(self, value):
                   value = float(value)
 
-                  if value != value or not abs(value) < float("inf"):
+                  if not (
+                      value == value
+                      and abs(value) < float("inf")
+                  ):
                       raise ValidationError(
                           "histogram value must be finite"
                       )
 
                   with self._lock:
-                      if len(self._values) >= self.max_observations:
+                      if (
+                          len(self._values)
+                          >= self.max_observations
+                      ):
                           self._values.pop(0)
 
                       self._values.append(value)
 
-              def snapshot(self) -> HistogramSnapshot:
+              def snapshot(self):
                   with self._lock:
-                      values = list(self._values)
+                      values = list(
+                          self._values
+                      )
 
                   if not values:
                       return HistogramSnapshot(
@@ -1264,10 +1433,16 @@ jobs:
                       len(values),
                       min(values),
                       max(values),
-                      sum(values) / len(values),
+                      sum(values)
+                      / len(values),
                       quantiles(
                           values,
-                          (0.50, 0.90, 0.95, 0.99),
+                          (
+                              0.50,
+                              0.90,
+                              0.95,
+                              0.99,
+                          ),
                       ),
                   )
 
@@ -1276,15 +1451,13 @@ jobs:
               def __init__(
                   self,
                   *,
-                  max_series: int = 100_000,
+                  max_series=100_000,
               ):
                   self.registry = MetricRegistry(
                       max_series=max_series
                   )
-                  self._histograms: dict[
-                      tuple[str, tuple[tuple[str, str], ...]],
-                      Histogram,
-                  ] = {}
+
+                  self._histograms = {}
                   self._lock = threading.RLock()
 
               def counter(
@@ -1333,27 +1506,40 @@ jobs:
                   self,
                   name,
                   labels=None,
-              ) -> Histogram:
-                  normalized = normalize_labels(labels)
-                  key = (name, tuple(normalized.items()))
+              ):
+                  normalized = normalize_labels(
+                      labels
+                  )
+
+                  key = (
+                      name,
+                      tuple(
+                          normalized.items()
+                      ),
+                  )
 
                   with self._lock:
-                      histogram = self._histograms.get(key)
+                      histogram = (
+                          self._histograms.get(key)
+                      )
 
                       if histogram is None:
                           histogram = Histogram(
                               name,
                               normalized,
                           )
-                          self._histograms[key] = histogram
+
+                          self._histograms[
+                              key
+                          ] = histogram
 
                       return histogram
 
               def snapshot(self):
                   with self._lock:
                       histograms = [
-                          histogram.snapshot()
-                          for histogram
+                          item.snapshot()
+                          for item
                           in self._histograms.values()
                       ]
 
@@ -1368,12 +1554,17 @@ jobs:
                               "name": item.name,
                               "labels": item.labels,
                               "count": item.count,
-                              "minimum": item.minimum,
-                              "maximum": item.maximum,
-                              "average": item.average,
-                              "quantiles": item.quantiles,
+                              "minimum":
+                                  item.minimum,
+                              "maximum":
+                                  item.maximum,
+                              "average":
+                                  item.average,
+                              "quantiles":
+                                  item.quantiles,
                           }
-                          for item in histograms
+                          for item
+                          in histograms
                       ],
                   }
 
@@ -1391,8 +1582,6 @@ jobs:
           cat > observability/collector/collector.py <<'PY'
           from __future__ import annotations
 
-          import threading
-
           from ..core import (
               BoundedQueue,
               ObservationEvent,
@@ -1401,32 +1590,25 @@ jobs:
 
 
           class Collector:
-              """
-              Admission boundary for telemetry.
-
-              The queue has a hard capacity. Producers can choose between
-              immediate rejection and bounded blocking. There is no
-              unbounded memory growth.
-              """
-
               def __init__(
                   self,
                   policy: ObservationPolicy,
               ):
                   self.policy = policy.validate()
+
                   self.queue = BoundedQueue(
                       self.policy.max_queue_size
                   )
-                  self._lock = threading.RLock()
+
                   self._closed = False
 
               def submit(
                   self,
                   event: ObservationEvent,
                   *,
-                  block: bool = False,
-                  timeout: float | None = None,
-              ) -> bool:
+                  block=False,
+                  timeout=None,
+              ):
                   if not isinstance(
                       event,
                       ObservationEvent,
@@ -1435,36 +1617,37 @@ jobs:
                           "collector accepts ObservationEvent"
                       )
 
-                  with self._lock:
-                      if self._closed:
-                          return False
+                  if self._closed:
+                      return False
 
-                      return self.queue.put(
-                          event,
-                          block=block,
-                          timeout=timeout,
-                      )
+                  return self.queue.put(
+                      event,
+                      block=block,
+                      timeout=timeout,
+                  )
 
               def get(self, timeout=None):
                   return self.queue.get(timeout)
 
               def close(self):
-                  with self._lock:
-                      self._closed = True
-                      self.queue.close()
+                  self._closed = True
+                  self.queue.close()
 
               def stats(self):
                   return {
-                      "queued": self.queue.qsize(),
-                      "accepted": self.queue.accepted.value(),
-                      "dropped": self.queue.dropped.value(),
-                      "closed": self._closed,
+                      "queued":
+                          self.queue.qsize(),
+                      "accepted":
+                          self.queue.accepted.value(),
+                      "dropped":
+                          self.queue.dropped.value(),
+                      "closed":
+                          self._closed,
                   }
 
               @property
               def closed(self):
-                  with self._lock:
-                      return self._closed
+                  return self._closed
 
 
           __all__ = ["Collector"]
@@ -1486,29 +1669,26 @@ jobs:
 
 
           class AggregationEngine:
-              """
-              Deterministic in-process aggregation.
-
-              The engine deliberately has no network dependency. External
-              exporters consume immutable snapshots produced by this layer.
-              """
-
               def __init__(
                   self,
-                  registry: MetricRegistry | None = None,
+                  registry=None,
               ):
                   self.registry = (
-                      registry or MetricRegistry()
+                      registry
+                      or MetricRegistry()
                   )
+
                   self._lock = threading.RLock()
                   self._event_count = 0
                   self._error_count = 0
-                  self._latencies = defaultdict(list)
+                  self._latencies = defaultdict(
+                      list
+                  )
 
               def process(
                   self,
                   event: ObservationEvent,
-              ) -> None:
+              ):
                   with self._lock:
                       self._event_count += 1
 
@@ -1518,12 +1698,15 @@ jobs:
                       }:
                           self._error_count += 1
 
-                      duration = event.payload.get(
-                          "duration_ms"
+                      duration = (
+                          event.payload.get(
+                              "duration_ms"
+                          )
                       )
 
                       if duration is not None:
                           value = float(duration)
+
                           self._latencies[
                               event.event_type
                           ].append(value)
@@ -1543,7 +1726,7 @@ jobs:
                                   ),
                                   labels={
                                       "event_type":
-                                      event.event_type
+                                          event.event_type
                                   },
                               )
                           )
@@ -1561,17 +1744,28 @@ jobs:
                               in self.registry.snapshot()
                           ],
                           "latency_quantiles": {
-                              event_type: quantiles(
+                              event_type:
+                                  quantiles(
+                                      values,
+                                      (
+                                          0.50,
+                                          0.90,
+                                          0.95,
+                                          0.99,
+                                      ),
+                                  )
+                              for (
+                                  event_type,
                                   values,
-                                  (0.50, 0.90, 0.95, 0.99),
                               )
-                              for event_type, values
                               in self._latencies.items()
                           },
                       }
 
 
-          __all__ = ["AggregationEngine"]
+          __all__ = [
+              "AggregationEngine",
+          ]
           PY
 
           cat > observability/health/health.py <<'PY'
@@ -1600,7 +1794,9 @@ jobs:
                           "health check name is required"
                       )
 
-                  if not callable(self.callback):
+                  if not callable(
+                      self.callback
+                  ):
                       raise ValidationError(
                           "health callback must be callable"
                       )
@@ -1610,7 +1806,7 @@ jobs:
                           "health timeout must be positive"
                       )
 
-              def run(self) -> HealthResult:
+              def run(self):
                   start = time.monotonic_ns()
 
                   try:
@@ -1631,13 +1827,18 @@ jobs:
                       message = ""
 
                   except Exception as exc:
-                      state = HealthState.UNHEALTHY
+                      state = (
+                          HealthState.UNHEALTHY
+                      )
+
                       message = (
-                          f"{type(exc).__name__}: {exc}"
+                          f"{type(exc).__name__}: "
+                          f"{exc}"
                       )
 
                   latency = (
-                      time.monotonic_ns() - start
+                      time.monotonic_ns()
+                      - start
                   ) / 1_000_000
 
                   return HealthResult(
@@ -1652,21 +1853,20 @@ jobs:
           class HealthRegistry:
               def __init__(self):
                   self._lock = threading.RLock()
-                  self._checks: dict[
-                      str,
-                      HealthCheck,
-                  ] = {}
+                  self._checks = {}
 
-              def register(
-                  self,
-                  check: HealthCheck,
-              ):
+              def register(self, check):
                   with self._lock:
-                      self._checks[check.name] = check
+                      self._checks[
+                          check.name
+                      ] = check
 
-              def remove(self, name: str):
+              def remove(self, name):
                   with self._lock:
-                      self._checks.pop(name, None)
+                      self._checks.pop(
+                          name,
+                          None,
+                      )
 
               def run_all(self):
                   with self._lock:
@@ -1679,7 +1879,7 @@ jobs:
                       for check in checks
                   ]
 
-              def overall(self) -> HealthState:
+              def overall(self):
                   results = self.run_all()
 
                   if not results:
@@ -1690,22 +1890,56 @@ jobs:
                       for result in results
                   }
 
-                  if HealthState.UNHEALTHY in states:
-                      return HealthState.UNHEALTHY
+                  if (
+                      HealthState.UNHEALTHY
+                      in states
+                  ):
+                      return (
+                          HealthState.UNHEALTHY
+                      )
 
-                  if HealthState.DEGRADED in states:
-                      return HealthState.DEGRADED
+                  if (
+                      HealthState.DEGRADED
+                      in states
+                  ):
+                      return (
+                          HealthState.DEGRADED
+                      )
 
                   return HealthState.HEALTHY
 
               def report(self):
                   results = self.run_all()
 
+                  overall = (
+                      HealthState.UNKNOWN
+                      if not results
+                      else (
+                          HealthState.UNHEALTHY
+                          if any(
+                              item.state
+                              is HealthState.UNHEALTHY
+                              for item in results
+                          )
+                          else (
+                              HealthState.DEGRADED
+                              if any(
+                                  item.state
+                                  is HealthState.DEGRADED
+                                  for item in results
+                              )
+                              else HealthState.HEALTHY
+                          )
+                      )
+                  )
+
                   return {
-                      "state": self.overall().value,
+                      "state":
+                          overall.value,
                       "checks": [
                           result.to_dict()
-                          for result in results
+                          for result
+                          in results
                       ],
                   }
 
@@ -1728,9 +1962,9 @@ jobs:
               AlertRecord,
               AlertState,
               ObservationEvent,
+              digest,
               new_id,
               normalize_labels,
-              digest,
           )
 
 
@@ -1763,36 +1997,31 @@ jobs:
                   self.predicate = predicate
                   self.message = message
                   self.severity = severity
-                  self.cooldown_seconds = cooldown_seconds
+                  self.cooldown_seconds = (
+                      cooldown_seconds
+                  )
 
 
           class AlertManager:
               def __init__(self):
                   self._lock = threading.RLock()
-                  self._rules: dict[
-                      str,
-                      AlertRule,
-                  ] = {}
-                  self._records: dict[
-                      str,
-                      AlertRecord,
-                  ] = {}
+                  self._rules = {}
+                  self._records = {}
 
-              def register(
-                  self,
-                  rule: AlertRule,
-              ):
+              def register(self, rule):
                   with self._lock:
-                      self._rules[rule.rule_id] = rule
+                      self._rules[
+                          rule.rule_id
+                      ] = rule
 
               def unregister(self, rule_id):
                   with self._lock:
-                      self._rules.pop(rule_id, None)
+                      self._rules.pop(
+                          rule_id,
+                          None,
+                      )
 
-              def evaluate(
-                  self,
-                  event: ObservationEvent,
-              ):
+              def evaluate(self, event):
                   triggered = []
                   current_ns = time.time_ns()
 
@@ -1804,7 +2033,9 @@ jobs:
                       for rule in rules:
                           try:
                               matched = bool(
-                                  rule.predicate(event)
+                                  rule.predicate(
+                                      event
+                                  )
                               )
                           except Exception:
                               matched = False
@@ -1826,8 +2057,10 @@ jobs:
                                   labels,
                           })
 
-                          previous = self._records.get(
-                              fingerprint
+                          previous = (
+                              self._records.get(
+                                  fingerprint
+                              )
                           )
 
                           if (
@@ -1843,30 +2076,53 @@ jobs:
                               self._records[
                                   fingerprint
                               ] = AlertRecord(
-                                  alert_id=previous.alert_id,
-                                  rule_id=previous.rule_id,
-                                  state=previous.state,
-                                  fingerprint=previous.fingerprint,
-                                  first_seen_ns=previous.first_seen_ns,
-                                  last_seen_ns=current_ns,
-                                  message=previous.message,
-                                  labels=previous.labels,
+                                  alert_id=(
+                                      previous.alert_id
+                                  ),
+                                  rule_id=(
+                                      previous.rule_id
+                                  ),
+                                  state=(
+                                      previous.state
+                                  ),
+                                  fingerprint=(
+                                      previous.fingerprint
+                                  ),
+                                  first_seen_ns=(
+                                      previous.first_seen_ns
+                                  ),
+                                  last_seen_ns=(
+                                      current_ns
+                                  ),
+                                  message=(
+                                      previous.message
+                                  ),
+                                  labels=(
+                                      previous.labels
+                                  ),
                                   occurrence_count=(
                                       previous.occurrence_count
                                       + 1
                                   ),
                               )
+
                               continue
 
                           record = AlertRecord(
                               alert_id=(
                                   previous.alert_id
                                   if previous
-                                  else new_id("alert")
+                                  else new_id(
+                                      "alert"
+                                  )
                               ),
                               rule_id=rule.rule_id,
-                              state=AlertState.FIRING,
-                              fingerprint=fingerprint,
+                              state=(
+                                  AlertState.FIRING
+                              ),
+                              fingerprint=(
+                                  fingerprint
+                              ),
                               first_seen_ns=(
                                   previous.first_seen_ns
                                   if previous
@@ -1876,7 +2132,8 @@ jobs:
                               message=rule.message,
                               labels=labels,
                               occurrence_count=(
-                                  previous.occurrence_count + 1
+                                  previous.occurrence_count
+                                  + 1
                                   if previous
                                   else 1
                               ),
@@ -1886,13 +2143,15 @@ jobs:
                               fingerprint
                           ] = record
 
-                          triggered.append(record)
+                          triggered.append(
+                              record
+                          )
 
                   return triggered
 
               def acknowledge(
                   self,
-                  fingerprint: str,
+                  fingerprint,
               ):
                   with self._lock:
                       record = self._records.get(
@@ -1905,21 +2164,34 @@ jobs:
                       updated = AlertRecord(
                           alert_id=record.alert_id,
                           rule_id=record.rule_id,
-                          state=AlertState.ACKNOWLEDGED,
-                          fingerprint=record.fingerprint,
-                          first_seen_ns=record.first_seen_ns,
-                          last_seen_ns=time.time_ns(),
+                          state=(
+                              AlertState.ACKNOWLEDGED
+                          ),
+                          fingerprint=(
+                              record.fingerprint
+                          ),
+                          first_seen_ns=(
+                              record.first_seen_ns
+                          ),
+                          last_seen_ns=(
+                              time.time_ns()
+                          ),
                           message=record.message,
                           labels=record.labels,
-                          occurrence_count=record.occurrence_count,
+                          occurrence_count=(
+                              record.occurrence_count
+                          ),
                       )
 
-                      self._records[fingerprint] = updated
+                      self._records[
+                          fingerprint
+                      ] = updated
+
                       return updated
 
               def resolve(
                   self,
-                  fingerprint: str,
+                  fingerprint,
               ):
                   with self._lock:
                       record = self._records.get(
@@ -1932,23 +2204,37 @@ jobs:
                       updated = AlertRecord(
                           alert_id=record.alert_id,
                           rule_id=record.rule_id,
-                          state=AlertState.RESOLVED,
-                          fingerprint=record.fingerprint,
-                          first_seen_ns=record.first_seen_ns,
-                          last_seen_ns=time.time_ns(),
+                          state=(
+                              AlertState.RESOLVED
+                          ),
+                          fingerprint=(
+                              record.fingerprint
+                          ),
+                          first_seen_ns=(
+                              record.first_seen_ns
+                          ),
+                          last_seen_ns=(
+                              time.time_ns()
+                          ),
                           message=record.message,
                           labels=record.labels,
-                          occurrence_count=record.occurrence_count,
+                          occurrence_count=(
+                              record.occurrence_count
+                          ),
                       )
 
-                      self._records[fingerprint] = updated
+                      self._records[
+                          fingerprint
+                      ] = updated
+
                       return updated
 
               def active(self):
                   with self._lock:
                       return [
                           record
-                          for record in self._records.values()
+                          for record
+                          in self._records.values()
                           if record.state
                           in {
                               AlertState.FIRING,
@@ -1970,7 +2256,6 @@ jobs:
 
           import threading
           import time
-          from dataclasses import replace
 
           from ..core import (
               IncidentRecord,
@@ -2002,14 +2287,11 @@ jobs:
 
               def __init__(self):
                   self._lock = threading.RLock()
-                  self._items: dict[
-                      str,
-                      IncidentRecord,
-                  ] = {}
+                  self._items = {}
 
               def create(
                   self,
-                  title: str,
+                  title,
                   *,
                   severity="warning",
                   correlation_ids=(),
@@ -2021,19 +2303,21 @@ jobs:
                           "invalid incident title"
                       )
 
-                  now = time.time_ns()
+                  timestamp = time.time_ns()
 
                   record = IncidentRecord(
                       incident_id=new_id("inc"),
                       title=title,
                       state=IncidentState.OPEN,
                       severity=severity,
-                      created_at_ns=now,
-                      updated_at_ns=now,
+                      created_at_ns=timestamp,
+                      updated_at_ns=timestamp,
                       correlation_ids=tuple(
                           correlation_ids
                       ),
-                      alert_ids=tuple(alert_ids),
+                      alert_ids=tuple(
+                          alert_ids
+                      ),
                       metadata=metadata or {},
                   )
 
@@ -2046,9 +2330,17 @@ jobs:
 
               def transition(
                   self,
-                  incident_id: str,
-                  state: IncidentState,
+                  incident_id,
+                  state,
               ):
+                  if not isinstance(
+                      state,
+                      IncidentState,
+                  ):
+                      raise ValidationError(
+                          "state must be IncidentState"
+                      )
+
                   with self._lock:
                       current = self._items.get(
                           incident_id
@@ -2059,19 +2351,37 @@ jobs:
                               incident_id
                           )
 
-                      if state not in self._TRANSITIONS[
-                          current.state
-                      ]:
+                      if state not in (
+                          self._TRANSITIONS[
+                              current.state
+                          ]
+                      ):
                           raise ValidationError(
                               "invalid incident transition: "
                               f"{current.state.value} -> "
                               f"{state.value}"
                           )
 
-                      updated = replace(
-                          current,
+                      updated = IncidentRecord(
+                          incident_id=(
+                              current.incident_id
+                          ),
+                          title=current.title,
                           state=state,
-                          updated_at_ns=time.time_ns(),
+                          severity=current.severity,
+                          created_at_ns=(
+                              current.created_at_ns
+                          ),
+                          updated_at_ns=(
+                              time.time_ns()
+                          ),
+                          correlation_ids=(
+                              current.correlation_ids
+                          ),
+                          alert_ids=(
+                              current.alert_ids
+                          ),
+                          metadata=current.metadata,
                       )
 
                       self._items[
@@ -2120,6 +2430,7 @@ jobs:
 
               def __post_init__(self):
                   validate_name(self.name)
+
                   if len(self.version) > 128:
                       raise ValueError(
                           "component version too long"
@@ -2129,28 +2440,23 @@ jobs:
           class Registry:
               def __init__(self):
                   self._lock = threading.RLock()
-                  self._components: dict[
-                      str,
-                      Component,
-                  ] = {}
+                  self._components = {}
 
-              def register(
-                  self,
-                  component: Component,
-              ):
+              def register(self, component):
                   with self._lock:
-                      if component.name in self._components:
+                      if (
+                          component.name
+                          in self._components
+                      ):
                           raise ValueError(
                               "component already registered"
                           )
+
                       self._components[
                           component.name
                       ] = component
 
-              def upsert(
-                  self,
-                  component: Component,
-              ):
+              def upsert(self, component):
                   with self._lock:
                       self._components[
                           component.name
@@ -2158,7 +2464,9 @@ jobs:
 
               def get(self, name):
                   with self._lock:
-                      return self._components.get(name)
+                      return self._components.get(
+                          name
+                      )
 
               def remove(self, name):
                   with self._lock:
@@ -2193,7 +2501,7 @@ jobs:
           class PolicyEngine:
               def __init__(
                   self,
-                  policy: ObservationPolicy | None = None,
+                  policy=None,
               ):
                   self.policy = (
                       policy
@@ -2208,19 +2516,25 @@ jobs:
               def labels(self, labels):
                   return normalize_labels(
                       labels,
-                      max_keys=self.policy.max_labels,
+                      max_keys=(
+                          self.policy.max_labels
+                      ),
                   )
 
-              def serialized_size(self, payload) -> int:
+              def serialized_size(self, payload):
                   return len(
                       stable_json(
-                          self.sanitize(payload)
+                          self.sanitize(
+                              payload
+                          )
                       ).encode("utf-8")
                   )
 
-              def allowed(self, payload) -> bool:
+              def allowed(self, payload):
                   return (
-                      self.serialized_size(payload)
+                      self.serialized_size(
+                          payload
+                      )
                       <= self.policy.max_event_bytes
                   )
 
@@ -2276,7 +2590,9 @@ jobs:
                           "end_ns precedes start_ns"
                       )
 
-                  if not 1 <= self.limit <= 100_000:
+                  if not (
+                      1 <= self.limit <= 100_000
+                  ):
                       raise ValueError(
                           "query limit out of range"
                       )
@@ -2299,16 +2615,21 @@ jobs:
               def __init__(self, storage):
                   self.storage = storage
 
-              def execute(
-                  self,
-                  query: Query,
-              ):
-                  normalized = query.normalized()
+              def execute(self, query):
+                  normalized = (
+                      query.normalized()
+                  )
 
                   return self.storage.query(
-                      start_ns=normalized.start_ns,
-                      end_ns=normalized.end_ns,
-                      event_type=normalized.event_type,
+                      start_ns=(
+                          normalized.start_ns
+                      ),
+                      end_ns=(
+                          normalized.end_ns
+                      ),
+                      event_type=(
+                          normalized.event_type
+                      ),
                       limit=normalized.limit,
                       offset=normalized.offset,
                   )
@@ -2340,13 +2661,17 @@ jobs:
               @classmethod
               def create(
                   cls,
-                  sequence: int,
+                  sequence,
                   data,
               ):
-                  frozen = copy.deepcopy(data)
+                  frozen = copy.deepcopy(
+                      data
+                  )
 
                   return cls(
-                      created_at_ns=time.time_ns(),
+                      created_at_ns=(
+                          time.time_ns()
+                      ),
                       sequence=sequence,
                       data=frozen,
                       content_digest=digest(
@@ -2354,7 +2679,7 @@ jobs:
                       ),
                   )
 
-              def verify(self) -> bool:
+              def verify(self):
                   return (
                       digest(self.data)
                       == self.content_digest
@@ -2367,7 +2692,9 @@ jobs:
                       "sequence":
                           self.sequence,
                       "data":
-                          copy.deepcopy(self.data),
+                          copy.deepcopy(
+                              self.data
+                          ),
                       "content_digest":
                           self.content_digest,
                   }
@@ -2395,7 +2722,8 @@ jobs:
               def to_dict(self):
                   return {
                       "contract_version": "1.0",
-                      "state": self.state.value,
+                      "state":
+                          self.state.value,
                       "components":
                           dict(self.components),
                       "metrics":
@@ -2417,7 +2745,10 @@ jobs:
           ):
               state = (
                   health.overall()
-                  if hasattr(health, "overall")
+                  if hasattr(
+                      health,
+                      "overall",
+                  )
                   else HealthState.UNKNOWN
               )
 
@@ -2466,17 +2797,19 @@ jobs:
                       "name": name,
                       "data": data,
                   })
+
                   return self
 
               def build(self):
                   return {
-                      "contract_version": "1.0",
+                      "contract_version":
+                          "1.0",
                       "generated_at_ns":
                           time.time_ns(),
-                      "title": self.title,
-                      "sections": list(
-                          self._sections
-                      ),
+                      "title":
+                          self.title,
+                      "sections":
+                          list(self._sections),
                   }
 
               def json(self):
@@ -2488,7 +2821,9 @@ jobs:
                   )
 
 
-          __all__ = ["ReportBuilder"]
+          __all__ = [
+              "ReportBuilder",
+          ]
           PY
 
           cat > observability/dashboards/dashboards.py <<'PY'
@@ -2513,14 +2848,13 @@ jobs:
               title: str
               widgets: tuple[Widget, ...] = ()
 
-              def add(
-                  self,
-                  widget: Widget,
-              ) -> "Dashboard":
+              def add(self, widget):
                   return Dashboard(
                       self.dashboard_id,
                       self.title,
-                      self.widgets + (widget,),
+                      self.widgets + (
+                          widget,
+                      ),
                   )
 
               def to_dict(self):
@@ -2538,9 +2872,12 @@ jobs:
                               "query":
                                   widget.query,
                               "options":
-                                  dict(widget.options),
+                                  dict(
+                                      widget.options
+                                  ),
                           }
-                          for widget in self.widgets
+                          for widget
+                          in self.widgets
                       ],
                   }
 
@@ -2549,10 +2886,7 @@ jobs:
               def __init__(self):
                   self._items = {}
 
-              def register(
-                  self,
-                  dashboard: Dashboard,
-              ):
+              def register(self, dashboard):
                   self._items[
                       dashboard.dashboard_id
                   ] = dashboard
@@ -2622,10 +2956,7 @@ jobs:
                       if sink in sinks:
                           sinks.remove(sink)
 
-              def dispatch(
-                  self,
-                  event,
-              ):
+              def dispatch(self, event):
                   with self._lock:
                       sinks = list(
                           self._routes.get(
@@ -2654,7 +2985,9 @@ jobs:
                   return results
 
 
-          __all__ = ["EventRouter"]
+          __all__ = [
+              "EventRouter",
+          ]
           PY
 
           cat > observability/exporter/exporter.py <<'PY'
@@ -2738,31 +3071,35 @@ jobs:
               ObservationEvent,
               PersistenceError,
               SCHEMA_VERSION,
+              digest,
               stable_json,
           )
 
 
           class SQLiteObservationStore:
               """
-              Durable append-only observation store.
+              Durable observation store.
 
-              Guarantees:
-              - SQLite WAL mode.
-              - Full synchronous commits.
-              - Transactional inserts.
-              - Unique event IDs for idempotency.
+              Properties:
+              - SQLite WAL.
+              - FULL synchronous commits.
+              - Foreign keys enabled.
               - Explicit schema version.
-              - Indexed time/type/correlation/trace access.
+              - Unique event IDs.
+              - Transactional inserts.
+              - Idempotent writes.
+              - Indexed temporal queries.
+              - Correlation and trace indexes.
               - Retention deletion.
-              - Integrity verification.
-              - Thread-safe connection access.
+              - Integrity checking.
+              - Thread-safe connection ownership.
               """
 
               def __init__(
                   self,
-                  path: str,
+                  path,
                   *,
-                  timeout: float = 30.0,
+                  timeout=30.0,
               ):
                   if not path:
                       raise PersistenceError(
@@ -2783,6 +3120,7 @@ jobs:
                   )
 
                   self._lock = threading.RLock()
+                  self._closed = False
 
                   try:
                       self._db = sqlite3.connect(
@@ -2803,19 +3141,17 @@ jobs:
                           str(exc)
                       ) from exc
 
-                  self._closed = False
-
               def _configure(self):
-                  statements = (
+                  for statement in (
                       "PRAGMA journal_mode=WAL",
                       "PRAGMA synchronous=FULL",
                       "PRAGMA foreign_keys=ON",
                       "PRAGMA busy_timeout=30000",
                       "PRAGMA temp_store=MEMORY",
-                  )
-
-                  for statement in statements:
-                      self._db.execute(statement)
+                  ):
+                      self._db.execute(
+                          statement
+                      )
 
               def _migrate(self):
                   with self._db:
@@ -2824,7 +3160,8 @@ jobs:
                           CREATE TABLE IF NOT EXISTS
                           schema_version (
                               version INTEGER NOT NULL,
-                              upgraded_at_ns INTEGER NOT NULL
+                              upgraded_at_ns
+                                  INTEGER NOT NULL
                           )
                           """
                       )
@@ -2843,7 +3180,10 @@ jobs:
                               row["version"]
                           )
 
-                          if version > SCHEMA_VERSION:
+                          if (
+                              version
+                              > SCHEMA_VERSION
+                          ):
                               raise PersistenceError(
                                   "database schema is newer "
                                   "than runtime"
@@ -2866,17 +3206,29 @@ jobs:
                           """
                           CREATE TABLE IF NOT EXISTS
                           observations (
-                              sequence INTEGER PRIMARY KEY AUTOINCREMENT,
-                              event_id TEXT NOT NULL UNIQUE,
-                              event_type TEXT NOT NULL,
-                              timestamp_ns INTEGER NOT NULL,
-                              severity TEXT NOT NULL,
-                              correlation_id TEXT NOT NULL,
-                              trace_id TEXT NOT NULL,
-                              span_id TEXT NOT NULL,
-                              payload_json TEXT NOT NULL,
-                              event_json TEXT NOT NULL,
-                              content_digest TEXT NOT NULL
+                              sequence
+                                  INTEGER PRIMARY KEY
+                                  AUTOINCREMENT,
+                              event_id
+                                  TEXT NOT NULL UNIQUE,
+                              event_type
+                                  TEXT NOT NULL,
+                              timestamp_ns
+                                  INTEGER NOT NULL,
+                              severity
+                                  TEXT NOT NULL,
+                              correlation_id
+                                  TEXT NOT NULL,
+                              trace_id
+                                  TEXT NOT NULL,
+                              span_id
+                                  TEXT NOT NULL,
+                              payload_json
+                                  TEXT NOT NULL,
+                              event_json
+                                  TEXT NOT NULL,
+                              content_digest
+                                  TEXT NOT NULL
                           )
                           """
                       )
@@ -2924,10 +3276,7 @@ jobs:
                           "observation store is closed"
                       )
 
-              def append(
-                  self,
-                  event: ObservationEvent,
-              ) -> int:
+              def append(self, event):
                   if not isinstance(
                       event,
                       ObservationEvent,
@@ -2937,14 +3286,14 @@ jobs:
                       )
 
                   document = event.to_dict()
+
                   event_json = stable_json(
                       document
                   )
+
                   payload_json = stable_json(
                       event.payload
                   )
-
-                  from ..core import digest
 
                   content_digest = digest(
                       document
@@ -2955,38 +3304,40 @@ jobs:
 
                       try:
                           with self._db:
-                              cursor = self._db.execute(
-                                  """
-                                  INSERT OR IGNORE INTO
-                                  observations (
-                                      event_id,
-                                      event_type,
-                                      timestamp_ns,
-                                      severity,
-                                      correlation_id,
-                                      trace_id,
-                                      span_id,
-                                      payload_json,
-                                      event_json,
-                                      content_digest
+                              cursor = (
+                                  self._db.execute(
+                                      """
+                                      INSERT OR IGNORE
+                                      INTO observations (
+                                          event_id,
+                                          event_type,
+                                          timestamp_ns,
+                                          severity,
+                                          correlation_id,
+                                          trace_id,
+                                          span_id,
+                                          payload_json,
+                                          event_json,
+                                          content_digest
+                                      )
+                                      VALUES (
+                                          ?, ?, ?, ?, ?,
+                                          ?, ?, ?, ?, ?
+                                      )
+                                      """,
+                                      (
+                                          event.event_id,
+                                          event.event_type,
+                                          event.timestamp_ns,
+                                          event.severity,
+                                          event.context.correlation_id,
+                                          event.context.trace_id,
+                                          event.context.span_id,
+                                          payload_json,
+                                          event_json,
+                                          content_digest,
+                                      ),
                                   )
-                                  VALUES (
-                                      ?, ?, ?, ?, ?, ?,
-                                      ?, ?, ?, ?
-                                  )
-                                  """,
-                                  (
-                                      event.event_id,
-                                      event.event_type,
-                                      event.timestamp_ns,
-                                      event.severity,
-                                      event.context.correlation_id,
-                                      event.context.trace_id,
-                                      event.context.span_id,
-                                      payload_json,
-                                      event_json,
-                                      content_digest,
-                                  ),
                               )
 
                               if cursor.rowcount:
@@ -3001,7 +3352,9 @@ jobs:
                                       FROM observations
                                       WHERE event_id=?
                                       """,
-                                      (event.event_id,),
+                                      (
+                                          event.event_id,
+                                      ),
                                   ).fetchone()
                               )
 
@@ -3024,15 +3377,17 @@ jobs:
               def query(
                   self,
                   *,
-                  start_ns: int = 0,
-                  end_ns: int | None = None,
-                  event_type: str | None = None,
-                  correlation_id: str | None = None,
-                  trace_id: str | None = None,
-                  limit: int = 1000,
-                  offset: int = 0,
+                  start_ns=0,
+                  end_ns=None,
+                  event_type=None,
+                  correlation_id=None,
+                  trace_id=None,
+                  limit=1000,
+                  offset=0,
               ):
-                  if not 1 <= limit <= 100_000:
+                  if not (
+                      1 <= limit <= 100_000
+                  ):
                       raise ValueError(
                           "limit out of range"
                       )
@@ -3042,11 +3397,8 @@ jobs:
                           "offset cannot be negative"
                       )
 
-                  end_ns = (
-                      end_ns
-                      if end_ns is not None
-                      else time.time_ns()
-                  )
+                  if end_ns is None:
+                      end_ns = time.time_ns()
 
                   clauses = [
                       "timestamp_ns >= ?",
@@ -3084,7 +3436,8 @@ jobs:
 
                   sql = (
                       "SELECT event_json "
-                      "FROM observations WHERE "
+                      "FROM observations "
+                      "WHERE "
                       + " AND ".join(clauses)
                       + " ORDER BY "
                       "timestamp_ns ASC, "
@@ -3100,10 +3453,13 @@ jobs:
                       self._ensure_open()
 
                       try:
-                          rows = self._db.execute(
-                              sql,
-                              arguments,
-                          ).fetchall()
+                          rows = (
+                              self._db.execute(
+                                  sql,
+                                  arguments,
+                              ).fetchall()
+                          )
+
                       except sqlite3.Error as exc:
                           raise PersistenceError(
                               str(exc)
@@ -3118,20 +3474,24 @@ jobs:
 
               def purge_before(
                   self,
-                  cutoff_ns: int,
-              ) -> int:
+                  cutoff_ns,
+              ):
                   with self._lock:
                       self._ensure_open()
 
                       try:
                           with self._db:
-                              cursor = self._db.execute(
-                                  """
-                                  DELETE FROM
-                                  observations
-                                  WHERE timestamp_ns < ?
-                                  """,
-                                  (cutoff_ns,),
+                              cursor = (
+                                  self._db.execute(
+                                      """
+                                      DELETE FROM
+                                      observations
+                                      WHERE timestamp_ns < ?
+                                      """,
+                                      (
+                                          cutoff_ns,
+                                      ),
+                                  )
                               )
 
                               return int(
@@ -3145,19 +3505,21 @@ jobs:
 
               def retention(
                   self,
-                  retention_seconds: int,
-              ) -> int:
+                  retention_seconds,
+              ):
                   cutoff = (
                       time.time_ns()
-                      - retention_seconds
-                      * 1_000_000_000
+                      - (
+                          retention_seconds
+                          * 1_000_000_000
+                      )
                   )
 
                   return self.purge_before(
                       cutoff
                   )
 
-              def count(self) -> int:
+              def count(self):
                   with self._lock:
                       self._ensure_open()
 
@@ -3170,12 +3532,13 @@ jobs:
                                   """
                               ).fetchone()[0]
                           )
+
                       except sqlite3.Error as exc:
                           raise PersistenceError(
                               str(exc)
                           ) from exc
 
-              def integrity_check(self) -> bool:
+              def integrity_check(self):
                   with self._lock:
                       self._ensure_open()
 
@@ -3199,9 +3562,11 @@ jobs:
                           self._db.execute(
                               "PRAGMA wal_checkpoint(TRUNCATE)"
                           )
+
                           self._db.execute(
                               "VACUUM"
                           )
+
                       except sqlite3.Error as exc:
                           raise PersistenceError(
                               str(exc)
@@ -3253,24 +3618,23 @@ jobs:
 
           class MonitoringCoordinator:
               """
-              Owns the asynchronous observation pipeline.
+              Asynchronous observation pipeline.
 
-              Producer path:
+              Producer:
                   emit -> bounded queue
 
-              Worker path:
+              Worker:
                   persistence -> aggregation -> alerts -> subscribers
 
-              Persistence is performed before derived processing so that the
-              durable record is the source of truth.
+              Durable persistence occurs before derived processing.
               """
 
               def __init__(
                   self,
                   *,
-                  policy: ObservationPolicy | None = None,
+                  policy=None,
                   storage=None,
-                  worker_count: int = 2,
+                  worker_count=2,
               ):
                   self.policy = (
                       policy
@@ -3285,20 +3649,22 @@ jobs:
                   self.collector = Collector(
                       self.policy
                   )
+
                   self.storage = storage
                   self.engine = (
                       AggregationEngine()
                   )
+
                   self.events = EventBus()
                   self.alerts = AlertManager()
 
-                  self.worker_count = worker_count
+                  self.worker_count = (
+                      worker_count
+                  )
 
                   self._lock = threading.RLock()
                   self._running = False
-                  self._workers: list[
-                      threading.Thread
-                  ] = []
+                  self._workers = []
                   self._fatal_errors = []
                   self._processed = 0
                   self._failed = 0
@@ -3314,24 +3680,29 @@ jobs:
                       for index in range(
                           self.worker_count
                       ):
-                          thread = threading.Thread(
-                              target=self._worker,
-                              name=(
-                                  "zyra-observability-"
-                                  f"{index}"
-                              ),
-                              daemon=True,
+                          worker = (
+                              threading.Thread(
+                                  target=self._worker,
+                                  name=(
+                                      "zyra-observability-"
+                                      f"{index}"
+                                  ),
+                                  daemon=True,
+                              )
                           )
 
                           self._workers.append(
-                              thread
+                              worker
                           )
-                          thread.start()
+
+                          worker.start()
 
               def _worker(self):
                   while True:
                       with self._lock:
-                          running = self._running
+                          running = (
+                              self._running
+                          )
 
                       event = self.collector.get(
                           timeout=0.25
@@ -3340,6 +3711,7 @@ jobs:
                       if event is None:
                           if not running:
                               return
+
                           continue
 
                       try:
@@ -3374,24 +3746,23 @@ jobs:
                       except Exception as exc:
                           with self._lock:
                               self._failed += 1
-                              self._fatal_errors.append(
-                                  {
-                                      "type":
-                                          type(exc).__name__,
-                                      "message":
-                                          str(exc),
-                                      "timestamp_ns":
-                                          time.time_ns(),
-                                  }
-                              )
+
+                              self._fatal_errors.append({
+                                  "type":
+                                      type(exc).__name__,
+                                  "message":
+                                      str(exc),
+                                  "timestamp_ns":
+                                      time.time_ns(),
+                              })
 
               def emit(
                   self,
-                  event: ObservationEvent,
+                  event,
                   *,
                   block=False,
                   timeout=None,
-              ) -> bool:
+              ):
                   with self._lock:
                       if not self._running:
                           return False
@@ -3404,7 +3775,7 @@ jobs:
 
               def stop(
                   self,
-                  timeout: float = 30.0,
+                  timeout=30.0,
               ):
                   with self._lock:
                       if not self._running:
@@ -3429,7 +3800,9 @@ jobs:
                               "did not stop"
                           )
 
-                      worker.join(remaining)
+                      worker.join(
+                          remaining
+                      )
 
                       if worker.is_alive():
                           raise TimeoutError(
@@ -3441,6 +3814,13 @@ jobs:
 
               def health(self):
                   with self._lock:
+                      storage_count = None
+
+                      if self.storage is not None:
+                          storage_count = (
+                              self.storage.count()
+                          )
+
                       return {
                           "running":
                               self._running,
@@ -3459,26 +3839,21 @@ jobs:
                                   self.alerts.active()
                               ),
                           "storage_count":
-                              (
-                                  self.storage.count()
-                                  if self.storage is not None
-                                  else None
-                              ),
+                              storage_count,
                       }
 
               def snapshot(self):
-                  with self._lock:
-                      return {
-                          "health":
-                              self.health(),
-                          "engine":
-                              self.engine.snapshot(),
-                          "alerts": [
-                              alert.to_dict()
-                              for alert
-                              in self.alerts.active()
-                          ],
-                      }
+                  return {
+                      "health":
+                          self.health(),
+                      "engine":
+                          self.engine.snapshot(),
+                      "alerts": [
+                          alert.to_dict()
+                          for alert
+                          in self.alerts.active()
+                      ],
+                  }
 
 
           __all__ = [
@@ -3511,10 +3886,10 @@ jobs:
 
           class ObservabilityManager:
               """
-              Application-facing lifecycle owner.
+              Composition root for the observability subsystem.
 
-              This class is the composition root for observability only.
-              It does not own application modules and never imports apps/.
+              It owns observability infrastructure only and intentionally
+              does not import apps/.
               """
 
               def __init__(
@@ -3615,8 +3990,7 @@ jobs:
 
                   accepted = (
                       self.monitoring.emit(
-                          event,
-                          block=False,
+                          event
                       )
                   )
 
@@ -3673,13 +4047,13 @@ jobs:
               """
               Stable public facade.
 
-              Application code can depend on this contract without
-              importing implementation modules.
+              Application integrations should depend on this facade rather
+              than internal implementation modules.
               """
 
               def __init__(
                   self,
-                  manager: ObservabilityManager,
+                  manager,
               ):
                   self.manager = manager
 
@@ -3757,10 +4131,14 @@ jobs:
               EventBus,
           )
 
-          from .api.api import ObservabilityAPI
+          from .api.api import (
+              ObservabilityAPI,
+          )
+
           from .manager.manager import (
               ObservabilityManager,
           )
+
 
           __all__ = [
               "CONTRACT_VERSION",
@@ -3795,6 +4173,8 @@ jobs:
           ]
           PY
 
+          # Preserve existing __init__.py files.
+          # Create only those that genuinely do not exist.
           for package in \
             alerts \
             api \
@@ -3818,21 +4198,32 @@ jobs:
             status \
             storage
           do
-            touch \
-              "observability/${package}/__init__.py"
+            if [[ ! -f \
+              "observability/${package}/__init__.py" \
+            ]]; then
+              printf '%s\n' \
+                '"""ZYRA Observability package."""' \
+                > \
+                "observability/${package}/__init__.py"
+            fi
           done
 
           cat > observability/tests/test_production.py <<'PY'
           from __future__ import annotations
 
           import tempfile
+          import threading
           import time
           from pathlib import Path
 
           import pytest
 
           import observability
+
           from observability import (
+              AlertState,
+              CapacityError,
+              IncidentState,
               ObservationConfig,
               ObservationContext,
               ObservationError,
@@ -3840,54 +4231,86 @@ jobs:
               ObservationPolicy,
               ObservabilityError,
           )
+
           from observability.alerts.alerts import (
               AlertManager,
               AlertRule,
           )
+
           from observability.collector.collector import (
               Collector,
           )
+
           from observability.incidents.incidents import (
               IncidentManager,
           )
+
           from observability.metrics.metrics import (
               Metrics,
           )
-          from observability.policy.policy import (
-              PolicyEngine,
-          )
+
           from observability.snapshot.snapshot import (
               Snapshot,
           )
+
           from observability.storage.storage import (
               SQLiteObservationStore,
           )
 
 
-          def test_public_error_contract():
-              assert ObservationError is ObservabilityError
-              assert observability.ObservationError is (
-                  ObservabilityError
+          def make_event(event_type="TEST"):
+              return ObservationEvent.create(
+                  event_type,
+                  ObservationContext.create(
+                      "test",
+                      "operation",
+                  ),
+                  {
+                      "value": 1,
+                  },
               )
 
 
-          def test_context_trace_parent_contract():
-              parent = ObservationContext.create(
-                  "test",
-                  "parent",
-                  labels={"environment": "ci"},
+          def test_public_error_compatibility():
+              assert (
+                  ObservationError
+                  is ObservabilityError
+              )
+
+              assert (
+                  observability.ObservationError
+                  is ObservabilityError
+              )
+
+
+          def test_context_parent_relationship():
+              parent = (
+                  ObservationContext.create(
+                      "test",
+                      "parent",
+                      labels={
+                          "environment": "ci",
+                      },
+                  )
               )
 
               child = parent.child(
                   "child",
-                  labels={"stage": "validation"},
+                  labels={
+                      "stage": "validation",
+                  },
               )
 
-              assert child.trace_id == parent.trace_id
+              assert (
+                  child.trace_id
+                  == parent.trace_id
+              )
+
               assert (
                   child.parent_span_id
                   == parent.span_id
               )
+
               assert (
                   child.correlation_id
                   == parent.correlation_id
@@ -3897,48 +4320,64 @@ jobs:
           def test_policy_redaction():
               policy = ObservationPolicy()
 
-              result = policy.redact({
+              value = policy.redact({
                   "password": "secret",
                   "token": "secret",
                   "nested": {
-                      "authorization": "secret"
+                      "authorization":
+                          "secret",
                   },
                   "safe": "value",
               })
 
-              assert result["password"] == (
-                  "[REDACTED]"
+              assert (
+                  value["password"]
+                  == "[REDACTED]"
               )
-              assert result["token"] == (
-                  "[REDACTED]"
+
+              assert (
+                  value["token"]
+                  == "[REDACTED]"
               )
-              assert result["nested"][
-                  "authorization"
-              ] == "[REDACTED]"
-              assert result["safe"] == "value"
+
+              assert (
+                  value["nested"][
+                      "authorization"
+                  ]
+                  == "[REDACTED]"
+              )
+
+              assert (
+                  value["safe"]
+                  == "value"
+              )
 
 
-          def test_bounded_queue_rejects_overflow():
+          def test_bounded_queue_backpressure():
               collector = Collector(
                   ObservationPolicy(
                       max_queue_size=1
                   )
               )
 
-              event = ObservationEvent.create(
-                  "QUEUE_TEST",
-                  ObservationContext.create(
-                      "test",
-                      "queue",
-                  ),
+              first = make_event(
+                  "QUEUE_ONE"
               )
 
-              assert collector.submit(event)
-              assert not collector.submit(event)
-              assert collector.stats()["dropped"] == 1
+              second = make_event(
+                  "QUEUE_TWO"
+              )
+
+              assert collector.submit(first)
+              assert not collector.submit(second)
+
+              assert (
+                  collector.stats()["dropped"]
+                  == 1
+              )
 
 
-          def test_sqlite_idempotency_and_integrity():
+          def test_storage_idempotency():
               with tempfile.TemporaryDirectory() as tmp:
                   database = (
                       Path(tmp)
@@ -3951,37 +4390,74 @@ jobs:
                       )
                   )
 
-                  event = (
-                      ObservationEvent.create(
-                          "STORE_TEST",
-                          ObservationContext.create(
-                              "test",
-                              "store",
-                          ),
-                          {"value": 123},
-                      )
+                  event = make_event(
+                      "STORE_TEST"
                   )
 
-                  first = store.append(event)
-                  second = store.append(event)
+                  first = store.append(
+                      event
+                  )
+
+                  second = store.append(
+                      event
+                  )
 
                   assert first == second
                   assert store.count() == 1
                   assert store.integrity_check()
 
-                  rows = store.query(
+                  records = store.query(
                       event_type="STORE_TEST"
                   )
 
-                  assert len(rows) == 1
-                  assert rows[0][
-                      "event_type"
-                  ] == "STORE_TEST"
+                  assert len(records) == 1
+                  assert (
+                      records[0]["event_type"]
+                      == "STORE_TEST"
+                  )
 
                   store.close()
 
 
-          def test_metrics_counter_is_monotonic():
+          def test_storage_survives_reopen():
+              with tempfile.TemporaryDirectory() as tmp:
+                  database = (
+                      Path(tmp)
+                      / "reopen.db"
+                  )
+
+                  event = make_event(
+                      "RECOVERY_TEST"
+                  )
+
+                  store = (
+                      SQLiteObservationStore(
+                          str(database)
+                      )
+                  )
+
+                  store.append(event)
+                  store.close()
+
+                  reopened = (
+                      SQLiteObservationStore(
+                          str(database)
+                      )
+                  )
+
+                  assert reopened.count() == 1
+                  assert reopened.integrity_check()
+
+                  records = reopened.query(
+                      event_type="RECOVERY_TEST"
+                  )
+
+                  assert len(records) == 1
+
+                  reopened.close()
+
+
+          def test_metric_counter():
               metrics = Metrics()
 
               metrics.counter(
@@ -4000,581 +4476,4 @@ jobs:
                   )
               )
 
-              assert sample is not None
-              assert sample.value == 3
-
-
-          def test_alert_deduplication():
-              manager = AlertManager()
-
-              manager.register(
-                  AlertRule(
-                      "always",
-                      lambda event: True,
-                      cooldown_seconds=3600,
-                  )
-              )
-
-              event = (
-                  ObservationEvent.create(
-                      "ALERT_TEST",
-                      ObservationContext.create(
-                          "test",
-                          "alert",
-                      ),
-                  )
-              )
-
-              first = manager.evaluate(event)
-              second = manager.evaluate(event)
-
-              assert len(first) == 1
-              assert len(second) == 0
-              assert len(manager.active()) == 1
-
-
-          def test_incident_state_machine():
-              manager = IncidentManager()
-
-              incident = manager.create(
-                  "Production incident"
-              )
-
-              incident = manager.transition(
-                  incident.incident_id,
-                  incident.state.ACKNOWLEDGED,
-              )
-
-              incident = manager.transition(
-                  incident.incident_id,
-                  incident.state.MITIGATED,
-              )
-
-              incident = manager.transition(
-                  incident.incident_id,
-                  incident.state.RESOLVED,
-              )
-
-              incident = manager.transition(
-                  incident.incident_id,
-                  incident.state.CLOSED,
-              )
-
-              assert incident.state.value == "closed"
-
-              with pytest.raises(Exception):
-                  manager.transition(
-                      incident.incident_id,
-                      incident.state.OPEN,
-                  )
-
-
-          def test_snapshot_integrity():
-              snapshot = Snapshot.create(
-                  1,
-                  {"status": "healthy"},
-              )
-
-              assert snapshot.verify()
-
-
-          def test_manager_end_to_end():
-              with tempfile.TemporaryDirectory() as tmp:
-                  config = ObservationConfig(
-                      service_name="zyra",
-                      environment="ci",
-                      storage_path=str(
-                          Path(tmp)
-                          / "manager.db"
-                      ),
-                      queue_size=64,
-                      worker_count=2,
-                      shutdown_timeout_seconds=10,
-                  )
-
-                  from observability.manager.manager import (
-                      ObservabilityManager,
-                  )
-
-                  manager = (
-                      ObservabilityManager(
-                          config
-                      )
-                  )
-
-                  manager.start()
-
-                  event = manager.emit(
-                      "integration",
-                      "test",
-                      "END_TO_END",
-                      {
-                          "password": "secret",
-                          "duration_ms": 10,
-                      },
-                  )
-
-                  assert event.event_type == (
-                      "END_TO_END"
-                  )
-
-                  deadline = (
-                      time.monotonic() + 5
-                  )
-
-                  while (
-                      manager.storage.count() == 0
-                      and time.monotonic()
-                      < deadline
-                  ):
-                      time.sleep(0.01)
-
-                  assert manager.storage.count() == 1
-
-                  status = manager.status()
-
-                  assert status["started"] is True
-
-                  manager.stop()
-          PY
-
-          cat > observability/README.md <<'MD'
-          # ZYRA Observability
-
-          Production observability subsystem for the ZYRA Network.
-
-          ## Architectural guarantees
-
-          The subsystem is designed as a long-term foundation rather than as
-          an application-specific logging utility.
-
-          Core characteristics:
-
-          - explicit versioned contracts;
-          - immutable event/domain records;
-          - deterministic serialization;
-          - bounded memory admission;
-          - bounded metric cardinality;
-          - explicit backpressure;
-          - durable SQLite WAL persistence;
-          - full synchronous database commits;
-          - idempotent event persistence;
-          - schema-version tracking;
-          - indexed temporal queries;
-          - retention controls;
-          - database integrity checks;
-          - asynchronous processing;
-          - controlled worker lifecycle;
-          - explicit alert state transitions;
-          - explicit incident state transitions;
-          - secret redaction;
-          - serialization/depth/size boundaries;
-          - vendor-neutral exporters;
-          - stable public facade;
-          - internal health checks;
-          - tests covering persistence, integrity, lifecycle,
-            concurrency boundaries, alerts, incidents, policies and
-            public compatibility.
-
-          ## Long-term evolution
-
-          The implementation is intended to serve as a durable foundation
-          for decades of evolution. No software implementation can honestly
-          guarantee unchanged operation for a literal twenty-year period:
-          operating systems, Python versions, cryptographic requirements,
-          storage media, deployment environments and regulatory requirements
-          will change.
-
-          Therefore the architecture deliberately separates:
-
-          1. stable public contracts;
-          2. versioned persistence schema;
-          3. internal implementations;
-          4. policy;
-          5. query interfaces;
-          6. exporters;
-          7. lifecycle management.
-
-          Future migrations should preserve the public contract and perform
-          explicit schema migrations rather than silently changing stored
-          semantics.
-
-          ## Boundary
-
-          This subsystem owns only `observability/`.
-
-          It intentionally does not import or modify `apps/`.
-          MD
-
-      - name: Static source validation
-        shell: bash
-        run: |
-          set -Eeuo pipefail
-
-          cd "${GITHUB_WORKSPACE}"
-
-          test -f observability/__init__.py
-          test -f observability/core.py
-          test -f observability/storage/storage.py
-          test -f observability/monitoring/monitoring.py
-          test -f observability/manager/manager.py
-          test -f observability/api/api.py
-
-          python -B - <<'PY'
-          from pathlib import Path
-
-          root = Path("observability")
-
-          required = [
-              "alerts",
-              "api",
-              "collector",
-              "context",
-              "dashboards",
-              "engine",
-              "events",
-              "exporter",
-              "health",
-              "incidents",
-              "manager",
-              "metrics",
-              "monitoring",
-              "policy",
-              "query",
-              "registry",
-              "reports",
-              "router",
-              "snapshot",
-              "status",
-              "storage",
-          ]
-
-          for package in required:
-              directory = root / package
-              init_file = directory / "__init__.py"
-
-              if not directory.is_dir():
-                  raise SystemExit(
-                      f"missing observability package: {package}"
-                  )
-
-              if not init_file.exists():
-                  raise SystemExit(
-                      f"missing package initializer: {init_file}"
-                  )
-
-          python_files = list(root.rglob("*.py"))
-
-          if not python_files:
-              raise SystemExit(
-                  "observability contains no Python source"
-              )
-
-          empty = [
-              str(path)
-              for path in python_files
-              if path.stat().st_size == 0
-          ]
-
-          if empty:
-              raise SystemExit(
-                  "empty Python files:\n"
-                  + "\n".join(empty)
-              )
-
-          print(
-              f"Validated {len(python_files)} Python files."
-          )
-          PY
-
-      - name: Compile observability
-        shell: bash
-        run: |
-          set -Eeuo pipefail
-
-          cd "${GITHUB_WORKSPACE}"
-
-          python -B -m compileall -q observability
-
-          find observability \
-            -type d \
-            -name '__pycache__' \
-            -prune \
-            -exec rm -rf {} +
-
-          find observability \
-            -type f \
-            \( -name '*.pyc' -o -name '*.pyo' \) \
-            -delete
-
-      - name: Public import validation
-        shell: bash
-        run: |
-          set -Eeuo pipefail
-
-          cd "${GITHUB_WORKSPACE}"
-
-          python -B - <<'PY'
-          import observability
-
-          from observability import (
-              AlertState,
-              CapacityError,
-              ConfigurationError,
-              DeliveryStatus,
-              HealthState,
-              IncidentState,
-              IntegrityError,
-              LifecycleError,
-              MetricKind,
-              MetricSample,
-              ObservationConfig,
-              ObservationContext,
-              ObservationError,
-              ObservationEvent,
-              ObservationPolicy,
-              ObservabilityError,
-              ObservabilityAPI,
-              ObservabilityManager,
-              PersistenceError,
-              SerializationError,
-              ValidationError,
-          )
-
-          assert ObservationError is ObservabilityError
-
-          assert MetricKind.COUNTER.value == "counter"
-          assert HealthState.HEALTHY.value == "healthy"
-          assert AlertState.FIRING.value == "firing"
-          assert IncidentState.OPEN.value == "open"
-          assert DeliveryStatus.ACCEPTED.value == "accepted"
-
-          context = ObservationContext.create(
-              "public",
-              "import",
-          )
-
-          event = ObservationEvent.create(
-              "PUBLIC_IMPORT_TEST",
-              context,
-              {"ok": True},
-          )
-
-          assert event.event_type == (
-              "PUBLIC_IMPORT_TEST"
-          )
-
-          print(
-              "PUBLIC API IMPORT VALIDATION: PASS"
-          )
-          PY
-
-      - name: Run production test suite
-        shell: bash
-        run: |
-          set -Eeuo pipefail
-
-          cd "${GITHUB_WORKSPACE}"
-
-          pytest \
-            -q \
-            observability/tests
-
-      - name: Persistence recovery validation
-        shell: bash
-        run: |
-          set -Eeuo pipefail
-
-          cd "${GITHUB_WORKSPACE}"
-
-          python -B - <<'PY'
-          import tempfile
-          from pathlib import Path
-
-          from observability import (
-              ObservationContext,
-              ObservationEvent,
-          )
-          from observability.storage.storage import (
-              SQLiteObservationStore,
-          )
-
-          with tempfile.TemporaryDirectory() as tmp:
-              database = (
-                  Path(tmp)
-                  / "recovery.db"
-              )
-
-              event = ObservationEvent.create(
-                  "RECOVERY",
-                  ObservationContext.create(
-                      "recovery",
-                      "write",
-                  ),
-                  {"durable": True},
-              )
-
-              store = SQLiteObservationStore(
-                  str(database)
-              )
-
-              sequence = store.append(event)
-
-              assert sequence > 0
-              assert store.count() == 1
-              assert store.integrity_check()
-
-              store.close()
-
-              reopened = (
-                  SQLiteObservationStore(
-                      str(database)
-                  )
-              )
-
-              assert reopened.count() == 1
-              assert reopened.integrity_check()
-
-              records = reopened.query(
-                  event_type="RECOVERY"
-              )
-
-              assert len(records) == 1
-              assert records[0]["event_type"] == (
-                  "RECOVERY"
-              )
-
-              reopened.close()
-
-          print(
-              "PERSISTENCE RECOVERY VALIDATION: PASS"
-          )
-          PY
-
-      - name: Boundary validation — apps must remain untouched
-        shell: bash
-        run: |
-          set -Eeuo pipefail
-
-          cd "${GITHUB_WORKSPACE}"
-
-          if git diff --name-only -- apps/ \
-              | grep -q .; then
-            echo "::error::The observability build modified apps/."
-            git diff --name-only -- apps/
-            exit 1
-          fi
-
-          if git status --porcelain=v1 \
-              | awk '{print $2}' \
-              | grep -E '^apps/'; then
-            echo "::error::Unstaged/staged changes detected in apps/."
-            git status --porcelain=v1
-            exit 1
-          fi
-
-      - name: Boundary validation — only observability may change
-        shell: bash
-        run: |
-          set -Eeuo pipefail
-
-          cd "${GITHUB_WORKSPACE}"
-
-          unexpected="$(
-            git status --porcelain=v1 \
-              | awk '{print $2}' \
-              | grep -v '^observability/' \
-              || true
-          )"
-
-          if [[ -n "${unexpected}" ]]; then
-            echo "::error::Unexpected changes outside observability/:"
-            echo "${unexpected}"
-            exit 1
-          fi
-
-      - name: Remove generated bytecode
-        shell: bash
-        run: |
-          set -Eeuo pipefail
-
-          cd "${GITHUB_WORKSPACE}"
-
-          find observability \
-            -type d \
-            -name '__pycache__' \
-            -prune \
-            -exec rm -rf {} +
-
-          find observability \
-            -type f \
-            \( -name '*.pyc' -o -name '*.pyo' \) \
-            -delete
-
-      - name: Git integrity checks
-        shell: bash
-        run: |
-          set -Eeuo pipefail
-
-          cd "${GITHUB_WORKSPACE}"
-
-          git diff --check
-
-          if git status --porcelain=v1 \
-              | awk '{print $2}' \
-              | grep -E '^apps/'; then
-            echo "::error::apps/ boundary violation."
-            exit 1
-          fi
-
-      - name: Stage observability only
-        shell: bash
-        run: |
-          set -Eeuo pipefail
-
-          cd "${GITHUB_WORKSPACE}"
-
-          git add -A -- observability/
-
-          staged="$(
-            git diff --cached --name-only
-          )"
-
-          if [[ -z "${staged}" ]]; then
-            echo "No observability changes detected."
-            exit 0
-          fi
-
-          unexpected="$(
-            printf '%s\n' "${staged}" \
-              | grep -v '^observability/' \
-              || true
-          )"
-
-          if [[ -n "${unexpected}" ]]; then
-            echo "::error::Staging boundary violation:"
-            echo "${unexpected}"
-            git reset
-            exit 1
-          fi
-
-      - name: Commit observability production foundation
-        shell: bash
-        run: |
-          set -Eeuo pipefail
-
-          cd "${GITHUB_WORKSPACE}"
-
-          if git diff --cached --quiet; then
-            echo "Nothing to commit."
-            exit 0
-          fi
-
-          git config user.name "ZYRA Observability Builder"
-          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-
-          git commit \
-            -m "feat(observability): establish long-term production foundation"
-
-          git push origin \
-            "HEAD:${GITHUB_REF_NAME}"
+              assert sample is not

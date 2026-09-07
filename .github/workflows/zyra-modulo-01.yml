@@ -982,7 +982,8 @@ jobs:
           An attestation is a canonical payload signed with the
           Network's Ed25519 key. Anyone holding the signer public key
           (embedded in the attestation itself) verifies it offline.
-          This is the primitive behind "certification" in the Network.
+          Issuance also publishes a versioned event through the
+          transactional outbox, so other engines can react.
           """
           from __future__ import annotations
 
@@ -995,6 +996,8 @@ jobs:
           from shared_engines.common.identifiers import new_id
           from shared_engines.common.serialization import canonical_json_dumps
           from shared_engines.common.validation import require_non_empty_str
+          from shared_engines.events.contracts import EventCatalog
+          from shared_engines.events.outbox import Outbox
           from shared_engines.storage.database import Database
           from shared_engines.storage.migrations import (
               Migration,
@@ -1060,7 +1063,7 @@ jobs:
 
 
           class AttestationIssuer:
-              """Issues and stores signed attestations, audited."""
+              """Issues and stores signed attestations, audited + evented."""
 
               def __init__(
                   self,
@@ -1068,11 +1071,15 @@ jobs:
                   clock: Clock,
                   signer: Ed25519Signer,
                   audit: AuditTrail,
+                  outbox: Outbox,
+                  catalog: EventCatalog,
               ) -> None:
                   self._db = db
                   self._clock = clock
                   self._signer = signer
                   self._audit = audit
+                  self._outbox = outbox
+                  self._catalog = catalog
                   MigrationRunner(
                       db,
                       "verification.attestations",
@@ -1117,6 +1124,17 @@ jobs:
                               1,
                           ),
                       )
+                      event = self._catalog.build(
+                          EVENT_ATTESTATION_ISSUED,
+                          aggregate_id=attestation_id,
+                          payload={
+                              "attestation_id": attestation_id,
+                              "subject_zid": subject_zid,
+                              "claim": claim,
+                          },
+                          clock=self._clock,
+                      )
+                      self._outbox.enqueue_in_transaction(cursor, event)
                   self._audit.append(
                       event_type=EVENT_ATTESTATION_ISSUED,
                       actor="attestation-issuer",
@@ -1284,7 +1302,12 @@ jobs:
                       catalog=catalog,
                   )
                   self._attestations = AttestationIssuer(
-                      db=db, clock=clock, signer=signer, audit=audit
+                      db=db,
+                      clock=clock,
+                      signer=signer,
+                      audit=audit,
+                      outbox=outbox,
+                      catalog=catalog,
                   )
                   self._metrics = metrics if metrics is not None else NoopMetrics()
                   self._log = engine_logger("verification")
@@ -2018,14 +2041,15 @@ jobs:
 
 
           def test_signature_rejects_wrong_key_and_tampered_data() -> None:
-              signer, public_pem = Ed25519Signer.generate()
-              verifier = Ed25519Verifier(public_pem)
+              signer, _private_pem = Ed25519Signer.generate()
+              verifier = Ed25519Verifier(signer.public_pem)
               data = b"authentic"
               signature = signer.sign(data)
               assert verifier.verify(data, signature)
               assert not verifier.verify(b"tampered", signature)
-              _, other_pem = Ed25519Signer.generate()
-              assert not Ed25519Verifier(other_pem).verify(data, signature)
+              other_signer, _ = Ed25519Signer.generate()
+              other_verifier = Ed25519Verifier(other_signer.public_pem)
+              assert not other_verifier.verify(data, signature)
           PYEOF
 
           echo "=== VERIFICATION BUILD OK ==="
@@ -2054,7 +2078,7 @@ jobs:
           if git diff --cached --quiet; then
             echo "No changes."
           else
-            git commit -m "zyra: module 06 VERIFICATION (media fingerprints, provenance, credential history, Ed25519 attestations) + tests"
+            git commit -m "zyra: module 06 VERIFICATION (media fingerprints, provenance, credential history, Ed25519 attestations + outbox events) + tests"
             git push origin "HEAD:${{ github.ref_name }}"
           fi
           echo "=== MODULE 06 VERIFICATION COMPLETE ==="

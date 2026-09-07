@@ -1,4 +1,4 @@
-name: zyra-modulo-06-verification
+name: zyra-modulo-07-runtime-api
 
 "on":
   workflow_dispatch:
@@ -9,7 +9,7 @@ permissions:
   contents: write
 
 concurrency:
-  group: zyra-modulo-06-${{ github.ref }}
+  group: zyra-modulo-07-${{ github.ref }}
   cancel-in-progress: false
 
 jobs:
@@ -31,7 +31,7 @@ jobs:
           python -m pip install --upgrade pip
           python -m pip install "cryptography>=42,<45" "flake8>=7,<8" "mypy>=1.10,<2" "pytest>=8,<9"
 
-      - name: Check modules 01-05 present
+      - name: Check modules 01-06 present
         run: |
           set -euo pipefail
           test -f shared_engines/common/errors.py
@@ -39,1195 +39,169 @@ jobs:
           test -f shared_engines/events/outbox.py
           test -f shared_engines/audit/chain.py
           test -f shared_engines/identity/engine.py
-          echo "modules 01-05 present: OK"
+          test -f shared_engines/verification/engine.py
+          echo "modules 01-06 present: OK"
 
-      - name: Build shared_engines/verification
+      - name: Build shared_engines/runtime (kernel + HTTP API)
         run: |
           set -euo pipefail
-          mkdir -p shared_engines/verification/tests
+          mkdir -p shared_engines/runtime/tests
 
-          cat > shared_engines/verification/__init__.py <<'PYEOF'
-          """Zyra verification engine.
+          cat > shared_engines/runtime/__init__.py <<'PYEOF'
+          """Zyra runtime: kernel + HTTP API.
 
-          Verifiable authenticity for the Network: documents, photos,
-          videos, audio, signed attestations, verifiable credential
-          history (bank/employer/education records), per-media
-          provenance chains. Third parties verify offline with the
-          Network's public key; every state change is audited.
-          AI-content detection requires real models and arrives as a
-          dedicated engine; this module does not fake it.
+          The kernel is the composition root: it wires storage,
+          events, audit, identity and verification into ONE living
+          system, bootstraps the Root Authority identity, and exposes
+          aggregated health. The API layer serves that system over
+          HTTP with bearer-token auth, strict error mapping and a
+          stable JSON envelope, so third parties (apps, banks,
+          external verifiers) can consume the Network.
           """
           from __future__ import annotations
 
-          from shared_engines.verification.attestations import (
-              Attestation,
-              AttestationIssuer,
-          )
-          from shared_engines.verification.credentials import (
-              CredentialRecord,
-              CredentialRegistry,
-              CredentialType,
-          )
-          from shared_engines.verification.engine import VerificationEngine
-          from shared_engines.verification.errors import (
-              AttestationNotFoundError,
-              CredentialNotFoundError,
-              DocumentNotFoundError,
-              InvalidSignatureError,
-              MediaNotFoundError,
-              ProvenanceError,
-              SigningKeyError,
-              TamperDetectedError,
-              VerificationError,
-          )
-          from shared_engines.verification.media import (
-              MediaKind,
-              MediaPage,
-              MediaRecord,
-              MediaRegistry,
-              content_sha256,
-          )
-          from shared_engines.verification.provenance import (
-              ProvenanceChain,
-              ProvenanceEvent,
-          )
-          from shared_engines.verification.signatures import (
-              Ed25519Signer,
-              Ed25519Verifier,
-          )
+          from shared_engines.runtime.api import ZyraApiHandler
+          from shared_engines.runtime.config import RuntimeConfig
+          from shared_engines.runtime.kernel import ZyraKernel
+          from shared_engines.runtime.responses import ApiError
+          from shared_engines.runtime.server import ZyraServer
 
           __all__ = [
-              "Attestation", "AttestationIssuer", "AttestationNotFoundError",
-              "CredentialNotFoundError", "CredentialRecord",
-              "CredentialRegistry", "CredentialType", "DocumentNotFoundError",
-              "Ed25519Signer", "Ed25519Verifier", "InvalidSignatureError",
-              "MediaKind", "MediaNotFoundError", "MediaPage", "MediaRecord",
-              "MediaRegistry", "ProvenanceChain", "ProvenanceError",
-              "ProvenanceEvent", "SigningKeyError", "TamperDetectedError",
-              "VerificationEngine", "VerificationError", "content_sha256",
+              "ApiError", "RuntimeConfig", "ZyraApiHandler",
+              "ZyraKernel", "ZyraServer",
           ]
           PYEOF
 
-          cat > shared_engines/verification/errors.py <<'PYEOF'
-          """Typed verification errors."""
+          cat > shared_engines/runtime/config.py <<'PYEOF'
+          """Validated runtime configuration.
+
+          Dangerous values fail at construction. The API token is
+          runtime state injected by the composition root (read from
+          the environment there); it is never hardcoded.
+          """
+          from __future__ import annotations
+
+          from dataclasses import dataclass
+
+          from shared_engines.common.errors import ConfigurationError
+          from shared_engines.common.validation import (
+              require_int_range,
+              require_non_empty_str,
+          )
+
+
+          @dataclass(frozen=True)
+          class RuntimeConfig:
+              host: str = "127.0.0.1"
+              port: int = 8080
+              max_body_bytes: int = 1_000_000
+              api_token: str | None = None
+
+              def __post_init__(self) -> None:
+                  require_non_empty_str(self.host, "host", config=True)
+                  require_int_range(self.port, "port", 1, 65535, config=True)
+                  require_int_range(
+                      self.max_body_bytes,
+                      "max_body_bytes",
+                      1,
+                      50_000_000,
+                      config=True,
+                  )
+                  if self.api_token is not None and len(self.api_token) < 16:
+                      raise ConfigurationError(
+                          "api_token must be at least 16 characters"
+                      )
+          PYEOF
+
+          cat > shared_engines/runtime/responses.py <<'PYEOF'
+          """HTTP response envelope and typed-error mapping.
+
+          Success: {"ok": true, "data": ...}
+          Failure: {"ok": false, "error": {"type": ..., "message": ...}}
+
+          Every engine error class maps to exactly one HTTP status so
+          external consumers get stable semantics, not leaks.
+          """
           from __future__ import annotations
 
           from shared_engines.common.errors import (
+              BackpressureError,
               ConfigurationError,
               EngineError,
-              IntegrityError,
-              NotFoundError,
+              PolicyViolation,
+              RecoveryRequired,
+              ValidationError,
           )
-
-
-          class VerificationError(EngineError):
-              """Base for verification engine failures."""
-
-
-          class DocumentNotFoundError(VerificationError, NotFoundError):
-              """No document exists for the given id."""
-
-
-          class MediaNotFoundError(VerificationError, NotFoundError):
-              """No media item exists for the given id."""
-
-
-          class TamperDetectedError(VerificationError, IntegrityError):
-              """Content does not match the registered fingerprint."""
-
-
-          class InvalidSignatureError(VerificationError, IntegrityError):
-              """A signature does not verify against the claimed key."""
-
-
-          class SigningKeyError(VerificationError, ConfigurationError):
-              """A signing/verification key could not be loaded."""
-
-
-          class AttestationNotFoundError(VerificationError, NotFoundError):
-              """No attestation exists for the given id."""
-
-
-          class CredentialNotFoundError(VerificationError, NotFoundError):
-              """No credential exists for the given id."""
-
-
-          class ProvenanceError(VerificationError, IntegrityError):
-              """The provenance chain is broken or inconsistent."""
-          PYEOF
-
-          cat > shared_engines/verification/signatures.py <<'PYEOF'
-          """Ed25519 digital signatures.
-
-          Real asymmetric cryptography: the Network signs with its
-          private key; anyone with the public key verifies. Signatures
-          are compact (64 bytes) and third-party verifiable without
-          any database access.
-          """
-          from __future__ import annotations
-
-          from cryptography.hazmat.primitives import serialization
-          from cryptography.hazmat.primitives.asymmetric.ed25519 import (
-              Ed25519PrivateKey,
-              Ed25519PublicKey,
-          )
-
-          from shared_engines.verification.errors import SigningKeyError
-
-
-          class Ed25519Signer:
-              """Holds the private signing key; signs canonical bytes."""
-
-              def __init__(self, private_pem: bytes) -> None:
-                  try:
-                      key = serialization.load_pem_private_key(
-                          private_pem, password=None
-                      )
-                  except Exception as exc:
-                      raise SigningKeyError(
-                          "private key PEM is not loadable"
-                      ) from exc
-                  if not isinstance(key, Ed25519PrivateKey):
-                      raise SigningKeyError("signing key must be Ed25519")
-                  self._key = key
-
-              @classmethod
-              def generate(cls) -> tuple[Ed25519Signer, bytes]:
-                  """Returns (signer, private_pem). Store the PEM safely."""
-                  private = Ed25519PrivateKey.generate()
-                  private_pem = private.private_bytes(
-                      encoding=serialization.Encoding.PEM,
-                      format=serialization.PrivateFormat.PKCS8,
-                      encryption_algorithm=serialization.NoEncryption(),
-                  )
-                  return cls(private_pem), private_pem
-
-              @property
-              def public_pem(self) -> bytes:
-                  return self._key.public_key().public_bytes(
-                      encoding=serialization.Encoding.PEM,
-                      format=serialization.PublicFormat.SubjectPublicKeyInfo,
-                  )
-
-              def sign(self, data: bytes) -> bytes:
-                  return self._key.sign(data)
-
-
-          class Ed25519Verifier:
-              """Verifies signatures against a public key.
-
-              This is the object a third party uses to check a Zyra
-              attestation offline.
-              """
-
-              def __init__(self, public_pem: bytes) -> None:
-                  try:
-                      key = serialization.load_pem_public_key(public_pem)
-                  except Exception as exc:
-                      raise SigningKeyError(
-                          "public key PEM is not loadable"
-                      ) from exc
-                  if not isinstance(key, Ed25519PublicKey):
-                      raise SigningKeyError(
-                          "verification key must be Ed25519"
-                      )
-                  self._key = key
-
-              def verify(self, data: bytes, signature: bytes) -> bool:
-                  try:
-                      self._key.verify(signature, data)
-                  except Exception:
-                      return False
-                  return True
-          PYEOF
-
-          cat > shared_engines/verification/media.py <<'PYEOF'
-          """Media registry: photos, videos, audio, documents.
-
-          A media record stores the SHA-256 fingerprint of the
-          ORIGINAL content plus its kind. Later, presenting the
-          content again re-hashes against the registry: mismatch
-          means tampering and is audited + evented. The registry
-          never stores raw content, only fingerprints and metadata.
-          """
-          from __future__ import annotations
-
-          import hashlib
-          import sqlite3
-          from dataclasses import dataclass
-          from enum import Enum
-
-          from shared_engines.audit.chain import AuditTrail
-          from shared_engines.common.clocks import Clock
-          from shared_engines.common.errors import IntegrityError
-          from shared_engines.common.identifiers import new_id
-          from shared_engines.common.validation import require_non_empty_str
-          from shared_engines.events.contracts import EventCatalog
-          from shared_engines.events.outbox import Outbox
-          from shared_engines.storage.database import Database
-          from shared_engines.storage.migrations import (
-              Migration,
-              MigrationRunner,
+          from shared_engines.identity.errors import (
+              IdentityAlreadyExistsError,
+              IdentityNotFoundError,
+              InvalidTransitionError,
           )
           from shared_engines.verification.errors import (
+              AttestationNotFoundError,
+              CredentialNotFoundError,
               MediaNotFoundError,
               TamperDetectedError,
           )
 
-          EVENT_MEDIA_REGISTERED = "verification.media.registered"
-          EVENT_MEDIA_TAMPER = "verification.media.tamper_detected"
 
-          MEDIA_MIGRATIONS = (
-              Migration(
-                  1,
-                  "media",
-                  (
-                      "CREATE TABLE media ("
-                      " media_id TEXT PRIMARY KEY,"
-                      " owner_zid TEXT NOT NULL,"
-                      " kind TEXT NOT NULL,"
-                      " title TEXT NOT NULL,"
-                      " content_sha256 TEXT NOT NULL,"
-                      " content_size INTEGER NOT NULL,"
-                      " content_type TEXT NOT NULL,"
-                      " created_at REAL NOT NULL,"
-                      " contract_version INTEGER NOT NULL)",
-                      "CREATE INDEX media_owner ON media (owner_zid)",
-                      "CREATE INDEX media_kind ON media (kind)",
-                  ),
-              ),
-          )
+          class ApiError(Exception):
+              """Explicit API failure with a stable status and code."""
+
+              def __init__(self, status: int, code: str, message: str) -> None:
+                  super().__init__(message)
+                  self.status = status
+                  self.code = code
+                  self.message = message
 
 
-          def content_sha256(content: bytes) -> str:
-              return hashlib.sha256(content).hexdigest()
-
-
-          class MediaKind(Enum):
-              PHOTO = "photo"
-              VIDEO = "video"
-              AUDIO = "audio"
-              DOCUMENT = "document"
-
-
-          @dataclass(frozen=True)
-          class MediaRecord:
-              media_id: str
-              owner_zid: str
-              kind: MediaKind
-              title: str
-              content_sha256: str
-              content_size: int
-              content_type: str
-              created_at: float
-              contract_version: int
-
-
-          @dataclass(frozen=True)
-          class MediaPage:
-              items: tuple[MediaRecord, ...]
-              offset: int
-              limit: int
-              total: int
-
-              @property
-              def has_more(self) -> bool:
-                  return self.offset + len(self.items) < self.total
-
-
-          class MediaRegistry:
-              """Durable registry of content fingerprints, any media kind."""
-
-              def __init__(
-                  self,
-                  db: Database,
-                  clock: Clock,
-                  audit: AuditTrail,
-                  outbox: Outbox,
-                  catalog: EventCatalog,
-              ) -> None:
-                  self._db = db
-                  self._clock = clock
-                  self._audit = audit
-                  self._outbox = outbox
-                  self._catalog = catalog
-                  MigrationRunner(
-                      db, "verification.media", MEDIA_MIGRATIONS
-                  ).run(clock)
-
-              def register(
-                  self,
-                  *,
-                  owner_zid: str,
-                  kind: MediaKind,
-                  title: str,
-                  content: bytes,
-                  content_type: str,
-                  actor: str,
-              ) -> MediaRecord:
-                  require_non_empty_str(owner_zid, "owner_zid")
-                  require_non_empty_str(title, "title")
-                  require_non_empty_str(content_type, "content_type")
-                  require_non_empty_str(actor, "actor")
-                  sha = content_sha256(content)
-                  media_id = f"MED-{new_id()}"
-                  now = self._clock.now()
-                  with self._db.transaction() as cursor:
-                      cursor.execute(
-                          "INSERT INTO media"
-                          " (media_id, owner_zid, kind, title,"
-                          "  content_sha256, content_size, content_type,"
-                          "  created_at, contract_version)"
-                          " VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
-                          (
-                              media_id,
-                              owner_zid,
-                              kind.value,
-                              title,
-                              sha,
-                              len(content),
-                              content_type,
-                              now,
-                              1,
-                          ),
-                      )
-                      event = self._catalog.build(
-                          EVENT_MEDIA_REGISTERED,
-                          aggregate_id=media_id,
-                          payload={
-                              "media_id": media_id,
-                              "owner_zid": owner_zid,
-                              "kind": kind.value,
-                              "content_sha256": sha,
-                              "content_type": content_type,
-                          },
-                          clock=self._clock,
-                      )
-                      self._outbox.enqueue_in_transaction(cursor, event)
-                  self._audit.append(
-                      event_type=EVENT_MEDIA_REGISTERED,
-                      actor=actor,
-                      subject=media_id,
-                      payload={
-                          "content_sha256": sha,
-                          "owner_zid": owner_zid,
-                      },
-                  )
-                  record = self.get(media_id)
-                  if record is None:
-                      raise IntegrityError("media vanished after insert")
-                  return record
-
-              def get(self, media_id: str) -> MediaRecord | None:
-                  row = self._db.query_one(
-                      "SELECT * FROM media WHERE media_id = ?", (media_id,)
-                  )
-                  if row is None:
-                      return None
-                  return self._record_from_row(row)
-
-              def verify_content(
-                  self, media_id: str, content: bytes
-              ) -> MediaRecord:
-                  record = self.get(media_id)
-                  if record is None:
-                      raise MediaNotFoundError(
-                          f"unknown media: {media_id}"
-                      )
-                  current = content_sha256(content)
-                  if current != record.content_sha256:
-                      self._audit.append(
-                          event_type=EVENT_MEDIA_TAMPER,
-                          actor="verification-engine",
-                          subject=media_id,
-                          payload={
-                              "expected_sha256": record.content_sha256,
-                              "observed_sha256": current,
-                          },
-                      )
-                      event = self._catalog.build(
-                          EVENT_MEDIA_TAMPER,
-                          aggregate_id=media_id,
-                          payload={
-                              "expected_sha256": record.content_sha256,
-                              "observed_sha256": current,
-                          },
-                          clock=self._clock,
-                      )
-                      self._outbox.enqueue(event)
-                      raise TamperDetectedError(
-                          f"content hash mismatch for {media_id}:"
-                          " the media does not match the registry"
-                      )
-                  return record
-
-              def list_by_owner(
-                  self,
-                  owner_zid: str,
-                  *,
-                  offset: int = 0,
-                  limit: int = 50,
-              ) -> MediaPage:
-                  total_row = self._db.query_one(
-                      "SELECT COUNT(*) AS n FROM media WHERE owner_zid = ?",
-                      (owner_zid,),
-                  )
-                  total = int(total_row["n"]) if total_row is not None else 0
-                  rows = self._db.query_all(
-                      "SELECT * FROM media WHERE owner_zid = ?"
-                      " ORDER BY created_at, media_id LIMIT ? OFFSET ?",
-                      (owner_zid, limit, offset),
-                  )
-                  items = tuple(self._record_from_row(row) for row in rows)
-                  return MediaPage(
-                      items=items, offset=offset, limit=limit, total=total
-                  )
-
-              @staticmethod
-              def _record_from_row(row: sqlite3.Row) -> MediaRecord:
-                  return MediaRecord(
-                      media_id=str(row["media_id"]),
-                      owner_zid=str(row["owner_zid"]),
-                      kind=MediaKind(str(row["kind"])),
-                      title=str(row["title"]),
-                      content_sha256=str(row["content_sha256"]),
-                      content_size=int(row["content_size"]),
-                      content_type=str(row["content_type"]),
-                      created_at=float(row["created_at"]),
-                      contract_version=int(row["contract_version"]),
-                  )
-          PYEOF
-
-          cat > shared_engines/verification/provenance.py <<'PYEOF'
-          """Content provenance: tamper-evident chain of custody.
-
-          Every action on a media item (registered, transferred,
-          annotated, verified, attested) is appended to a
-          hash-chained log specific to that media. Anyone can verify
-          the chain integrity by recomputing hashes from the events,
-          without access to the storage.
-          """
-          from __future__ import annotations
-
-          from dataclasses import dataclass
-
-          from shared_engines.common.clocks import Clock
-          from shared_engines.common.identifiers import stable_hash
-          from shared_engines.common.validation import require_non_empty_str
-          from shared_engines.storage.database import Database
-          from shared_engines.storage.migrations import (
-              Migration,
-              MigrationRunner,
-          )
-
-          GENESIS_HASH = "0" * 64
-
-          PROVENANCE_MIGRATIONS = (
-              Migration(
-                  1,
-                  "provenance",
-                  (
-                      "CREATE TABLE media_provenance ("
-                      " sequence INTEGER NOT NULL,"
-                      " media_id TEXT NOT NULL,"
-                      " actor_zid TEXT NOT NULL,"
-                      " action TEXT NOT NULL,"
-                      " detail TEXT NOT NULL,"
-                      " occurred_at REAL NOT NULL,"
-                      " previous_hash TEXT NOT NULL,"
-                      " event_hash TEXT NOT NULL,"
-                      " PRIMARY KEY (media_id, sequence))",
-                      "CREATE INDEX provenance_media"
-                      " ON media_provenance (media_id, sequence)",
-                  ),
-              ),
-          )
-
-
-          @dataclass(frozen=True)
-          class ProvenanceEvent:
-              sequence: int
-              media_id: str
-              actor_zid: str
-              action: str
-              detail: str
-              occurred_at: float
-              previous_hash: str
-              event_hash: str
-
-
-          class ProvenanceChain:
-              """Per-media hash-chained custody log."""
-
-              def __init__(self, db: Database, clock: Clock) -> None:
-                  self._db = db
-                  self._clock = clock
-                  MigrationRunner(
-                      db, "verification.provenance", PROVENANCE_MIGRATIONS
-                  ).run(clock)
-
-              def record(
-                  self,
-                  *,
-                  media_id: str,
-                  actor_zid: str,
-                  action: str,
-                  detail: str,
-              ) -> ProvenanceEvent:
-                  require_non_empty_str(media_id, "media_id")
-                  require_non_empty_str(actor_zid, "actor_zid")
-                  require_non_empty_str(action, "action")
-                  require_non_empty_str(detail, "detail")
-                  with self._db.transaction() as cursor:
-                      last = cursor.execute(
-                          "SELECT sequence, event_hash FROM media_provenance"
-                          " WHERE media_id = ?"
-                          " ORDER BY sequence DESC LIMIT 1",
-                          (media_id,),
-                      ).fetchone()
-                      sequence = (
-                          int(last["sequence"]) + 1
-                          if last is not None
-                          else 1
-                      )
-                      previous = (
-                          str(last["event_hash"])
-                          if last is not None
-                          else GENESIS_HASH
-                      )
-                      occurred_at = self._clock.now()
-                      event_hash = stable_hash(
-                          media_id,
-                          str(sequence),
-                          actor_zid,
-                          action,
-                          detail,
-                          f"{occurred_at:.6f}",
-                          previous,
-                      )
-                      cursor.execute(
-                          "INSERT INTO media_provenance"
-                          " (sequence, media_id, actor_zid, action, detail,"
-                          "  occurred_at, previous_hash, event_hash)"
-                          " VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
-                          (
-                              sequence,
-                              media_id,
-                              actor_zid,
-                              action,
-                              detail,
-                              occurred_at,
-                              previous,
-                              event_hash,
-                          ),
-                      )
-                  return ProvenanceEvent(
-                      sequence=sequence,
-                      media_id=media_id,
-                      actor_zid=actor_zid,
-                      action=action,
-                      detail=detail,
-                      occurred_at=occurred_at,
-                      previous_hash=previous,
-                      event_hash=event_hash,
-                  )
-
-              def history(
-                  self, media_id: str
-              ) -> tuple[ProvenanceEvent, ...]:
-                  rows = self._db.query_all(
-                      "SELECT * FROM media_provenance WHERE media_id = ?"
-                      " ORDER BY sequence",
-                      (media_id,),
-                  )
-                  return tuple(
-                      ProvenanceEvent(
-                          sequence=int(row["sequence"]),
-                          media_id=str(row["media_id"]),
-                          actor_zid=str(row["actor_zid"]),
-                          action=str(row["action"]),
-                          detail=str(row["detail"]),
-                          occurred_at=float(row["occurred_at"]),
-                          previous_hash=str(row["previous_hash"]),
-                          event_hash=str(row["event_hash"]),
-                      )
-                      for row in rows
-                  )
-
-              def verify_history(self, media_id: str) -> bool:
-                  """Recompute the chain; returns False if broken."""
-                  events = self.history(media_id)
-                  previous = GENESIS_HASH
-                  for index, event in enumerate(events, start=1):
-                      if event.sequence != index:
-                          return False
-                      if event.previous_hash != previous:
-                          return False
-                      expected = stable_hash(
-                          event.media_id,
-                          str(event.sequence),
-                          event.actor_zid,
-                          event.action,
-                          event.detail,
-                          f"{event.occurred_at:.6f}",
-                          previous,
-                      )
-                      if event.event_hash != expected:
-                          return False
-                      previous = event.event_hash
-                  return True
-          PYEOF
-
-          cat > shared_engines/verification/credentials.py <<'PYEOF'
-          """Verifiable credential history: bank/employer/education records.
-
-          A bank issues "client X has an active account since 2020";
-          an employer issues "person Y worked here from A to B"; a
-          school issues "degree C". These are DURABLE, REVOCABLE,
-          AUDITED records. Third parties query by subject and receive
-          the full history; integrity is backed by the audit chain.
-          Revocation is explicit, never a silent delete.
-          """
-          from __future__ import annotations
-
-          import sqlite3
-          from dataclasses import dataclass
-          from enum import Enum
-
-          from shared_engines.audit.chain import AuditTrail
-          from shared_engines.common.clocks import Clock
-          from shared_engines.common.errors import IntegrityError
-          from shared_engines.common.identifiers import new_id
-          from shared_engines.common.validation import require_non_empty_str
-          from shared_engines.events.contracts import EventCatalog
-          from shared_engines.events.outbox import Outbox
-          from shared_engines.storage.database import Database
-          from shared_engines.storage.migrations import (
-              Migration,
-              MigrationRunner,
-          )
-          from shared_engines.verification.errors import (
+          _NOT_FOUND_ERRORS = (
+              IdentityNotFoundError,
+              MediaNotFoundError,
+              AttestationNotFoundError,
               CredentialNotFoundError,
           )
 
-          EVENT_CREDENTIAL_ISSUED = "verification.credential.issued"
-          EVENT_CREDENTIAL_REVOKED = "verification.credential.revoked"
 
-          CREDENTIALS_MIGRATIONS = (
-              Migration(
-                  1,
-                  "credentials",
-                  (
-                      "CREATE TABLE credentials ("
-                      " credential_id TEXT PRIMARY KEY,"
-                      " subject_zid TEXT NOT NULL,"
-                      " issuer_zid TEXT NOT NULL,"
-                      " credential_type TEXT NOT NULL,"
-                      " title TEXT NOT NULL,"
-                      " detail TEXT NOT NULL,"
-                      " issued_at REAL NOT NULL,"
-                      " valid_from REAL NOT NULL,"
-                      " valid_until REAL,"
-                      " revoked INTEGER NOT NULL DEFAULT 0,"
-                      " revoked_at REAL,"
-                      " revoked_reason TEXT,"
-                      " contract_version INTEGER NOT NULL)",
-                      "CREATE INDEX credentials_subject"
-                      " ON credentials (subject_zid)",
-                      "CREATE INDEX credentials_issuer"
-                      " ON credentials (issuer_zid)",
-                      "CREATE INDEX credentials_type"
-                      " ON credentials (credential_type)",
-                  ),
-              ),
-          )
-
-
-          class CredentialType(Enum):
-              EMPLOYMENT = "employment"
-              EDUCATION = "education"
-              CERTIFICATION = "certification"
-              REFERENCE = "reference"
-              FINANCIAL = "financial"
-              IDENTITY_DOCUMENT = "identity_document"
-              TRANSACTION_HISTORY = "transaction_history"
-              KYC_VERIFIED = "kyc_verified"
-
-
-          @dataclass(frozen=True)
-          class CredentialRecord:
-              credential_id: str
-              subject_zid: str
-              issuer_zid: str
-              credential_type: CredentialType
-              title: str
-              detail: str
-              issued_at: float
-              valid_from: float
-              valid_until: float | None
-              revoked: bool
-              revoked_at: float | None
-              revoked_reason: str | None
-              contract_version: int
-
-
-          class CredentialRegistry:
-              """Durable credential history per subject, issued by others."""
-
-              def __init__(
-                  self,
-                  db: Database,
-                  clock: Clock,
-                  audit: AuditTrail,
-                  outbox: Outbox,
-                  catalog: EventCatalog,
-              ) -> None:
-                  self._db = db
-                  self._clock = clock
-                  self._audit = audit
-                  self._outbox = outbox
-                  self._catalog = catalog
-                  MigrationRunner(
-                      db, "verification.credentials", CREDENTIALS_MIGRATIONS
-                  ).run(clock)
-
-              def issue(
-                  self,
-                  *,
-                  subject_zid: str,
-                  issuer_zid: str,
-                  credential_type: CredentialType,
-                  title: str,
-                  detail: str,
-                  valid_from: float | None = None,
-                  valid_until: float | None = None,
-              ) -> CredentialRecord:
-                  require_non_empty_str(subject_zid, "subject_zid")
-                  require_non_empty_str(issuer_zid, "issuer_zid")
-                  require_non_empty_str(title, "title")
-                  require_non_empty_str(detail, "detail")
-                  credential_id = f"CRD-{new_id()}"
-                  now = self._clock.now()
-                  valid_from_value = (
-                      valid_from if valid_from is not None else now
-                  )
-                  with self._db.transaction() as cursor:
-                      cursor.execute(
-                          "INSERT INTO credentials"
-                          " (credential_id, subject_zid, issuer_zid,"
-                          "  credential_type, title, detail, issued_at,"
-                          "  valid_from, valid_until, revoked,"
-                          "  contract_version)"
-                          " VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 0, ?)",
-                          (
-                              credential_id,
-                              subject_zid,
-                              issuer_zid,
-                              credential_type.value,
-                              title,
-                              detail,
-                              now,
-                              valid_from_value,
-                              valid_until,
-                              1,
-                          ),
-                      )
-                      event = self._catalog.build(
-                          EVENT_CREDENTIAL_ISSUED,
-                          aggregate_id=credential_id,
-                          payload={
-                              "credential_id": credential_id,
-                              "subject_zid": subject_zid,
-                              "issuer_zid": issuer_zid,
-                              "credential_type": credential_type.value,
-                              "title": title,
-                          },
-                          clock=self._clock,
-                      )
-                      self._outbox.enqueue_in_transaction(cursor, event)
-                  self._audit.append(
-                      event_type=EVENT_CREDENTIAL_ISSUED,
-                      actor=issuer_zid,
-                      subject=credential_id,
-                      payload={
-                          "subject_zid": subject_zid,
-                          "credential_type": credential_type.value,
-                      },
-                  )
-                  record = self.get(credential_id)
-                  if record is None:
-                      raise IntegrityError(
-                          "credential vanished after insert"
-                      )
-                  return record
-
-              def get(self, credential_id: str) -> CredentialRecord | None:
-                  row = self._db.query_one(
-                      "SELECT * FROM credentials WHERE credential_id = ?",
-                      (credential_id,),
-                  )
-                  if row is None:
-                      return None
-                  return self._record_from_row(row)
-
-              def require(self, credential_id: str) -> CredentialRecord:
-                  record = self.get(credential_id)
-                  if record is None:
-                      raise CredentialNotFoundError(
-                          f"unknown credential: {credential_id}"
-                      )
-                  return record
-
-              def revoke(
-                  self,
-                  credential_id: str,
-                  *,
-                  revoked_by: str,
-                  reason: str,
-              ) -> CredentialRecord:
-                  require_non_empty_str(revoked_by, "revoked_by")
-                  require_non_empty_str(reason, "reason")
-                  existing = self.get(credential_id)
-                  if existing is None:
-                      raise CredentialNotFoundError(
-                          f"unknown credential: {credential_id}"
-                      )
-                  if existing.revoked:
-                      raise IntegrityError(
-                          f"credential {credential_id} already revoked"
-                      )
-                  now = self._clock.now()
-                  with self._db.transaction() as cursor:
-                      cursor.execute(
-                          "UPDATE credentials SET revoked = 1,"
-                          " revoked_at = ?, revoked_reason = ?"
-                          " WHERE credential_id = ?",
-                          (now, reason, credential_id),
-                      )
-                      event = self._catalog.build(
-                          EVENT_CREDENTIAL_REVOKED,
-                          aggregate_id=credential_id,
-                          payload={
-                              "credential_id": credential_id,
-                              "reason": reason,
-                          },
-                          clock=self._clock,
-                      )
-                      self._outbox.enqueue_in_transaction(cursor, event)
-                  self._audit.append(
-                      event_type=EVENT_CREDENTIAL_REVOKED,
-                      actor=revoked_by,
-                      subject=credential_id,
-                      payload={"reason": reason},
-                  )
-                  return self.require(credential_id)
-
-              def list_by_subject(
-                  self, subject_zid: str
-              ) -> tuple[CredentialRecord, ...]:
-                  rows = self._db.query_all(
-                      "SELECT * FROM credentials WHERE subject_zid = ?"
-                      " ORDER BY issued_at, credential_id",
-                      (subject_zid,),
-                  )
-                  return tuple(self._record_from_row(row) for row in rows)
-
-              def list_by_issuer(
-                  self, issuer_zid: str
-              ) -> tuple[CredentialRecord, ...]:
-                  rows = self._db.query_all(
-                      "SELECT * FROM credentials WHERE issuer_zid = ?"
-                      " ORDER BY issued_at, credential_id",
-                      (issuer_zid,),
-                  )
-                  return tuple(self._record_from_row(row) for row in rows)
-
-              @staticmethod
-              def _record_from_row(row: sqlite3.Row) -> CredentialRecord:
-                  valid_until = row["valid_until"]
-                  revoked_at = row["revoked_at"]
-                  revoked_reason = row["revoked_reason"]
-                  return CredentialRecord(
-                      credential_id=str(row["credential_id"]),
-                      subject_zid=str(row["subject_zid"]),
-                      issuer_zid=str(row["issuer_zid"]),
-                      credential_type=CredentialType(
-                          str(row["credential_type"])
-                      ),
-                      title=str(row["title"]),
-                      detail=str(row["detail"]),
-                      issued_at=float(row["issued_at"]),
-                      valid_from=float(row["valid_from"]),
-                      valid_until=(
-                          None
-                          if valid_until is None
-                          else float(valid_until)
-                      ),
-                      revoked=bool(int(row["revoked"])),
-                      revoked_at=(
-                          None if revoked_at is None else float(revoked_at)
-                      ),
-                      revoked_reason=(
-                          None
-                          if revoked_reason is None
-                          else str(revoked_reason)
-                      ),
-                      contract_version=int(row["contract_version"]),
-                  )
+          def map_engine_error(exc: EngineError) -> ApiError:
+              """Maps typed engine errors to stable HTTP semantics."""
+              if isinstance(exc, _NOT_FOUND_ERRORS):
+                  return ApiError(404, "not_found", str(exc))
+              if isinstance(exc, (InvalidTransitionError, TamperDetectedError)):
+                  return ApiError(409, "conflict", str(exc))
+              if isinstance(exc, IdentityAlreadyExistsError):
+                  return ApiError(409, "conflict", str(exc))
+              if isinstance(exc, PolicyViolation):
+                  return ApiError(403, "forbidden", str(exc))
+              if isinstance(exc, ValidationError):
+                  return ApiError(400, "invalid_request", str(exc))
+              if isinstance(exc, BackpressureError):
+                  return ApiError(503, "backpressure", str(exc))
+              if isinstance(exc, (RecoveryRequired, ConfigurationError)):
+                  return ApiError(500, "internal_error", "internal state error")
+              return ApiError(500, "internal_error", "internal error")
           PYEOF
 
-          cat > shared_engines/verification/attestations.py <<'PYEOF'
-          """Signed attestations: portable, third-party verifiable claims.
+          cat > shared_engines/runtime/kernel.py <<'PYEOF'
+          """ZyraKernel: the living composition root of the Network.
 
-          An attestation is a canonical payload signed with the
-          Network's Ed25519 key. Anyone holding the signer public key
-          (embedded in the attestation itself) verifies it offline.
-          Issuance also publishes a versioned event through the
-          transactional outbox, so other engines can react.
-          """
-          from __future__ import annotations
-
-          import sqlite3
-          from dataclasses import dataclass
-
-          from shared_engines.audit.chain import AuditTrail
-          from shared_engines.common.clocks import Clock
-          from shared_engines.common.errors import IntegrityError
-          from shared_engines.common.identifiers import new_id
-          from shared_engines.common.serialization import canonical_json_dumps
-          from shared_engines.common.validation import require_non_empty_str
-          from shared_engines.events.contracts import EventCatalog
-          from shared_engines.events.outbox import Outbox
-          from shared_engines.storage.database import Database
-          from shared_engines.storage.migrations import (
-              Migration,
-              MigrationRunner,
-          )
-          from shared_engines.verification.signatures import (
-              Ed25519Signer,
-              Ed25519Verifier,
-          )
-
-          ATTESTATION_FORMAT = "zyra.attestation.v1"
-          EVENT_ATTESTATION_ISSUED = "verification.attestation.issued"
-
-          ATTESTATION_MIGRATIONS = (
-              Migration(
-                  1,
-                  "attestations",
-                  (
-                      "CREATE TABLE attestations ("
-                      " attestation_id TEXT PRIMARY KEY,"
-                      " subject_zid TEXT NOT NULL,"
-                      " claim TEXT NOT NULL,"
-                      " subject_sha256 TEXT,"
-                      " issued_at REAL NOT NULL,"
-                      " signature BLOB NOT NULL,"
-                      " signer_public_pem BLOB NOT NULL,"
-                      " contract_version INTEGER NOT NULL)",
-                      "CREATE INDEX attestations_subject"
-                      " ON attestations (subject_zid)",
-                  ),
-              ),
-          )
-
-
-          @dataclass(frozen=True)
-          class Attestation:
-              attestation_id: str
-              subject_zid: str
-              claim: str
-              subject_sha256: str | None
-              issued_at: float
-              signature: bytes
-              signer_public_pem: bytes
-              contract_version: int
-
-
-          def _canonical_bytes(
-              attestation_id: str,
-              subject_zid: str,
-              claim: str,
-              subject_sha256: str | None,
-              issued_at: float,
-          ) -> bytes:
-              payload = {
-                  "format": ATTESTATION_FORMAT,
-                  "attestation_id": attestation_id,
-                  "subject_zid": subject_zid,
-                  "claim": claim,
-                  "subject_sha256": subject_sha256,
-                  "issued_at": f"{issued_at:.6f}",
-              }
-              return canonical_json_dumps(payload).encode("utf-8")
-
-
-          class AttestationIssuer:
-              """Issues and stores signed attestations, audited + evented."""
-
-              def __init__(
-                  self,
-                  db: Database,
-                  clock: Clock,
-                  signer: Ed25519Signer,
-                  audit: AuditTrail,
-                  outbox: Outbox,
-                  catalog: EventCatalog,
-              ) -> None:
-                  self._db = db
-                  self._clock = clock
-                  self._signer = signer
-                  self._audit = audit
-                  self._outbox = outbox
-                  self._catalog = catalog
-                  MigrationRunner(
-                      db,
-                      "verification.attestations",
-                      ATTESTATION_MIGRATIONS,
-                  ).run(clock)
-
-              def issue(
-                  self,
-                  *,
-                  subject_zid: str,
-                  claim: str,
-                  subject_sha256: str | None = None,
-              ) -> Attestation:
-                  require_non_empty_str(subject_zid, "subject_zid")
-                  require_non_empty_str(claim, "claim")
-                  attestation_id = f"ATT-{new_id()}"
-                  issued_at = self._clock.now()
-                  data = _canonical_bytes(
-                      attestation_id,
-                      subject_zid,
-                      claim,
-                      subject_sha256,
-                      issued_at,
-                  )
-                  signature = self._signer.sign(data)
-                  public_pem = self._signer.public_pem
-                  with self._db.transaction() as cursor:
-                      cursor.execute(
-                          "INSERT INTO attestations"
-                          " (attestation_id, subject_zid, claim,"
-                          "  subject_sha256, issued_at, signature,"
-                          "  signer_public_pem, contract_version)"
-                          " VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
-                          (
-                              attestation_id,
-                              subject_zid,
-                              claim,
-                              subject_sha256,
-                              issued_at,
-                              signature,
-                              public_pem,
-                              1,
-                          ),
-                      )
-                      event = self._catalog.build(
-                          EVENT_ATTESTATION_ISSUED,
-                          aggregate_id=attestation_id,
-                          payload={
-                              "attestation_id": attestation_id,
-                              "subject_zid": subject_zid,
-                              "claim": claim,
-                          },
-                          clock=self._clock,
-                      )
-                      self._outbox.enqueue_in_transaction(cursor, event)
-                  self._audit.append(
-                      event_type=EVENT_ATTESTATION_ISSUED,
-                      actor="attestation-issuer",
-                      subject=attestation_id,
-                      payload={
-                          "subject_zid": subject_zid,
-                          "claim": claim,
-                      },
-                  )
-                  stored = self.get(attestation_id)
-                  if stored is None:
-                      raise IntegrityError(
-                          "attestation vanished after insert"
-                      )
-                  return stored
-
-              def get(self, attestation_id: str) -> Attestation | None:
-                  row = self._db.query_one(
-                      "SELECT * FROM attestations WHERE attestation_id = ?",
-                      (attestation_id,),
-                  )
-                  if row is None:
-                      return None
-                  return self._attestation_from_row(row)
-
-              def list_by_subject(
-                  self, subject_zid: str
-              ) -> tuple[Attestation, ...]:
-                  rows = self._db.query_all(
-                      "SELECT * FROM attestations WHERE subject_zid = ?"
-                      " ORDER BY issued_at, attestation_id",
-                      (subject_zid,),
-                  )
-                  return tuple(
-                      self._attestation_from_row(row) for row in rows
-                  )
-
-              @staticmethod
-              def verify(attestation: Attestation) -> bool:
-                  """Third-party verification: canonical bytes + key.
-
-                  Works offline: the public key travels inside the
-                  attestation itself.
-                  """
-                  data = _canonical_bytes(
-                      attestation.attestation_id,
-                      attestation.subject_zid,
-                      attestation.claim,
-                      attestation.subject_sha256,
-                      attestation.issued_at,
-                  )
-                  verifier = Ed25519Verifier(attestation.signer_public_pem)
-                  return verifier.verify(data, attestation.signature)
-
-              @staticmethod
-              def _attestation_from_row(row: sqlite3.Row) -> Attestation:
-                  subject_sha256 = row["subject_sha256"]
-                  return Attestation(
-                      attestation_id=str(row["attestation_id"]),
-                      subject_zid=str(row["subject_zid"]),
-                      claim=str(row["claim"]),
-                      subject_sha256=(
-                          None
-                          if subject_sha256 is None
-                          else str(subject_sha256)
-                      ),
-                      issued_at=float(row["issued_at"]),
-                      signature=bytes(row["signature"]),
-                      signer_public_pem=bytes(row["signer_public_pem"]),
-                      contract_version=int(row["contract_version"]),
-                  )
-          PYEOF
-
-          cat > shared_engines/verification/engine.py <<'PYEOF'
-          """Verification engine: the public facade of the capability.
-
-          Media fingerprints detect tampering inside the Network.
-          Provenance chains prove custody per media item. Credential
-          history lets banks, employers and institutions issue
-          verifiable records about their clients/employees.
-          Attestations are portable signed statements that third
-          parties verify offline. AI-content detection requires real
-          models and arrives as a dedicated engine; this facade does
-          not fake it.
+          Builds and owns every engine over one durable database,
+          registers a central event catalog, bootstraps the Root
+          Authority identity (the Network's own ACTIVE institution),
+          and aggregates component health. This is the object the
+          HTTP layer serves; nothing else needs to know the wiring.
           """
           from __future__ import annotations
 
           from shared_engines.audit.chain import AuditTrail
           from shared_engines.common.clocks import Clock
-          from shared_engines.common.errors import PolicyViolation
           from shared_engines.events.contracts import EventCatalog
           from shared_engines.events.outbox import Outbox
-          from shared_engines.identity.contracts import IdentityStatus
+          from shared_engines.identity.contracts import (
+              Identity,
+              IdentityKind,
+              IdentityStatus,
+          )
           from shared_engines.identity.engine import IdentityEngine
           from shared_engines.observability.backend import (
               MetricsBackend,
@@ -1236,828 +210,1078 @@ jobs:
           )
           from shared_engines.observability.health import (
               ComponentHealth,
+              HealthCheck,
+              HealthRegistry,
               HealthStatus,
           )
+          from shared_engines.runtime.config import RuntimeConfig
           from shared_engines.storage.database import Database
-          from shared_engines.verification.attestations import (
-              Attestation,
-              AttestationIssuer,
-          )
-          from shared_engines.verification.credentials import (
-              CredentialRecord,
-              CredentialRegistry,
-              CredentialType,
-          )
-          from shared_engines.verification.errors import (
-              AttestationNotFoundError,
-              MediaNotFoundError,
-          )
-          from shared_engines.verification.media import (
-              MediaKind,
-              MediaPage,
-              MediaRecord,
-              MediaRegistry,
-          )
-          from shared_engines.verification.provenance import (
-              ProvenanceChain,
-              ProvenanceEvent,
-          )
-          from shared_engines.verification.signatures import (
-              Ed25519Signer,
-              Ed25519Verifier,
+          from shared_engines.verification.engine import VerificationEngine
+          from shared_engines.verification.signatures import Ed25519Signer
+
+          NETWORK_EVENT_TYPES = (
+              "identity.registered",
+              "identity.status_changed",
+              "verification.media.registered",
+              "verification.media.tamper_detected",
+              "verification.credential.issued",
+              "verification.credential.revoked",
+              "verification.attestation.issued",
           )
 
 
-          class VerificationEngine:
+          class _StorageHealth:
+              """Reports storage liveness through the adapter's ping."""
+
+              def __init__(self, db: Database) -> None:
+                  self._db = db
+
+              def check_health(self) -> ComponentHealth:
+                  if self._db.ping():
+                      return ComponentHealth(
+                          "storage", HealthStatus.HEALTHY, "ping ok"
+                      )
+                  return ComponentHealth(
+                      "storage", HealthStatus.UNHEALTHY, "ping failed"
+                  )
+
+
+          class ZyraKernel:
+              """Owns the engines; serves as the single source of truth."""
+
               def __init__(
                   self,
                   *,
                   db: Database,
                   clock: Clock,
                   signer: Ed25519Signer,
-                  audit: AuditTrail,
-                  outbox: Outbox,
-                  catalog: EventCatalog,
-                  identity: IdentityEngine,
+                  config: RuntimeConfig,
                   metrics: MetricsBackend | None = None,
               ) -> None:
-                  self._db = db
+                  self._config = config
                   self._clock = clock
-                  self._signer = signer
-                  self._audit = audit
-                  self._identity = identity
-                  self._media = MediaRegistry(
+                  self._db = db
+                  self._metrics = metrics if metrics is not None else NoopMetrics()
+                  self._log = engine_logger("runtime")
+                  self._audit = AuditTrail(db, clock)
+                  self._outbox = Outbox(db, clock)
+                  self._outbox.ensure_schema()
+                  self._catalog = EventCatalog()
+                  for event_type in NETWORK_EVENT_TYPES:
+                      self._catalog.register(event_type)
+                  self._identity = IdentityEngine(
                       db=db,
                       clock=clock,
-                      audit=audit,
-                      outbox=outbox,
-                      catalog=catalog,
+                      audit=self._audit,
+                      outbox=self._outbox,
+                      catalog=self._catalog,
+                      metrics=self._metrics,
                   )
-                  self._provenance = ProvenanceChain(db=db, clock=clock)
-                  self._credentials = CredentialRegistry(
-                      db=db,
-                      clock=clock,
-                      audit=audit,
-                      outbox=outbox,
-                      catalog=catalog,
-                  )
-                  self._attestations = AttestationIssuer(
+                  self._verification = VerificationEngine(
                       db=db,
                       clock=clock,
                       signer=signer,
-                      audit=audit,
-                      outbox=outbox,
-                      catalog=catalog,
+                      audit=self._audit,
+                      outbox=self._outbox,
+                      catalog=self._catalog,
+                      identity=self._identity,
+                      metrics=self._metrics,
                   )
-                  self._metrics = metrics if metrics is not None else NoopMetrics()
-                  self._log = engine_logger("verification")
+                  self._health = HealthRegistry()
+                  self._health.register("storage", _StorageHealth(db))
+                  self._health.register("identity", self._identity)
+                  self._health.register("verification", self._verification)
+                  self._root_zid: str | None = None
 
-              def register_media(
-                  self,
-                  *,
-                  owner_zid: str,
-                  kind: MediaKind,
-                  title: str,
-                  content: bytes,
-                  content_type: str,
-                  actor: str,
-              ) -> MediaRecord:
-                  self._identity.require_identity(owner_zid)
-                  record = self._media.register(
-                      owner_zid=owner_zid,
-                      kind=kind,
-                      title=title,
-                      content=content,
-                      content_type=content_type,
-                      actor=actor,
-                  )
-                  self._provenance.record(
-                      media_id=record.media_id,
-                      actor_zid=actor,
-                      action="registered",
-                      detail=f"kind={kind.value} title={title}",
-                  )
-                  self._metrics.increment(
-                      "verification.media.registered",
-                      tags={"kind": kind.value},
-                  )
-                  self._log.info("registered media=%s", record.media_id)
-                  return record
+              @property
+              def config(self) -> RuntimeConfig:
+                  return self._config
 
-              def verify_media(
-                  self, media_id: str, content: bytes
-              ) -> MediaRecord:
-                  record = self._media.verify_content(media_id, content)
-                  self._provenance.record(
-                      media_id=media_id,
-                      actor_zid="verification-engine",
-                      action="verified",
-                      detail="content matches registry",
-                  )
-                  self._metrics.increment(
-                      "verification.media.verified"
-                  )
-                  self._log.info("verified media=%s", media_id)
-                  return record
+              @property
+              def identity(self) -> IdentityEngine:
+                  return self._identity
 
-              def get_media(self, media_id: str) -> MediaRecord | None:
-                  return self._media.get(media_id)
+              @property
+              def verification(self) -> VerificationEngine:
+                  return self._verification
 
-              def list_media(
-                  self,
-                  owner_zid: str,
-                  *,
-                  offset: int = 0,
-                  limit: int = 50,
-              ) -> MediaPage:
-                  return self._media.list_by_owner(
-                      owner_zid, offset=offset, limit=limit
+              @property
+              def audit(self) -> AuditTrail:
+                  return self._audit
+
+              @property
+              def outbox(self) -> Outbox:
+                  return self._outbox
+
+              @property
+              def root_zid(self) -> str | None:
+                  return self._root_zid
+
+              def bootstrap_root(
+                  self, *, display_name: str = "Zyra Root Authority"
+              ) -> Identity:
+                  """Creates/returns the Network's own ACTIVE authority.
+
+                  Idempotent: the first call registers + activates it;
+                  later calls return the same identity.
+                  """
+                  if self._root_zid is not None:
+                      return self._identity.require_identity(self._root_zid)
+                  root = self._identity.register_identity(
+                      kind=IdentityKind.INSTITUTION,
+                      display_name=display_name,
+                      actor="kernel",
                   )
-
-              def media_history(
-                  self, media_id: str
-              ) -> tuple[ProvenanceEvent, ...]:
-                  if self._media.get(media_id) is None:
-                      raise MediaNotFoundError(
-                          f"unknown media: {media_id}"
-                      )
-                  return self._provenance.history(media_id)
-
-              def verify_media_history(self, media_id: str) -> bool:
-                  if self._media.get(media_id) is None:
-                      raise MediaNotFoundError(
-                          f"unknown media: {media_id}"
-                      )
-                  return self._provenance.verify_history(media_id)
-
-              def issue_credential(
-                  self,
-                  *,
-                  subject_zid: str,
-                  issuer_zid: str,
-                  credential_type: CredentialType,
-                  title: str,
-                  detail: str,
-                  valid_from: float | None = None,
-                  valid_until: float | None = None,
-              ) -> CredentialRecord:
-                  self._identity.require_identity(subject_zid)
-                  self._identity.require_identity(issuer_zid)
-                  issuer = self._identity.require_identity(issuer_zid)
-                  if issuer.status is not IdentityStatus.ACTIVE:
-                      raise PolicyViolation(
-                          f"issuer {issuer_zid} is not ACTIVE"
-                          f" (status={issuer.status.value})"
-                      )
-                  record = self._credentials.issue(
-                      subject_zid=subject_zid,
-                      issuer_zid=issuer_zid,
-                      credential_type=credential_type,
-                      title=title,
-                      detail=detail,
-                      valid_from=valid_from,
-                      valid_until=valid_until,
+                  self._identity.transition_identity(
+                      root.zid,
+                      IdentityStatus.ACTIVE,
+                      actor="kernel",
+                      reason="root authority bootstrap",
                   )
-                  self._metrics.increment(
-                      "verification.credential.issued",
-                      tags={"type": credential_type.value},
-                  )
-                  self._log.info(
-                      "issued credential=%s", record.credential_id
-                  )
-                  return record
+                  self._root_zid = root.zid
+                  self._log.info("root authority bootstrapped zid=%s", root.zid)
+                  return self._identity.require_identity(root.zid)
 
-              def get_credential(
-                  self, credential_id: str
-              ) -> CredentialRecord | None:
-                  return self._credentials.get(credential_id)
+              def health(self) -> ComponentHealth:
+                  """Worst-status aggregate across all components."""
+                  return self._health.overall()
 
-              def require_credential(
-                  self, credential_id: str
-              ) -> CredentialRecord:
-                  return self._credentials.require(credential_id)
-
-              def revoke_credential(
-                  self,
-                  credential_id: str,
-                  *,
-                  revoked_by: str,
-                  reason: str,
-              ) -> CredentialRecord:
-                  record = self._credentials.revoke(
-                      credential_id, revoked_by=revoked_by, reason=reason
-                  )
-                  self._metrics.increment(
-                      "verification.credential.revoked"
-                  )
-                  self._log.info(
-                      "revoked credential=%s", credential_id
-                  )
-                  return record
-
-              def subject_history(
-                  self, subject_zid: str
-              ) -> tuple[CredentialRecord, ...]:
-                  self._identity.require_identity(subject_zid)
-                  return self._credentials.list_by_subject(subject_zid)
-
-              def issuer_history(
-                  self, issuer_zid: str
-              ) -> tuple[CredentialRecord, ...]:
-                  return self._credentials.list_by_issuer(issuer_zid)
-
-              def issue_attestation(
-                  self,
-                  *,
-                  subject_zid: str,
-                  claim: str,
-                  subject_sha256: str | None = None,
-              ) -> Attestation:
-                  self._identity.require_identity(subject_zid)
-                  attestation = self._attestations.issue(
-                      subject_zid=subject_zid,
-                      claim=claim,
-                      subject_sha256=subject_sha256,
-                  )
-                  self._metrics.increment(
-                      "verification.attestation.issued"
-                  )
-                  self._log.info(
-                      "issued attestation=%s", attestation.attestation_id
-                  )
-                  return attestation
-
-              def require_attestation(self, attestation_id: str) -> Attestation:
-                  stored = self._attestations.get(attestation_id)
-                  if stored is None:
-                      raise AttestationNotFoundError(
-                          f"unknown attestation: {attestation_id}"
-                      )
-                  return stored
-
-              def list_attestations(
-                  self, subject_zid: str
-              ) -> tuple[Attestation, ...]:
-                  return self._attestations.list_by_subject(subject_zid)
-
-              def verify_attestation(self, attestation_id: str) -> bool:
-                  stored = self._attestations.get(attestation_id)
-                  if stored is None:
-                      raise AttestationNotFoundError(
-                          f"unknown attestation: {attestation_id}"
-                      )
-                  ok = AttestationIssuer.verify(stored)
-                  self._metrics.increment(
-                      "verification.attestation.verified",
-                      tags={"result": "ok" if ok else "bad"},
-                  )
-                  self._log.info(
-                      "attestation verified id=%s ok=%s",
-                      attestation_id,
-                      ok,
-                  )
-                  return ok
+              def health_components(self) -> tuple[ComponentHealth, ...]:
+                  return self._health.snapshot()
 
               def check_health(self) -> ComponentHealth:
-                  if not self._db.ping():
-                      return ComponentHealth(
-                          "verification",
-                          HealthStatus.UNHEALTHY,
-                          "storage unavailable",
-                      )
-                  probe = b"verification-health-probe"
-                  try:
-                      signature = self._signer.sign(probe)
-                      ok = Ed25519Verifier(
-                          self._signer.public_pem
-                      ).verify(probe, signature)
-                  except Exception:
-                      return ComponentHealth(
-                          "verification",
-                          HealthStatus.UNHEALTHY,
-                          "signer self-test failed",
-                      )
-                  status = (
-                      HealthStatus.HEALTHY if ok else HealthStatus.UNHEALTHY
-                  )
-                  return ComponentHealth(
-                      "verification", status, "storage + signer ok"
-                  )
+                  """Kernel itself satisfies the HealthCheck protocol."""
+                  return self.health()
           PYEOF
 
-          cat > shared_engines/verification/tests/test_verification.py <<'PYEOF'
+          cat > shared_engines/runtime/api.py <<'PYEOF'
+          """HTTP API over the kernel: stable routes, auth, envelopes.
+
+          Routes (all JSON):
+            GET  /health                                    (no auth)
+            POST /identity/register
+            GET  /identity/{zid}
+            POST /identity/transition
+            POST /verification/media
+            POST /verification/media/verify
+            GET  /verification/media/{media_id}
+            GET  /verification/media/{media_id}/history
+            POST /verification/credentials
+            GET  /verification/credentials/{credential_id}
+            POST /verification/credentials/revoke
+            GET  /verification/subjects/{zid}/credentials
+            POST /verification/attestations
+            POST /verification/attestations/verify
+
+          Auth: if a token is configured, every route except /health
+          requires ``Authorization: Bearer <token>`` compared in
+          constant time. This is the seed of metered API keys.
+          """
           from __future__ import annotations
 
-          from dataclasses import replace
-          from pathlib import Path
+          import base64
+          import hmac
+          import json
+          from typing import Any, ClassVar
+          from urllib.parse import urlparse
+          from http.server import BaseHTTPRequestHandler
 
-          import pytest
-
-          from shared_engines.audit.chain import AuditTrail
-          from shared_engines.common.clocks import FrozenClock
-          from shared_engines.common.errors import PolicyViolation
-          from shared_engines.events.contracts import Event, EventCatalog
-          from shared_engines.events.outbox import Outbox
+          from shared_engines.common.errors import EngineError
+          from shared_engines.common.errors import ValidationError
+          from shared_engines.common.serialization import canonical_json_dumps
           from shared_engines.identity.contracts import (
+              Identity,
               IdentityKind,
               IdentityStatus,
           )
-          from shared_engines.identity.engine import IdentityEngine
-          from shared_engines.identity.errors import IdentityNotFoundError
-          from shared_engines.observability.backend import InMemoryMetrics
-          from shared_engines.observability.health import HealthStatus
-          from shared_engines.storage.database import SQLiteAdapter
-          from shared_engines.verification.attestations import AttestationIssuer
-          from shared_engines.verification.credentials import CredentialType
-          from shared_engines.verification.engine import VerificationEngine
-          from shared_engines.verification.errors import (
-              AttestationNotFoundError,
-              CredentialNotFoundError,
-              MediaNotFoundError,
-              TamperDetectedError,
-          )
-          from shared_engines.verification.media import MediaKind
-          from shared_engines.verification.signatures import (
-              Ed25519Signer,
-              Ed25519Verifier,
-          )
+          from shared_engines.observability.health import ComponentHealth
+          from shared_engines.verification.attestations import Attestation
+          from shared_engines.verification.credentials import CredentialRecord
+          from shared_engines.verification.media import MediaKind, MediaRecord
+          from shared_engines.verification.provenance import ProvenanceEvent
+          from shared_engines.runtime.kernel import ZyraKernel
+          from shared_engines.runtime.responses import ApiError, map_engine_error
 
 
-          class _Harness:
-              def __init__(self, tmp_path: Path) -> None:
-                  self.db = SQLiteAdapter(tmp_path / "verification.db")
-                  self.clock = FrozenClock()
-                  self.audit = AuditTrail(self.db, self.clock)
-                  self.outbox = Outbox(self.db, self.clock)
-                  self.outbox.ensure_schema()
-                  self.catalog = EventCatalog()
-                  for event_type in (
-                      "verification.media.registered",
-                      "verification.media.tamper_detected",
-                      "verification.credential.issued",
-                      "verification.credential.revoked",
-                      "verification.attestation.issued",
-                      "identity.registered",
-                      "identity.status_changed",
+          class ZyraApiHandler(BaseHTTPRequestHandler):
+              """Thread-safe request handler bound to a shared kernel."""
+
+              kernel: ClassVar[ZyraKernel]
+
+              def log_message(self, format: str, *args: object) -> None:
+                  return None
+
+              def do_GET(self) -> None:
+                  self._dispatch("GET")
+
+              def do_POST(self) -> None:
+                  self._dispatch("POST")
+
+              def _dispatch(self, method: str) -> None:
+                  try:
+                      self._route(method)
+                  except ApiError as exc:
+                      self._send_json(exc.status, self._error_body(exc))
+                  except EngineError as exc:
+                      mapped = map_engine_error(exc)
+                      self._send_json(
+                          mapped.status, self._error_body(mapped)
+                      )
+                  except Exception:
+                      self._send_json(
+                          500,
+                          {
+                              "ok": False,
+                              "error": {
+                                  "type": "internal_error",
+                                  "message": "internal error",
+                              },
+                          },
+                      )
+
+              def _route(self, method: str) -> None:
+                  path = urlparse(self.path).path
+                  segments = [s for s in path.split("/") if s]
+                  if segments == ["health"] and method == "GET":
+                      self._handle_health()
+                      return
+                  if not self._authorized():
+                      raise ApiError(401, "unauthorized", "valid bearer token required")
+                  if method == "GET":
+                      self._route_get(segments)
+                  elif method == "POST":
+                      self._route_post(segments)
+                  else:
+                      raise ApiError(405, "method_not_allowed", "unsupported method")
+
+              def _route_get(self, s: list[str]) -> None:
+                  if len(s) == 2 and s[0] == "identity":
+                      self._handle_get_identity(s[1])
+                  elif (
+                      len(s) == 3 and s[0] == "verification"
+                      and s[1] == "media"
                   ):
-                      self.catalog.register(event_type)
-                  signer, _ = Ed25519Signer.generate()
-                  self.identity = IdentityEngine(
-                      db=self.db,
-                      clock=self.clock,
-                      audit=self.audit,
-                      outbox=self.outbox,
-                      catalog=self.catalog,
-                  )
-                  self.metrics = InMemoryMetrics()
-                  self.engine = VerificationEngine(
-                      db=self.db,
-                      clock=self.clock,
-                      signer=signer,
-                      audit=self.audit,
-                      outbox=self.outbox,
-                      catalog=self.catalog,
-                      identity=self.identity,
-                      metrics=self.metrics,
+                      self._handle_get_media(s[2])
+                  elif (
+                      len(s) == 4 and s[0] == "verification"
+                      and s[1] == "media" and s[3] == "history"
+                  ):
+                      self._handle_media_history(s[2])
+                  elif (
+                      len(s) == 3 and s[0] == "verification"
+                      and s[1] == "credentials"
+                  ):
+                      self._handle_get_credential(s[2])
+                  elif (
+                      len(s) == 4 and s[0] == "verification"
+                      and s[1] == "subjects" and s[3] == "credentials"
+                  ):
+                      self._handle_subject_credentials(s[2])
+                  else:
+                      raise ApiError(404, "not_found", "unknown route")
+
+              def _route_post(self, s: list[str]) -> None:
+                  if s == ["identity", "register"]:
+                      self._handle_register_identity()
+                  elif s == ["identity", "transition"]:
+                      self._handle_transition()
+                  elif s == ["verification", "media"]:
+                      self._handle_register_media()
+                  elif s == ["verification", "media", "verify"]:
+                      self._handle_verify_media()
+                  elif s == ["verification", "credentials"]:
+                      self._handle_issue_credential()
+                  elif s == ["verification", "credentials", "revoke"]:
+                      self._handle_revoke_credential()
+                  elif s == ["verification", "attestations"]:
+                      self._handle_issue_attestation()
+                  elif s == ["verification", "attestations", "verify"]:
+                      self._handle_verify_attestation()
+                  else:
+                      raise ApiError(404, "not_found", "unknown route")
+
+              def _authorized(self) -> bool:
+                  token = type(self).kernel.config.api_token
+                  if token is None:
+                      return True
+                  header = self.headers.get("Authorization")
+                  if header is None:
+                      return False
+                  return hmac.compare_digest(header, f"Bearer {token}")
+
+              def _read_json(self) -> dict[str, Any]:
+                  length_header = self.headers.get("Content-Length")
+                  if length_header is None:
+                      raise ApiError(411, "length_required", "Content-Length required")
+                  try:
+                      length = int(length_header)
+                  except ValueError as exc:
+                      raise ApiError(400, "invalid_request", "bad Content-Length") from exc
+                  max_body = type(self).kernel.config.max_body_bytes
+                  if length > max_body:
+                      raise ApiError(413, "payload_too_large", "body exceeds limit")
+                  raw = self.rfile.read(length)
+                  try:
+                      doc = json.loads(raw.decode("utf-8"))
+                  except (UnicodeDecodeError, ValueError) as exc:
+                      raise ApiError(400, "invalid_json", "body is not valid JSON") from exc
+                  if not isinstance(doc, dict):
+                      raise ApiError(400, "invalid_request", "body must be a JSON object")
+                  return doc
+
+              @staticmethod
+              def _require_str(doc: dict[str, Any], key: str) -> str:
+                  value = doc.get(key)
+                  if not isinstance(value, str) or not value.strip():
+                      raise ApiError(
+                          400, "invalid_request", f"missing field: {key}"
+                      )
+                  return value
+
+              @staticmethod
+              def _require_optional_str(
+                  doc: dict[str, Any], key: str
+              ) -> str | None:
+                  value = doc.get(key)
+                  if value is None:
+                      return None
+                  if not isinstance(value, str) or not value.strip():
+                      raise ApiError(
+                          400, "invalid_request", f"invalid field: {key}"
+                      )
+                  return value
+
+              def _send_json(self, status: int, payload: dict[str, Any]) -> None:
+                  body = canonical_json_dumps(payload).encode("utf-8")
+                  self.send_response(status)
+                  self.send_header("Content-Type", "application/json")
+                  self.send_header("Content-Length", str(len(body)))
+                  self.end_headers()
+                  self.wfile.write(body)
+
+              @staticmethod
+              def _error_body(exc: ApiError) -> dict[str, Any]:
+                  return {
+                      "ok": False,
+                      "error": {"type": exc.code, "message": exc.message},
+                  }
+
+              def _ok(self, data: Any, status: int = 200) -> None:
+                  self._send_json(status, {"ok": True, "data": data})
+
+              def _handle_health(self) -> None:
+                  kernel = type(self).kernel
+                  self._ok(
+                      {
+                          "overall": _health_json(kernel.health()),
+                          "components": [
+                              _health_json(c)
+                              for c in kernel.health_components()
+                          ],
+                      }
                   )
 
-              def _activate(self, zid: str) -> None:
-                  self.identity.transition_identity(
+              def _handle_register_identity(self) -> None:
+                  doc = self._read_json()
+                  kind_raw = self._require_str(doc, "kind")
+                  try:
+                      kind = IdentityKind(kind_raw)
+                  except ValueError as exc:
+                      raise ApiError(
+                          400, "invalid_request", "unknown kind"
+                      ) from exc
+                  identity = type(self).kernel.identity.register_identity(
+                      kind=kind,
+                      display_name=self._require_str(doc, "display_name"),
+                      actor=self._require_str(doc, "actor"),
+                  )
+                  self._ok(_identity_json(identity), status=201)
+
+              def _handle_get_identity(self, zid: str) -> None:
+                  identity = type(self).kernel.identity.get_identity(zid)
+                  if identity is None:
+                      raise ApiError(404, "not_found", f"unknown zid: {zid}")
+                  self._ok(_identity_json(identity))
+
+              def _handle_transition(self) -> None:
+                  doc = self._read_json()
+                  zid = self._require_str(doc, "zid")
+                  try:
+                      target = IdentityStatus(self._require_str(doc, "to_status"))
+                  except ValueError as exc:
+                      raise ApiError(
+                          400, "invalid_request", "unknown to_status"
+                      ) from exc
+                  identity = type(self).kernel.identity.transition_identity(
                       zid,
-                      IdentityStatus.ACTIVE,
-                      actor="bootstrap",
-                      reason="onboarded",
+                      target,
+                      actor=self._require_str(doc, "actor"),
+                      reason=self._require_str(doc, "reason"),
                   )
+                  self._ok(_identity_json(identity))
 
-              def active_issuer(self, name: str = "Bank A") -> str:
-                  issuer = self.identity.register_identity(
-                      kind=IdentityKind.INSTITUTION,
-                      display_name=name,
-                      actor="bootstrap",
+              def _handle_register_media(self) -> None:
+                  doc = self._read_json()
+                  kind_raw = self._require_str(doc, "kind")
+                  try:
+                      kind = MediaKind(kind_raw)
+                  except ValueError as exc:
+                      raise ApiError(
+                          400, "invalid_request", "unknown media kind"
+                      ) from exc
+                  content = self._decode_b64(self._require_str(doc, "content_b64"))
+                  record = type(self).kernel.verification.register_media(
+                      owner_zid=self._require_str(doc, "owner_zid"),
+                      kind=kind,
+                      title=self._require_str(doc, "title"),
+                      content=content,
+                      content_type=self._require_str(doc, "content_type"),
+                      actor=self._require_str(doc, "actor"),
                   )
-                  self._activate(issuer.zid)
-                  return issuer.zid
+                  self._ok(_media_json(record), status=201)
 
-              def active_subject(self, name: str = "Client A") -> str:
-                  subject = self.identity.register_identity(
-                      kind=IdentityKind.PERSON,
-                      display_name=name,
-                      actor="registrar",
+              def _handle_verify_media(self) -> None:
+                  doc = self._read_json()
+                  content = self._decode_b64(self._require_str(doc, "content_b64"))
+                  record = type(self).kernel.verification.verify_media(
+                      self._require_str(doc, "media_id"), content
                   )
-                  self._activate(subject.zid)
-                  return subject.zid
+                  self._ok(_media_json(record))
 
-              def close(self) -> None:
-                  self.db.close()
+              def _handle_get_media(self, media_id: str) -> None:
+                  record = type(self).kernel.verification.get_media(media_id)
+                  if record is None:
+                      raise ApiError(
+                          404, "not_found", f"unknown media: {media_id}"
+                      )
+                  self._ok(_media_json(record))
+
+              def _handle_media_history(self, media_id: str) -> None:
+                  history = type(self).kernel.verification.media_history(media_id)
+                  self._ok([_provenance_json(e) for e in history])
+
+              def _handle_issue_credential(self) -> None:
+                  doc = self._read_json()
+                  type_raw = self._require_str(doc, "credential_type")
+                  try:
+                      credential_type = _credential_type(type_raw)
+                  except ValueError as exc:
+                      raise ApiError(
+                          400, "invalid_request", "unknown credential_type"
+                      ) from exc
+                  record = type(self).kernel.verification.issue_credential(
+                      subject_zid=self._require_str(doc, "subject_zid"),
+                      issuer_zid=self._require_str(doc, "issuer_zid"),
+                      credential_type=credential_type,
+                      title=self._require_str(doc, "title"),
+                      detail=self._require_str(doc, "detail"),
+                  )
+                  self._ok(_credential_json(record), status=201)
+
+              def _handle_get_credential(self, credential_id: str) -> None:
+                  record = (
+                      type(self).kernel.verification.get_credential(credential_id)
+                  )
+                  if record is None:
+                      raise ApiError(
+                          404,
+                          "not_found",
+                          f"unknown credential: {credential_id}",
+                      )
+                  self._ok(_credential_json(record))
+
+              def _handle_revoke_credential(self) -> None:
+                  doc = self._read_json()
+                  record = type(self).kernel.verification.revoke_credential(
+                      self._require_str(doc, "credential_id"),
+                      revoked_by=self._require_str(doc, "revoked_by"),
+                      reason=self._require_str(doc, "reason"),
+                  )
+                  self._ok(_credential_json(record))
+
+              def _handle_subject_credentials(self, zid: str) -> None:
+                  history = type(self).kernel.verification.subject_history(zid)
+                  self._ok([_credential_json(c) for c in history])
+
+              def _handle_issue_attestation(self) -> None:
+                  doc = self._read_json()
+                  attestation = type(self).kernel.verification.issue_attestation(
+                      subject_zid=self._require_str(doc, "subject_zid"),
+                      claim=self._require_str(doc, "claim"),
+                      subject_sha256=self._require_optional_str(
+                          doc, "subject_sha256"
+                      ),
+                  )
+                  self._ok(_attestation_json(attestation), status=201)
+
+              def _handle_verify_attestation(self) -> None:
+                  doc = self._read_json()
+                  ok = type(self).kernel.verification.verify_attestation(
+                      self._require_str(doc, "attestation_id")
+                  )
+                  self._ok({"valid": ok})
+
+              @staticmethod
+              def _decode_b64(value: str) -> bytes:
+                  try:
+                      return base64.b64decode(value, validate=True)
+                  except ValueError as exc:
+                      raise ApiError(
+                          400, "invalid_request", "content_b64 is not valid base64"
+                      ) from exc
 
 
-          def test_register_photo_video_audio_document(
-              tmp_path: Path,
-          ) -> None:
-              harness = _Harness(tmp_path)
-              owner = harness.active_subject()
-              photo = harness.engine.register_media(
-                  owner_zid=owner,
-                  kind=MediaKind.PHOTO,
-                  title="profile.jpg",
-                  content=b"\xff\xd8\xff\xe0fake-jpeg-bytes",
-                  content_type="image/jpeg",
-                  actor="clerk",
-              )
-              video = harness.engine.register_media(
-                  owner_zid=owner,
-                  kind=MediaKind.VIDEO,
-                  title="interview.mp4",
-                  content=b"\x00\x00\x00\x18ftypmp42fake-mp4",
-                  content_type="video/mp4",
-                  actor="clerk",
-              )
-              audio = harness.engine.register_media(
-                  owner_zid=owner,
-                  kind=MediaKind.AUDIO,
-                  title="voice.wav",
-                  content=b"RIFFfake-wav",
-                  content_type="audio/wav",
-                  actor="clerk",
-              )
-              document = harness.engine.register_media(
-                  owner_zid=owner,
-                  kind=MediaKind.DOCUMENT,
-                  title="contract.pdf",
-                  content=b"%PDF-1.4 fake-pdf",
-                  content_type="application/pdf",
-                  actor="clerk",
-              )
-              assert photo.kind is MediaKind.PHOTO
-              assert video.kind is MediaKind.VIDEO
-              assert audio.kind is MediaKind.AUDIO
-              assert document.kind is MediaKind.DOCUMENT
-              ids = {
-                  photo.media_id,
-                  video.media_id,
-                  audio.media_id,
-                  document.media_id,
+          def _credential_type(value: str) -> object:
+              from shared_engines.verification.credentials import CredentialType
+
+              return CredentialType(value)
+
+
+          def _health_json(component: ComponentHealth) -> dict[str, object]:
+              return {
+                  "component": component.component,
+                  "status": component.status.value,
+                  "detail": component.detail,
               }
-              assert len(ids) == 4
-              harness.close()
 
 
-          def test_media_tampering_detected_for_any_kind(
-              tmp_path: Path,
-          ) -> None:
-              harness = _Harness(tmp_path)
-              owner = harness.active_subject()
-              photo = harness.engine.register_media(
-                  owner_zid=owner,
-                  kind=MediaKind.PHOTO,
-                  title="original.jpg",
-                  content=b"original-jpeg",
-                  content_type="image/jpeg",
-                  actor="clerk",
-              )
-              with pytest.raises(TamperDetectedError):
-                  harness.engine.verify_media(
-                      photo.media_id, b"photoshopped-jpeg"
-                  )
-              video = harness.engine.register_media(
-                  owner_zid=owner,
-                  kind=MediaKind.VIDEO,
-                  title="original.mp4",
-                  content=b"original-mp4",
-                  content_type="video/mp4",
-                  actor="clerk",
-              )
-              with pytest.raises(TamperDetectedError):
-                  harness.engine.verify_media(
-                      video.media_id, b"deepfake-mp4"
-                  )
-              harness.close()
-
-
-          def test_media_history_chain_verifiable(tmp_path: Path) -> None:
-              harness = _Harness(tmp_path)
-              owner = harness.active_subject()
-              media = harness.engine.register_media(
-                  owner_zid=owner,
-                  kind=MediaKind.PHOTO,
-                  title="evidence.jpg",
-                  content=b"evidence-bytes",
-                  content_type="image/jpeg",
-                  actor="uploader-1",
-              )
-              harness.engine.verify_media(media.media_id, b"evidence-bytes")
-              history = harness.engine.media_history(media.media_id)
-              assert len(history) == 2
-              assert history[0].action == "registered"
-              assert history[1].action == "verified"
-              assert harness.engine.verify_media_history(media.media_id)
-              harness.close()
-
-
-          def test_credential_history_for_bank_client(
-              tmp_path: Path,
-          ) -> None:
-              harness = _Harness(tmp_path)
-              bank = harness.active_issuer("Global Bank")
-              client = harness.active_subject("Client X")
-              harness.engine.issue_credential(
-                  subject_zid=client,
-                  issuer_zid=bank,
-                  credential_type=CredentialType.KYC_VERIFIED,
-                  title="KYC completed",
-                  detail="Identity verified in person",
-              )
-              harness.engine.issue_credential(
-                  subject_zid=client,
-                  issuer_zid=bank,
-                  credential_type=CredentialType.FINANCIAL,
-                  title="Active account",
-                  detail="Checking account active since 2020",
-              )
-              employer = harness.active_issuer("Tech Corp")
-              harness.engine.issue_credential(
-                  subject_zid=client,
-                  issuer_zid=employer,
-                  credential_type=CredentialType.EMPLOYMENT,
-                  title="Senior Engineer",
-                  detail="Employed from 2021 to present",
-              )
-              history = harness.engine.subject_history(client)
-              assert len(history) == 3
-              types = {c.credential_type for c in history}
-              assert types == {
-                  CredentialType.KYC_VERIFIED,
-                  CredentialType.FINANCIAL,
-                  CredentialType.EMPLOYMENT,
+          def _identity_json(identity: Identity) -> dict[str, object]:
+              return {
+                  "zid": identity.zid,
+                  "kind": identity.kind.value,
+                  "status": identity.status.value,
+                  "display_name": identity.display_name,
+                  "created_at": identity.created_at,
+                  "updated_at": identity.updated_at,
+                  "contract_version": identity.contract_version,
               }
-              issuers = {c.issuer_zid for c in history}
-              assert issuers == {bank, employer}
-              assert all(not c.revoked for c in history)
-              harness.close()
 
 
-          def test_credential_revocation_is_explicit(
-              tmp_path: Path,
-          ) -> None:
-              harness = _Harness(tmp_path)
-              issuer = harness.active_issuer("Cert Body")
-              subject = harness.active_subject("Certified Person")
-              credential = harness.engine.issue_credential(
-                  subject_zid=subject,
-                  issuer_zid=issuer,
-                  credential_type=CredentialType.CERTIFICATION,
-                  title="ISO 27001 Auditor",
-                  detail="Valid for 3 years",
-              )
-              assert not credential.revoked
-              revoked = harness.engine.revoke_credential(
-                  credential.credential_id,
-                  revoked_by=issuer,
-                  reason="Misconduct detected",
-              )
-              assert revoked.revoked
-              assert revoked.revoked_reason == "Misconduct detected"
-              history = harness.engine.subject_history(subject)
-              assert len(history) == 1
-              assert history[0].revoked
-              harness.close()
-
-
-          def test_issuer_must_be_active(tmp_path: Path) -> None:
-              harness = _Harness(tmp_path)
-              dormant_issuer = harness.identity.register_identity(
-                  kind=IdentityKind.INSTITUTION,
-                  display_name="Not Yet Active Corp",
-                  actor="bootstrap",
-              )
-              subject = harness.active_subject("Client Y")
-              with pytest.raises(PolicyViolation):
-                  harness.engine.issue_credential(
-                      subject_zid=subject,
-                      issuer_zid=dormant_issuer.zid,
-                      credential_type=CredentialType.REFERENCE,
-                      title="Ref",
-                      detail="Should fail: issuer not ACTIVE",
-                  )
-              harness.close()
-
-
-          def test_subject_must_exist(tmp_path: Path) -> None:
-              harness = _Harness(tmp_path)
-              issuer = harness.active_issuer()
-              with pytest.raises(IdentityNotFoundError):
-                  harness.engine.issue_credential(
-                      subject_zid="ZID-ghost",
-                      issuer_zid=issuer,
-                      credential_type=CredentialType.REFERENCE,
-                      title="x",
-                      detail="y",
-                  )
-              harness.close()
-
-
-          def test_credential_not_found(tmp_path: Path) -> None:
-              harness = _Harness(tmp_path)
-              with pytest.raises(CredentialNotFoundError):
-                  harness.engine.require_credential("CRD-missing")
-              with pytest.raises(CredentialNotFoundError):
-                  harness.engine.revoke_credential(
-                      "CRD-missing",
-                      revoked_by="anyone",
-                      reason="no reason",
-                  )
-              harness.close()
-
-
-          def test_attestation_third_party_verifiable(
-              tmp_path: Path,
-          ) -> None:
-              harness = _Harness(tmp_path)
-              subject = harness.active_subject()
-              attestation = harness.engine.issue_attestation(
-                  subject_zid=subject,
-                  claim="identity_active",
-              )
-              assert AttestationIssuer.verify(attestation) is True
-              forged = replace(attestation, claim="forged")
-              assert AttestationIssuer.verify(forged) is False
-              assert (
-                  harness.engine.verify_attestation(
-                      attestation.attestation_id
-                  )
-                  is True
-              )
-              harness.close()
-
-
-          def test_attestation_binds_media_content(
-              tmp_path: Path,
-          ) -> None:
-              harness = _Harness(tmp_path)
-              owner = harness.active_subject()
-              media = harness.engine.register_media(
-                  owner_zid=owner,
-                  kind=MediaKind.DOCUMENT,
-                  title="title-deed.pdf",
-                  content=b"title-deed-content",
-                  content_type="application/pdf",
-                  actor="clerk",
-              )
-              attestation = harness.engine.issue_attestation(
-                  subject_zid=owner,
-                  claim="document_is_authentic",
-                  subject_sha256=media.content_sha256,
-              )
-              assert attestation.subject_sha256 == media.content_sha256
-              assert AttestationIssuer.verify(attestation) is True
-              forged = replace(
-                  attestation, subject_sha256="0" * 64
-              )
-              assert AttestationIssuer.verify(forged) is False
-              harness.close()
-
-
-          def test_unknown_media_and_attestation_raise(
-              tmp_path: Path,
-          ) -> None:
-              harness = _Harness(tmp_path)
-              with pytest.raises(MediaNotFoundError):
-                  harness.engine.verify_media("MED-missing", b"x")
-              with pytest.raises(MediaNotFoundError):
-                  harness.engine.media_history("MED-missing")
-              with pytest.raises(AttestationNotFoundError):
-                  harness.engine.require_attestation("ATT-missing")
-              with pytest.raises(AttestationNotFoundError):
-                  harness.engine.verify_attestation("ATT-missing")
-              harness.close()
-
-
-          def test_media_pagination_by_owner(tmp_path: Path) -> None:
-              harness = _Harness(tmp_path)
-              owner = harness.active_subject()
-              for index in range(5):
-                  harness.engine.register_media(
-                      owner_zid=owner,
-                      kind=MediaKind.PHOTO,
-                      title=f"photo-{index}.jpg",
-                      content=f"content-{index}".encode("utf-8"),
-                      content_type="image/jpeg",
-                      actor="clerk",
-                  )
-              page1 = harness.engine.list_media(
-                  owner, offset=0, limit=3
-              )
-              assert page1.total == 5
-              assert len(page1.items) == 3
-              assert page1.has_more
-              page2 = harness.engine.list_media(
-                  owner, offset=3, limit=3
-              )
-              assert len(page2.items) == 2
-              assert not page2.has_more
-              harness.close()
-
-
-          def test_audit_chain_intact_after_full_flow(
-              tmp_path: Path,
-          ) -> None:
-              harness = _Harness(tmp_path)
-              issuer = harness.active_issuer("Bank Z")
-              subject = harness.active_subject("Person Q")
-              media = harness.engine.register_media(
-                  owner_zid=subject,
-                  kind=MediaKind.DOCUMENT,
-                  title="statement.pdf",
-                  content=b"statement",
-                  content_type="application/pdf",
-                  actor="clerk",
-              )
-              harness.engine.issue_credential(
-                  subject_zid=subject,
-                  issuer_zid=issuer,
-                  credential_type=CredentialType.FINANCIAL,
-                  title="Statement issued",
-                  detail=f"See media {media.media_id}",
-              )
-              harness.engine.issue_attestation(
-                  subject_zid=subject,
-                  claim="kyc_complete",
-              )
-              with pytest.raises(TamperDetectedError):
-                  harness.engine.verify_media(media.media_id, b"wrong")
-              assert harness.audit.verify() > 0
-              harness.close()
-
-
-          def test_outbox_events_from_full_flow(tmp_path: Path) -> None:
-              harness = _Harness(tmp_path)
-              issuer = harness.active_issuer()
-              subject = harness.active_subject()
-              harness.engine.register_media(
-                  owner_zid=subject,
-                  kind=MediaKind.PHOTO,
-                  title="a.jpg",
-                  content=b"aa",
-                  content_type="image/jpeg",
-                  actor="clerk",
-              )
-              harness.engine.issue_credential(
-                  subject_zid=subject,
-                  issuer_zid=issuer,
-                  credential_type=CredentialType.KYC_VERIFIED,
-                  title="KYC",
-                  detail="verified",
-              )
-              harness.engine.issue_attestation(
-                  subject_zid=subject,
-                  claim="c",
-              )
-              collected: list[Event] = []
-
-              def collect(event: Event) -> None:
-                  collected.append(event)
-
-              harness.outbox.dispatch_pending(collect)
-              by_type = {event.event_type for event in collected}
-              assert by_type >= {
-                  "verification.media.registered",
-                  "verification.credential.issued",
-                  "verification.attestation.issued",
+          def _media_json(record: MediaRecord) -> dict[str, object]:
+              return {
+                  "media_id": record.media_id,
+                  "owner_zid": record.owner_zid,
+                  "kind": record.kind.value,
+                  "title": record.title,
+                  "content_sha256": record.content_sha256,
+                  "content_size": record.content_size,
+                  "content_type": record.content_type,
+                  "created_at": record.created_at,
+                  "contract_version": record.contract_version,
               }
-              harness.close()
 
 
-          def test_health_healthy_then_unhealthy(tmp_path: Path) -> None:
-              harness = _Harness(tmp_path)
-              assert (
-                  harness.engine.check_health().status
-                  is HealthStatus.HEALTHY
-              )
-              harness.db.close()
-              assert (
-                  harness.engine.check_health().status
-                  is HealthStatus.UNHEALTHY
-              )
+          def _provenance_json(event: ProvenanceEvent) -> dict[str, object]:
+              return {
+                  "sequence": event.sequence,
+                  "media_id": event.media_id,
+                  "actor_zid": event.actor_zid,
+                  "action": event.action,
+                  "detail": event.detail,
+                  "occurred_at": event.occurred_at,
+                  "previous_hash": event.previous_hash,
+                  "event_hash": event.event_hash,
+              }
 
 
-          def test_signature_rejects_wrong_key_and_tampered_data() -> None:
-              signer, _private_pem = Ed25519Signer.generate()
-              verifier = Ed25519Verifier(signer.public_pem)
-              data = b"authentic"
-              signature = signer.sign(data)
-              assert verifier.verify(data, signature)
-              assert not verifier.verify(b"tampered", signature)
-              other_signer, _ = Ed25519Signer.generate()
-              other_verifier = Ed25519Verifier(other_signer.public_pem)
-              assert not other_verifier.verify(data, signature)
+          def _credential_json(record: CredentialRecord) -> dict[str, object]:
+              return {
+                  "credential_id": record.credential_id,
+                  "subject_zid": record.subject_zid,
+                  "issuer_zid": record.issuer_zid,
+                  "credential_type": record.credential_type.value,
+                  "title": record.title,
+                  "detail": record.detail,
+                  "issued_at": record.issued_at,
+                  "valid_from": record.valid_from,
+                  "valid_until": record.valid_until,
+                  "revoked": record.revoked,
+                  "revoked_at": record.revoked_at,
+                  "revoked_reason": record.revoked_reason,
+                  "contract_version": record.contract_version,
+              }
+
+
+          def _attestation_json(attestation: Attestation) -> dict[str, object]:
+              return {
+                  "attestation_id": attestation.attestation_id,
+                  "subject_zid": attestation.subject_zid,
+                  "claim": attestation.claim,
+                  "subject_sha256": attestation.subject_sha256,
+                  "issued_at": attestation.issued_at,
+                  "signature_b64": base64.b64encode(
+                      attestation.signature
+                  ).decode("ascii"),
+                  "signer_public_pem": attestation.signer_public_pem.decode(
+                      "utf-8"
+                  ),
+                  "contract_version": attestation.contract_version,
+              }
           PYEOF
 
-          echo "=== VERIFICATION BUILD OK ==="
+          cat > shared_engines/runtime/server.py <<'PYEOF'
+          """Threaded HTTP server bound to the Zyra API handler."""
+          from __future__ import annotations
+
+          from http.server import ThreadingHTTPServer
+
+          from shared_engines.runtime.api import ZyraApiHandler
+
+
+          class ZyraServer(ThreadingHTTPServer):
+              """Daemon-threaded server; bind via ZyraApiHandler ClassVars."""
+
+              daemon_threads = True
+              allow_reuse_address = True
+
+              def __init__(self, address: tuple[str, int]) -> None:
+                  super().__init__(address, ZyraApiHandler)
+          PYEOF
+
+          cat > shared_engines/runtime/tests/test_runtime_api.py <<'PYEOF'
+          from __future__ import annotations
+
+          import base64
+          import json
+          import threading
+          import urllib.error
+          import urllib.request
+          from collections.abc import Iterator
+
+          import pytest
+
+          from shared_engines.common.clocks import FrozenClock
+          from shared_engines.identity.contracts import IdentityKind, IdentityStatus
+          from shared_engines.runtime.config import RuntimeConfig
+          from shared_engines.runtime.api import ZyraApiHandler
+          from shared_engines.runtime.kernel import ZyraKernel
+          from shared_engines.runtime.server import ZyraServer
+          from shared_engines.storage.database import SQLiteAdapter
+          from shared_engines.verification.credentials import CredentialType
+          from shared_engines.verification.errors import TamperDetectedError
+          from shared_engines.verification.signatures import Ed25519Signer
+
+
+          class _Cluster:
+              """Boots a real HTTP server over a live kernel."""
+
+              def __init__(
+                  self, tmp_path: object, token: str | None = None
+              ) -> None:
+                  self.db = SQLiteAdapter(f"{tmp_path}/runtime.db")
+                  self.kernel = ZyraKernel(
+                      db=self.db,
+                      clock=FrozenClock(),
+                      signer=Ed25519Signer.generate()[0],
+                      config=RuntimeConfig(
+                          host="127.0.0.1", port=0, api_token=token
+                      ),
+                  )
+                  self.kernel.bootstrap_root()
+                  ZyraApiHandler.kernel = self.kernel
+                  self.server = ZyraServer(("127.0.0.1", 0))
+                  self.thread = threading.Thread(
+                      target=self.server.serve_forever, daemon=True
+                  )
+                  self.thread.start()
+                  port = int(self.server.socket.getsockname()[1])
+                  self.base = f"http://127.0.0.1:{port}"
+
+              def stop(self) -> None:
+                  self.server.shutdown()
+                  self.server.server_close()
+                  self.thread.join(timeout=5)
+                  self.db.close()
+
+              def call(
+                  self,
+                  method: str,
+                  path: str,
+                  body: dict | None = None,
+                  token: str | None = None,
+              ) -> tuple[int, dict]:
+                  headers = {"Content-Type": "application/json"}
+                  use_token = token
+                  if use_token is None:
+                      use_token = self.kernel.config.api_token
+                  if use_token is not None:
+                      headers["Authorization"] = f"Bearer {use_token}"
+                  data = (
+                      json.dumps(body).encode("utf-8")
+                      if body is not None
+                      else None
+                  )
+                  request = urllib.request.Request(
+                      f"{self.base}{path}",
+                      data=data,
+                      headers=headers,
+                      method=method,
+                  )
+                  try:
+                      with urllib.request.urlopen(request, timeout=10) as resp:
+                          payload = json.loads(resp.read().decode("utf-8"))
+                          return int(resp.status), payload
+                  except urllib.error.HTTPError as exc:
+                      payload = json.loads(exc.read().decode("utf-8") or "{}")
+                      return int(exc.code), payload
+
+
+          @pytest.fixture
+          def cluster(tmp_path) -> Iterator[_Cluster]:
+              running = _Cluster(tmp_path)
+              yield running
+              running.stop()
+
+
+          @pytest.fixture
+          def secured_cluster(tmp_path) -> Iterator[_Cluster]:
+              running = _Cluster(tmp_path, token="super-secret-token-123")
+              yield running
+              running.stop()
+
+
+          def _register_via_api(
+              cluster: _Cluster, name: str
+          ) -> dict:
+              status, payload = cluster.call(
+                  "POST",
+                  "/identity/register",
+                  {
+                      "kind": "person",
+                      "display_name": name,
+                      "actor": "api-clerk",
+                  },
+              )
+              assert status == 201
+              assert payload["ok"] is True
+              return payload["data"]
+
+
+          def _activate_via_api(cluster: _Cluster, zid: str) -> dict:
+              status, payload = cluster.call(
+                  "POST",
+                  "/identity/transition",
+                  {
+                      "zid": zid,
+                      "to_status": "ACTIVE",
+                      "actor": "api-admin",
+                      "reason": "onboarded",
+                  },
+              )
+              assert status == 200
+              return payload["data"]
+
+
+          def test_health_is_open_and_reports_components(
+              cluster: _Cluster,
+          ) -> None:
+              status, payload = cluster.call("GET", "/health")
+              assert status == 200
+              assert payload["ok"] is True
+              assert payload["data"]["overall"]["status"] == "healthy"
+              names = {c["component"] for c in payload["data"]["components"]}
+              assert {"storage", "identity", "verification"} <= names
+
+
+          def test_identity_register_get_transition_flow(
+              cluster: _Cluster,
+          ) -> None:
+              created = _register_via_api(cluster, "Alice")
+              zid = created["zid"]
+              assert zid.startswith("ZID-")
+              assert created["status"] == "REGISTERED"
+              status, payload = cluster.call("GET", f"/identity/{zid}")
+              assert status == 200
+              assert payload["data"]["display_name"] == "Alice"
+              moved = _activate_via_api(cluster, zid)
+              assert moved["status"] == "ACTIVE"
+              bad_status, bad = cluster.call(
+                  "POST",
+                  "/identity/transition",
+                  {
+                      "zid": zid,
+                      "to_status": "VERIFIED",
+                      "actor": "api-admin",
+                      "reason": "skips states",
+                  },
+              )
+              assert bad_status == 409
+              assert bad["error"]["type"] == "conflict"
+
+
+          def test_unknown_identity_returns_404(cluster: _Cluster) -> None:
+              status, payload = cluster.call("GET", "/identity/ZID-ghost")
+              assert status == 404
+              assert payload["error"]["type"] == "not_found"
+
+
+          def test_media_register_verify_tamper_via_http(
+              cluster: _Cluster,
+          ) -> None:
+              owner = _activate_via_api(
+                  cluster, _register_via_api(cluster, "Owner")["zid"]
+              )
+              content = b"photo-bytes-original"
+              encoded = base64.b64encode(content).decode("ascii")
+              status, payload = cluster.call(
+                  "POST",
+                  "/verification/media",
+                  {
+                      "owner_zid": owner["zid"],
+                      "kind": "photo",
+                      "title": "photo.jpg",
+                      "content_b64": encoded,
+                      "content_type": "image/jpeg",
+                      "actor": "clerk",
+                  },
+              )
+              assert status == 201
+              media_id = payload["data"]["media_id"]
+              assert payload["data"]["content_sha256"]
+              verify_status, _ = cluster.call(
+                  "POST",
+                  "/verification/media/verify",
+                  {"media_id": media_id, "content_b64": encoded},
+              )
+              assert verify_status == 200
+              tamper_status, tamper = cluster.call(
+                  "POST",
+                  "/verification/media/verify",
+                  {
+                      "media_id": media_id,
+                      "content_b64": base64.b64encode(b"tampered").decode(
+                          "ascii"
+                      ),
+                  },
+              )
+              assert tamper_status == 409
+              assert tamper["error"]["type"] == "conflict"
+              history_status, history = cluster.call(
+                  "GET", f"/verification/media/{media_id}/history"
+              )
+              assert history_status == 200
+              actions = [e["action"] for e in history["data"]]
+              assert actions == ["registered", "verified", "verified"]
+
+
+          def test_media_requires_known_owner(cluster: _Cluster) -> None:
+              status, payload = cluster.call(
+                  "POST",
+                  "/verification/media",
+                  {
+                      "owner_zid": "ZID-ghost",
+                      "kind": "photo",
+                      "title": "x.jpg",
+                      "content_b64": base64.b64encode(b"c").decode("ascii"),
+                      "content_type": "image/jpeg",
+                      "actor": "clerk",
+                  },
+              )
+              assert status == 404
+
+
+          def test_credential_full_flow_via_http(cluster: _Cluster) -> None:
+              root = cluster.kernel.root_zid
+              assert root is not None
+              client = _activate_via_api(
+                  cluster, _register_via_api(cluster, "Bank Client")["zid"]
+              )
+              status, payload = cluster.call(
+                  "POST",
+                  "/verification/credentials",
+                  {
+                      "subject_zid": client["zid"],
+                      "issuer_zid": root,
+                      "credential_type": "kyc_verified",
+                      "title": "KYC completed",
+                      "detail": "verified in person",
+                  },
+              )
+              assert status == 201
+              credential_id = payload["data"]["credential_id"]
+              get_status, got = cluster.call(
+                  "GET", f"/verification/credentials/{credential_id}"
+              )
+              assert get_status == 200
+              assert got["data"]["credential_type"] == "kyc_verified"
+              list_status, listed = cluster.call(
+                  "GET", f"/verification/subjects/{client['zid']}/credentials"
+              )
+              assert list_status == 200
+              assert len(listed["data"]) == 1
+              revoke_status, revoked = cluster.call(
+                  "POST",
+                  "/verification/credentials/revoke",
+                  {
+                      "credential_id": credential_id,
+                      "revoked_by": root,
+                      "reason": "manual review",
+                  },
+              )
+              assert revoke_status == 200
+              assert revoked["data"]["revoked"] is True
+
+
+          def test_credential_issuer_must_be_active(
+              cluster: _Cluster,
+          ) -> None:
+              dormant = _register_via_api(cluster, "Dormant Corp")
+              dorm_status, _ = cluster.call(
+                  "POST",
+                  "/identity/register",
+                  {
+                      "kind": "institution",
+                      "display_name": "Dormant Inst",
+                      "actor": "api-clerk",
+                  },
+              )
+              assert dorm_status == 201
+              _ = dormant
+              subject = _activate_via_api(
+                  cluster, _register_via_api(cluster, "S")["zid"]
+              )
+              inst_status, inst = cluster.call(
+                  "POST",
+                  "/identity/register",
+                  {
+                      "kind": "institution",
+                      "display_name": "Inactive Inst",
+                      "actor": "api-clerk",
+                  },
+              )
+              assert inst_status == 201
+              status, payload = cluster.call(
+                  "POST",
+                  "/verification/credentials",
+                  {
+                      "subject_zid": subject["zid"],
+                      "issuer_zid": inst["data"]["zid"],
+                      "credential_type": "reference",
+                      "title": "ref",
+                      "detail": "issuer is only REGISTERED",
+                  },
+              )
+              assert status == 403
+              assert payload["error"]["type"] == "forbidden"
+
+
+          def test_attestation_issue_and_verify_via_http(
+              cluster: _Cluster,
+          ) -> None:
+              subject = _activate_via_api(
+                  cluster, _register_via_api(cluster, "Attested")["zid"]
+              )
+              status, payload = cluster.call(
+                  "POST",
+                  "/verification/attestations",
+                  {"subject_zid": subject["zid"], "claim": "identity_active"},
+              )
+              assert status == 201
+              attestation_id = payload["data"]["attestation_id"]
+              assert payload["data"]["signature_b64"]
+              verify_status, verified = cluster.call(
+                  "POST",
+                  "/verification/attestations/verify",
+                  {"attestation_id": attestation_id},
+              )
+              assert verify_status == 200
+              assert verified["data"]["valid"] is True
+
+
+          def test_auth_required_and_accepted(
+              secured_cluster: _Cluster,
+          ) -> None:
+              secured = secured_cluster
+              no_token_status, no_token = secured.call(
+                  "POST",
+                  "/identity/register",
+                  {"kind": "person", "display_name": "X", "actor": "a"},
+                  token=None,
+              )
+              assert no_token_status == 401
+              assert no_token["error"]["type"] == "unauthorized"
+              wrong_status, _ = secured.call(
+                  "POST",
+                  "/identity/register",
+                  {"kind": "person", "display_name": "X", "actor": "a"},
+                  token="wrong-token-wrong-token",
+              )
+              assert wrong_status == 401
+              good_status, good = secured.call(
+                  "POST",
+                  "/identity/register",
+                  {"kind": "person", "display_name": "X", "actor": "a"},
+              )
+              assert good_status == 201
+              health_status, _ = secured.call("GET", "/health", token=None)
+              assert health_status == 200
+
+
+          def test_unknown_route_and_bad_json(cluster: _Cluster) -> None:
+              status, _ = cluster.call("GET", "/definitely/not/here")
+              assert status == 404
+              bad_status, bad = cluster.call(
+                  "POST",
+                  "/identity/register",
+                  {"kind": "person", "display_name": "", "actor": "a"},
+              )
+              assert bad_status == 400
+
+
+          def test_root_authority_is_active_and_persistent(
+              cluster: _Cluster,
+          ) -> None:
+              root = cluster.kernel.root_zid
+              assert root is not None
+              status, payload = cluster.call("GET", f"/identity/{root}")
+              assert status == 200
+              assert payload["data"]["status"] == "ACTIVE"
+              assert payload["data"]["kind"] == "institution"
+
+
+          def test_kernel_health_after_crash_of_storage(
+              tmp_path,
+          ) -> None:
+              cluster = _Cluster(tmp_path)
+              try:
+                  assert cluster.kernel.health().status.value == "healthy"
+              finally:
+                  cluster.stop()
+              assert cluster.kernel.health().status.value == "unhealthy"
+
+
+          def test_audit_chain_covers_api_traffic(
+              cluster: _Cluster,
+          ) -> None:
+              _register_via_api(cluster, "Audited 1")
+              _register_via_api(cluster, "Audited 2")
+              subject = _activate_via_api(
+                  cluster, _register_via_api(cluster, "Audited 3")["zid"]
+              )
+              root = cluster.kernel.root_zid
+              assert root is not None
+              cred_status, _ = cluster.call(
+                  "POST",
+                  "/verification/credentials",
+                  {
+                      "subject_zid": subject["zid"],
+                      "issuer_zid": root,
+                      "credential_type": "employment",
+                      "title": "Hired",
+                      "detail": "via API",
+                  },
+              )
+              assert cred_status == 201
+              count = cluster.kernel.audit.verify()
+              assert count >= 5
+          PYEOF
+
+          echo "=== RUNTIME BUILD OK ==="
 
       - name: Quality gates (mypy first; full regression all modules)
         run: |
           set -euo pipefail
-          M="shared_engines/common shared_engines/storage shared_engines/events shared_engines/observability shared_engines/audit shared_engines/security shared_engines/identity shared_engines/verification"
+          M="shared_engines/common shared_engines/storage shared_engines/events shared_engines/observability shared_engines/audit shared_engines/security shared_engines/identity shared_engines/verification shared_engines/runtime"
           python -m compileall -q $M
           echo "compile OK"
           find $M -name '__pycache__' -type d -prune -exec rm -rf {} +
@@ -2078,7 +1302,7 @@ jobs:
           if git diff --cached --quiet; then
             echo "No changes."
           else
-            git commit -m "zyra: module 06 VERIFICATION (media fingerprints, provenance, credential history, Ed25519 attestations + outbox events) + tests"
+            git commit -m "zyra: module 07 RUNTIME (kernel composition root, root authority, HTTP API with auth + typed error mapping) + live-server tests"
             git push origin "HEAD:${{ github.ref_name }}"
           fi
-          echo "=== MODULE 06 VERIFICATION COMPLETE ==="
+          echo "=== MODULE 07 RUNTIME COMPLETE ==="

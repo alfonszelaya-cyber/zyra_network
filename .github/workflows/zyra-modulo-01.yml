@@ -1,4 +1,4 @@
-name: zyra-modulo-01-common
+name: zyra-modulo-02-data
 
 "on":
   workflow_dispatch:
@@ -9,13 +9,13 @@ permissions:
   contents: write
 
 concurrency:
-  group: zyra-modulo-01-${{ github.ref }}
+  group: zyra-modulo-02-${{ github.ref }}
   cancel-in-progress: false
 
 jobs:
   build:
     runs-on: ubuntu-latest
-    timeout-minutes: 15
+    timeout-minutes: 20
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -31,10 +31,19 @@ jobs:
           python -m pip install --upgrade pip
           python -m pip install "flake8>=7,<8" "mypy>=1.10,<2" "pytest>=8,<9"
 
-      - name: Build shared_engines/common
+      - name: Check module 01 (common) is present
         run: |
           set -euo pipefail
-          mkdir -p shared_engines/common/tests
+          if [ ! -f shared_engines/common/errors.py ]; then
+            echo "Module 01 (common) is missing. Run it first."; exit 1
+          fi
+          echo "common present: OK"
+
+      - name: Build storage + events + audit
+        run: |
+          set -euo pipefail
+          mkdir -p shared_engines/storage/tests shared_engines/events/tests \
+            shared_engines/audit/tests
 
           cat > shared_engines/__init__.py <<'PYEOF'
           """Zyra Network shared engines layer."""
@@ -57,450 +66,1241 @@ jobs:
               sys.path.insert(0, str(ROOT))
           PYEOF
 
-          cat > shared_engines/common/__init__.py <<'PYEOF'
-          """Zyra foundation primitives."""
+          cat > shared_engines/storage/__init__.py <<'PYEOF'
+          """Durable storage: adapter, migrations, verified backups."""
           from __future__ import annotations
 
-          from shared_engines.common.errors import (
-              BackpressureError,
-              BudgetExceeded,
-              ConfigurationError,
-              ConcurrencyError,
-              EngineError,
-              IntegrityError,
-              LeaseLost,
-              MigrationError,
-              NotFoundError,
-              PolicyViolation,
-              ProviderPermanentError,
-              ProviderTransientError,
-              RecoveryRequired,
-              SerializationError,
-              UnsupportedVersionError,
-              ValidationError,
-          )
+          from shared_engines.storage.backup import BackupManager
+          from shared_engines.storage.database import Database, SQLiteAdapter
+          from shared_engines.storage.migrations import Migration, MigrationRunner
 
           __all__ = [
-              "BackpressureError", "BudgetExceeded", "ConfigurationError",
-              "ConcurrencyError", "EngineError", "IntegrityError",
-              "LeaseLost", "MigrationError", "NotFoundError",
-              "PolicyViolation", "ProviderPermanentError",
-              "ProviderTransientError", "RecoveryRequired",
-              "SerializationError", "UnsupportedVersionError",
-              "ValidationError",
+              "BackupManager", "Database", "Migration",
+              "MigrationRunner", "SQLiteAdapter",
           ]
           PYEOF
 
-          cat > shared_engines/common/errors.py <<'PYEOF'
-          """Typed error hierarchy."""
+          cat > shared_engines/storage/database.py <<'PYEOF'
+          """Durable storage adapter contract and the local SQLite adapter.
+
+          Domain logic depends on the ``Database`` protocol only.
+          SQLiteAdapter is the local durable implementation (WAL, FULL
+          synchronous, foreign keys, busy timeout, explicit
+          transactions). It is NOT distributed HA; future PostgreSQL
+          adapters implement the same protocol.
+          """
           from __future__ import annotations
 
+          import sqlite3
+          import threading
+          from collections.abc import Iterator, Sequence
+          from contextlib import AbstractContextManager, contextmanager
+          from pathlib import Path
+          from typing import Any, Protocol
 
-          class EngineError(Exception):
-              """Base for every engine error."""
-
-
-          class ConfigurationError(EngineError):
-              """Unsafe configuration; fail at startup."""
-
-
-          class ValidationError(EngineError):
-              """Input failed validation."""
+          from shared_engines.common.errors import IntegrityError
+          from shared_engines.common.validation import require_int_range
 
 
-          class SerializationError(EngineError):
-              """Serialization or parsing failed."""
+          class Database(Protocol):
+              """Minimal synchronous storage surface used by all engines."""
 
-
-          class IntegrityError(EngineError):
-              """Data failed integrity verification."""
-
-
-          class ConcurrencyError(EngineError):
-              """Concurrent access conflict."""
-
-
-          class LeaseLost(ConcurrencyError):
-              """Fencing token rejected."""
-
-
-          class RecoveryRequired(EngineError):
-              """Externally-uncertain outcome."""
-
-
-          class ProviderTransientError(EngineError):
-              """Retryable provider failure."""
-
-
-          class ProviderPermanentError(EngineError):
-              """Non-retryable provider failure."""
-
-
-          class BackpressureError(EngineError):
-              """Bounded queue full."""
-
-
-          class BudgetExceeded(EngineError):
-              """Budget or limit exceeded."""
-
-
-          class MigrationError(EngineError):
-              """Migration inconsistency."""
-
-
-          class UnsupportedVersionError(EngineError):
-              """Incompatible version."""
-
-
-          class NotFoundError(EngineError):
-              """Entity does not exist."""
-
-
-          class PolicyViolation(EngineError):
-              """Denied by policy."""
-          PYEOF
-
-          cat > shared_engines/common/clocks.py <<'PYEOF'
-          """Injectable clocks."""
-          from __future__ import annotations
-
-          import time
-          from typing import Protocol
-
-
-          class Clock(Protocol):
-              def now(self) -> float:
+              def execute(
+                  self, sql: str, params: Sequence[Any] = ()
+              ) -> sqlite3.Cursor:
                   ...
 
-              def sleep(self, seconds: float) -> None:
+              def query_all(
+                  self, sql: str, params: Sequence[Any] = ()
+              ) -> list[sqlite3.Row]:
+                  ...
+
+              def query_one(
+                  self, sql: str, params: Sequence[Any] = ()
+              ) -> sqlite3.Row | None:
+                  ...
+
+              def transaction(self) -> AbstractContextManager[sqlite3.Cursor]:
+                  ...
+
+              def ping(self) -> bool:
+                  ...
+
+              def integrity_check(self) -> None:
+                  ...
+
+              def close(self) -> None:
                   ...
 
 
-          class SystemClock:
-              def now(self) -> float:
-                  return time.time()
+          class SQLiteAdapter:
+              """Thread-safe single-connection adapter."""
 
-              def sleep(self, seconds: float) -> None:
-                  time.sleep(seconds)
-
-
-          class FrozenClock:
-              def __init__(self, start: float = 1_000_000.0) -> None:
-                  self._now = start
-
-              def now(self) -> float:
-                  return self._now
-
-              def sleep(self, seconds: float) -> None:
-                  self._now += seconds
-
-              def advance(self, seconds: float) -> None:
-                  self._now += seconds
-          PYEOF
-
-          cat > shared_engines/common/serialization.py <<'PYEOF'
-          """Canonical JSON."""
-          from __future__ import annotations
-
-          import json
-          from decimal import Decimal
-          from typing import Any
-
-          from shared_engines.common.errors import SerializationError
-
-          _SEP = (",", ":")
-
-
-          def _default(obj: Any) -> Any:
-              if isinstance(obj, Decimal):
-                  return {"__decimal__": str(obj)}
-              raise SerializationError(f"type {type(obj).__name__} not serializable")
-
-
-          def canonical_json_dumps(payload: Any) -> str:
-              try:
-                  return json.dumps(
-                      payload, separators=_SEP, sort_keys=True,
-                      default=_default, ensure_ascii=False,
+              def __init__(
+                  self, path: str | Path, *, busy_timeout_ms: int = 5000
+              ) -> None:
+                  require_int_range(
+                      busy_timeout_ms, "busy_timeout_ms", 1, 600_000, config=True
                   )
-              except (TypeError, ValueError) as exc:
-                  raise SerializationError(f"not serializable: {exc}") from exc
+                  target = Path(path)
+                  if str(target) != ":memory:":
+                      target.parent.mkdir(parents=True, exist_ok=True)
+                  self._lock = threading.RLock()
+                  self._conn = sqlite3.connect(
+                      str(target),
+                      timeout=busy_timeout_ms / 1000.0,
+                      isolation_level=None,
+                      check_same_thread=False,
+                  )
+                  self._conn.row_factory = sqlite3.Row
+                  self._conn.execute("PRAGMA journal_mode=WAL")
+                  self._conn.execute("PRAGMA synchronous=FULL")
+                  self._conn.execute("PRAGMA foreign_keys=ON")
+                  self._conn.execute(f"PRAGMA busy_timeout={int(busy_timeout_ms)}")
 
+              def execute(
+                  self, sql: str, params: Sequence[Any] = ()
+              ) -> sqlite3.Cursor:
+                  with self._lock:
+                      return self._conn.execute(sql, tuple(params))
 
-          def canonical_json_loads(raw: str) -> Any:
-              try:
-                  return json.loads(raw)
-              except (TypeError, ValueError) as exc:
-                  raise SerializationError(f"invalid JSON: {exc}") from exc
+              def query_all(
+                  self, sql: str, params: Sequence[Any] = ()
+              ) -> list[sqlite3.Row]:
+                  with self._lock:
+                      return self._conn.execute(sql, tuple(params)).fetchall()
+
+              def query_one(
+                  self, sql: str, params: Sequence[Any] = ()
+              ) -> sqlite3.Row | None:
+                  with self._lock:
+                      return self._conn.execute(sql, tuple(params)).fetchone()
+
+              @contextmanager
+              def transaction(self) -> Iterator[sqlite3.Cursor]:
+                  with self._lock:
+                      self._conn.execute("BEGIN IMMEDIATE")
+                      cursor = self._conn.cursor()
+                      try:
+                          yield cursor
+                      except BaseException:
+                          self._conn.execute("ROLLBACK")
+                          raise
+                      self._conn.execute("COMMIT")
+
+              def ping(self) -> bool:
+                  try:
+                      with self._lock:
+                          self._conn.execute("SELECT 1").fetchone()
+                  except sqlite3.Error:
+                      return False
+                  return True
+
+              def integrity_check(self) -> None:
+                  row = self.query_one("PRAGMA integrity_check")
+                  result = str(row[0]) if row is not None else ""
+                  if result != "ok":
+                      raise IntegrityError(
+                          f"sqlite integrity check failed: {result}"
+                      )
+
+              def backup_to(self, destination: Path) -> None:
+                  """Consistent online backup via the sqlite backup API."""
+                  destination.parent.mkdir(parents=True, exist_ok=True)
+                  with self._lock:
+                      target = sqlite3.connect(str(destination))
+                      try:
+                          self._conn.backup(target)
+                      finally:
+                          target.close()
+
+              def close(self) -> None:
+                  with self._lock:
+                      self._conn.close()
           PYEOF
 
-          cat > shared_engines/common/identifiers.py <<'PYEOF'
-          """Stable ids and hashing."""
+          cat > shared_engines/storage/migrations.py <<'PYEOF'
+          """Checksummed, ordered, immutable schema migrations.
+
+          Re-running validates previously applied checksums and refuses
+          to rewrite history. Namespaces let independent engines
+          migrate the same database without version collisions.
+          """
           from __future__ import annotations
 
           import hashlib
-          import uuid
-
-          from shared_engines.common.serialization import canonical_json_dumps
-
-
-          def new_id() -> str:
-              return uuid.uuid4().hex
-
-
-          def stable_hash(*parts: str) -> str:
-              digest = hashlib.sha256()
-              for part in parts:
-                  digest.update(part.encode("utf-8"))
-                  digest.update(b"\x1f")
-              return digest.hexdigest()
-
-
-          def payload_fingerprint(payload: object) -> str:
-              return stable_hash(canonical_json_dumps(payload))
-          PYEOF
-
-          cat > shared_engines/common/validation.py <<'PYEOF'
-          """Fail-fast validation helpers."""
-          from __future__ import annotations
-
-          import math
           from collections.abc import Sequence
-
-          from shared_engines.common.errors import ConfigurationError, ValidationError
-
-
-          def _raise(message: str, config: bool) -> None:
-              if config:
-                  raise ConfigurationError(message)
-              raise ValidationError(message)
-
-
-          def require_non_empty_str(
-              value: str, name: str, *, config: bool = False
-          ) -> str:
-              if not isinstance(value, str) or not value.strip():
-                  _raise(f"{name} must be a non-empty string", config)
-              return value
-
-
-          def require_int_range(
-              value: int, name: str, minimum: int, maximum: int,
-              *, config: bool = False,
-          ) -> int:
-              if not isinstance(value, int) or isinstance(value, bool):
-                  _raise(f"{name} must be an integer", config)
-              if not minimum <= value <= maximum:
-                  _raise(f"{name} must be in [{minimum}, {maximum}]", config)
-              return value
-
-
-          def require_positive_number(
-              value: float, name: str, *, config: bool = False
-          ) -> float:
-              if isinstance(value, bool) or not isinstance(value, (int, float)):
-                  _raise(f"{name} must be a number", config)
-              if not math.isfinite(value) or value <= 0:
-                  _raise(f"{name} must be a positive finite number", config)
-              return float(value)
-
-
-          def require_one_of(
-              value: str, allowed: Sequence[str], name: str,
-              *, config: bool = False,
-          ) -> str:
-              if value not in allowed:
-                  _raise(f"{name} must be one of {sorted(allowed)}", config)
-              return value
-          PYEOF
-
-          cat > shared_engines/common/result.py <<'PYEOF'
-          """Explicit success/failure container."""
-          from __future__ import annotations
-
-          from typing import Generic, TypeVar, cast
-
-          from shared_engines.common.errors import ConfigurationError, EngineError
-
-          ValueT = TypeVar("ValueT")
-
-
-          class Result(Generic[ValueT]):
-              """Holds exactly one of value or error.
-
-              Factories: ``Result.ok(v)``, ``Result.err(e)``.
-              Predicate: ``result.is_ok``.
-              """
-
-              __slots__ = ("_value", "_error")
-
-              def __init__(
-                  self, value: ValueT | None, error: EngineError | None
-              ) -> None:
-                  if (value is None) == (error is None):
-                      raise ConfigurationError(
-                          "Result requires exactly one of value or error"
-                      )
-                  self._value = value
-                  self._error = error
-
-              @classmethod
-              def ok(cls, value: ValueT) -> "Result[ValueT]":
-                  return cls(value, None)
-
-              @classmethod
-              def err(cls, error: EngineError) -> "Result[ValueT]":
-                  return cls(None, error)
-
-              @property
-              def is_ok(self) -> bool:
-                  return self._error is None
-
-              @property
-              def value(self) -> ValueT:
-                  if self._error is not None:
-                      raise self._error
-                  return cast(ValueT, self._value)
-
-              @property
-              def error(self) -> EngineError | None:
-                  return self._error
-          PYEOF
-
-          cat > shared_engines/common/pagination.py <<'PYEOF'
-          """Page container."""
-          from __future__ import annotations
-
           from dataclasses import dataclass
-          from typing import Generic, TypeVar
 
-          from shared_engines.common.validation import require_int_range
-
-          ItemT = TypeVar("ItemT")
+          from shared_engines.common.clocks import Clock
+          from shared_engines.common.errors import MigrationError
+          from shared_engines.common.validation import require_non_empty_str
+          from shared_engines.storage.database import Database
 
 
           @dataclass(frozen=True)
-          class Page(Generic[ItemT]):
-              items: tuple[ItemT, ...]
-              offset: int
-              limit: int
-              total: int
+          class Migration:
+              version: int
+              name: str
+              statements: tuple[str, ...]
 
               def __post_init__(self) -> None:
-                  require_int_range(self.offset, "offset", 0, 10**12)
-                  require_int_range(self.limit, "limit", 1, 10**6)
-                  require_int_range(self.total, "total", 0, 10**12)
+                  if self.version <= 0:
+                      raise MigrationError("migration version must be positive")
+                  require_non_empty_str(self.name, "migration name", config=True)
+                  if not self.statements:
+                      raise MigrationError(
+                          "migration must contain at least one statement"
+                      )
 
               @property
-              def has_more(self) -> bool:
-                  return self.offset + len(self.items) < self.total
+              def checksum(self) -> str:
+                  digest = hashlib.sha256()
+                  for statement in self.statements:
+                      digest.update(statement.strip().encode("utf-8"))
+                      digest.update(b"\x1e")
+                  return digest.hexdigest()
 
-              @property
-              def next_offset(self) -> int | None:
-                  if self.has_more:
-                      return self.offset + len(self.items)
-                  return None
+
+          class MigrationRunner:
+              def __init__(
+                  self,
+                  db: Database,
+                  namespace: str,
+                  migrations: Sequence[Migration],
+              ) -> None:
+                  require_non_empty_str(namespace, "namespace", config=True)
+                  if not migrations:
+                      raise MigrationError("a migration set must not be empty")
+                  versions = [m.version for m in migrations]
+                  if versions != sorted(versions) or len(set(versions)) != len(
+                      versions
+                  ):
+                      raise MigrationError(
+                          "migration versions must be unique and ascending"
+                      )
+                  self._db = db
+                  self._namespace = namespace
+                  self._migrations = tuple(migrations)
+
+              def run(self, clock: Clock) -> tuple[int, ...]:
+                  self._db.execute(
+                      "CREATE TABLE IF NOT EXISTS schema_migrations ("
+                      " namespace TEXT NOT NULL,"
+                      " version INTEGER NOT NULL,"
+                      " name TEXT NOT NULL,"
+                      " checksum TEXT NOT NULL,"
+                      " applied_at REAL NOT NULL,"
+                      " PRIMARY KEY (namespace, version))"
+                  )
+                  applied = {
+                      int(row["version"]): str(row["checksum"])
+                      for row in self._db.query_all(
+                          "SELECT version, checksum FROM schema_migrations"
+                          " WHERE namespace = ?",
+                          (self._namespace,),
+                      )
+                  }
+                  for migration in self._migrations:
+                      recorded = applied.get(migration.version)
+                      if recorded is not None:
+                          if recorded != migration.checksum:
+                              raise MigrationError(
+                                  f"migration {self._namespace}."
+                                  f"v{migration.version}"
+                                  f" ({migration.name}) was modified"
+                                  " after application"
+                              )
+                          continue
+                      self._apply(migration, clock)
+                  return tuple(m.version for m in self._migrations)
+
+              def _apply(self, migration: Migration, clock: Clock) -> None:
+                  with self._db.transaction() as cursor:
+                      for statement in migration.statements:
+                          cursor.execute(statement)
+                      cursor.execute(
+                          "INSERT INTO schema_migrations"
+                          " (namespace, version, name, checksum, applied_at)"
+                          " VALUES (?, ?, ?, ?, ?)",
+                          (
+                              self._namespace,
+                              migration.version,
+                              migration.name,
+                              migration.checksum,
+                              clock.now(),
+                          ),
+                      )
           PYEOF
 
-          cat > shared_engines/common/types.py <<'PYEOF'
-          """Semantic aliases."""
+          cat > shared_engines/storage/backup.py <<'PYEOF'
+          """Verified backup and restore for local durable stores.
+
+          A backup is valid only after its file hash matches the
+          manifest and a fresh read-only connection passes
+          ``integrity_check``. Restore swaps atomically.
+          """
           from __future__ import annotations
 
-          from typing import NewType
+          import hashlib
+          import os
+          import sqlite3
+          from pathlib import Path
 
-          ISO4217Code = NewType("ISO4217Code", str)
-          ISO3166Code = NewType("ISO3166Code", str)
-          Sha256Hex = NewType("Sha256Hex", str)
-          EngineName = NewType("EngineName", str)
+          from shared_engines.common.clocks import Clock
+          from shared_engines.common.errors import IntegrityError
+          from shared_engines.common.identifiers import new_id
+          from shared_engines.common.serialization import (
+              canonical_json_dumps,
+              canonical_json_loads,
+          )
+          from shared_engines.storage.database import SQLiteAdapter
+
+
+          def _file_sha256(path: Path) -> str:
+              digest = hashlib.sha256()
+              with path.open("rb") as handle:
+                  for chunk in iter(lambda: handle.read(512 * 1024), b""):
+                      digest.update(chunk)
+              return digest.hexdigest()
+
+
+          def _manifest_path(backup_path: Path) -> Path:
+              return backup_path.with_suffix(".manifest.json")
+
+
+          class BackupManager:
+              def __init__(self, adapter: SQLiteAdapter, clock: Clock) -> None:
+                  self._adapter = adapter
+                  self._clock = clock
+
+              def create_backup(self, target_dir: Path) -> Path:
+                  target_dir.mkdir(parents=True, exist_ok=True)
+                  stamp = f"{int(self._clock.now())}-{new_id()[:8]}"
+                  backup_path = target_dir / f"backup-{stamp}.db"
+                  self._adapter.backup_to(backup_path)
+                  manifest = {
+                      "created_at": self._clock.now(),
+                      "file": backup_path.name,
+                      "sha256": _file_sha256(backup_path),
+                  }
+                  _manifest_path(backup_path).write_text(
+                      canonical_json_dumps(manifest), encoding="utf-8"
+                  )
+                  self.verify_backup(backup_path)
+                  return backup_path
+
+              def verify_backup(self, backup_path: Path) -> str:
+                  if not backup_path.exists():
+                      raise IntegrityError(f"backup file missing: {backup_path}")
+                  manifest_path = _manifest_path(backup_path)
+                  if not manifest_path.exists():
+                      raise IntegrityError(
+                          f"backup manifest missing: {manifest_path}"
+                      )
+                  manifest = canonical_json_loads(
+                      manifest_path.read_text(encoding="utf-8")
+                  )
+                  digest = _file_sha256(backup_path)
+                  if not isinstance(manifest, dict) or digest != manifest.get(
+                      "sha256"
+                  ):
+                      raise IntegrityError(
+                          "backup file hash does not match manifest"
+                      )
+                  connection = sqlite3.connect(
+                      f"file:{backup_path}?mode=ro", uri=True
+                  )
+                  try:
+                      row = connection.execute("PRAGMA integrity_check").fetchone()
+                  finally:
+                      connection.close()
+                  if row is None or str(row[0]) != "ok":
+                      raise IntegrityError(
+                          "backup copy failed sqlite integrity_check"
+                      )
+                  return digest
+
+              def restore(self, backup_path: Path, target_path: Path) -> None:
+                  self.verify_backup(backup_path)
+                  target_path.parent.mkdir(parents=True, exist_ok=True)
+                  for suffix in ("-wal", "-shm"):
+                      Path(str(target_path) + suffix).unlink(missing_ok=True)
+                  tmp = target_path.with_name(
+                      f"{target_path.name}.restore-{new_id()[:8]}"
+                  )
+                  tmp.write_bytes(backup_path.read_bytes())
+                  os.replace(tmp, target_path)
           PYEOF
 
-          cat > shared_engines/common/tests/test_common.py <<'PYEOF'
+          cat > shared_engines/storage/tests/test_storage.py <<'PYEOF'
           from __future__ import annotations
+
+          from pathlib import Path
 
           import pytest
 
           from shared_engines.common.clocks import FrozenClock
-          from shared_engines.common.errors import (
-              ConfigurationError,
-              SerializationError,
-              ValidationError,
-          )
-          from shared_engines.common.pagination import Page
-          from shared_engines.common.result import Result
-          from shared_engines.common.serialization import canonical_json_dumps
-          from shared_engines.common.validation import (
-              require_int_range,
-              require_non_empty_str,
-              require_one_of,
-              require_positive_number,
-          )
+          from shared_engines.common.errors import IntegrityError, MigrationError
+          from shared_engines.storage.backup import BackupManager
+          from shared_engines.storage.database import SQLiteAdapter
+          from shared_engines.storage.migrations import Migration, MigrationRunner
 
 
-          def test_canonical_json_stable() -> None:
-              assert canonical_json_dumps({"b": 1, "a": 2}) == '{"a":2,"b":1}'
-              with pytest.raises(SerializationError):
-                  canonical_json_dumps({"x": object()})
+          class SimulatedCrash(Exception):
+              """Local failure to prove transactional rollback."""
 
 
-          def test_frozen_clock() -> None:
-              clock = FrozenClock(start=100.0)
-              clock.sleep(5.0)
-              assert clock.now() == 105.0
+          def _mig(version: int, name: str, sql: str) -> Migration:
+              return Migration(version=version, name=name, statements=(sql,))
 
 
-          def test_result() -> None:
-              ok: Result[int] = Result.ok(3)
-              assert ok.is_ok and ok.value == 3
-              err: Result[int] = Result.err(ConfigurationError("bad"))
-              assert not err.is_ok
-              assert err.error is not None
-              with pytest.raises(ConfigurationError):
-                  _ = err.value
-              with pytest.raises(ConfigurationError):
-                  Result[int](None, None)
-              with pytest.raises(ConfigurationError):
-                  Result[int](1, ConfigurationError("bad"))
+          def test_migrations_apply_once(tmp_path: Path) -> None:
+              adapter = SQLiteAdapter(tmp_path / "state.db")
+              runner = MigrationRunner(
+                  adapter,
+                  "test",
+                  (
+                      _mig(1, "create", "CREATE TABLE t (id INTEGER)"),
+                      _mig(2, "seed", "INSERT INTO t (id) VALUES (1)"),
+                  ),
+              )
+              assert runner.run(FrozenClock()) == (1, 2)
+              assert runner.run(FrozenClock()) == (1, 2)
+              assert len(adapter.query_all("SELECT id FROM t")) == 1
+              adapter.close()
 
 
-          def test_page() -> None:
-              page: Page[int] = Page(items=(1, 2), offset=0, limit=2, total=5)
-              assert page.has_more and page.next_offset == 2
-              last: Page[int] = Page(items=(1,), offset=4, limit=2, total=5)
-              assert not last.has_more and last.next_offset is None
-              with pytest.raises(ValidationError):
-                  Page(items=(), offset=-1, limit=2, total=0)
+          def test_migration_checksum_tampering_detected(tmp_path: Path) -> None:
+              adapter = SQLiteAdapter(tmp_path / "state.db")
+              runner = MigrationRunner(
+                  adapter, "test", (_mig(1, "create", "CREATE TABLE t (id)"),)
+              )
+              runner.run(FrozenClock())
+              adapter.execute(
+                  "UPDATE schema_migrations SET checksum = 'tampered'"
+                  " WHERE version = 1"
+              )
+              with pytest.raises(MigrationError):
+                  runner.run(FrozenClock())
+              adapter.close()
 
 
-          def test_validators() -> None:
-              assert require_non_empty_str("x", "v") == "x"
-              with pytest.raises(ValidationError):
-                  require_non_empty_str("  ", "v")
-              with pytest.raises(ValidationError):
-                  require_int_range(-1, "o", 0, 10)
-              with pytest.raises(ValidationError):
-                  require_positive_number(-1.0, "t")
-              with pytest.raises(ValidationError):
-                  require_positive_number(float("inf"), "t")
-              assert require_one_of("A", ("A", "B"), "m") == "A"
-              with pytest.raises(ValidationError):
-                  require_one_of("C", ("A", "B"), "m")
+          def test_transaction_rollback_on_crash(tmp_path: Path) -> None:
+              adapter = SQLiteAdapter(tmp_path / "state.db")
+              adapter.execute("CREATE TABLE t (id INTEGER)")
+              with pytest.raises(SimulatedCrash):
+                  with adapter.transaction() as cursor:
+                      cursor.execute("INSERT INTO t (id) VALUES (1)")
+                      raise SimulatedCrash("died mid-transaction")
+              row = adapter.query_one("SELECT COUNT(*) AS n FROM t")
+              assert row is not None
+              assert int(row["n"]) == 0
+              adapter.close()
+
+
+          def test_backup_verify_restore_and_tamper(tmp_path: Path) -> None:
+              adapter = SQLiteAdapter(tmp_path / "live.db")
+              adapter.execute("CREATE TABLE t (id INTEGER)")
+              adapter.execute("INSERT INTO t (id) VALUES (42)")
+              manager = BackupManager(adapter, FrozenClock())
+              backup = manager.create_backup(tmp_path / "backups")
+              assert len(manager.verify_backup(backup)) == 64
+              restore_target = tmp_path / "restored.db"
+              manager.restore(backup, restore_target)
+              replica = SQLiteAdapter(restore_target)
+              row = replica.query_one("SELECT id FROM t")
+              assert row is not None
+              assert int(row["id"]) == 42
+              replica.close()
+              corrupted = backup.read_bytes() + b"corruption"
+              backup.write_bytes(corrupted)
+              with pytest.raises(IntegrityError):
+                  manager.verify_backup(backup)
+              adapter.close()
+
+
+          def test_backup_without_manifest_rejected(tmp_path: Path) -> None:
+              adapter = SQLiteAdapter(tmp_path / "live.db")
+              adapter.execute("CREATE TABLE t (id INTEGER)")
+              manager = BackupManager(adapter, FrozenClock())
+              backup = manager.create_backup(tmp_path / "backups")
+              backup.with_suffix(".manifest.json").unlink()
+              with pytest.raises(IntegrityError):
+                  manager.verify_backup(backup)
+              adapter.close()
           PYEOF
 
-          echo "build OK"
+          cat > shared_engines/events/__init__.py <<'PYEOF'
+          """Versioned events, transactional outbox and consumer inbox."""
+          from __future__ import annotations
 
-      - name: Quality gates
+          from shared_engines.events.contracts import Event, EventCatalog
+          from shared_engines.events.inbox import Inbox
+          from shared_engines.events.outbox import Outbox
+
+          __all__ = ["Event", "EventCatalog", "Inbox", "Outbox"]
+          PYEOF
+
+          cat > shared_engines/events/contracts.py <<'PYEOF'
+          """Versioned event contracts and the central catalog."""
+          from __future__ import annotations
+
+          from collections.abc import Callable, Mapping
+          from dataclasses import dataclass
+
+          from shared_engines.common.clocks import Clock
+          from shared_engines.common.errors import (
+              ConfigurationError,
+              UnsupportedVersionError,
+              ValidationError,
+          )
+          from shared_engines.common.identifiers import new_id, stable_hash
+          from shared_engines.common.serialization import canonical_json_dumps
+
+          EVENT_ENVELOPE_VERSION = 1
+          PayloadValidator = Callable[[Mapping[str, object]], None]
+
+
+          @dataclass(frozen=True)
+          class Event:
+              event_id: str
+              event_type: str
+              aggregate_id: str
+              schema_version: int
+              envelope_version: int
+              timestamp: float
+              payload: Mapping[str, object]
+              fingerprint: str
+
+
+          def _default_validator(payload: Mapping[str, object]) -> None:
+              if not isinstance(payload, dict):
+                  raise ValidationError("event payload must be a mapping")
+
+
+          class EventCatalog:
+              """Central registry of event types, validators, versions."""
+
+              def __init__(self) -> None:
+                  self._schemas: dict[str, dict[int, PayloadValidator]] = {}
+
+              def register(
+                  self,
+                  event_type: str,
+                  *,
+                  schema_version: int = 1,
+                  validator: PayloadValidator | None = None,
+              ) -> None:
+                  if not event_type:
+                      raise ConfigurationError("event_type must be non-empty")
+                  if schema_version <= 0:
+                      raise ConfigurationError("schema_version must be positive")
+                  validators = self._schemas.setdefault(event_type, {})
+                  if schema_version in validators:
+                      return
+                  validators[schema_version] = validator or _default_validator
+
+              def build(
+                  self,
+                  event_type: str,
+                  *,
+                  aggregate_id: str,
+                  payload: Mapping[str, object],
+                  clock: Clock,
+                  schema_version: int | None = None,
+              ) -> Event:
+                  versions = self._schemas.get(event_type)
+                  if not versions:
+                      raise ValidationError(
+                          f"event type not registered: {event_type}"
+                      )
+                  version = (
+                      schema_version if schema_version is not None else max(versions)
+                  )
+                  validator = versions.get(version)
+                  if validator is None:
+                      raise UnsupportedVersionError(
+                          f"unsupported version {version} for {event_type}"
+                      )
+                  validator(payload)
+                  fingerprint = stable_hash(
+                      event_type,
+                      aggregate_id,
+                      str(version),
+                      canonical_json_dumps(dict(payload)),
+                  )
+                  return Event(
+                      event_id=new_id(),
+                      event_type=event_type,
+                      aggregate_id=aggregate_id,
+                      schema_version=version,
+                      envelope_version=EVENT_ENVELOPE_VERSION,
+                      timestamp=clock.now(),
+                      payload=dict(payload),
+                      fingerprint=fingerprint,
+                  )
+
+              @property
+              def registered_types(self) -> tuple[str, ...]:
+                  return tuple(sorted(self._schemas))
+          PYEOF
+
+          cat > shared_engines/events/outbox.py <<'PYEOF'
+          """Transactional outbox with at-least-once dispatch.
+
+          ``enqueue_in_transaction`` runs inside the SAME transaction as
+          the state change. A crash between handler and mark causes
+          redelivery; consumers suppress duplicates via the Inbox.
+          """
+          from __future__ import annotations
+
+          import sqlite3
+          from collections.abc import Callable
+
+          from shared_engines.common.clocks import Clock
+          from shared_engines.common.serialization import (
+              canonical_json_dumps,
+              canonical_json_loads,
+          )
+          from shared_engines.events.contracts import Event
+          from shared_engines.storage.database import Database
+          from shared_engines.storage.migrations import Migration, MigrationRunner
+
+          MIGRATIONS = (
+              Migration(
+                  1,
+                  "events_outbox",
+                  (
+                      "CREATE TABLE events_outbox ("
+                      " event_id TEXT PRIMARY KEY,"
+                      " event_type TEXT NOT NULL,"
+                      " aggregate_id TEXT NOT NULL,"
+                      " schema_version INTEGER NOT NULL,"
+                      " envelope_version INTEGER NOT NULL,"
+                      " created_at REAL NOT NULL,"
+                      " payload TEXT NOT NULL,"
+                      " fingerprint TEXT NOT NULL,"
+                      " published_at REAL)",
+                      "CREATE INDEX events_outbox_pending"
+                      " ON events_outbox (published_at, created_at)",
+                  ),
+              ),
+          )
+
+
+          class Outbox:
+              """Persists events atomically with the state producing them."""
+
+              def __init__(self, db: Database, clock: Clock) -> None:
+                  self._db = db
+                  self._clock = clock
+
+              def ensure_schema(self) -> None:
+                  MigrationRunner(self._db, "events.outbox", MIGRATIONS).run(
+                      self._clock
+                  )
+
+              def enqueue_in_transaction(
+                  self, cursor: sqlite3.Cursor, event: Event
+              ) -> None:
+                  cursor.execute(
+                      "INSERT INTO events_outbox"
+                      " (event_id, event_type, aggregate_id, schema_version,"
+                      "  envelope_version, created_at, payload, fingerprint,"
+                      "  published_at)"
+                      " VALUES (?, ?, ?, ?, ?, ?, ?, ?, NULL)",
+                      (
+                          event.event_id,
+                          event.event_type,
+                          event.aggregate_id,
+                          event.schema_version,
+                          event.envelope_version,
+                          event.timestamp,
+                          canonical_json_dumps(dict(event.payload)),
+                          event.fingerprint,
+                      ),
+                  )
+
+              def enqueue(self, event: Event) -> None:
+                  with self._db.transaction() as cursor:
+                      self.enqueue_in_transaction(cursor, event)
+
+              def pending(self, limit: int = 100) -> tuple[Event, ...]:
+                  rows = self._db.query_all(
+                      "SELECT * FROM events_outbox WHERE published_at IS NULL"
+                      " ORDER BY created_at, event_id LIMIT ?",
+                      (limit,),
+                  )
+                  return tuple(self._to_event(row) for row in rows)
+
+              def dispatch_pending(
+                  self,
+                  handler: Callable[[Event], None],
+                  *,
+                  batch_size: int = 100,
+              ) -> int:
+                  delivered = 0
+                  for event in self.pending(batch_size):
+                      handler(event)
+                      self._db.execute(
+                          "UPDATE events_outbox SET published_at = ?"
+                          " WHERE event_id = ? AND published_at IS NULL",
+                          (self._clock.now(), event.event_id),
+                      )
+                      delivered += 1
+                  return delivered
+
+              @staticmethod
+              def _to_event(row: sqlite3.Row) -> Event:
+                  return Event(
+                      event_id=str(row["event_id"]),
+                      event_type=str(row["event_type"]),
+                      aggregate_id=str(row["aggregate_id"]),
+                      schema_version=int(row["schema_version"]),
+                      envelope_version=int(row["envelope_version"]),
+                      timestamp=float(row["created_at"]),
+                      payload=canonical_json_loads(str(row["payload"])),
+                      fingerprint=str(row["fingerprint"]),
+                  )
+          PYEOF
+
+          cat > shared_engines/events/inbox.py <<'PYEOF'
+          """Consumer-side deduplication: record and effect commit together."""
+          from __future__ import annotations
+
+          import sqlite3
+          from collections.abc import Callable
+
+          from shared_engines.common.clocks import Clock
+          from shared_engines.events.contracts import Event
+          from shared_engines.storage.database import Database
+          from shared_engines.storage.migrations import Migration, MigrationRunner
+
+          MIGRATIONS = (
+              Migration(
+                  1,
+                  "events_inbox",
+                  (
+                      "CREATE TABLE events_inbox ("
+                      " event_id TEXT PRIMARY KEY,"
+                      " event_type TEXT NOT NULL,"
+                      " processed_at REAL NOT NULL)"
+                  ),
+              ),
+          )
+
+
+          class Inbox:
+              """Deduplicates deliveries within one atomic transaction."""
+
+              def __init__(self, db: Database, clock: Clock) -> None:
+                  self._db = db
+                  self._clock = clock
+                  MigrationRunner(db, "events.inbox", MIGRATIONS).run(clock)
+
+              def process(
+                  self, event: Event, handler: Callable[[Event], None]
+              ) -> bool:
+                  """Applies handler once per event_id; False for duplicates."""
+                  try:
+                      with self._db.transaction() as cursor:
+                          cursor.execute(
+                              "INSERT INTO events_inbox"
+                              " (event_id, event_type, processed_at)"
+                              " VALUES (?, ?, ?)",
+                              (
+                                  event.event_id,
+                                  event.event_type,
+                                  self._clock.now(),
+                              ),
+                          )
+                          handler(event)
+                  except sqlite3.IntegrityError:
+                      return False
+                  return True
+          PYEOF
+
+          cat > shared_engines/events/tests/test_events.py <<'PYEOF'
+          from __future__ import annotations
+
+          from pathlib import Path
+
+          import pytest
+
+          from shared_engines.common.clocks import FrozenClock
+          from shared_engines.common.errors import ValidationError
+          from shared_engines.events.contracts import Event, EventCatalog
+          from shared_engines.events.inbox import Inbox
+          from shared_engines.events.outbox import Outbox
+          from shared_engines.storage.database import SQLiteAdapter
+
+
+          class SimulatedCrash(Exception):
+              """Local failure to prove redelivery semantics."""
+
+
+          def _outbox(adapter: SQLiteAdapter) -> Outbox:
+              outbox = Outbox(adapter, FrozenClock())
+              outbox.ensure_schema()
+              return outbox
+
+
+          def _event(catalog: EventCatalog, clock: FrozenClock) -> Event:
+              return catalog.build(
+                  "test.ping", aggregate_id="agg-1", payload={"n": 1}, clock=clock
+              )
+
+
+          def test_outbox_dispatch_marks_published(tmp_path: Path) -> None:
+              adapter = SQLiteAdapter(tmp_path / "events.db")
+              catalog = EventCatalog()
+              catalog.register("test.ping")
+              outbox = _outbox(adapter)
+              event = _event(catalog, FrozenClock())
+              outbox.enqueue(event)
+              assert len(outbox.pending()) == 1
+              seen: list[str] = []
+
+              def collect(seen_event: Event) -> None:
+                  seen.append(seen_event.event_id)
+
+              assert outbox.dispatch_pending(collect) == 1
+              assert outbox.dispatch_pending(collect) == 0
+              assert seen == [event.event_id]
+              adapter.close()
+
+
+          def test_outbox_redelivers_on_handler_failure(tmp_path: Path) -> None:
+              adapter = SQLiteAdapter(tmp_path / "events.db")
+              catalog = EventCatalog()
+              catalog.register("test.ping")
+              outbox = _outbox(adapter)
+              outbox.enqueue(_event(catalog, FrozenClock()))
+
+              def failing(received: Event) -> None:
+                  raise SimulatedCrash("consumer crashed mid-dispatch")
+
+              with pytest.raises(SimulatedCrash):
+                  outbox.dispatch_pending(failing)
+              assert len(outbox.pending()) == 1
+              adapter.close()
+
+
+          def test_inbox_deduplicates_deliveries(tmp_path: Path) -> None:
+              adapter = SQLiteAdapter(tmp_path / "events.db")
+              clock = FrozenClock()
+              catalog = EventCatalog()
+              catalog.register("test.ping")
+              inbox = Inbox(adapter, clock)
+              event = _event(catalog, clock)
+              calls: list[int] = []
+
+              def handle(received: Event) -> None:
+                  calls.append(1)
+
+              assert inbox.process(event, handle) is True
+              assert inbox.process(event, handle) is False
+              assert calls == [1]
+              adapter.close()
+
+
+          def test_inbox_rolls_back_record_and_effect(tmp_path: Path) -> None:
+              adapter = SQLiteAdapter(tmp_path / "events.db")
+              clock = FrozenClock()
+              adapter.execute(
+                  "CREATE TABLE effects (event_id TEXT NOT NULL,"
+                  " applied_at REAL NOT NULL)"
+              )
+              inbox = Inbox(adapter, clock)
+              catalog = EventCatalog()
+              catalog.register("test.effect")
+              event = catalog.build(
+                  "test.effect", aggregate_id="agg", payload={}, clock=clock
+              )
+
+              def failing_effect(received: Event) -> None:
+                  adapter.execute(
+                      "INSERT INTO effects (event_id, applied_at) VALUES (?, ?)",
+                      (received.event_id, clock.now()),
+                  )
+                  raise SimulatedCrash("effect crashed")
+
+              with pytest.raises(SimulatedCrash):
+                  inbox.process(event, failing_effect)
+              row = adapter.query_one("SELECT COUNT(*) AS n FROM effects")
+              assert row is not None
+              assert int(row["n"]) == 0
+              assert inbox.process(event, lambda e: None) is True
+              adapter.close()
+
+
+          def test_catalog_rejects_and_fingerprints_stable() -> None:
+              catalog = EventCatalog()
+              clock = FrozenClock()
+              with pytest.raises(ValidationError):
+                  _event(catalog, clock)
+              catalog.register("test.ping")
+              first = _event(catalog, clock)
+              second = _event(catalog, clock)
+              assert first.fingerprint == second.fingerprint
+              assert first.event_id != second.event_id
+              assert "test.ping" in catalog.registered_types
+          PYEOF
+
+          cat > shared_engines/audit/__init__.py <<'PYEOF'
+          """Shared audit capability: append-only hash chain."""
+          from __future__ import annotations
+
+          from shared_engines.audit.chain import AuditRecord, AuditTrail
+
+          __all__ = ["AuditRecord", "AuditTrail"]
+          PYEOF
+
+          cat > shared_engines/audit/chain.py <<'PYEOF'
+          """Append-only hash-chained audit trail with checkpoints.
+
+          Each record commits to the previous record's hash; any later
+          mutation breaks verification from that point. Checkpoints pin
+          (sequence, chain_hash) for external anchoring later. This
+          local chain is tamper-EVIDENT; it is not cryptographic proof
+          against an attacker with full database control.
+          """
+          from __future__ import annotations
+
+          from collections.abc import Mapping
+          from dataclasses import dataclass
+          from typing import Any
+
+          from shared_engines.common.clocks import Clock
+          from shared_engines.common.errors import IntegrityError, ValidationError
+          from shared_engines.common.identifiers import (
+              payload_fingerprint,
+              stable_hash,
+          )
+          from shared_engines.common.validation import require_non_empty_str
+          from shared_engines.storage.database import Database
+          from shared_engines.storage.migrations import Migration, MigrationRunner
+
+          GENESIS_HASH = "0" * 64
+
+          MIGRATIONS = (
+              Migration(
+                  1,
+                  "audit_chain",
+                  (
+                      "CREATE TABLE audit_records ("
+                      " sequence INTEGER PRIMARY KEY,"
+                      " timestamp REAL NOT NULL,"
+                      " event_type TEXT NOT NULL,"
+                      " actor TEXT NOT NULL,"
+                      " subject TEXT NOT NULL,"
+                      " payload_hash TEXT NOT NULL,"
+                      " previous_hash TEXT NOT NULL,"
+                      " record_hash TEXT NOT NULL)",
+                      "CREATE TABLE audit_checkpoints ("
+                      " sequence INTEGER PRIMARY KEY,"
+                      " chain_hash TEXT NOT NULL,"
+                      " checkpoint_hash TEXT NOT NULL,"
+                      " created_at REAL NOT NULL)",
+                  ),
+              ),
+          )
+
+
+          @dataclass(frozen=True)
+          class AuditRecord:
+              sequence: int
+              timestamp: float
+              event_type: str
+              actor: str
+              subject: str
+              payload_hash: str
+              previous_hash: str
+              record_hash: str
+
+
+          def _compute_record_hash(
+              sequence: int,
+              timestamp: float,
+              event_type: str,
+              actor: str,
+              subject: str,
+              payload_hash: str,
+              previous_hash: str,
+          ) -> str:
+              return stable_hash(
+                  str(sequence),
+                  f"{timestamp:.6f}",
+                  event_type,
+                  actor,
+                  subject,
+                  payload_hash,
+                  previous_hash,
+              )
+
+
+          class AuditTrail:
+              """Tamper-evident chain; checkpoints pin the chain head."""
+
+              def __init__(self, db: Database, clock: Clock) -> None:
+                  self._db = db
+                  self._clock = clock
+                  MigrationRunner(db, "audit", MIGRATIONS).run(clock)
+
+              def append(
+                  self,
+                  *,
+                  event_type: str,
+                  actor: str,
+                  subject: str,
+                  payload: Mapping[str, Any],
+              ) -> AuditRecord:
+                  require_non_empty_str(event_type, "event_type")
+                  require_non_empty_str(actor, "actor")
+                  require_non_empty_str(subject, "subject")
+                  payload_hash = payload_fingerprint(dict(payload))
+                  with self._db.transaction() as cursor:
+                      last = cursor.execute(
+                          "SELECT sequence, record_hash FROM audit_records"
+                          " ORDER BY sequence DESC LIMIT 1"
+                      ).fetchone()
+                      sequence = int(last["sequence"]) + 1 if last is not None else 1
+                      previous_hash = (
+                          str(last["record_hash"])
+                          if last is not None
+                          else GENESIS_HASH
+                      )
+                      timestamp = self._clock.now()
+                      record_hash = _compute_record_hash(
+                          sequence,
+                          timestamp,
+                          event_type,
+                          actor,
+                          subject,
+                          payload_hash,
+                          previous_hash,
+                      )
+                      cursor.execute(
+                          "INSERT INTO audit_records"
+                          " (sequence, timestamp, event_type, actor, subject,"
+                          "  payload_hash, previous_hash, record_hash)"
+                          " VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+                          (
+                              sequence,
+                              timestamp,
+                              event_type,
+                              actor,
+                              subject,
+                              payload_hash,
+                              previous_hash,
+                              record_hash,
+                          ),
+                      )
+                  return AuditRecord(
+                      sequence=sequence,
+                      timestamp=timestamp,
+                      event_type=event_type,
+                      actor=actor,
+                      subject=subject,
+                      payload_hash=payload_hash,
+                      previous_hash=previous_hash,
+                      record_hash=record_hash,
+                  )
+
+              def verify(self) -> int:
+                  """Recomputes the whole chain; raises on any break."""
+                  previous = GENESIS_HASH
+                  count = 0
+                  for row in self._db.query_all(
+                      "SELECT * FROM audit_records ORDER BY sequence"
+                  ):
+                      expected_sequence = count + 1
+                      if int(row["sequence"]) != expected_sequence:
+                          raise IntegrityError(
+                              f"audit chain gap at sequence {expected_sequence}"
+                          )
+                      expected = _compute_record_hash(
+                          expected_sequence,
+                          float(row["timestamp"]),
+                          str(row["event_type"]),
+                          str(row["actor"]),
+                          str(row["subject"]),
+                          str(row["payload_hash"]),
+                          previous,
+                      )
+                      if str(row["previous_hash"]) != previous:
+                          raise IntegrityError(
+                              f"chain broken at sequence {expected_sequence}:"
+                              " previous hash mismatch"
+                          )
+                      if str(row["record_hash"]) != expected:
+                          raise IntegrityError(
+                              f"record modified at sequence {expected_sequence}"
+                          )
+                      previous = str(row["record_hash"])
+                      count = expected_sequence
+                  return count
+
+              def checkpoint(self) -> tuple[int, str]:
+                  count = self.verify()
+                  if count == 0:
+                      raise ValidationError(
+                          "cannot checkpoint an empty audit trail"
+                      )
+                  last = self._db.query_one(
+                      "SELECT sequence, record_hash FROM audit_records"
+                      " ORDER BY sequence DESC LIMIT 1"
+                  )
+                  if last is None:
+                      raise IntegrityError("audit trail vanished")
+                  sequence = int(last["sequence"])
+                  chain_hash = str(last["record_hash"])
+                  checkpoint_hash = stable_hash(
+                      "audit-checkpoint", str(sequence), chain_hash
+                  )
+                  self._db.execute(
+                      "INSERT INTO audit_checkpoints"
+                      " (sequence, chain_hash, checkpoint_hash, created_at)"
+                      " VALUES (?, ?, ?, ?)",
+                      (sequence, chain_hash, checkpoint_hash, self._clock.now()),
+                  )
+                  return sequence, checkpoint_hash
+
+              def verify_checkpoints(self) -> int:
+                  """Re-verifies the chain and every checkpoint binding."""
+                  self.verify()
+                  rows = self._db.query_all(
+                      "SELECT * FROM audit_checkpoints ORDER BY sequence"
+                  )
+                  for row in rows:
+                      sequence = int(row["sequence"])
+                      record = self._db.query_one(
+                          "SELECT record_hash FROM audit_records"
+                          " WHERE sequence = ?",
+                          (sequence,),
+                      )
+                      if record is None or str(record["record_hash"]) != str(
+                          row["chain_hash"]
+                      ):
+                          raise IntegrityError(
+                              f"checkpoint at {sequence} no longer matches chain"
+                          )
+                      expected = stable_hash(
+                          "audit-checkpoint", str(sequence), str(row["chain_hash"])
+                      )
+                      if expected != str(row["checkpoint_hash"]):
+                          raise IntegrityError(
+                              f"checkpoint modified at sequence {sequence}"
+                          )
+                  return len(rows)
+          PYEOF
+
+          cat > shared_engines/audit/tests/test_audit.py <<'PYEOF'
+          from __future__ import annotations
+
+          from concurrent.futures import ThreadPoolExecutor
+          from pathlib import Path
+
+          import pytest
+
+          from shared_engines.audit.chain import AuditTrail
+          from shared_engines.common.clocks import FrozenClock
+          from shared_engines.common.errors import IntegrityError, ValidationError
+          from shared_engines.storage.database import SQLiteAdapter
+
+
+          def _trail(tmp_path: Path) -> tuple[AuditTrail, SQLiteAdapter]:
+              db = SQLiteAdapter(tmp_path / "audit.db")
+              return AuditTrail(db, FrozenClock()), db
+
+
+          def test_chain_verifies_and_detects_tampering(tmp_path: Path) -> None:
+              trail, db = _trail(tmp_path)
+              for index in range(3):
+                  trail.append(
+                      event_type="test.event",
+                      actor="tester",
+                      subject=f"s{index}",
+                      payload={"i": index},
+                  )
+              assert trail.verify() == 3
+              db.execute(
+                  "UPDATE audit_records SET event_type = 'evil'"
+                  " WHERE sequence = 2"
+              )
+              with pytest.raises(IntegrityError):
+                  trail.verify()
+              db.close()
+
+
+          def test_chain_detects_row_deletion(tmp_path: Path) -> None:
+              trail, db = _trail(tmp_path)
+              for index in range(3):
+                  trail.append(
+                      event_type="t", actor="a", subject=f"s{index}", payload={}
+                  )
+              db.execute("DELETE FROM audit_records WHERE sequence = 2")
+              with pytest.raises(IntegrityError):
+                  trail.verify()
+              db.close()
+
+
+          def test_checkpoint_binds_chain(tmp_path: Path) -> None:
+              trail, db = _trail(tmp_path)
+              trail.append(event_type="t", actor="a", subject="s", payload={"n": 1})
+              sequence, checkpoint_hash = trail.checkpoint()
+              assert sequence == 1
+              assert len(checkpoint_hash) == 64
+              trail.append(event_type="t", actor="a", subject="s2", payload={})
+              assert trail.verify_checkpoints() == 1
+              db.execute(
+                  "UPDATE audit_records SET subject = 'rewritten'"
+                  " WHERE sequence = 1"
+              )
+              with pytest.raises(IntegrityError):
+                  trail.verify_checkpoints()
+              db.close()
+
+
+          def test_checkpoint_requires_records(tmp_path: Path) -> None:
+              trail, _ = _trail(tmp_path)
+              with pytest.raises(ValidationError):
+                  trail.checkpoint()
+
+
+          def test_chain_gap_free_under_concurrency(tmp_path: Path) -> None:
+              trail, db = _trail(tmp_path)
+
+              def write(index: int) -> None:
+                  trail.append(
+                      event_type="t",
+                      actor="worker",
+                      subject=f"s{index}",
+                      payload={"i": index},
+                  )
+
+              with ThreadPoolExecutor(max_workers=4) as pool:
+                  list(pool.map(write, range(24)))
+              assert trail.verify() == 24
+              db.close()
+          PYEOF
+
+          echo "=== MODULE 02 BUILD COMPLETE ==="
+
+      - name: Quality gates (full regression: all modules)
         run: |
           set -euo pipefail
-          M="shared_engines/common"
-          python -m compileall -q shared_engines/__init__.py $M
+          python -m compileall -q shared_engines
           echo "compile OK"
-          flake8 $M --max-line-length=100
+          find shared_engines -name '__pycache__' -type d -prune -exec rm -rf {} +
+          flake8 shared_engines --max-line-length=100
           echo "flake8 OK"
-          mypy --strict --cache-dir="${RUNNER_TEMP}/mypy-cache" $M
+          mypy --strict --cache-dir="${RUNNER_TEMP}/mypy-cache" shared_engines
           echo "mypy OK"
-          PYTHONPATH="$PWD" python -m pytest -q -p no:cacheprovider $M/tests
+          PYTHONPATH="$PWD" python -m pytest -q -p no:cacheprovider shared_engines
           echo "pytest OK"
-          find $M -name '__pycache__' -type d -prune -exec rm -rf {} +
+          find shared_engines -name '__pycache__' -type d -prune -exec rm -rf {} +
 
       - name: Commit and push
         run: |
@@ -511,7 +1311,7 @@ jobs:
           if git diff --cached --quiet; then
             echo "No changes."
           else
-            git commit -m "zyra: module 01 common (typed errors, clocks, json, ids, validation, result, pagination) + tests"
+            git commit -m "zyra: module 02 data (storage: adapter+migrations+backup, events: catalog+outbox+inbox, audit: hash-chain+checkpoints) + tests"
             git push origin "HEAD:${{ github.ref_name }}"
           fi
-          echo "=== MODULE 01 COMPLETE ==="
+          echo "=== MODULE 02 COMPLETE ==="

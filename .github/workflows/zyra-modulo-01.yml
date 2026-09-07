@@ -1,4 +1,4 @@
-name: zyra-modulo-07-runtime-api
+name: zyra-modulo-08-tokens
 
 "on":
   workflow_dispatch:
@@ -9,7 +9,7 @@ permissions:
   contents: write
 
 concurrency:
-  group: zyra-modulo-07-${{ github.ref }}
+  group: zyra-modulo-08-${{ github.ref }}
   cancel-in-progress: false
 
 jobs:
@@ -31,7 +31,7 @@ jobs:
           python -m pip install --upgrade pip
           python -m pip install "cryptography>=42,<45" "flake8>=7,<8" "mypy>=1.10,<2" "pytest>=8,<9"
 
-      - name: Check modules 01-06 present
+      - name: Check modules 01-07 present
         run: |
           set -euo pipefail
           test -f shared_engines/common/errors.py
@@ -40,164 +40,846 @@ jobs:
           test -f shared_engines/audit/chain.py
           test -f shared_engines/identity/engine.py
           test -f shared_engines/verification/engine.py
-          echo "modules 01-06 present: OK"
+          test -f shared_engines/runtime/kernel.py
+          echo "modules 01-07 present: OK"
 
-      - name: Build shared_engines/runtime (kernel + HTTP API)
+      - name: Build shared_engines/tokenization
         run: |
           set -euo pipefail
-          mkdir -p shared_engines/runtime/tests
+          mkdir -p shared_engines/tokenization/tests
 
-          cat > shared_engines/runtime/__init__.py <<'PYEOF'
-          """Zyra runtime: kernel + HTTP API.
+          cat > shared_engines/tokenization/__init__.py <<'PYEOF'
+          """Zyra tokenization: auditable activity-to-value ledger.
 
-          The kernel is the composition root: it wires storage,
-          events, audit, identity and verification into ONE living
-          system, bootstraps the Root Authority identity, and exposes
-          aggregated health. The API layer serves that system over
-          HTTP with bearer-token auth, strict error mapping and a
-          stable JSON envelope, so third parties (apps, banks,
-          external verifiers) can consume the Network.
+          A bank-grade double-entry ledger over identity: tokens are
+          ONLY minted through explicit emission rules bound to real
+          Network activities (media registered, credentials earned,
+          app events), with daily and lifetime caps to prevent
+          inflation. Users redeem tokens on a catalog of tangible
+          items (premium space, features, discounts). Every movement
+          is one transaction, audited and evented; the accounting
+          invariant is machine-checkable. An on-chain adapter can be
+          attached later without rewriting the ledger.
           """
           from __future__ import annotations
 
-          from shared_engines.runtime.api import ZyraApiHandler
-          from shared_engines.runtime.config import RuntimeConfig
-          from shared_engines.runtime.kernel import ZyraKernel
-          from shared_engines.runtime.responses import ApiError
-          from shared_engines.runtime.server import ZyraServer
+          from shared_engines.tokenization.engine import TokenEngine
+          from shared_engines.tokenization.errors import (
+              EmissionCapExceededError,
+              InsufficientBalanceError,
+              ItemInactiveError,
+              RuleInactiveError,
+              TokenizationError,
+              UnknownItemError,
+              UnknownRuleError,
+          )
+          from shared_engines.tokenization.ledger import (
+              EmissionRule,
+              LedgerTransaction,
+              RedemptionItem,
+              RedemptionRecord,
+              SYSTEM_BURN,
+              SYSTEM_TREASURY,
+              TokenLedger,
+          )
 
           __all__ = [
-              "ApiError", "RuntimeConfig", "ZyraApiHandler",
-              "ZyraKernel", "ZyraServer",
+              "SYSTEM_BURN", "SYSTEM_TREASURY", "EmissionCapExceededError",
+              "EmissionRule", "InsufficientBalanceError", "ItemInactiveError",
+              "LedgerTransaction", "RedemptionItem", "RedemptionRecord",
+              "RuleInactiveError", "TokenEngine", "TokenLedger",
+              "TokenizationError", "UnknownItemError", "UnknownRuleError",
           ]
           PYEOF
 
-          cat > shared_engines/runtime/config.py <<'PYEOF'
-          """Validated runtime configuration.
+          cat > shared_engines/tokenization/errors.py <<'PYEOF'
+          """Typed tokenization errors."""
+          from __future__ import annotations
 
-          ``port=0`` is valid and standard: it asks the OS for an
-          ephemeral free port (tests and orchestrators rely on it).
-          The API token is runtime state injected by the composition
-          root; it is never hardcoded.
+          from shared_engines.common.errors import (
+              ConfigurationError,
+              EngineError,
+              NotFoundError,
+              ValidationError,
+          )
+
+
+          class TokenizationError(EngineError):
+              """Base for token engine failures."""
+
+
+          class InsufficientBalanceError(TokenizationError, ValidationError):
+              """The account cannot cover the requested amount."""
+
+
+          class UnknownRuleError(TokenizationError, NotFoundError):
+              """No emission rule exists for the given id/activity."""
+
+
+          class RuleInactiveError(TokenizationError, ValidationError):
+              """The emission rule exists but is disabled."""
+
+
+          class EmissionCapExceededError(TokenizationError, ValidationError):
+              """The emission would exceed a daily or lifetime cap."""
+
+
+          class UnknownItemError(TokenizationError, NotFoundError):
+              """No redemption item exists for the given id."""
+
+
+          class ItemInactiveError(TokenizationError, ValidationError):
+              """The redemption item exists but is disabled."""
+
+
+          class DuplicateRuleError(TokenizationError, ConfigurationError):
+              """An emission rule already exists for this activity."""
+          PYEOF
+
+          cat > shared_engines/tokenization/ledger.py <<'PYEOF'
+          """Double-entry token ledger with capped emission and redemption.
+
+          Accounting model (bank-grade):
+          - Every movement is ONE transaction row: kind, debit_account,
+            credit_account, amount, reason, ref.
+          - Mints debit the system treasury and credit a user account.
+          - Redemptions debit a user account and credit the system
+            burn account.
+          - Invariant, machine-checked: sum(user balances) equals
+            total minted minus total redeemed. Transfers between
+            users (future kind) cancel out by construction.
+          - Tokens enter circulation ONLY through emission rules with
+            daily and lifetime caps, or through explicit admin grants
+            that are always audited with the acting actor.
           """
           from __future__ import annotations
 
+          import sqlite3
           from dataclasses import dataclass
+          from typing import Final
 
-          from shared_engines.common.errors import ConfigurationError
+          from shared_engines.audit.chain import AuditTrail
+          from shared_engines.common.clocks import Clock
+          from shared_engines.common.errors import IntegrityError
+          from shared_engines.common.identifiers import new_id
           from shared_engines.common.validation import (
               require_int_range,
               require_non_empty_str,
           )
+          from shared_engines.storage.database import Database
+          from shared_engines.storage.migrations import (
+              Migration,
+              MigrationRunner,
+          )
+          from shared_engines.tokenization.errors import (
+              DuplicateRuleError,
+              EmissionCapExceededError,
+              InsufficientBalanceError,
+              ItemInactiveError,
+              RuleInactiveError,
+              UnknownItemError,
+              UnknownRuleError,
+          )
+
+          SYSTEM_TREASURY: Final[str] = "zyra://treasury"
+          SYSTEM_BURN: Final[str] = "zyra://burn"
+          _SECONDS_PER_DAY: Final[int] = 86_400
+
+          TOKEN_MIGRATIONS = (
+              Migration(
+                  1,
+                  "token_accounts",
+                  (
+                      "CREATE TABLE token_accounts ("
+                      " account_id TEXT PRIMARY KEY,"
+                      " balance INTEGER NOT NULL DEFAULT 0,"
+                      " created_at REAL NOT NULL,"
+                      " updated_at REAL NOT NULL)",
+                  ),
+              ),
+              Migration(
+                  2,
+                  "token_transactions",
+                  (
+                      "CREATE TABLE token_transactions ("
+                      " tx_id TEXT PRIMARY KEY,"
+                      " kind TEXT NOT NULL,"
+                      " debit_account TEXT NOT NULL,"
+                      " credit_account TEXT NOT NULL,"
+                      " amount INTEGER NOT NULL,"
+                      " reason TEXT NOT NULL,"
+                      " ref_type TEXT NOT NULL,"
+                      " ref_id TEXT NOT NULL,"
+                      " actor TEXT NOT NULL,"
+                      " created_at REAL NOT NULL)",
+                      "CREATE INDEX token_tx_account"
+                      " ON token_transactions (debit_account, created_at)",
+                      "CREATE INDEX token_tx_credit"
+                      " ON token_transactions (credit_account, created_at)",
+                  ),
+              ),
+              Migration(
+                  3,
+                  "emission_rules",
+                  (
+                      "CREATE TABLE emission_rules ("
+                      " rule_id TEXT PRIMARY KEY,"
+                      " activity TEXT NOT NULL UNIQUE,"
+                      " amount INTEGER NOT NULL,"
+                      " daily_cap INTEGER,"
+                      " lifetime_cap INTEGER,"
+                      " active INTEGER NOT NULL DEFAULT 1,"
+                      " created_at REAL NOT NULL)",
+                  ),
+              ),
+              Migration(
+                  4,
+                  "emission_log",
+                  (
+                      "CREATE TABLE emission_log ("
+                      " emission_id TEXT PRIMARY KEY,"
+                      " rule_id TEXT NOT NULL,"
+                      " subject_zid TEXT NOT NULL,"
+                      " day INTEGER NOT NULL,"
+                      " amount INTEGER NOT NULL,"
+                      " tx_id TEXT NOT NULL,"
+                      " created_at REAL NOT NULL)",
+                      "CREATE INDEX emission_log_rule_subject"
+                      " ON emission_log (rule_id, subject_zid, day)",
+                  ),
+              ),
+              Migration(
+                  5,
+                  "redemption_items",
+                  (
+                      "CREATE TABLE redemption_items ("
+                      " item_id TEXT PRIMARY KEY,"
+                      " title TEXT NOT NULL,"
+                      " cost INTEGER NOT NULL,"
+                      " active INTEGER NOT NULL DEFAULT 1,"
+                      " created_at REAL NOT NULL)",
+                  ),
+              ),
+              Migration(
+                  6,
+                  "redemptions",
+                  (
+                      "CREATE TABLE redemptions ("
+                      " redemption_id TEXT PRIMARY KEY,"
+                      " subject_zid TEXT NOT NULL,"
+                      " item_id TEXT NOT NULL,"
+                      " cost INTEGER NOT NULL,"
+                      " tx_id TEXT NOT NULL,"
+                      " created_at REAL NOT NULL)",
+                      "CREATE INDEX redemptions_subject"
+                      " ON redemptions (subject_zid, created_at)",
+                  ),
+              ),
+          )
 
 
           @dataclass(frozen=True)
-          class RuntimeConfig:
-              host: str = "127.0.0.1"
-              port: int = 8080
-              max_body_bytes: int = 1_000_000
-              api_token: str | None = None
+          class EmissionRule:
+              rule_id: str
+              activity: str
+              amount: int
+              daily_cap: int | None
+              lifetime_cap: int | None
+              active: bool
+              created_at: float
 
-              def __post_init__(self) -> None:
-                  require_non_empty_str(self.host, "host", config=True)
-                  if not isinstance(self.port, int) or isinstance(
-                      self.port, bool
-                  ):
-                      raise ConfigurationError("port must be an integer")
-                  if not 0 <= self.port <= 65535:
-                      raise ConfigurationError(
-                          "port must be in [0, 65535] (0 = ephemeral)"
-                      )
-                  require_int_range(
-                      self.max_body_bytes,
-                      "max_body_bytes",
-                      1,
-                      50_000_000,
-                      config=True,
+
+          @dataclass(frozen=True)
+          class RedemptionItem:
+              item_id: str
+              title: str
+              cost: int
+              active: bool
+              created_at: float
+
+
+          @dataclass(frozen=True)
+          class LedgerTransaction:
+              tx_id: str
+              kind: str
+              debit_account: str
+              credit_account: str
+              amount: int
+              reason: str
+              ref_type: str
+              ref_id: str
+              actor: str
+              created_at: float
+
+
+          @dataclass(frozen=True)
+          class RedemptionRecord:
+              redemption_id: str
+              subject_zid: str
+              item_id: str
+              cost: int
+              tx_id: str
+              created_at: float
+
+
+          class TokenLedger:
+              """The accounting core: accounts, transactions, rules."""
+
+              def __init__(self, db: Database, clock: Clock) -> None:
+                  self._db = db
+                  self._clock = clock
+                  MigrationRunner(
+                      db, "tokenization", TOKEN_MIGRATIONS
+                  ).run(clock)
+
+              @staticmethod
+              def _day_of(now: float) -> int:
+                  return int(now // _SECONDS_PER_DAY)
+
+              def _ensure_account(
+                  self, cursor: sqlite3.Cursor, account: str, now: float
+              ) -> None:
+                  cursor.execute(
+                      "INSERT OR IGNORE INTO token_accounts"
+                      " (account_id, balance, created_at, updated_at)"
+                      " VALUES (?, 0, ?, ?)",
+                      (account, now, now),
                   )
-                  if self.api_token is not None and len(self.api_token) < 16:
-                      raise ConfigurationError(
-                          "api_token must be at least 16 characters"
+
+              def _credit(
+                  self,
+                  cursor: sqlite3.Cursor,
+                  account: str,
+                  amount: int,
+                  now: float,
+              ) -> None:
+                  self._ensure_account(cursor, account, now)
+                  cursor.execute(
+                      "UPDATE token_accounts SET balance = balance + ?,"
+                      " updated_at = ? WHERE account_id = ?",
+                      (amount, now, account),
+                  )
+
+              def _debit(
+                  self,
+                  cursor: sqlite3.Cursor,
+                  account: str,
+                  amount: int,
+                  now: float,
+              ) -> None:
+                  row = cursor.execute(
+                      "SELECT balance FROM token_accounts"
+                      " WHERE account_id = ?",
+                      (account,),
+                  ).fetchone()
+                  balance = int(row["balance"]) if row is not None else 0
+                  if balance < amount:
+                      raise InsufficientBalanceError(
+                          f"account {account} has {balance},"
+                          f" needs {amount}"
                       )
+                  cursor.execute(
+                      "UPDATE token_accounts SET balance = balance - ?,"
+                      " updated_at = ? WHERE account_id = ?",
+                      (amount, now, account),
+                  )
+
+              def _record_tx(
+                  self,
+                  cursor: sqlite3.Cursor,
+                  *,
+                  kind: str,
+                  debit: str,
+                  credit: str,
+                  amount: int,
+                  reason: str,
+                  ref_type: str,
+                  ref_id: str,
+                  actor: str,
+                  now: float,
+              ) -> LedgerTransaction:
+                  tx_id = f"TX-{new_id()}"
+                  cursor.execute(
+                      "INSERT INTO token_transactions"
+                      " (tx_id, kind, debit_account, credit_account,"
+                      "  amount, reason, ref_type, ref_id, actor,"
+                      "  created_at)"
+                      " VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                      (
+                          tx_id,
+                          kind,
+                          debit,
+                          credit,
+                          amount,
+                          reason,
+                          ref_type,
+                          ref_id,
+                          actor,
+                          now,
+                      ),
+                  )
+                  return LedgerTransaction(
+                      tx_id=tx_id,
+                      kind=kind,
+                      debit_account=debit,
+                      credit_account=credit,
+                      amount=amount,
+                      reason=reason,
+                      ref_type=ref_type,
+                      ref_id=ref_id,
+                      actor=actor,
+                      created_at=now,
+                  )
+
+              def define_rule(
+                  self,
+                  *,
+                  activity: str,
+                  amount: int,
+                  daily_cap: int | None = None,
+                  lifetime_cap: int | None = None,
+              ) -> EmissionRule:
+                  require_non_empty_str(activity, "activity", config=True)
+                  require_int_range(amount, "amount", 1, 1_000_000, config=True)
+                  if daily_cap is not None:
+                      require_int_range(
+                          daily_cap, "daily_cap", 1, 10_000_000, config=True
+                      )
+                      if daily_cap < amount:
+                          raise IntegrityError(
+                              "daily_cap must be >= amount"
+                          )
+                  if lifetime_cap is not None:
+                      require_int_range(
+                          lifetime_cap,
+                          "lifetime_cap",
+                          1,
+                          1_000_000_000,
+                          config=True,
+                      )
+                      if lifetime_cap < amount:
+                          raise IntegrityError(
+                              "lifetime_cap must be >= amount"
+                          )
+                  rule_id = f"RULE-{new_id()}"
+                  now = self._clock.now()
+                  try:
+                      with self._db.transaction() as cursor:
+                          cursor.execute(
+                              "INSERT INTO emission_rules"
+                              " (rule_id, activity, amount, daily_cap,"
+                              "  lifetime_cap, active, created_at)"
+                              " VALUES (?, ?, ?, ?, ?, 1, ?)",
+                              (
+                                  rule_id,
+                                  activity,
+                                  amount,
+                                  daily_cap,
+                                  lifetime_cap,
+                                  now,
+                              ),
+                          )
+                  except sqlite3.IntegrityError as exc:
+                      raise DuplicateRuleError(
+                          f"activity already has a rule: {activity}"
+                      ) from exc
+                  rule = self.get_rule_by_activity(activity)
+                  if rule is None:
+                      raise IntegrityError("rule vanished after insert")
+                  return rule
+
+              def get_rule_by_activity(
+                  self, activity: str
+              ) -> EmissionRule | None:
+                  row = self._db.query_one(
+                      "SELECT * FROM emission_rules WHERE activity = ?",
+                      (activity,),
+                  )
+                  if row is None:
+                      return None
+                  return self._rule_from_row(row)
+
+              def list_rules(self) -> tuple[EmissionRule, ...]:
+                  rows = self._db.query_all(
+                      "SELECT * FROM emission_rules"
+                      " ORDER BY created_at, rule_id"
+                  )
+                  return tuple(self._rule_from_row(row) for row in rows)
+
+              def set_rule_active(
+                  self, activity: str, *, active: bool
+              ) -> EmissionRule:
+                  rule = self.get_rule_by_activity(activity)
+                  if rule is None:
+                      raise UnknownRuleError(
+                          f"unknown rule activity: {activity}"
+                      )
+                  self._db.execute(
+                      "UPDATE emission_rules SET active = ?"
+                      " WHERE rule_id = ?",
+                      (1 if active else 0, rule.rule_id),
+                  )
+                  updated = self.get_rule_by_activity(activity)
+                  if updated is None:
+                      raise IntegrityError("rule vanished during update")
+                  return updated
+
+              def _check_caps(
+                  self,
+                  cursor: sqlite3.Cursor,
+                  rule: EmissionRule,
+                  subject_zid: str,
+                  now: float,
+              ) -> None:
+                  day = self._day_of(now)
+                  if rule.daily_cap is not None:
+                      row = cursor.execute(
+                          "SELECT COALESCE(SUM(amount), 0) AS total"
+                          " FROM emission_log WHERE rule_id = ?"
+                          " AND subject_zid = ? AND day = ?",
+                          (rule.rule_id, subject_zid, day),
+                      ).fetchone()
+                      today_total = (
+                          int(row["total"]) if row is not None else 0
+                      )
+                      if today_total + rule.amount > rule.daily_cap:
+                          raise EmissionCapExceededError(
+                              f"daily cap {rule.daily_cap} exceeded"
+                              f" for {rule.activity}"
+                              f" (today {today_total})"
+                          )
+                  if rule.lifetime_cap is not None:
+                      row = cursor.execute(
+                          "SELECT COALESCE(SUM(amount), 0) AS total"
+                          " FROM emission_log WHERE rule_id = ?"
+                          " AND subject_zid = ?",
+                          (rule.rule_id, subject_zid),
+                      ).fetchone()
+                      life_total = (
+                          int(row["total"]) if row is not None else 0
+                      )
+                      if life_total + rule.amount > rule.lifetime_cap:
+                          raise EmissionCapExceededError(
+                              f"lifetime cap {rule.lifetime_cap}"
+                              f" exceeded for {rule.activity}"
+                          )
+
+              def earn(
+                  self,
+                  *,
+                  subject_zid: str,
+                  activity: str,
+                  ref_type: str,
+                  ref_id: str,
+              ) -> LedgerTransaction:
+                  """Mints via an active rule, enforcing caps atomically."""
+                  require_non_empty_str(subject_zid, "subject_zid")
+                  require_non_empty_str(ref_type, "ref_type")
+                  require_non_empty_str(ref_id, "ref_id")
+                  with self._db.transaction() as cursor:
+                      rule_row = cursor.execute(
+                          "SELECT * FROM emission_rules WHERE activity = ?",
+                          (activity,),
+                      ).fetchone()
+                      if rule_row is None:
+                          raise UnknownRuleError(
+                              f"no rule for activity: {activity}"
+                          )
+                      rule = self._rule_from_row(rule_row)
+                      if not rule.active:
+                          raise RuleInactiveError(
+                              f"rule {activity} is inactive"
+                          )
+                      now = self._clock.now()
+                      self._check_caps(cursor, rule, subject_zid, now)
+                      tx = self._record_tx(
+                          cursor,
+                          kind="mint",
+                          debit=SYSTEM_TREASURY,
+                          credit=subject_zid,
+                          amount=rule.amount,
+                          reason=f"rule:{rule.rule_id}",
+                          ref_type=ref_type,
+                          ref_id=ref_id,
+                          actor="token-engine",
+                          now=now,
+                      )
+                      cursor.execute(
+                          "INSERT INTO emission_log"
+                          " (emission_id, rule_id, subject_zid, day,"
+                          "  amount, tx_id, created_at)"
+                          " VALUES (?, ?, ?, ?, ?, ?, ?)",
+                          (
+                              f"EMI-{new_id()}",
+                              rule.rule_id,
+                              subject_zid,
+                              self._day_of(now),
+                              rule.amount,
+                              tx.tx_id,
+                              now,
+                          ),
+                      )
+                  return tx
+
+              def grant(
+                  self,
+                  *,
+                  subject_zid: str,
+                  amount: int,
+                  reason: str,
+                  actor: str,
+              ) -> LedgerTransaction:
+                  """Admin mint: always audited with the acting actor."""
+                  require_non_empty_str(subject_zid, "subject_zid")
+                  require_int_range(amount, "amount", 1, 10_000_000)
+                  require_non_empty_str(reason, "reason")
+                  require_non_empty_str(actor, "actor")
+                  now = self._clock.now()
+                  with self._db.transaction() as cursor:
+                      tx = self._record_tx(
+                          cursor,
+                          kind="mint",
+                          debit=SYSTEM_TREASURY,
+                          credit=subject_zid,
+                          amount=amount,
+                          reason=reason,
+                          ref_type="admin_grant",
+                          ref_id="manual",
+                          actor=actor,
+                          now=now,
+                      )
+                  return tx
+
+              def balance(self, account: str) -> int:
+                  row = self._db.query_one(
+                      "SELECT balance FROM token_accounts"
+                      " WHERE account_id = ?",
+                      (account,),
+                  )
+                  if row is None:
+                      return 0
+                  return int(row["balance"])
+
+              def history(
+                  self, account: str, *, limit: int = 50
+              ) -> tuple[LedgerTransaction, ...]:
+                  require_int_range(limit, "limit", 1, 500)
+                  rows = self._db.query_all(
+                      "SELECT * FROM token_transactions"
+                      " WHERE debit_account = ? OR credit_account = ?"
+                      " ORDER BY created_at DESC, tx_id DESC LIMIT ?",
+                      (account, account, limit),
+                  )
+                  return tuple(self._tx_from_row(row) for row in rows)
+
+              def define_item(
+                  self,
+                  *,
+                  item_id: str,
+                  title: str,
+                  cost: int,
+                  active: bool = True,
+              ) -> RedemptionItem:
+                  require_non_empty_str(item_id, "item_id", config=True)
+                  require_non_empty_str(title, "title", config=True)
+                  require_int_range(cost, "cost", 1, 10_000_000, config=True)
+                  now = self._clock.now()
+                  self._db.execute(
+                      "INSERT OR REPLACE INTO redemption_items"
+                      " (item_id, title, cost, active, created_at)"
+                      " VALUES (?, ?, ?, ?, ?)",
+                      (item_id, title, cost, 1 if active else 0, now),
+                  )
+                  item = self.get_item(item_id)
+                  if item is None:
+                      raise IntegrityError("item vanished after insert")
+                  return item
+
+              def get_item(self, item_id: str) -> RedemptionItem | None:
+                  row = self._db.query_one(
+                      "SELECT * FROM redemption_items WHERE item_id = ?",
+                      (item_id,),
+                  )
+                  if row is None:
+                      return None
+                  return self._item_from_row(row)
+
+              def list_items(self) -> tuple[RedemptionItem, ...]:
+                  rows = self._db.query_all(
+                      "SELECT * FROM redemption_items"
+                      " ORDER BY cost, item_id"
+                  )
+                  return tuple(self._item_from_row(row) for row in rows)
+
+              def redeem(
+                  self, subject_zid: str, item_id: str
+              ) -> RedemptionRecord:
+                  """Burns tokens against a catalog item, atomically."""
+                  require_non_empty_str(subject_zid, "subject_zid")
+                  require_non_empty_str(item_id, "item_id")
+                  with self._db.transaction() as cursor:
+                      item_row = cursor.execute(
+                          "SELECT * FROM redemption_items"
+                          " WHERE item_id = ?",
+                          (item_id,),
+                      ).fetchone()
+                      if item_row is None:
+                          raise UnknownItemError(
+                              f"unknown item: {item_id}"
+                          )
+                      item = self._item_from_row(item_row)
+                      if not item.active:
+                          raise ItemInactiveError(
+                              f"item {item_id} is inactive"
+                          )
+                      now = self._clock.now()
+                      self._debit(
+                          cursor, subject_zid, item.cost, now
+                      )
+                      self._credit(cursor, SYSTEM_BURN, item.cost, now)
+                      tx = self._record_tx(
+                          cursor,
+                          kind="redeem",
+                          debit=subject_zid,
+                          credit=SYSTEM_BURN,
+                          amount=item.cost,
+                          reason=f"item:{item.item_id}",
+                          ref_type="redemption",
+                          ref_id=item.item_id,
+                          actor=subject_zid,
+                          now=now,
+                      )
+                      redemption_id = f"RDM-{new_id()}"
+                      cursor.execute(
+                          "INSERT INTO redemptions"
+                          " (redemption_id, subject_zid, item_id, cost,"
+                          "  tx_id, created_at)"
+                          " VALUES (?, ?, ?, ?, ?, ?)",
+                          (
+                              redemption_id,
+                              subject_zid,
+                              item.item_id,
+                              item.cost,
+                              tx.tx_id,
+                              now,
+                          ),
+                      )
+                  return RedemptionRecord(
+                      redemption_id=redemption_id,
+                      subject_zid=subject_zid,
+                      item_id=item.item_id,
+                      cost=item.cost,
+                      tx_id=tx.tx_id,
+                      created_at=now,
+                  )
+
+              def list_redemptions(
+                  self, subject_zid: str
+              ) -> tuple[RedemptionRecord, ...]:
+                  rows = self._db.query_all(
+                      "SELECT * FROM redemptions WHERE subject_zid = ?"
+                      " ORDER BY created_at DESC, redemption_id DESC",
+                      (subject_zid,),
+                  )
+                  return tuple(
+                      RedemptionRecord(
+                          redemption_id=str(row["redemption_id"]),
+                          subject_zid=str(row["subject_zid"]),
+                          item_id=str(row["item_id"]),
+                          cost=int(row["cost"]),
+                          tx_id=str(row["tx_id"]),
+                          created_at=float(row["created_at"]),
+                      )
+                      for row in rows
+                  )
+
+              def invariant_check(self) -> bool:
+                  """user balances == minted - redeemed (accounting law)."""
+                  users_row = self._db.query_one(
+                      "SELECT COALESCE(SUM(balance), 0) AS total"
+                      " FROM token_accounts WHERE account_id NOT IN"
+                      " (?, ?)",
+                      (SYSTEM_TREASURY, SYSTEM_BURN),
+                  )
+                  minted_row = self._db.query_one(
+                      "SELECT COALESCE(SUM(amount), 0) AS total"
+                      " FROM token_transactions WHERE kind = 'mint'"
+                  )
+                  redeemed_row = self._db.query_one(
+                      "SELECT COALESCE(SUM(amount), 0) AS total"
+                      " FROM token_transactions WHERE kind = 'redeem'"
+                  )
+                  user_total = (
+                      int(users_row["total"])
+                      if users_row is not None
+                      else 0
+                  )
+                  minted = (
+                      int(minted_row["total"])
+                      if minted_row is not None
+                      else 0
+                  )
+                  redeemed = (
+                      int(redeemed_row["total"])
+                      if redeemed_row is not None
+                      else 0
+                  )
+                  return user_total == minted - redeemed
+
+              @staticmethod
+              def _rule_from_row(row: sqlite3.Row) -> EmissionRule:
+                  daily_cap = row["daily_cap"]
+                  lifetime_cap = row["lifetime_cap"]
+                  return EmissionRule(
+                      rule_id=str(row["rule_id"]),
+                      activity=str(row["activity"]),
+                      amount=int(row["amount"]),
+                      daily_cap=(
+                          None if daily_cap is None else int(daily_cap)
+                      ),
+                      lifetime_cap=(
+                          None
+                          if lifetime_cap is None
+                          else int(lifetime_cap)
+                      ),
+                      active=bool(int(row["active"])),
+                      created_at=float(row["created_at"]),
+                  )
+
+              @staticmethod
+              def _item_from_row(row: sqlite3.Row) -> RedemptionItem:
+                  return RedemptionItem(
+                      item_id=str(row["item_id"]),
+                      title=str(row["title"]),
+                      cost=int(row["cost"]),
+                      active=bool(int(row["active"])),
+                      created_at=float(row["created_at"]),
+                  )
+
+              @staticmethod
+              def _tx_from_row(row: sqlite3.Row) -> LedgerTransaction:
+                  return LedgerTransaction(
+                      tx_id=str(row["tx_id"]),
+                      kind=str(row["kind"]),
+                      debit_account=str(row["debit_account"]),
+                      credit_account=str(row["credit_account"]),
+                      amount=int(row["amount"]),
+                      reason=str(row["reason"]),
+                      ref_type=str(row["ref_type"]),
+                      ref_id=str(row["ref_id"]),
+                      actor=str(row["actor"]),
+                      created_at=float(row["created_at"]),
+                  )
           PYEOF
 
-          cat > shared_engines/runtime/responses.py <<'PYEOF'
-          """HTTP response envelope and typed-error mapping.
+          cat > shared_engines/tokenization/engine.py <<'PYEOF'
+          """Token engine: the public facade of the capability.
 
-          Success: {"ok": true, "data": ...}
-          Failure: {"ok": false, "error": {"type": ..., "message": ...}}
-
-          Every engine error class maps to exactly one HTTP status so
-          external consumers get stable semantics, not leaks.
-          """
-          from __future__ import annotations
-
-          from shared_engines.common.errors import (
-              BackpressureError,
-              ConfigurationError,
-              EngineError,
-              PolicyViolation,
-              RecoveryRequired,
-              ValidationError,
-          )
-          from shared_engines.identity.errors import (
-              IdentityAlreadyExistsError,
-              IdentityNotFoundError,
-              InvalidTransitionError,
-          )
-          from shared_engines.verification.errors import (
-              AttestationNotFoundError,
-              CredentialNotFoundError,
-              MediaNotFoundError,
-              TamperDetectedError,
-          )
-
-
-          class ApiError(Exception):
-              """Explicit API failure with a stable status and code."""
-
-              def __init__(self, status: int, code: str, message: str) -> None:
-                  super().__init__(message)
-                  self.status = status
-                  self.code = code
-                  self.message = message
-
-
-          _NOT_FOUND_ERRORS = (
-              IdentityNotFoundError,
-              MediaNotFoundError,
-              AttestationNotFoundError,
-              CredentialNotFoundError,
-          )
-
-
-          def map_engine_error(exc: EngineError) -> ApiError:
-              """Maps typed engine errors to stable HTTP semantics."""
-              if isinstance(exc, _NOT_FOUND_ERRORS):
-                  return ApiError(404, "not_found", str(exc))
-              if isinstance(exc, (InvalidTransitionError, TamperDetectedError)):
-                  return ApiError(409, "conflict", str(exc))
-              if isinstance(exc, IdentityAlreadyExistsError):
-                  return ApiError(409, "conflict", str(exc))
-              if isinstance(exc, PolicyViolation):
-                  return ApiError(403, "forbidden", str(exc))
-              if isinstance(exc, ValidationError):
-                  return ApiError(400, "invalid_request", str(exc))
-              if isinstance(exc, BackpressureError):
-                  return ApiError(503, "backpressure", str(exc))
-              if isinstance(exc, (RecoveryRequired, ConfigurationError)):
-                  return ApiError(500, "internal_error", "internal state error")
-              return ApiError(500, "internal_error", "internal error")
-          PYEOF
-
-          cat > shared_engines/runtime/kernel.py <<'PYEOF'
-          """ZyraKernel: the living composition root of the Network.
-
-          Builds and owns every engine over one durable database,
-          registers a central event catalog, bootstraps the Root
-          Authority identity (the Network's own ACTIVE institution),
-          and aggregates component health. This is the object the
-          HTTP layer serves; nothing else needs to know the wiring.
+          Earn is the only user-facing minting path and it always goes
+          through a rule bound to a real Network activity reference.
+          Grants are admin-only and audited. Redemptions burn tokens
+          against catalog items (tangible value). Every movement is
+          evented through the outbox and audited in the hash chain.
           """
           from __future__ import annotations
 
@@ -205,11 +887,6 @@ jobs:
           from shared_engines.common.clocks import Clock
           from shared_engines.events.contracts import EventCatalog
           from shared_engines.events.outbox import Outbox
-          from shared_engines.identity.contracts import (
-              Identity,
-              IdentityKind,
-              IdentityStatus,
-          )
           from shared_engines.identity.engine import IdentityEngine
           from shared_engines.observability.backend import (
               MetricsBackend,
@@ -218,1155 +895,734 @@ jobs:
           )
           from shared_engines.observability.health import (
               ComponentHealth,
-              HealthRegistry,
               HealthStatus,
           )
-          from shared_engines.runtime.config import RuntimeConfig
           from shared_engines.storage.database import Database
-          from shared_engines.verification.engine import VerificationEngine
-          from shared_engines.verification.signatures import Ed25519Signer
+          from shared_engines.tokenization.errors import UnknownRuleError
+          from shared_engines.tokenization.ledger import (
+              EmissionRule,
+              LedgerTransaction,
+              RedemptionItem,
+              RedemptionRecord,
+              TokenLedger,
+          )
 
-          NETWORK_EVENT_TYPES = (
-              "identity.registered",
-              "identity.status_changed",
-              "verification.media.registered",
-              "verification.media.tamper_detected",
-              "verification.credential.issued",
-              "verification.credential.revoked",
-              "verification.attestation.issued",
+          EVENT_TOKEN_EARNED = "token.earned"
+          EVENT_TOKEN_GRANTED = "token.granted"
+          EVENT_TOKEN_REDEEMED = "token.redeemed"
+          TOKEN_EVENT_TYPES = (
+              EVENT_TOKEN_EARNED,
+              EVENT_TOKEN_GRANTED,
+              EVENT_TOKEN_REDEEMED,
           )
 
 
-          class _StorageHealth:
-              """Reports storage liveness through the adapter's ping."""
-
-              def __init__(self, db: Database) -> None:
-                  self._db = db
-
-              def check_health(self) -> ComponentHealth:
-                  if self._db.ping():
-                      return ComponentHealth(
-                          "storage", HealthStatus.HEALTHY, "ping ok"
-                      )
-                  return ComponentHealth(
-                      "storage", HealthStatus.UNHEALTHY, "ping failed"
-                  )
-
-
-          class ZyraKernel:
-              """Owns the engines; serves as the single source of truth."""
-
+          class TokenEngine:
               def __init__(
                   self,
                   *,
                   db: Database,
                   clock: Clock,
-                  signer: Ed25519Signer,
-                  config: RuntimeConfig,
+                  audit: AuditTrail,
+                  outbox: Outbox,
+                  catalog: EventCatalog,
+                  identity: IdentityEngine,
                   metrics: MetricsBackend | None = None,
               ) -> None:
-                  self._config = config
-                  self._clock = clock
                   self._db = db
+                  self._clock = clock
+                  self._audit = audit
+                  self._outbox = outbox
+                  self._catalog = catalog
+                  self._identity = identity
                   self._metrics = metrics if metrics is not None else NoopMetrics()
-                  self._log = engine_logger("runtime")
-                  self._audit = AuditTrail(db, clock)
-                  self._outbox = Outbox(db, clock)
-                  self._outbox.ensure_schema()
-                  self._catalog = EventCatalog()
-                  for event_type in NETWORK_EVENT_TYPES:
+                  self._log = engine_logger("tokenization")
+                  for event_type in TOKEN_EVENT_TYPES:
                       self._catalog.register(event_type)
-                  self._identity = IdentityEngine(
-                      db=db,
-                      clock=clock,
-                      audit=self._audit,
-                      outbox=self._outbox,
-                      catalog=self._catalog,
-                      metrics=self._metrics,
+                  self._ledger = TokenLedger(db, clock)
+
+              @property
+              def ledger(self) -> TokenLedger:
+                  return self._ledger
+
+              def define_rule(
+                  self,
+                  *,
+                  activity: str,
+                  amount: int,
+                  daily_cap: int | None = None,
+                  lifetime_cap: int | None = None,
+              ) -> EmissionRule:
+                  rule = self._ledger.define_rule(
+                      activity=activity,
+                      amount=amount,
+                      daily_cap=daily_cap,
+                      lifetime_cap=lifetime_cap,
                   )
-                  self._verification = VerificationEngine(
-                      db=db,
-                      clock=clock,
-                      signer=signer,
-                      audit=self._audit,
-                      outbox=self._outbox,
-                      catalog=self._catalog,
-                      identity=self._identity,
-                      metrics=self._metrics,
-                  )
-                  self._health = HealthRegistry()
-                  self._health.register("storage", _StorageHealth(db))
-                  self._health.register("identity", self._identity)
-                  self._health.register("verification", self._verification)
-                  self._root_zid: str | None = None
-
-              @property
-              def config(self) -> RuntimeConfig:
-                  return self._config
-
-              @property
-              def identity(self) -> IdentityEngine:
-                  return self._identity
-
-              @property
-              def verification(self) -> VerificationEngine:
-                  return self._verification
-
-              @property
-              def audit(self) -> AuditTrail:
-                  return self._audit
-
-              @property
-              def outbox(self) -> Outbox:
-                  return self._outbox
-
-              @property
-              def root_zid(self) -> str | None:
-                  return self._root_zid
-
-              def bootstrap_root(
-                  self, *, display_name: str = "Zyra Root Authority"
-              ) -> Identity:
-                  """Creates/returns the Network's own ACTIVE authority.
-
-                  Idempotent: the first call registers + activates it;
-                  later calls return the same identity.
-                  """
-                  if self._root_zid is not None:
-                      return self._identity.require_identity(self._root_zid)
-                  root = self._identity.register_identity(
-                      kind=IdentityKind.INSTITUTION,
-                      display_name=display_name,
-                      actor="kernel",
-                  )
-                  self._identity.transition_identity(
-                      root.zid,
-                      IdentityStatus.ACTIVE,
-                      actor="kernel",
-                      reason="root authority bootstrap",
-                  )
-                  self._root_zid = root.zid
                   self._log.info(
-                      "root authority bootstrapped zid=%s", root.zid
+                      "rule defined activity=%s amount=%d",
+                      activity,
+                      amount,
                   )
-                  return self._identity.require_identity(root.zid)
+                  return rule
 
-              def health(self) -> ComponentHealth:
-                  """Worst-status aggregate across all components."""
-                  return self._health.overall()
+              def set_rule_active(
+                  self, activity: str, *, active: bool
+              ) -> EmissionRule:
+                  return self._ledger.set_rule_active(
+                      activity, active=active
+                  )
 
-              def health_components(self) -> tuple[ComponentHealth, ...]:
-                  return self._health.snapshot()
+              def list_rules(self) -> tuple[EmissionRule, ...]:
+                  return self._ledger.list_rules()
+
+              def earn(
+                  self,
+                  *,
+                  subject_zid: str,
+                  activity: str,
+                  ref_type: str,
+                  ref_id: str,
+              ) -> LedgerTransaction:
+                  self._identity.require_identity(subject_zid)
+                  tx = self._ledger.earn(
+                      subject_zid=subject_zid,
+                      activity=activity,
+                      ref_type=ref_type,
+                      ref_id=ref_id,
+                  )
+                  event = self._catalog.build(
+                      EVENT_TOKEN_EARNED,
+                      aggregate_id=subject_zid,
+                      payload={
+                          "subject_zid": subject_zid,
+                          "activity": activity,
+                          "amount": tx.amount,
+                          "ref_type": ref_type,
+                          "ref_id": ref_id,
+                          "tx_id": tx.tx_id,
+                      },
+                      clock=self._clock,
+                  )
+                  self._outbox.enqueue(event)
+                  self._audit.append(
+                      event_type=EVENT_TOKEN_EARNED,
+                      actor=subject_zid,
+                      subject=tx.tx_id,
+                      payload={
+                          "activity": activity,
+                          "amount": tx.amount,
+                          "ref_type": ref_type,
+                          "ref_id": ref_id,
+                      },
+                  )
+                  self._metrics.increment(
+                      "token.earned", tags={"activity": activity}
+                  )
+                  self._log.info(
+                      "earned subject=%s activity=%s amount=%d",
+                      subject_zid,
+                      activity,
+                      tx.amount,
+                  )
+                  return tx
+
+              def grant(
+                  self,
+                  *,
+                  subject_zid: str,
+                  amount: int,
+                  reason: str,
+                  actor: str,
+              ) -> LedgerTransaction:
+                  self._identity.require_identity(subject_zid)
+                  tx = self._ledger.grant(
+                      subject_zid=subject_zid,
+                      amount=amount,
+                      reason=reason,
+                      actor=actor,
+                  )
+                  event = self._catalog.build(
+                      EVENT_TOKEN_GRANTED,
+                      aggregate_id=subject_zid,
+                      payload={
+                          "subject_zid": subject_zid,
+                          "amount": amount,
+                          "reason": reason,
+                          "actor": actor,
+                          "tx_id": tx.tx_id,
+                      },
+                      clock=self._clock,
+                  )
+                  self._outbox.enqueue(event)
+                  self._audit.append(
+                      event_type=EVENT_TOKEN_GRANTED,
+                      actor=actor,
+                      subject=tx.tx_id,
+                      payload={
+                          "subject_zid": subject_zid,
+                          "amount": amount,
+                          "reason": reason,
+                      },
+                  )
+                  self._metrics.increment("token.granted")
+                  self._log.info(
+                      "granted subject=%s amount=%d by=%s",
+                      subject_zid,
+                      amount,
+                      actor,
+                  )
+                  return tx
+
+              def balance(self, subject_zid: str) -> int:
+                  self._identity.require_identity(subject_zid)
+                  return self._ledger.balance(subject_zid)
+
+              def history(
+                  self, subject_zid: str, *, limit: int = 50
+              ) -> tuple[LedgerTransaction, ...]:
+                  self._identity.require_identity(subject_zid)
+                  return self._ledger.history(subject_zid, limit=limit)
+
+              def define_item(
+                  self,
+                  *,
+                  item_id: str,
+                  title: str,
+                  cost: int,
+                  active: bool = True,
+              ) -> RedemptionItem:
+                  item = self._ledger.define_item(
+                      item_id=item_id, title=title, cost=cost, active=active
+                  )
+                  self._log.info(
+                      "item defined item=%s cost=%d", item_id, cost
+                  )
+                  return item
+
+              def list_items(self) -> tuple[RedemptionItem, ...]:
+                  return self._ledger.list_items()
+
+              def redeem(
+                  self, subject_zid: str, item_id: str
+              ) -> RedemptionRecord:
+                  self._identity.require_identity(subject_zid)
+                  record = self._ledger.redeem(subject_zid, item_id)
+                  event = self._catalog.build(
+                      EVENT_TOKEN_REDEEMED,
+                      aggregate_id=subject_zid,
+                      payload={
+                          "subject_zid": subject_zid,
+                          "item_id": item_id,
+                          "cost": record.cost,
+                          "redemption_id": record.redemption_id,
+                      },
+                      clock=self._clock,
+                  )
+                  self._outbox.enqueue(event)
+                  self._audit.append(
+                      event_type=EVENT_TOKEN_REDEEMED,
+                      actor=subject_zid,
+                      subject=record.redemption_id,
+                      payload={
+                          "item_id": item_id,
+                          "cost": record.cost,
+                      },
+                  )
+                  self._metrics.increment("token.redeemed")
+                  self._log.info(
+                      "redeemed subject=%s item=%s cost=%d",
+                      subject_zid,
+                      item_id,
+                      record.cost,
+                  )
+                  return record
+
+              def list_redemptions(
+                  self, subject_zid: str
+              ) -> tuple[RedemptionRecord, ...]:
+                  self._identity.require_identity(subject_zid)
+                  return self._ledger.list_redemptions(subject_zid)
+
+              def invariant_check(self) -> bool:
+                  return self._ledger.invariant_check()
+
+              def require_rule(self, activity: str) -> EmissionRule:
+                  rule = self._ledger.get_rule_by_activity(activity)
+                  if rule is None:
+                      raise UnknownRuleError(
+                          f"unknown rule activity: {activity}"
+                      )
+                  return rule
 
               def check_health(self) -> ComponentHealth:
-                  """Kernel itself satisfies the HealthCheck protocol."""
-                  return self.health()
+                  if not self._db.ping():
+                      return ComponentHealth(
+                          "tokenization",
+                          HealthStatus.UNHEALTHY,
+                          "storage unavailable",
+                      )
+                  if not self._ledger.invariant_check():
+                      return ComponentHealth(
+                          "tokenization",
+                          HealthStatus.UNHEALTHY,
+                          "accounting invariant broken",
+                      )
+                  return ComponentHealth(
+                      "tokenization",
+                      HealthStatus.HEALTHY,
+                      "ledger invariant holds",
+                  )
           PYEOF
 
-          cat > shared_engines/runtime/api.py <<'PYEOF'
-          """HTTP API over the kernel: stable routes, auth, envelopes.
-
-          Routes (all JSON):
-            GET  /health                                    (no auth)
-            POST /identity/register
-            GET  /identity/{zid}
-            POST /identity/transition
-            POST /verification/media
-            POST /verification/media/verify
-            GET  /verification/media/{media_id}
-            GET  /verification/media/{media_id}/history
-            POST /verification/credentials
-            GET  /verification/credentials/{credential_id}
-            POST /verification/credentials/revoke
-            GET  /verification/subjects/{zid}/credentials
-            POST /verification/attestations
-            POST /verification/attestations/verify
-
-          Auth: if a token is configured, every route except /health
-          requires ``Authorization: Bearer <token>`` compared in
-          constant time. This is the seed of metered API keys.
-          """
+          cat > shared_engines/tokenization/tests/test_tokenization.py <<'PYEOF'
           from __future__ import annotations
 
-          import base64
-          import hmac
-          import json
-          from http.server import BaseHTTPRequestHandler
-          from typing import Any, ClassVar
-          from urllib.parse import urlparse
-
-          from shared_engines.common.errors import EngineError
-          from shared_engines.common.serialization import canonical_json_dumps
-          from shared_engines.identity.contracts import (
-              Identity,
-              IdentityKind,
-              IdentityStatus,
-          )
-          from shared_engines.observability.health import ComponentHealth
-          from shared_engines.verification.attestations import Attestation
-          from shared_engines.verification.credentials import (
-              CredentialRecord,
-              CredentialType,
-          )
-          from shared_engines.verification.media import (
-              MediaKind,
-              MediaRecord,
-          )
-          from shared_engines.verification.provenance import ProvenanceEvent
-          from shared_engines.runtime.kernel import ZyraKernel
-          from shared_engines.runtime.responses import (
-              ApiError,
-              map_engine_error,
-          )
-
-
-          class ZyraApiHandler(BaseHTTPRequestHandler):
-              """Thread-safe request handler bound to a shared kernel."""
-
-              kernel: ClassVar[ZyraKernel]
-
-              def log_message(self, format: str, *args: object) -> None:
-                  return None
-
-              def do_GET(self) -> None:
-                  self._dispatch("GET")
-
-              def do_POST(self) -> None:
-                  self._dispatch("POST")
-
-              def _dispatch(self, method: str) -> None:
-                  try:
-                      self._route(method)
-                  except ApiError as exc:
-                      self._send_json(exc.status, self._error_body(exc))
-                  except EngineError as exc:
-                      mapped = map_engine_error(exc)
-                      self._send_json(
-                          mapped.status, self._error_body(mapped)
-                      )
-                  except Exception:
-                      self._send_json(
-                          500,
-                          {
-                              "ok": False,
-                              "error": {
-                                  "type": "internal_error",
-                                  "message": "internal error",
-                              },
-                          },
-                      )
-
-              def _route(self, method: str) -> None:
-                  path = urlparse(self.path).path
-                  segments = [s for s in path.split("/") if s]
-                  if segments == ["health"] and method == "GET":
-                      self._handle_health()
-                      return
-                  if not self._authorized():
-                      raise ApiError(
-                          401,
-                          "unauthorized",
-                          "valid bearer token required",
-                      )
-                  if method == "GET":
-                      self._route_get(segments)
-                  elif method == "POST":
-                      self._route_post(segments)
-                  else:
-                      raise ApiError(
-                          405, "method_not_allowed", "unsupported method"
-                      )
-
-              def _route_get(self, s: list[str]) -> None:
-                  if len(s) == 2 and s[0] == "identity":
-                      self._handle_get_identity(s[1])
-                  elif (
-                      len(s) == 3
-                      and s[0] == "verification"
-                      and s[1] == "media"
-                  ):
-                      self._handle_get_media(s[2])
-                  elif (
-                      len(s) == 4
-                      and s[0] == "verification"
-                      and s[1] == "media"
-                      and s[3] == "history"
-                  ):
-                      self._handle_media_history(s[2])
-                  elif (
-                      len(s) == 3
-                      and s[0] == "verification"
-                      and s[1] == "credentials"
-                  ):
-                      self._handle_get_credential(s[2])
-                  elif (
-                      len(s) == 4
-                      and s[0] == "verification"
-                      and s[1] == "subjects"
-                      and s[3] == "credentials"
-                  ):
-                      self._handle_subject_credentials(s[2])
-                  else:
-                      raise ApiError(404, "not_found", "unknown route")
-
-              def _route_post(self, s: list[str]) -> None:
-                  if s == ["identity", "register"]:
-                      self._handle_register_identity()
-                  elif s == ["identity", "transition"]:
-                      self._handle_transition()
-                  elif s == ["verification", "media"]:
-                      self._handle_register_media()
-                  elif s == ["verification", "media", "verify"]:
-                      self._handle_verify_media()
-                  elif s == ["verification", "credentials"]:
-                      self._handle_issue_credential()
-                  elif s == ["verification", "credentials", "revoke"]:
-                      self._handle_revoke_credential()
-                  elif s == ["verification", "attestations"]:
-                      self._handle_issue_attestation()
-                  elif s == ["verification", "attestations", "verify"]:
-                      self._handle_verify_attestation()
-                  else:
-                      raise ApiError(404, "not_found", "unknown route")
-
-              def _authorized(self) -> bool:
-                  token = type(self).kernel.config.api_token
-                  if token is None:
-                      return True
-                  header = self.headers.get("Authorization")
-                  if header is None:
-                      return False
-                  return hmac.compare_digest(header, f"Bearer {token}")
-
-              def _read_json(self) -> dict[str, Any]:
-                  length_header = self.headers.get("Content-Length")
-                  if length_header is None:
-                      raise ApiError(
-                          411, "length_required", "Content-Length required"
-                      )
-                  try:
-                      length = int(length_header)
-                  except ValueError as exc:
-                      raise ApiError(
-                          400, "invalid_request", "bad Content-Length"
-                      ) from exc
-                  max_body = type(self).kernel.config.max_body_bytes
-                  if length > max_body:
-                      raise ApiError(
-                          413, "payload_too_large", "body exceeds limit"
-                      )
-                  raw = self.rfile.read(length)
-                  try:
-                      doc: Any = json.loads(raw.decode("utf-8"))
-                  except (UnicodeDecodeError, ValueError) as exc:
-                      raise ApiError(
-                          400, "invalid_json", "body is not valid JSON"
-                      ) from exc
-                  if not isinstance(doc, dict):
-                      raise ApiError(
-                          400, "invalid_request", "body must be a JSON object"
-                      )
-                  typed: dict[str, Any] = {}
-                  for key, value in doc.items():
-                      typed[str(key)] = value
-                  return typed
-
-              @staticmethod
-              def _require_str(doc: dict[str, Any], key: str) -> str:
-                  value = doc.get(key)
-                  if not isinstance(value, str) or not value.strip():
-                      raise ApiError(
-                          400, "invalid_request", f"missing field: {key}"
-                      )
-                  return value
-
-              @staticmethod
-              def _require_optional_str(
-                  doc: dict[str, Any], key: str
-              ) -> str | None:
-                  value = doc.get(key)
-                  if value is None:
-                      return None
-                  if not isinstance(value, str) or not value.strip():
-                      raise ApiError(
-                          400, "invalid_request", f"invalid field: {key}"
-                      )
-                  return value
-
-              def _send_json(
-                  self, status: int, payload: dict[str, Any]
-              ) -> None:
-                  body = canonical_json_dumps(payload).encode("utf-8")
-                  self.send_response(status)
-                  self.send_header("Content-Type", "application/json")
-                  self.send_header("Content-Length", str(len(body)))
-                  self.end_headers()
-                  self.wfile.write(body)
-
-              @staticmethod
-              def _error_body(exc: ApiError) -> dict[str, Any]:
-                  return {
-                      "ok": False,
-                      "error": {"type": exc.code, "message": exc.message},
-                  }
-
-              def _ok(self, data: Any, status: int = 200) -> None:
-                  self._send_json(status, {"ok": True, "data": data})
-
-              def _handle_health(self) -> None:
-                  kernel = type(self).kernel
-                  self._ok(
-                      {
-                          "overall": _health_json(kernel.health()),
-                          "components": [
-                              _health_json(c)
-                              for c in kernel.health_components()
-                          ],
-                      }
-                  )
-
-              def _handle_register_identity(self) -> None:
-                  doc = self._read_json()
-                  kind_raw = self._require_str(doc, "kind")
-                  try:
-                      kind = IdentityKind(kind_raw)
-                  except ValueError as exc:
-                      raise ApiError(
-                          400, "invalid_request", "unknown kind"
-                      ) from exc
-                  identity = type(self).kernel.identity.register_identity(
-                      kind=kind,
-                      display_name=self._require_str(doc, "display_name"),
-                      actor=self._require_str(doc, "actor"),
-                  )
-                  self._ok(_identity_json(identity), status=201)
-
-              def _handle_get_identity(self, zid: str) -> None:
-                  identity = type(self).kernel.identity.get_identity(zid)
-                  if identity is None:
-                      raise ApiError(
-                          404, "not_found", f"unknown zid: {zid}"
-                      )
-                  self._ok(_identity_json(identity))
-
-              def _handle_transition(self) -> None:
-                  doc = self._read_json()
-                  zid = self._require_str(doc, "zid")
-                  try:
-                      target = IdentityStatus(
-                          self._require_str(doc, "to_status")
-                      )
-                  except ValueError as exc:
-                      raise ApiError(
-                          400, "invalid_request", "unknown to_status"
-                      ) from exc
-                  identity = type(self).kernel.identity.transition_identity(
-                      zid,
-                      target,
-                      actor=self._require_str(doc, "actor"),
-                      reason=self._require_str(doc, "reason"),
-                  )
-                  self._ok(_identity_json(identity))
-
-              def _handle_register_media(self) -> None:
-                  doc = self._read_json()
-                  kind_raw = self._require_str(doc, "kind")
-                  try:
-                      kind = MediaKind(kind_raw)
-                  except ValueError as exc:
-                      raise ApiError(
-                          400, "invalid_request", "unknown media kind"
-                      ) from exc
-                  content = self._decode_b64(
-                      self._require_str(doc, "content_b64")
-                  )
-                  record = type(self).kernel.verification.register_media(
-                      owner_zid=self._require_str(doc, "owner_zid"),
-                      kind=kind,
-                      title=self._require_str(doc, "title"),
-                      content=content,
-                      content_type=self._require_str(doc, "content_type"),
-                      actor=self._require_str(doc, "actor"),
-                  )
-                  self._ok(_media_json(record), status=201)
-
-              def _handle_verify_media(self) -> None:
-                  doc = self._read_json()
-                  content = self._decode_b64(
-                      self._require_str(doc, "content_b64")
-                  )
-                  record = type(self).kernel.verification.verify_media(
-                      self._require_str(doc, "media_id"), content
-                  )
-                  self._ok(_media_json(record))
-
-              def _handle_get_media(self, media_id: str) -> None:
-                  record = type(self).kernel.verification.get_media(media_id)
-                  if record is None:
-                      raise ApiError(
-                          404, "not_found", f"unknown media: {media_id}"
-                      )
-                  self._ok(_media_json(record))
-
-              def _handle_media_history(self, media_id: str) -> None:
-                  history = (
-                      type(self).kernel.verification.media_history(media_id)
-                  )
-                  self._ok([_provenance_json(e) for e in history])
-
-              def _handle_issue_credential(self) -> None:
-                  doc = self._read_json()
-                  type_raw = self._require_str(doc, "credential_type")
-                  try:
-                      credential_type = CredentialType(type_raw)
-                  except ValueError as exc:
-                      raise ApiError(
-                          400, "invalid_request", "unknown credential_type"
-                      ) from exc
-                  record = type(self).kernel.verification.issue_credential(
-                      subject_zid=self._require_str(doc, "subject_zid"),
-                      issuer_zid=self._require_str(doc, "issuer_zid"),
-                      credential_type=credential_type,
-                      title=self._require_str(doc, "title"),
-                      detail=self._require_str(doc, "detail"),
-                  )
-                  self._ok(_credential_json(record), status=201)
-
-              def _handle_get_credential(self, credential_id: str) -> None:
-                  record = type(self).kernel.verification.get_credential(
-                      credential_id
-                  )
-                  if record is None:
-                      raise ApiError(
-                          404,
-                          "not_found",
-                          f"unknown credential: {credential_id}",
-                      )
-                  self._ok(_credential_json(record))
-
-              def _handle_revoke_credential(self) -> None:
-                  doc = self._read_json()
-                  record = type(self).kernel.verification.revoke_credential(
-                      self._require_str(doc, "credential_id"),
-                      revoked_by=self._require_str(doc, "revoked_by"),
-                      reason=self._require_str(doc, "reason"),
-                  )
-                  self._ok(_credential_json(record))
-
-              def _handle_subject_credentials(self, zid: str) -> None:
-                  history = (
-                      type(self).kernel.verification.subject_history(zid)
-                  )
-                  self._ok([_credential_json(c) for c in history])
-
-              def _handle_issue_attestation(self) -> None:
-                  doc = self._read_json()
-                  attestation = (
-                      type(self).kernel.verification.issue_attestation(
-                          subject_zid=self._require_str(doc, "subject_zid"),
-                          claim=self._require_str(doc, "claim"),
-                          subject_sha256=self._require_optional_str(
-                              doc, "subject_sha256"
-                          ),
-                      )
-                  )
-                  self._ok(_attestation_json(attestation), status=201)
-
-              def _handle_verify_attestation(self) -> None:
-                  doc = self._read_json()
-                  ok = type(self).kernel.verification.verify_attestation(
-                      self._require_str(doc, "attestation_id")
-                  )
-                  self._ok({"valid": ok})
-
-              @staticmethod
-              def _decode_b64(value: str) -> bytes:
-                  try:
-                      return base64.b64decode(value, validate=True)
-                  except ValueError as exc:
-                      raise ApiError(
-                          400,
-                          "invalid_request",
-                          "content_b64 is not valid base64",
-                      ) from exc
-
-
-          def _health_json(component: ComponentHealth) -> dict[str, object]:
-              return {
-                  "component": component.component,
-                  "status": component.status.value,
-                  "detail": component.detail,
-              }
-
-
-          def _identity_json(identity: Identity) -> dict[str, object]:
-              return {
-                  "zid": identity.zid,
-                  "kind": identity.kind.value,
-                  "status": identity.status.value,
-                  "display_name": identity.display_name,
-                  "created_at": identity.created_at,
-                  "updated_at": identity.updated_at,
-                  "contract_version": identity.contract_version,
-              }
-
-
-          def _media_json(record: MediaRecord) -> dict[str, object]:
-              return {
-                  "media_id": record.media_id,
-                  "owner_zid": record.owner_zid,
-                  "kind": record.kind.value,
-                  "title": record.title,
-                  "content_sha256": record.content_sha256,
-                  "content_size": record.content_size,
-                  "content_type": record.content_type,
-                  "created_at": record.created_at,
-                  "contract_version": record.contract_version,
-              }
-
-
-          def _provenance_json(event: ProvenanceEvent) -> dict[str, object]:
-              return {
-                  "sequence": event.sequence,
-                  "media_id": event.media_id,
-                  "actor_zid": event.actor_zid,
-                  "action": event.action,
-                  "detail": event.detail,
-                  "occurred_at": event.occurred_at,
-                  "previous_hash": event.previous_hash,
-                  "event_hash": event.event_hash,
-              }
-
-
-          def _credential_json(record: CredentialRecord) -> dict[str, object]:
-              return {
-                  "credential_id": record.credential_id,
-                  "subject_zid": record.subject_zid,
-                  "issuer_zid": record.issuer_zid,
-                  "credential_type": record.credential_type.value,
-                  "title": record.title,
-                  "detail": record.detail,
-                  "issued_at": record.issued_at,
-                  "valid_from": record.valid_from,
-                  "valid_until": record.valid_until,
-                  "revoked": record.revoked,
-                  "revoked_at": record.revoked_at,
-                  "revoked_reason": record.revoked_reason,
-                  "contract_version": record.contract_version,
-              }
-
-
-          def _attestation_json(attestation: Attestation) -> dict[str, object]:
-              return {
-                  "attestation_id": attestation.attestation_id,
-                  "subject_zid": attestation.subject_zid,
-                  "claim": attestation.claim,
-                  "subject_sha256": attestation.subject_sha256,
-                  "issued_at": attestation.issued_at,
-                  "signature_b64": base64.b64encode(
-                      attestation.signature
-                  ).decode("ascii"),
-                  "signer_public_pem": attestation.signer_public_pem.decode(
-                      "utf-8"
-                  ),
-                  "contract_version": attestation.contract_version,
-              }
-          PYEOF
-
-          cat > shared_engines/runtime/server.py <<'PYEOF'
-          """Threaded HTTP server bound to the Zyra API handler."""
-          from __future__ import annotations
-
-          from http.server import ThreadingHTTPServer
-
-          from shared_engines.runtime.api import ZyraApiHandler
-
-
-          class ZyraServer(ThreadingHTTPServer):
-              """Daemon-threaded server; bind via ZyraApiHandler ClassVars."""
-
-              daemon_threads = True
-              allow_reuse_address = True
-
-              def __init__(self, address: tuple[str, int]) -> None:
-                  super().__init__(address, ZyraApiHandler)
-
-              @property
-              def bound_port(self) -> int:
-                  """The actual port bound (useful when port=0/ephemeral)."""
-                  return int(self.server_address[1])
-          PYEOF
-
-          cat > shared_engines/runtime/tests/test_runtime_api.py <<'PYEOF'
-          from __future__ import annotations
-
-          import base64
-          import json
-          import threading
-          import urllib.error
-          import urllib.request
-          from collections.abc import Iterator
           from pathlib import Path
-          from typing import Any
 
           import pytest
 
+          from shared_engines.audit.chain import AuditTrail
           from shared_engines.common.clocks import FrozenClock
-          from shared_engines.runtime.api import ZyraApiHandler
-          from shared_engines.runtime.config import RuntimeConfig
-          from shared_engines.runtime.kernel import ZyraKernel
-          from shared_engines.runtime.server import ZyraServer
+          from shared_engines.common.errors import ConfigurationError
+          from shared_engines.events.contracts import Event, EventCatalog
+          from shared_engines.events.outbox import Outbox
+          from shared_engines.identity.contracts import IdentityKind
+          from shared_engines.identity.engine import IdentityEngine
+          from shared_engines.observability.backend import InMemoryMetrics
+          from shared_engines.observability.health import HealthStatus
           from shared_engines.storage.database import SQLiteAdapter
-          from shared_engines.verification.signatures import Ed25519Signer
+          from shared_engines.tokenization.engine import TokenEngine
+          from shared_engines.tokenization.errors import (
+              DuplicateRuleError,
+              EmissionCapExceededError,
+              InsufficientBalanceError,
+              ItemInactiveError,
+              RuleInactiveError,
+              UnknownItemError,
+              UnknownRuleError,
+          )
 
 
-          class _Cluster:
-              """Boots a real HTTP server over a live kernel."""
-
-              def __init__(
-                  self, tmp_path: Path, token: str | None = None
-              ) -> None:
-                  self.db = SQLiteAdapter(Path(tmp_path) / "runtime.db")
-                  self.kernel = ZyraKernel(
+          class _Harness:
+              def __init__(self, tmp_path: Path) -> None:
+                  self.db = SQLiteAdapter(tmp_path / "tokens.db")
+                  self.clock = FrozenClock()
+                  self.audit = AuditTrail(self.db, self.clock)
+                  self.outbox = Outbox(self.db, self.clock)
+                  self.outbox.ensure_schema()
+                  self.catalog = EventCatalog()
+                  for event_type in (
+                      "token.earned",
+                      "token.granted",
+                      "token.redeemed",
+                      "identity.registered",
+                      "identity.status_changed",
+                  ):
+                      self.catalog.register(event_type)
+                  self.identity = IdentityEngine(
                       db=self.db,
-                      clock=FrozenClock(),
-                      signer=Ed25519Signer.generate()[0],
-                      config=RuntimeConfig(
-                          host="127.0.0.1", port=0, api_token=token
-                      ),
+                      clock=self.clock,
+                      audit=self.audit,
+                      outbox=self.outbox,
+                      catalog=self.catalog,
                   )
-                  self.kernel.bootstrap_root()
-                  ZyraApiHandler.kernel = self.kernel
-                  self.server = ZyraServer(("127.0.0.1", 0))
-                  self.thread = threading.Thread(
-                      target=self.server.serve_forever, daemon=True
-                  )
-                  self.thread.start()
-                  self.base = (
-                      f"http://127.0.0.1:{self.server.bound_port}"
+                  self.metrics = InMemoryMetrics()
+                  self.engine = TokenEngine(
+                      db=self.db,
+                      clock=self.clock,
+                      audit=self.audit,
+                      outbox=self.outbox,
+                      catalog=self.catalog,
+                      identity=self.identity,
+                      metrics=self.metrics,
                   )
 
-              def stop(self) -> None:
-                  self.server.shutdown()
-                  self.server.server_close()
-                  self.thread.join(timeout=5)
+              def make_user(self, name: str = "User") -> str:
+                  user = self.identity.register_identity(
+                      kind=IdentityKind.PERSON,
+                      display_name=name,
+                      actor="registrar",
+                  )
+                  return user.zid
+
+              def close(self) -> None:
                   self.db.close()
 
-              def call(
-                  self,
-                  method: str,
-                  path: str,
-                  body: dict[str, Any] | None = None,
-                  *,
-                  token: str | None = None,
-                  omit_auth: bool = False,
-              ) -> tuple[int, dict[str, Any]]:
-                  headers: dict[str, str] = {
-                      "Content-Type": "application/json"
-                  }
-                  if not omit_auth:
-                      use = (
-                          token
-                          if token is not None
-                          else self.kernel.config.api_token
-                      )
-                      if use is not None:
-                          headers["Authorization"] = f"Bearer {use}"
-                  data = (
-                      json.dumps(body).encode("utf-8")
-                      if body is not None
-                      else None
-                  )
-                  request = urllib.request.Request(
-                      f"{self.base}{path}",
-                      data=data,
-                      headers=headers,
-                      method=method,
-                  )
-                  try:
-                      with urllib.request.urlopen(
-                          request, timeout=10
-                      ) as resp:
-                          payload: dict[str, Any] = json.loads(
-                              resp.read().decode("utf-8")
-                          )
-                          return int(resp.status), payload
-                  except urllib.error.HTTPError as exc:
-                      raw = exc.read().decode("utf-8") or "{}"
-                      error_payload: dict[str, Any] = json.loads(raw)
-                      return int(exc.code), error_payload
 
-
-          @pytest.fixture
-          def cluster(tmp_path: Path) -> Iterator[_Cluster]:
-              running = _Cluster(tmp_path)
-              yield running
-              running.stop()
-
-
-          @pytest.fixture
-          def secured_cluster(tmp_path: Path) -> Iterator[_Cluster]:
-              running = _Cluster(tmp_path, token="super-secret-token-123")
-              yield running
-              running.stop()
-
-
-          def _register_via_api(
-              cluster: _Cluster, name: str
-          ) -> dict[str, Any]:
-              status, payload = cluster.call(
-                  "POST",
-                  "/identity/register",
-                  {
-                      "kind": "person",
-                      "display_name": name,
-                      "actor": "api-clerk",
-                  },
-              )
-              assert status == 201
-              assert payload["ok"] is True
-              data: dict[str, Any] = payload["data"]
-              return data
-
-
-          def _activate_via_api(
-              cluster: _Cluster, zid: str
-          ) -> dict[str, Any]:
-              status, payload = cluster.call(
-                  "POST",
-                  "/identity/transition",
-                  {
-                      "zid": zid,
-                      "to_status": "ACTIVE",
-                      "actor": "api-admin",
-                      "reason": "onboarded",
-                  },
-              )
-              assert status == 200
-              data: dict[str, Any] = payload["data"]
-              return data
-
-
-          def test_health_is_open_and_reports_components(
-              cluster: _Cluster,
-          ) -> None:
-              status, payload = cluster.call(
-                  "GET", "/health", omit_auth=True
-              )
-              assert status == 200
-              assert payload["ok"] is True
-              assert payload["data"]["overall"]["status"] == "healthy"
-              names = {
-                  c["component"] for c in payload["data"]["components"]
-              }
-              assert {"storage", "identity", "verification"} <= names
-
-
-          def test_identity_register_get_transition_flow(
-              cluster: _Cluster,
-          ) -> None:
-              created = _register_via_api(cluster, "Alice")
-              zid = created["zid"]
-              assert zid.startswith("ZID-")
-              assert created["status"] == "REGISTERED"
-              status, payload = cluster.call("GET", f"/identity/{zid}")
-              assert status == 200
-              assert payload["data"]["display_name"] == "Alice"
-              moved = _activate_via_api(cluster, zid)
-              assert moved["status"] == "ACTIVE"
-              bad_status, bad = cluster.call(
-                  "POST",
-                  "/identity/transition",
-                  {
-                      "zid": zid,
-                      "to_status": "VERIFIED",
-                      "actor": "api-admin",
-                      "reason": "skips states",
-                  },
-              )
-              assert bad_status == 409
-              assert bad["error"]["type"] == "conflict"
-
-
-          def test_unknown_identity_returns_404(
-              cluster: _Cluster,
-          ) -> None:
-              status, payload = cluster.call("GET", "/identity/ZID-ghost")
-              assert status == 404
-              assert payload["error"]["type"] == "not_found"
-
-
-          def test_media_register_verify_tamper_via_http(
-              cluster: _Cluster,
-          ) -> None:
-              owner = _activate_via_api(
-                  cluster, _register_via_api(cluster, "Owner")["zid"]
-              )
-              content = b"photo-bytes-original"
-              encoded = base64.b64encode(content).decode("ascii")
-              status, payload = cluster.call(
-                  "POST",
-                  "/verification/media",
-                  {
-                      "owner_zid": owner["zid"],
-                      "kind": "photo",
-                      "title": "photo.jpg",
-                      "content_b64": encoded,
-                      "content_type": "image/jpeg",
-                      "actor": "clerk",
-                  },
-              )
-              assert status == 201
-              media_id = payload["data"]["media_id"]
-              assert payload["data"]["content_sha256"]
-              verify_status, _ = cluster.call(
-                  "POST",
-                  "/verification/media/verify",
-                  {"media_id": media_id, "content_b64": encoded},
-              )
-              assert verify_status == 200
-              tamper_status, tamper = cluster.call(
-                  "POST",
-                  "/verification/media/verify",
-                  {
-                      "media_id": media_id,
-                      "content_b64": base64.b64encode(
-                          b"tampered"
-                      ).decode("ascii"),
-                  },
-              )
-              assert tamper_status == 409
-              assert tamper["error"]["type"] == "conflict"
-              history_status, history = cluster.call(
-                  "GET", f"/verification/media/{media_id}/history"
-              )
-              assert history_status == 200
-              actions = [e["action"] for e in history["data"]]
-              assert actions == ["registered", "verified"]
-
-
-          def test_media_requires_known_owner(
-              cluster: _Cluster,
-          ) -> None:
-              status, _ = cluster.call(
-                  "POST",
-                  "/verification/media",
-                  {
-                      "owner_zid": "ZID-ghost",
-                      "kind": "photo",
-                      "title": "x.jpg",
-                      "content_b64": base64.b64encode(b"c").decode("ascii"),
-                      "content_type": "image/jpeg",
-                      "actor": "clerk",
-                  },
-              )
-              assert status == 404
-
-
-          def test_credential_full_flow_via_http(
-              cluster: _Cluster,
-          ) -> None:
-              root = cluster.kernel.root_zid
-              assert root is not None
-              client = _activate_via_api(
-                  cluster, _register_via_api(cluster, "Bank Client")["zid"]
-              )
-              status, payload = cluster.call(
-                  "POST",
-                  "/verification/credentials",
-                  {
-                      "subject_zid": client["zid"],
-                      "issuer_zid": root,
-                      "credential_type": "kyc_verified",
-                      "title": "KYC completed",
-                      "detail": "verified in person",
-                  },
-              )
-              assert status == 201
-              credential_id = payload["data"]["credential_id"]
-              get_status, got = cluster.call(
-                  "GET", f"/verification/credentials/{credential_id}"
-              )
-              assert get_status == 200
-              assert got["data"]["credential_type"] == "kyc_verified"
-              list_status, listed = cluster.call(
-                  "GET",
-                  f"/verification/subjects/{client['zid']}/credentials",
-              )
-              assert list_status == 200
-              assert len(listed["data"]) == 1
-              revoke_status, revoked = cluster.call(
-                  "POST",
-                  "/verification/credentials/revoke",
-                  {
-                      "credential_id": credential_id,
-                      "revoked_by": root,
-                      "reason": "manual review",
-                  },
-              )
-              assert revoke_status == 200
-              assert revoked["data"]["revoked"] is True
-
-
-          def test_credential_issuer_must_be_active(
-              cluster: _Cluster,
-          ) -> None:
-              subject = _activate_via_api(
-                  cluster, _register_via_api(cluster, "S")["zid"]
-              )
-              inst_status, inst = cluster.call(
-                  "POST",
-                  "/identity/register",
-                  {
-                      "kind": "institution",
-                      "display_name": "Inactive Inst",
-                      "actor": "api-clerk",
-                  },
-              )
-              assert inst_status == 201
-              status, payload = cluster.call(
-                  "POST",
-                  "/verification/credentials",
-                  {
-                      "subject_zid": subject["zid"],
-                      "issuer_zid": inst["data"]["zid"],
-                      "credential_type": "reference",
-                      "title": "ref",
-                      "detail": "issuer is only REGISTERED",
-                  },
-              )
-              assert status == 403
-              assert payload["error"]["type"] == "forbidden"
-
-
-          def test_attestation_issue_and_verify_via_http(
-              cluster: _Cluster,
-          ) -> None:
-              subject = _activate_via_api(
-                  cluster, _register_via_api(cluster, "Attested")["zid"]
-              )
-              status, payload = cluster.call(
-                  "POST",
-                  "/verification/attestations",
-                  {
-                      "subject_zid": subject["zid"],
-                      "claim": "identity_active",
-                  },
-              )
-              assert status == 201
-              attestation_id = payload["data"]["attestation_id"]
-              assert payload["data"]["signature_b64"]
-              verify_status, verified = cluster.call(
-                  "POST",
-                  "/verification/attestations/verify",
-                  {"attestation_id": attestation_id},
-              )
-              assert verify_status == 200
-              assert verified["data"]["valid"] is True
-
-
-          def test_auth_required_and_accepted(
-              secured_cluster: _Cluster,
-          ) -> None:
-              secured = secured_cluster
-              no_token_status, no_token = secured.call(
-                  "POST",
-                  "/identity/register",
-                  {"kind": "person", "display_name": "X", "actor": "a"},
-                  omit_auth=True,
-              )
-              assert no_token_status == 401
-              assert no_token["error"]["type"] == "unauthorized"
-              wrong_status, _ = secured.call(
-                  "POST",
-                  "/identity/register",
-                  {"kind": "person", "display_name": "X", "actor": "a"},
-                  token="wrong-token-wrong-token",
-              )
-              assert wrong_status == 401
-              good_status, _ = secured.call(
-                  "POST",
-                  "/identity/register",
-                  {"kind": "person", "display_name": "X", "actor": "a"},
-              )
-              assert good_status == 201
-              health_status, _ = secured.call(
-                  "GET", "/health", omit_auth=True
-              )
-              assert health_status == 200
-
-
-          def test_unknown_route_and_bad_json(
-              cluster: _Cluster,
-          ) -> None:
-              status, _ = cluster.call("GET", "/definitely/not/here")
-              assert status == 404
-              bad_status, _ = cluster.call(
-                  "POST",
-                  "/identity/register",
-                  {"kind": "person", "display_name": "", "actor": "a"},
-              )
-              assert bad_status == 400
-
-
-          def test_root_authority_is_active_and_persistent(
-              cluster: _Cluster,
-          ) -> None:
-              root = cluster.kernel.root_zid
-              assert root is not None
-              status, payload = cluster.call("GET", f"/identity/{root}")
-              assert status == 200
-              assert payload["data"]["status"] == "ACTIVE"
-              assert payload["data"]["kind"] == "institution"
-
-
-          def test_kernel_health_after_crash_of_storage(
+          def test_earn_via_rule_mints_and_invariant_holds(
               tmp_path: Path,
           ) -> None:
-              cluster = _Cluster(tmp_path)
-              try:
-                  assert (
-                      cluster.kernel.health().status.value == "healthy"
-                  )
-              finally:
-                  cluster.stop()
+              harness = _Harness(tmp_path)
+              user = harness.make_user()
+              harness.engine.define_rule(
+                  activity="media.registered", amount=10
+              )
+              tx = harness.engine.earn(
+                  subject_zid=user,
+                  activity="media.registered",
+                  ref_type="media",
+                  ref_id="MED-1",
+              )
+              assert tx.amount == 10
+              assert harness.engine.balance(user) == 10
+              assert harness.engine.invariant_check()
               assert (
-                  cluster.kernel.health().status.value == "unhealthy"
+                  harness.metrics.counter_value(
+                      "token.earned", {"activity": "media.registered"}
+                  )
+                  == 1
               )
+              harness.close()
 
 
-          def test_audit_chain_covers_api_traffic(
-              cluster: _Cluster,
+          def test_earn_requires_existing_rule(tmp_path: Path) -> None:
+              harness = _Harness(tmp_path)
+              user = harness.make_user()
+              with pytest.raises(UnknownRuleError):
+                  harness.engine.earn(
+                      subject_zid=user,
+                      activity="never.defined",
+                      ref_type="x",
+                      ref_id="y",
+                  )
+              harness.close()
+
+
+          def test_inactive_rule_blocks_earning(tmp_path: Path) -> None:
+              harness = _Harness(tmp_path)
+              user = harness.make_user()
+              harness.engine.define_rule(activity="recycle", amount=5)
+              harness.engine.set_rule_active("recycle", active=False)
+              with pytest.raises(RuleInactiveError):
+                  harness.engine.earn(
+                      subject_zid=user,
+                      activity="recycle",
+                      ref_type="event",
+                      ref_id="r1",
+                  )
+              harness.engine.set_rule_active("recycle", active=True)
+              tx = harness.engine.earn(
+                  subject_zid=user,
+                  activity="recycle",
+                  ref_type="event",
+                  ref_id="r2",
+              )
+              assert tx.amount == 5
+              harness.close()
+
+
+          def test_daily_cap_blocks_then_next_day_allows(
+              tmp_path: Path,
           ) -> None:
-              _register_via_api(cluster, "Audited 1")
-              _register_via_api(cluster, "Audited 2")
-              subject = _activate_via_api(
-                  cluster, _register_via_api(cluster, "Audited 3")["zid"]
+              harness = _Harness(tmp_path)
+              user = harness.make_user()
+              harness.engine.define_rule(
+                  activity="daily.active",
+                  amount=1,
+                  daily_cap=2,
               )
-              root = cluster.kernel.root_zid
-              assert root is not None
-              cred_status, _ = cluster.call(
-                  "POST",
-                  "/verification/credentials",
-                  {
-                      "subject_zid": subject["zid"],
-                      "issuer_zid": root,
-                      "credential_type": "employment",
-                      "title": "Hired",
-                      "detail": "via API",
-                  },
+              harness.engine.earn(
+                  subject_zid=user,
+                  activity="daily.active",
+                  ref_type="day",
+                  ref_id="d1",
               )
-              assert cred_status == 201
-              count = cluster.kernel.audit.verify()
-              assert count >= 5
+              harness.engine.earn(
+                  subject_zid=user,
+                  activity="daily.active",
+                  ref_type="day",
+                  ref_id="d2",
+              )
+              with pytest.raises(EmissionCapExceededError):
+                  harness.engine.earn(
+                      subject_zid=user,
+                      activity="daily.active",
+                      ref_type="day",
+                      ref_id="d3",
+                  )
+              harness.clock.advance(86_400)
+              tx = harness.engine.earn(
+                  subject_zid=user,
+                  activity="daily.active",
+                  ref_type="day",
+                  ref_id="d4",
+              )
+              assert tx.amount == 1
+              assert harness.engine.balance(user) == 3
+              assert harness.engine.invariant_check()
+              harness.close()
+
+
+          def test_lifetime_cap_never_resets(tmp_path: Path) -> None:
+              harness = _Harness(tmp_path)
+              user = harness.make_user()
+              harness.engine.define_rule(
+                  activity="bonus",
+                  amount=5,
+                  lifetime_cap=5,
+              )
+              harness.engine.earn(
+                  subject_zid=user,
+                  activity="bonus",
+                  ref_type="once",
+                  ref_id="1",
+              )
+              harness.clock.advance(86_400)
+              with pytest.raises(EmissionCapExceededError):
+                  harness.engine.earn(
+                      subject_zid=user,
+                      activity="bonus",
+                      ref_type="again",
+                      ref_id="2",
+                  )
+              assert harness.engine.balance(user) == 5
+              harness.close()
+
+
+          def test_admin_grant_is_audited_and_evented(
+              tmp_path: Path,
+          ) -> None:
+              harness = _Harness(tmp_path)
+              user = harness.make_user()
+              tx = harness.engine.grant(
+                  subject_zid=user,
+                  amount=100,
+                  reason="genesis allocation",
+                  actor="founder",
+              )
+              assert tx.kind == "mint"
+              assert harness.engine.balance(user) == 100
+              assert harness.audit.verify() >= 1
+              events = harness.outbox.pending()
+              types = {e.event_type for e in events}
+              assert "token.granted" in types
+              harness.close()
+
+
+          def test_redeem_burns_balance_atomically(
+              tmp_path: Path,
+          ) -> None:
+              harness = _Harness(tmp_path)
+              user = harness.make_user()
+              harness.engine.define_rule(
+                  activity="earn.base", amount=50
+              )
+              harness.engine.earn(
+                  subject_zid=user,
+                  activity="earn.base",
+                  ref_type="seed",
+                  ref_id="1",
+              )
+              harness.engine.define_item(
+                  item_id="premium_space_1gb",
+                  title="1 GB premium space",
+                  cost=30,
+              )
+              record = harness.engine.redeem(user, "premium_space_1gb")
+              assert record.cost == 30
+              assert harness.engine.balance(user) == 20
+              assert harness.engine.invariant_check()
+              listed = harness.engine.list_redemptions(user)
+              assert len(listed) == 1
+              assert listed[0].item_id == "premium_space_1gb"
+              harness.close()
+
+
+          def test_redeem_insufficient_balance_rejected(
+              tmp_path: Path,
+          ) -> None:
+              harness = _Harness(tmp_path)
+              user = harness.make_user()
+              harness.engine.define_rule(activity="small", amount=5)
+              harness.engine.earn(
+                  subject_zid=user,
+                  activity="small",
+                  ref_type="x",
+                  ref_id="1",
+              )
+              harness.engine.define_item(
+                  item_id="big_item", title="Too expensive", cost=500
+              )
+              with pytest.raises(InsufficientBalanceError):
+                  harness.engine.redeem(user, "big_item")
+              assert harness.engine.balance(user) == 5
+              assert harness.engine.invariant_check()
+              harness.close()
+
+
+          def test_item_inactive_and_unknown_cases(
+              tmp_path: Path,
+          ) -> None:
+              harness = _Harness(tmp_path)
+              user = harness.make_user()
+              harness.engine.define_rule(activity="base", amount=100)
+              harness.engine.earn(
+                  subject_zid=user,
+                  activity="base",
+                  ref_type="x",
+                  ref_id="1",
+              )
+              harness.engine.define_item(
+                  item_id="off_item", title="Disabled", cost=10,
+                  active=False,
+              )
+              with pytest.raises(ItemInactiveError):
+                  harness.engine.redeem(user, "off_item")
+              with pytest.raises(UnknownItemError):
+                  harness.engine.redeem(user, "never_defined")
+              harness.close()
+
+
+          def test_duplicate_rule_activity_rejected(
+              tmp_path: Path,
+          ) -> None:
+              harness = _Harness(tmp_path)
+              harness.engine.define_rule(activity="dup", amount=1)
+              with pytest.raises(DuplicateRuleError):
+                  harness.engine.define_rule(activity="dup", amount=2)
+              harness.close()
+
+
+          def test_history_is_descending_and_complete(
+              tmp_path: Path,
+          ) -> None:
+              harness = _Harness(tmp_path)
+              user = harness.make_user()
+              harness.engine.define_rule(activity="h", amount=1)
+              for index in range(3):
+                  harness.clock.advance(1)
+                  harness.engine.earn(
+                      subject_zid=user,
+                      activity="h",
+                      ref_type="seq",
+                      ref_id=str(index),
+                  )
+              history = harness.engine.history(user)
+              assert len(history) == 3
+              assert all(tx.kind == "mint" for tx in history)
+              harness.close()
+
+
+          def test_invariant_detects_direct_tampering(
+              tmp_path: Path,
+          ) -> None:
+              harness = _Harness(tmp_path)
+              user = harness.make_user()
+              harness.engine.define_rule(activity="inv", amount=10)
+              harness.engine.earn(
+                  subject_zid=user,
+                  activity="inv",
+                  ref_type="x",
+                  ref_id="1",
+              )
+              assert harness.engine.invariant_check()
+              harness.db.execute(
+                  "UPDATE token_accounts SET balance = 999999"
+                  " WHERE account_id = ?",
+                  (user,),
+              )
+              assert not harness.engine.invariant_check()
+              assert (
+                  harness.engine.check_health().status
+                  is HealthStatus.UNHEALTHY
+              )
+              harness.close()
+
+
+          def test_unknown_identity_blocked_everywhere(
+              tmp_path: Path,
+          ) -> None:
+              harness = _Harness(tmp_path)
+              harness.engine.define_rule(activity="x", amount=1)
+              from shared_engines.identity.errors import (
+                  IdentityNotFoundError,
+              )
+
+              with pytest.raises(IdentityNotFoundError):
+                  harness.engine.earn(
+                      subject_zid="ZID-ghost",
+                      activity="x",
+                      ref_type="r",
+                      ref_id="1",
+                  )
+              with pytest.raises(IdentityNotFoundError):
+                  harness.engine.balance("ZID-ghost")
+              with pytest.raises(IdentityNotFoundError):
+                  harness.engine.grant(
+                      subject_zid="ZID-ghost",
+                      amount=1,
+                      reason="r",
+                      actor="admin",
+                  )
+              harness.close()
+
+
+          def test_config_rejects_bad_rule_definitions(
+              tmp_path: Path,
+          ) -> None:
+              harness = _Harness(tmp_path)
+              with pytest.raises(ConfigurationError):
+                  harness.engine.define_rule(activity="bad", amount=0)
+              with pytest.raises(ConfigurationError):
+                  harness.engine.define_rule(
+                      activity="bad2", amount=10, daily_cap=5
+                  )
+              with pytest.raises(ConfigurationError):
+                  harness.engine.define_rule(
+                      activity="bad3", amount=10, lifetime_cap=5
+                  )
+              harness.close()
+
+
+          def test_outbox_events_cover_full_token_flow(
+              tmp_path: Path,
+          ) -> None:
+              harness = _Harness(tmp_path)
+              user = harness.make_user()
+              harness.engine.define_rule(activity="flow", amount=20)
+              harness.engine.earn(
+                  subject_zid=user,
+                  activity="flow",
+                  ref_type="x",
+                  ref_id="1",
+              )
+              harness.engine.define_item(
+                  item_id="reward", title="Reward", cost=10
+              )
+              harness.engine.redeem(user, "reward")
+              collected: list[Event] = []
+
+              def collect(event: Event) -> None:
+                  collected.append(event)
+
+              harness.outbox.dispatch_pending(collect)
+              by_type = {event.event_type for event in collected}
+              assert by_type >= {"token.earned", "token.redeemed"}
+              harness.close()
+
+
+          def test_health_healthy_then_unhealthy_without_storage(
+              tmp_path: Path,
+          ) -> None:
+              harness = _Harness(tmp_path)
+              assert (
+                  harness.engine.check_health().status
+                  is HealthStatus.HEALTHY
+              )
+              harness.db.close()
+              assert (
+                  harness.engine.check_health().status
+                  is HealthStatus.UNHEALTHY
+              )
           PYEOF
 
-          echo "=== RUNTIME BUILD OK ==="
+          echo "=== TOKENS BUILD OK ==="
 
       - name: Quality gates (mypy first; full regression all modules)
         run: |
           set -euo pipefail
-          M="shared_engines/common shared_engines/storage shared_engines/events shared_engines/observability shared_engines/audit shared_engines/security shared_engines/identity shared_engines/verification shared_engines/runtime"
+          M="shared_engines/common shared_engines/storage shared_engines/events shared_engines/observability shared_engines/audit shared_engines/security shared_engines/identity shared_engines/verification shared_engines/runtime shared_engines/tokenization"
           python -m compileall -q $M
           echo "compile OK"
           find $M -name '__pycache__' -type d -prune -exec rm -rf {} +
@@ -1387,7 +1643,7 @@ jobs:
           if git diff --cached --quiet; then
             echo "No changes."
           else
-            git commit -m "zyra: module 07 RUNTIME (kernel, root authority, HTTP API with auth + typed error mapping, port=0 ephemeral fix) + live-server tests"
+            git commit -m "zyra: module 08 TOKENIZATION (double-entry ledger, capped emission rules, redemption catalog, accounting invariant) + tests"
             git push origin "HEAD:${{ github.ref_name }}"
           fi
-          echo "=== MODULE 07 RUNTIME COMPLETE ==="
+          echo "=== MODULE 08 TOKENS COMPLETE ==="

@@ -43,551 +43,17 @@ jobs:
           test -f shared_engines/tokenization/engine.py
           echo "modules 01-08 present: OK"
 
-      - name: Build clean currency + upgrade runtime API
+      - name: Fix currency engine (single QuoteSigner import, typed signer)
         run: |
           set -euo pipefail
-          rm -rf shared_engines/currency
-          mkdir -p shared_engines/currency/tests
-
-          cat > shared_engines/currency/__init__.py <<'PYEOF'
-          """Zyra currency engine: exact FX trust layer.
-
-          The Network never custodies funds. Banks and payment
-          providers move money; Zyra provides exact-decimal rates,
-          immutable rate history, bridge routing (GTQ->USD->CNY),
-          Ed25519-signed quotes verifiable offline by any counterparty,
-          and auditable conversion records. Settlement references
-          attach afterwards - never faked here.
-          """
-          from __future__ import annotations
-
-          from shared_engines.currency.contracts import (
-              CurrencyPair,
-              Money,
-              Quote,
-              SignedQuote,
-          )
-          from shared_engines.currency.engine import CurrencyEngine
-          from shared_engines.currency.errors import (
-              CurrencyError,
-              InvalidRateError,
-              NoRouteError,
-              QuoteExpiredError,
-              RateUnavailableError,
-              StaleRateError,
-              UnknownCurrencyError,
-          )
-          from shared_engines.currency.rates import (
-              ProviderChain,
-              RateProvider,
-              StaticTableRateProvider,
-              compose_rates,
-          )
-          from shared_engines.currency.registry import CurrencyRegistry
-          from shared_engines.currency.signing import QuoteSigner
-          from shared_engines.currency.store import DurableRateStore
-
-          __all__ = [
-              "CurrencyError", "CurrencyPair", "CurrencyRegistry",
-              "DurableRateStore", "InvalidRateError", "Money",
-              "NoRouteError", "ProviderChain", "Quote",
-              "QuoteExpiredError", "QuoteSigner", "RateProvider",
-              "RateUnavailableError", "SignedQuote", "StaleRateError",
-              "StaticTableRateProvider", "UnknownCurrencyError",
-              "compose_rates",
-          ]
-          PYEOF
-
-          cat > shared_engines/currency/errors.py <<'PYEOF'
-          """Typed currency errors."""
-          from __future__ import annotations
-
-          from shared_engines.common.errors import (
-              EngineError,
-              NotFoundError,
-              ProviderTransientError,
-              ValidationError,
-          )
-
-
-          class CurrencyError(EngineError):
-              """Base for currency engine failures."""
-
-
-          class UnknownCurrencyError(CurrencyError, NotFoundError):
-              """The currency code is not in the registry."""
-
-
-          class InvalidRateError(CurrencyError, ValidationError):
-              """A rate is not a positive finite decimal."""
-
-
-          class RateUnavailableError(CurrencyError, ProviderTransientError):
-              """No provider could quote the pair."""
-
-
-          class StaleRateError(CurrencyError, ValidationError):
-              """The only stored quote is beyond the max age."""
-
-
-          class QuoteExpiredError(CurrencyError, ValidationError):
-              """A signed quote past its validity window."""
-
-
-          class NoRouteError(CurrencyError, NotFoundError):
-              """No direct or bridge route exists for the pair."""
-          PYEOF
-
-          cat > shared_engines/currency/contracts.py <<'PYEOF'
-          """Versioned currency contracts: Money, pairs, quotes.
-
-          Money accepts Decimal ONLY: binary floats are rejected at
-          construction because their representation error is exactly
-          the class of financial bug this engine prevents.
-          """
-          from __future__ import annotations
-
-          from dataclasses import dataclass
-          from decimal import Decimal
-
-          from shared_engines.common.errors import ValidationError
-          from shared_engines.common.validation import require_non_empty_str
-
-          CURRENCY_CONTRACT_VERSION = 1
-
-
-          @dataclass(frozen=True)
-          class Money:
-              amount: Decimal
-              currency: str
-
-              def __post_init__(self) -> None:
-                  if not isinstance(self.amount, Decimal):
-                      raise ValidationError(
-                          "Money amount must be Decimal (build from str)"
-                      )
-                  if not self.amount.is_finite() or self.amount < 0:
-                      raise ValidationError(
-                          "Money amount must be finite and non-negative"
-                      )
-                  require_non_empty_str(self.currency, "currency")
-
-
-          @dataclass(frozen=True)
-          class CurrencyPair:
-              base: str
-              quote: str
-
-              def __post_init__(self) -> None:
-                  require_non_empty_str(self.base, "base")
-                  require_non_empty_str(self.quote, "quote")
-                  if self.base == self.quote:
-                      raise ValidationError("base and quote must differ")
-
-              @property
-              def normalized(self) -> str:
-                  return f"{self.base}/{self.quote}"
-
-
-          @dataclass(frozen=True)
-          class Quote:
-              pair: CurrencyPair
-              rate: Decimal
-              quoted_at: float
-              expires_at: float
-              source: str
-
-              def __post_init__(self) -> None:
-                  if not isinstance(self.rate, Decimal):
-                      raise ValidationError("rate must be Decimal")
-                  if not self.rate.is_finite() or self.rate <= 0:
-                      raise ValidationError("rate must be positive")
-                  if self.expires_at <= self.quoted_at:
-                      raise ValidationError("quote window is empty")
-
-
-          @dataclass(frozen=True)
-          class SignedQuote:
-              quote: Quote
-              issuer_zid: str
-              signature: bytes
-              signer_public_pem: bytes
-              contract_version: int = CURRENCY_CONTRACT_VERSION
-          PYEOF
-
-          cat > shared_engines/currency/registry.py <<'PYEOF'
-          """Currency registry: known codes, asset types, minor units."""
-          from __future__ import annotations
-
-          from dataclasses import dataclass
-          from enum import Enum
-
-          from shared_engines.common.errors import ConfigurationError
-          from shared_engines.common.validation import require_int_range
-          from shared_engines.currency.errors import UnknownCurrencyError
-
-
-          class CurrencyAssetType(Enum):
-              FIAT = "fiat"
-              CRYPTO = "crypto"
-              COMMODITY = "commodity"
-
-
-          @dataclass(frozen=True)
-          class CurrencySpec:
-              code: str
-              asset_type: CurrencyAssetType
-              minor_units: int
-
-
-          _BASELINE: dict[str, tuple[CurrencyAssetType, int]] = {
-              "USD": (CurrencyAssetType.FIAT, 2),
-              "EUR": (CurrencyAssetType.FIAT, 2),
-              "GBP": (CurrencyAssetType.FIAT, 2),
-              "CHF": (CurrencyAssetType.FIAT, 2),
-              "JPY": (CurrencyAssetType.FIAT, 0),
-              "CNY": (CurrencyAssetType.FIAT, 2),
-              "GTQ": (CurrencyAssetType.FIAT, 2),
-              "MXN": (CurrencyAssetType.FIAT, 2),
-              "COP": (CurrencyAssetType.FIAT, 2),
-              "BRL": (CurrencyAssetType.FIAT, 2),
-              "ARS": (CurrencyAssetType.FIAT, 2),
-              "CLP": (CurrencyAssetType.FIAT, 0),
-              "BTC": (CurrencyAssetType.CRYPTO, 8),
-              "ETH": (CurrencyAssetType.CRYPTO, 8),
-              "USDT": (CurrencyAssetType.CRYPTO, 6),
-              "XAU": (CurrencyAssetType.COMMODITY, 3),
-          }
-
-
-          class CurrencyRegistry:
-              def __init__(self) -> None:
-                  self._specs: dict[str, CurrencySpec] = {
-                      code: CurrencySpec(
-                          code=code,
-                          asset_type=asset_type,
-                          minor_units=minor_units,
-                      )
-                      for code, (asset_type, minor_units) in _BASELINE.items()
-                  }
-
-              def register(
-                  self,
-                  code: str,
-                  asset_type: CurrencyAssetType,
-                  minor_units: int,
-              ) -> None:
-                  code = code.upper().strip()
-                  if len(code) < 2 or len(code) > 8:
-                      raise ConfigurationError(
-                          "currency code must be 2-8 characters"
-                      )
-                  require_int_range(
-                      minor_units, "minor_units", 0, 8, config=True
-                  )
-                  self._specs[code] = CurrencySpec(
-                      code=code,
-                      asset_type=asset_type,
-                      minor_units=minor_units,
-                  )
-
-              def require(self, code: str) -> CurrencySpec:
-                  spec = self._specs.get(code.upper().strip())
-                  if spec is None:
-                      raise UnknownCurrencyError(
-                          f"unknown currency: {code}"
-                      )
-                  return spec
-
-              def is_known(self, code: str) -> bool:
-                  return code.upper().strip() in self._specs
-
-              @property
-              def codes(self) -> tuple[str, ...]:
-                  return tuple(sorted(self._specs))
-          PYEOF
-
-          cat > shared_engines/currency/rates.py <<'PYEOF'
-          """Rate providers behind a protocol + exact composition.
-
-          The domain depends on ``RateProvider`` only. The static
-          table is an operator-maintained reference source that
-          validates every entry at construction.
-          """
-          from __future__ import annotations
-
-          from collections.abc import Sequence
-          from decimal import Decimal
-
-          from shared_engines.common.clocks import Clock
-          from shared_engines.common.errors import ConfigurationError
-          from shared_engines.currency.contracts import CurrencyPair, Quote
-          from shared_engines.currency.errors import RateUnavailableError
-
-
-          class RateProvider:
-              """A named source of point-in-time quotes."""
-
-              name: str
-
-              def fetch(self, pair: CurrencyPair, clock: Clock) -> Quote:
-                  raise RateUnavailableError(
-                      "RateProvider.fetch must be implemented"
-                  )
-
-
-          class StaticTableRateProvider(RateProvider):
-              """Operator-maintained reference rates (exact decimals)."""
-
-              def __init__(
-                  self,
-                  rates: dict[str, str],
-                  clock: Clock,
-                  *,
-                  ttl_seconds: float = 300.0,
-              ) -> None:
-                  if not rates:
-                      raise ConfigurationError(
-                          "static rate table must not be empty"
-                      )
-                  self._clock = clock
-                  self._rates: dict[str, Decimal] = {}
-                  self.name = "static-table"
-                  self._ttl = ttl_seconds
-                  for key, raw in rates.items():
-                      try:
-                          value = Decimal(raw)
-                      except Exception as exc:
-                          raise ConfigurationError(
-                              f"static rate {key} is not a decimal"
-                          ) from exc
-                      if not value.is_finite() or value <= 0:
-                          raise ConfigurationError(
-                              f"static rate {key} must be positive"
-                          )
-                      self._rates[key] = value
-
-              def fetch(self, pair: CurrencyPair, clock: Clock) -> Quote:
-                  rate = self._rates.get(pair.normalized)
-                  if rate is None:
-                      raise RateUnavailableError(
-                          f"no quote for {pair.normalized}"
-                      )
-                  now = clock.now()
-                  return Quote(
-                      pair=pair,
-                      rate=rate,
-                      quoted_at=now,
-                      expires_at=now + self._ttl,
-                      source=self.name,
-                  )
-
-
-          class ProviderChain:
-              """Tries providers in order; first success wins."""
-
-              def __init__(self, providers: Sequence[RateProvider]) -> None:
-                  if not providers:
-                      raise ConfigurationError(
-                          "at least one provider required"
-                      )
-                  self._providers: tuple[RateProvider, ...] = tuple(providers)
-
-              def fetch(self, pair: CurrencyPair, clock: Clock) -> Quote:
-                  failures: list[str] = []
-                  for provider in self._providers:
-                      try:
-                          return provider.fetch(pair, clock)
-                      except RateUnavailableError as exc:
-                          failures.append(f"{provider.name}: {exc}")
-                  raise RateUnavailableError(
-                      f"all providers exhausted: {'; '.join(failures)}"
-                  )
-
-
-          def compose_rates(leg1: Decimal, leg2: Decimal) -> Decimal:
-              """Composes two legs multiplicatively (exact)."""
-              return leg1 * leg2
-          PYEOF
-
-          cat > shared_engines/currency/store.py <<'PYEOF'
-          """Durable rate store: immutable exact-decimal history."""
-          from __future__ import annotations
-
-          from decimal import Decimal
-
-          from shared_engines.common.clocks import Clock
-          from shared_engines.common.errors import IntegrityError
-          from shared_engines.currency.contracts import CurrencyPair, Quote
-          from shared_engines.storage.database import Database
-          from shared_engines.storage.migrations import (
-              Migration,
-              MigrationRunner,
-          )
-
-          RATES_MIGRATIONS = (
-              Migration(
-                  1,
-                  "exchange_rates",
-                  (
-                      "CREATE TABLE exchange_rates ("
-                      " id INTEGER PRIMARY KEY AUTOINCREMENT,"
-                      " pair TEXT NOT NULL,"
-                      " rate TEXT NOT NULL,"
-                      " source TEXT NOT NULL,"
-                      " as_at REAL NOT NULL,"
-                      " fetched_at REAL NOT NULL,"
-                      " UNIQUE (pair, source, as_at))",
-                      "CREATE INDEX rates_pair_time"
-                      " ON exchange_rates (pair, as_at)",
-                  ),
-              ),
-          )
-
-
-          class DurableRateStore:
-              def __init__(self, db: Database, clock: Clock) -> None:
-                  self._db = db
-                  self._clock = clock
-                  MigrationRunner(
-                      db, "currency", RATES_MIGRATIONS
-                  ).run(clock)
-
-              def save(self, quote: Quote) -> None:
-                  with self._db.transaction() as cursor:
-                      existing = cursor.execute(
-                          "SELECT rate FROM exchange_rates"
-                          " WHERE pair = ? AND source = ? AND as_at = ?",
-                          (
-                              quote.pair.normalized,
-                              quote.source,
-                              quote.quoted_at,
-                          ),
-                      ).fetchone()
-                      if existing is not None:
-                          if str(existing["rate"]) != str(quote.rate):
-                              raise IntegrityError(
-                                  "conflicting rate for identical"
-                                  " pair/source/timestamp"
-                              )
-                          return
-                      cursor.execute(
-                          "INSERT INTO exchange_rates"
-                          " (pair, rate, source, as_at, fetched_at)"
-                          " VALUES (?, ?, ?, ?, ?)",
-                          (
-                              quote.pair.normalized,
-                              str(quote.rate),
-                              quote.source,
-                              quote.quoted_at,
-                              self._clock.now(),
-                          ),
-                      )
-
-              def latest(self, pair: CurrencyPair) -> Quote | None:
-                  row = self._db.query_one(
-                      "SELECT * FROM exchange_rates WHERE pair = ?"
-                      " ORDER BY as_at DESC LIMIT 1",
-                      (pair.normalized,),
-                  )
-                  if row is None:
-                      return None
-                  return self._quote_from_row(row)
-
-              def as_of(
-                  self, pair: CurrencyPair, at: float
-              ) -> Quote | None:
-                  row = self._db.query_one(
-                      "SELECT * FROM exchange_rates WHERE pair = ?"
-                      " AND as_at <= ? ORDER BY as_at DESC LIMIT 1",
-                      (pair.normalized, at),
-                  )
-                  if row is None:
-                      return None
-                  return self._quote_from_row(row)
-
-              @staticmethod
-              def _quote_from_row(row: object) -> Quote:
-                  if not hasattr(row, "__getitem__"):
-                      raise IntegrityError("invalid rate row type")
-                  normalized = str(row["pair"])
-                  parts = normalized.split("/", 1)
-                  if len(parts) != 2:
-                      raise IntegrityError("corrupt pair in rate row")
-                  rate = Decimal(str(row["rate"]))
-                  as_at = float(row["as_at"])
-                  return Quote(
-                      pair=CurrencyPair(parts[0], parts[1]),
-                      rate=rate,
-                      quoted_at=as_at,
-                      expires_at=as_at + 300.0,
-                      source=str(row["source"]),
-                  )
-          PYEOF
-
-          cat > shared_engines/currency/signing.py <<'PYEOF'
-          """Ed25519-signed quotes: portable, third-party verifiable FX."""
-          from __future__ import annotations
-
-          from shared_engines.common.serialization import canonical_json_dumps
-          from shared_engines.currency.contracts import Quote, SignedQuote
-          from shared_engines.verification.signatures import (
-              Ed25519Signer,
-              Ed25519Verifier,
-          )
-
-          QUOTE_FORMAT = "zyra.fxquote.v1"
-
-
-          def quote_canonical_bytes(signed: SignedQuote) -> bytes:
-              payload = {
-                  "format": QUOTE_FORMAT,
-                  "pair": signed.quote.pair.normalized,
-                  "rate": str(signed.quote.rate),
-                  "quoted_at": f"{signed.quote.quoted_at:.6f}",
-                  "expires_at": f"{signed.quote.expires_at:.6f}",
-                  "source": signed.quote.source,
-                  "issuer_zid": signed.issuer_zid,
-              }
-              return canonical_json_dumps(payload).encode("utf-8")
-
-
-          class QuoteSigner:
-              """Signs and verifies FX quotes with the Network key."""
-
-              def __init__(self, signer: Ed25519Signer) -> None:
-                  self._signer = signer
-
-              def sign(self, quote: Quote, *, issuer_zid: str) -> SignedQuote:
-                  candidate = SignedQuote(
-                      quote=quote,
-                      issuer_zid=issuer_zid,
-                      signature=b"",
-                      signer_public_pem=self._signer.public_pem,
-                  )
-                  data = quote_canonical_bytes(candidate)
-                  signature = self._signer.sign(data)
-                  return SignedQuote(
-                      quote=quote,
-                      issuer_zid=issuer_zid,
-                      signature=signature,
-                      signer_public_pem=self._signer.public_pem,
-                  )
-
-              @staticmethod
-              def verify(signed: SignedQuote) -> bool:
-                  data = quote_canonical_bytes(signed)
-                  verifier = Ed25519Verifier(signed.signer_public_pem)
-                  return verifier.verify(data, signed.signature)
-          PYEOF
-
           cat > shared_engines/currency/engine.py <<'PYEOF'
           """Currency engine: quotes, bridge routing, signed FX records.
 
-          The bridge logic lives inside the engine (route resolution
-          is an engine decision): direct quote first, then via the
-          configured bridge currency. Stale stored rates are refused,
-          never silently used.
+          Bridge logic lives inside the engine: direct quote first,
+          then via the configured bridge currency. Stale stored rates
+          are refused, never used silently. Settlement happens
+          outside the Network (banks/providers move the funds); its
+          reference attaches via record_settlement() - never faked.
           """
           from __future__ import annotations
 
@@ -640,6 +106,7 @@ jobs:
               Migration,
               MigrationRunner,
           )
+          from shared_engines.verification.signatures import Ed25519Signer
 
           EVENT_QUOTED = "currency.quote.issued"
           EVENT_CONVERTED = "currency.conversion.recorded"
@@ -675,7 +142,7 @@ jobs:
                   db: Database,
                   clock: Clock,
                   providers: list[RateProvider],
-                  signer: object,
+                  signer: Ed25519Signer,
                   audit: AuditTrail,
                   outbox: Outbox,
                   catalog: EventCatalog,
@@ -684,13 +151,6 @@ jobs:
                   max_rate_age_seconds: float = 300.0,
                   metrics: MetricsBackend | None = None,
               ) -> None:
-                  from shared_engines.currency.signing import QuoteSigner
-                  from shared_engines.verification.signatures import (
-                      Ed25519Signer,
-                  )
-
-                  if not isinstance(signer, Ed25519Signer):
-                      raise ValidationError("signer must be Ed25519Signer")
                   require_non_empty_str(bridge, "bridge", config=True)
                   require_positive_number(
                       max_rate_age_seconds,
@@ -916,6 +376,7 @@ jobs:
               def _fetch_quote(
                   self, pair: CurrencyPair, stored: Quote | None
               ) -> Quote:
+                  """Direct first; via bridge otherwise. Honest failures."""
                   try:
                       return self._chain.fetch(pair, self._clock)
                   except RateUnavailableError:
@@ -962,417 +423,1098 @@ jobs:
                   )
           PYEOF
 
-          cat > shared_engines/currency/tests/test_currency.py <<'PYEOF'
+          echo "=== ENGINE FIXED ==="
+
+      - name: Rebuild kernel.py completely (full wiring, no patches)
+        run: |
+          set -euo pipefail
+          cat > shared_engines/runtime/kernel.py <<'PYEOF'
+          """ZyraKernel: the living composition root of the Network.
+
+          Builds and owns every engine over one durable database,
+          registers the central event catalog, bootstraps the Root
+          Authority identity, wires the token ledger and the FX
+          engine, and aggregates component health.
+          """
           from __future__ import annotations
 
-          from dataclasses import replace
-          from decimal import Decimal
-          from pathlib import Path
-
-          import pytest
-
           from shared_engines.audit.chain import AuditTrail
-          from shared_engines.common.clocks import FrozenClock
+          from shared_engines.common.clocks import Clock
+          from shared_engines.currency.engine import CurrencyEngine
+          from shared_engines.currency.rates import StaticTableRateProvider
+          from shared_engines.events.contracts import EventCatalog
+          from shared_engines.events.outbox import Outbox
+          from shared_engines.identity.contracts import (
+              Identity,
+              IdentityKind,
+              IdentityStatus,
+          )
+          from shared_engines.identity.engine import IdentityEngine
+          from shared_engines.observability.backend import (
+              MetricsBackend,
+              NoopMetrics,
+              engine_logger,
+          )
+          from shared_engines.observability.health import (
+              ComponentHealth,
+              HealthRegistry,
+              HealthStatus,
+          )
+          from shared_engines.runtime.config import RuntimeConfig
+          from shared_engines.storage.database import Database
+          from shared_engines.tokenization.engine import TokenEngine
+          from shared_engines.verification.engine import VerificationEngine
+          from shared_engines.verification.signatures import Ed25519Signer
+
+          NETWORK_EVENT_TYPES = (
+              "identity.registered",
+              "identity.status_changed",
+              "verification.media.registered",
+              "verification.media.tamper_detected",
+              "verification.credential.issued",
+              "verification.credential.revoked",
+              "verification.attestation.issued",
+          )
+
+          DEFAULT_FX_RATES: dict[str, str] = {
+              "USD/EUR": "0.92",
+              "USD/CNY": "7.25",
+              "GTQ/USD": "0.128",
+              "USD/MXN": "17.0",
+          }
+
+
+          class _StorageHealth:
+              """Reports storage liveness through the adapter's ping."""
+
+              def __init__(self, db: Database) -> None:
+                  self._db = db
+
+              def check_health(self) -> ComponentHealth:
+                  if self._db.ping():
+                      return ComponentHealth(
+                          "storage", HealthStatus.HEALTHY, "ping ok"
+                      )
+                  return ComponentHealth(
+                      "storage", HealthStatus.UNHEALTHY, "ping failed"
+                  )
+
+
+          class ZyraKernel:
+              """Owns the engines; serves as the single source of truth."""
+
+              def __init__(
+                  self,
+                  *,
+                  db: Database,
+                  clock: Clock,
+                  signer: Ed25519Signer,
+                  config: RuntimeConfig,
+                  fx_rates: dict[str, str] | None = None,
+                  metrics: MetricsBackend | None = None,
+              ) -> None:
+                  self._config = config
+                  self._clock = clock
+                  self._db = db
+                  self._metrics = metrics if metrics is not None else NoopMetrics()
+                  self._log = engine_logger("runtime")
+                  self._audit = AuditTrail(db, clock)
+                  self._outbox = Outbox(db, clock)
+                  self._outbox.ensure_schema()
+                  self._catalog = EventCatalog()
+                  for event_type in NETWORK_EVENT_TYPES:
+                      self._catalog.register(event_type)
+                  self._identity = IdentityEngine(
+                      db=db,
+                      clock=clock,
+                      audit=self._audit,
+                      outbox=self._outbox,
+                      catalog=self._catalog,
+                      metrics=self._metrics,
+                  )
+                  self._verification = VerificationEngine(
+                      db=db,
+                      clock=clock,
+                      signer=signer,
+                      audit=self._audit,
+                      outbox=self._outbox,
+                      catalog=self._catalog,
+                      identity=self._identity,
+                      metrics=self._metrics,
+                  )
+                  self._tokens = TokenEngine(
+                      db=db,
+                      clock=clock,
+                      audit=self._audit,
+                      outbox=self._outbox,
+                      catalog=self._catalog,
+                      identity=self._identity,
+                      metrics=self._metrics,
+                  )
+                  self._currency = CurrencyEngine(
+                      db=db,
+                      clock=clock,
+                      providers=[
+                          StaticTableRateProvider(
+                              fx_rates
+                              if fx_rates is not None
+                              else DEFAULT_FX_RATES,
+                              clock,
+                          )
+                      ],
+                      signer=signer,
+                      audit=self._audit,
+                      outbox=self._outbox,
+                      catalog=self._catalog,
+                      identity=self._identity,
+                      metrics=self._metrics,
+                  )
+                  self._health = HealthRegistry()
+                  self._health.register("storage", _StorageHealth(db))
+                  self._health.register("identity", self._identity)
+                  self._health.register("verification", self._verification)
+                  self._health.register("tokens", self._tokens)
+                  self._health.register("currency", self._currency)
+                  self._root_zid: str | None = None
+
+              @property
+              def config(self) -> RuntimeConfig:
+                  return self._config
+
+              @property
+              def identity(self) -> IdentityEngine:
+                  return self._identity
+
+              @property
+              def verification(self) -> VerificationEngine:
+                  return self._verification
+
+              @property
+              def tokens(self) -> TokenEngine:
+                  return self._tokens
+
+              @property
+              def currency(self) -> CurrencyEngine:
+                  return self._currency
+
+              @property
+              def audit(self) -> AuditTrail:
+                  return self._audit
+
+              @property
+              def outbox(self) -> Outbox:
+                  return self._outbox
+
+              @property
+              def root_zid(self) -> str | None:
+                  return self._root_zid
+
+              def bootstrap_root(
+                  self, *, display_name: str = "Zyra Root Authority"
+              ) -> Identity:
+                  """Creates/returns the Network's own ACTIVE authority."""
+                  if self._root_zid is not None:
+                      return self._identity.require_identity(self._root_zid)
+                  root = self._identity.register_identity(
+                      kind=IdentityKind.INSTITUTION,
+                      display_name=display_name,
+                      actor="kernel",
+                  )
+                  self._identity.transition_identity(
+                      root.zid,
+                      IdentityStatus.ACTIVE,
+                      actor="kernel",
+                      reason="root authority bootstrap",
+                  )
+                  self._root_zid = root.zid
+                  self._log.info(
+                      "root authority bootstrapped zid=%s", root.zid
+                  )
+                  return self._identity.require_identity(root.zid)
+
+              def health(self) -> ComponentHealth:
+                  """Worst-status aggregate across all components."""
+                  return self._health.overall()
+
+              def health_components(self) -> tuple[ComponentHealth, ...]:
+                  return self._health.snapshot()
+
+              def check_health(self) -> ComponentHealth:
+                  """Kernel itself satisfies the HealthCheck protocol."""
+                  return self.health()
+          PYEOF
+
+          echo "=== KERNEL REBUILT ==="
+
+      - name: Rebuild responses.py (full error mapping incl. tokens + FX)
+        run: |
+          set -euo pipefail
+          cat > shared_engines/runtime/responses.py <<'PYEOF'
+          """HTTP response envelope and typed-error mapping.
+
+          Success: {"ok": true, "data": ...}
+          Failure: {"ok": false, "error": {"type": ..., "message": ...}}
+          """
+          from __future__ import annotations
+
           from shared_engines.common.errors import (
+              BackpressureError,
               ConfigurationError,
-              IntegrityError,
-              NotFoundError,
+              EngineError,
+              PolicyViolation,
+              RecoveryRequired,
               ValidationError,
           )
-          from shared_engines.currency.contracts import CurrencyPair, Quote
-          from shared_engines.currency.engine import CurrencyEngine
           from shared_engines.currency.errors import (
               NoRouteError,
               RateUnavailableError,
               StaleRateError,
               UnknownCurrencyError,
           )
-          from shared_engines.currency.rates import (
-              ProviderChain,
-              RateProvider,
-              StaticTableRateProvider,
-              compose_rates,
+          from shared_engines.identity.errors import (
+              IdentityAlreadyExistsError,
+              IdentityNotFoundError,
+              InvalidTransitionError,
           )
-          from shared_engines.currency.signing import QuoteSigner
-          from shared_engines.currency.store import DurableRateStore
-          from shared_engines.events.contracts import Event, EventCatalog
-          from shared_engines.events.outbox import Outbox
-          from shared_engines.identity.contracts import IdentityKind
-          from shared_engines.identity.engine import IdentityEngine
-          from shared_engines.identity.errors import IdentityNotFoundError
-          from shared_engines.observability.backend import InMemoryMetrics
-          from shared_engines.observability.health import HealthStatus
-          from shared_engines.storage.database import SQLiteAdapter
-          from shared_engines.verification.signatures import Ed25519Signer
-
-          RATES = {
-              "USD/CNY": "7.25",
-              "USD/EUR": "0.92",
-              "GTQ/USD": "0.128",
-              "USD/MXN": "17.0",
-          }
+          from shared_engines.tokenization.errors import (
+              DuplicateRuleError,
+              EmissionCapExceededError,
+              InsufficientBalanceError,
+              ItemInactiveError,
+              RuleInactiveError,
+              UnknownItemError,
+              UnknownRuleError,
+          )
+          from shared_engines.verification.errors import (
+              AttestationNotFoundError,
+              CredentialNotFoundError,
+              MediaNotFoundError,
+              TamperDetectedError,
+          )
 
 
-          class _Dead(RateProvider):
-              name = "dead"
+          class ApiError(Exception):
+              """Explicit API failure with a stable status and code."""
 
-              def fetch(self, pair: CurrencyPair, clock: object) -> Quote:
-                  raise RateUnavailableError("provider down")
+              def __init__(self, status: int, code: str, message: str) -> None:
+                  super().__init__(message)
+                  self.status = status
+                  self.code = code
+                  self.message = message
 
 
-          class _Harness:
-              def __init__(self, tmp_path: Path) -> None:
-                  self.db = SQLiteAdapter(tmp_path / "fx.db")
-                  self.clock = FrozenClock()
-                  self.audit = AuditTrail(self.db, self.clock)
-                  self.outbox = Outbox(self.db, self.clock)
-                  self.outbox.ensure_schema()
-                  self.catalog = EventCatalog()
-                  for event_type in (
-                      "currency.quote.issued",
-                      "currency.conversion.recorded",
-                      "identity.registered",
-                      "identity.status_changed",
-                  ):
-                      self.catalog.register(event_type)
-                  self.identity = IdentityEngine(
-                      db=self.db,
-                      clock=self.clock,
-                      audit=self.audit,
-                      outbox=self.outbox,
-                      catalog=self.catalog,
+          _NOT_FOUND_ERRORS = (
+              IdentityNotFoundError,
+              MediaNotFoundError,
+              AttestationNotFoundError,
+              CredentialNotFoundError,
+              UnknownRuleError,
+              UnknownItemError,
+              UnknownCurrencyError,
+              NoRouteError,
+          )
+
+          _CONFLICT_ERRORS = (
+              InvalidTransitionError,
+              TamperDetectedError,
+              IdentityAlreadyExistsError,
+              InsufficientBalanceError,
+              EmissionCapExceededError,
+              RuleInactiveError,
+              ItemInactiveError,
+              StaleRateError,
+              DuplicateRuleError,
+          )
+
+
+          def map_engine_error(exc: EngineError) -> ApiError:
+              """Maps typed engine errors to stable HTTP semantics."""
+              if isinstance(exc, _NOT_FOUND_ERRORS):
+                  return ApiError(404, "not_found", str(exc))
+              if isinstance(exc, _CONFLICT_ERRORS):
+                  return ApiError(409, "conflict", str(exc))
+              if isinstance(exc, PolicyViolation):
+                  return ApiError(403, "forbidden", str(exc))
+              if isinstance(exc, ValidationError):
+                  return ApiError(400, "invalid_request", str(exc))
+              if isinstance(
+                  exc, (BackpressureError, RateUnavailableError)
+              ):
+                  return ApiError(503, "unavailable", str(exc))
+              if isinstance(exc, (RecoveryRequired, ConfigurationError)):
+                  return ApiError(
+                      500, "internal_error", "internal state error"
                   )
-                  self.metrics = InMemoryMetrics()
-                  self.signer, _ = Ed25519Signer.generate()
-                  self.engine = CurrencyEngine(
-                      db=self.db,
-                      clock=self.clock,
-                      providers=[StaticTableRateProvider(RATES, self.clock)],
-                      signer=self.signer,
-                      audit=self.audit,
-                      outbox=self.outbox,
-                      catalog=self.catalog,
-                      identity=self.identity,
-                      metrics=self.metrics,
-                  )
-
-              def make_user(self, name: str = "Trader") -> str:
-                  user = self.identity.register_identity(
-                      kind=IdentityKind.PERSON,
-                      display_name=name,
-                      actor="registrar",
-                  )
-                  return user.zid
-
-              def close(self) -> None:
-                  self.db.close()
-
-
-          def test_decimal_exactness_where_floats_fail() -> None:
-              assert Decimal("0.1") + Decimal("0.2") == Decimal("0.3")
-              assert compose_rates(
-                  Decimal("0.128"), Decimal("7.25")
-              ) == Decimal("0.928")
-
-
-          def test_quote_direct_pair_exact_and_signed(
-              tmp_path: Path,
-          ) -> None:
-              harness = _Harness(tmp_path)
-              user = harness.make_user()
-              signed = harness.engine.quote(
-                  base="USD", quote_ccy="CNY", requester_zid=user
-              )
-              assert signed.quote.rate == Decimal("7.25")
-              assert QuoteSigner.verify(signed) is True
-              forged = replace(signed, issuer_zid="ZID-fake")
-              assert QuoteSigner.verify(forged) is False
-              harness.close()
-
-
-          def test_bridge_route_gtq_to_cny_via_usd(
-              tmp_path: Path,
-          ) -> None:
-              harness = _Harness(tmp_path)
-              user = harness.make_user()
-              signed = harness.engine.quote(
-                  base="GTQ", quote_ccy="CNY", requester_zid=user
-              )
-              assert signed.quote.rate == Decimal("0.928")
-              assert signed.quote.source.startswith("bridge:USD")
-              assert QuoteSigner.verify(signed) is True
-              harness.close()
-
-
-          def test_second_quote_served_from_store(tmp_path: Path) -> None:
-              harness = _Harness(tmp_path)
-              user = harness.make_user()
-              first = harness.engine.quote(
-                  base="USD", quote_ccy="EUR", requester_zid=user
-              )
-              second = harness.engine.quote(
-                  base="USD", quote_ccy="EUR", requester_zid=user
-              )
-              assert second.quote.rate == first.quote.rate
-              assert second.quote.quoted_at == first.quote.quoted_at
-              harness.close()
-
-
-          def test_stale_only_rate_raises(tmp_path: Path) -> None:
-              harness = _Harness(tmp_path)
-              user = harness.make_user()
-              harness.engine.quote(
-                  base="USD", quote_ccy="MXN", requester_zid=user
-              )
-              harness.clock.advance(301)
-              with pytest.raises(StaleRateError):
-                  harness.engine.quote(
-                      base="USD", quote_ccy="MXN", requester_zid=user
-                  )
-              harness.close()
-
-
-          def test_unknown_currency_and_ghost_requester(
-              tmp_path: Path,
-          ) -> None:
-              harness = _Harness(tmp_path)
-              user = harness.make_user()
-              with pytest.raises(UnknownCurrencyError):
-                  harness.engine.quote(
-                      base="USD", quote_ccy="ZZZ", requester_zid=user
-                  )
-              with pytest.raises(IdentityNotFoundError):
-                  harness.engine.quote(
-                      base="USD", quote_ccy="EUR", requester_zid="ZID-x"
-                  )
-              harness.close()
-
-
-          def test_no_route_when_bridge_is_endpoint(
-              tmp_path: Path,
-          ) -> None:
-              harness = _Harness(tmp_path)
-              user = harness.make_user()
-              with pytest.raises(NoRouteError):
-                  harness.engine.quote(
-                      base="GTQ", quote_ccy="ZZZ", requester_zid=user
-                  )
-              harness.close()
-
-
-          def test_convert_records_intent_and_audit(
-              tmp_path: Path,
-          ) -> None:
-              harness = _Harness(tmp_path)
-              user = harness.make_user()
-              signed, conversion_id, exact = harness.engine.convert(
-                  subject_zid=user,
-                  base="GTQ",
-                  quote_ccy="USD",
-                  amount=Decimal("1000.00"),
-              )
-              assert exact == Decimal("128.0000")
-              assert conversion_id.startswith("CNV-")
-              record = harness.engine.get_conversion(conversion_id)
-              assert record is not None
-              assert record["fx_settlement_ref"] is None
-              assert harness.audit.verify() >= 1
-              assert signed.quote.rate == Decimal("0.128")
-              harness.close()
-
-
-          def test_settlement_closes_loop(tmp_path: Path) -> None:
-              harness = _Harness(tmp_path)
-              user = harness.make_user()
-              _, conversion_id, _ = harness.engine.convert(
-                  subject_zid=user,
-                  base="USD",
-                  quote_ccy="MXN",
-                  amount=Decimal("100"),
-              )
-              harness.engine.record_settlement(
-                  conversion_id, settlement_ref="WIRE-12345"
-              )
-              record = harness.engine.get_conversion(conversion_id)
-              assert record is not None
-              assert record["fx_settlement_ref"] == "WIRE-12345"
-              harness.close()
-
-
-          def test_settlement_unknown_conversion(tmp_path: Path) -> None:
-              harness = _Harness(tmp_path)
-              with pytest.raises(NotFoundError):
-                  harness.engine.record_settlement(
-                      "CNV-missing", settlement_ref="x"
-                  )
-              harness.close()
-
-
-          def test_rate_store_immutable_and_historical(
-              tmp_path: Path,
-          ) -> None:
-              harness = _Harness(tmp_path)
-              provider = StaticTableRateProvider(RATES, harness.clock)
-              pair = CurrencyPair("USD", "MXN")
-              quote = provider.fetch(pair, harness.clock)
-              store = DurableRateStore(harness.db, harness.clock)
-              store.save(quote)
-              store.save(quote)
-              with pytest.raises(IntegrityError):
-                  store.save(
-                      Quote(
-                          pair=pair,
-                          rate=Decimal("999"),
-                          quoted_at=quote.quoted_at,
-                          expires_at=quote.expires_at,
-                          source="static-table",
-                      )
-                  )
-              historical = store.as_of(pair, quote.quoted_at + 1)
-              assert historical is not None
-              assert historical.rate == Decimal("17.0")
-              harness.db.close()
-
-
-          def test_outbox_events_from_currency_flow(
-              tmp_path: Path,
-          ) -> None:
-              harness = _Harness(tmp_path)
-              user = harness.make_user()
-              harness.engine.convert(
-                  subject_zid=user,
-                  base="USD",
-                  quote_ccy="EUR",
-                  amount=Decimal("50"),
-              )
-              collected: list[Event] = []
-
-              def collect(event: Event) -> None:
-                  collected.append(event)
-
-              harness.outbox.dispatch_pending(collect)
-              by_type = {event.event_type for event in collected}
-              assert by_type >= {
-                  "currency.quote.issued",
-                  "currency.conversion.recorded",
-              }
-              harness.close()
-
-
-          def test_health_healthy_then_unhealthy(
-              tmp_path: Path,
-          ) -> None:
-              harness = _Harness(tmp_path)
-              assert (
-                  harness.engine.check_health().status
-                  is HealthStatus.HEALTHY
-              )
-              harness.db.close()
-              assert (
-                  harness.engine.check_health().status
-                  is HealthStatus.UNHEALTHY
-              )
-
-
-          def test_provider_chain_and_config_guards() -> None:
-              clock = FrozenClock()
-              with pytest.raises(RateUnavailableError):
-                  ProviderChain([_Dead()]).fetch(
-                      CurrencyPair("USD", "EUR"), clock
-                  )
-              with pytest.raises(ConfigurationError):
-                  ProviderChain([])
-              with pytest.raises(ConfigurationError):
-                  StaticTableRateProvider({}, clock)
-              with pytest.raises(ConfigurationError):
-                  StaticTableRateProvider({"USD/EUR": "abc"}, clock)
-
-
-          def test_quote_rejects_same_currency(tmp_path: Path) -> None:
-              harness = _Harness(tmp_path)
-              user = harness.make_user()
-              with pytest.raises(ValidationError):
-                  harness.engine.quote(
-                      base="USD", quote_ccy="USD", requester_zid=user
-                  )
-              harness.close()
+              return ApiError(500, "internal_error", "internal error")
           PYEOF
 
-          echo "=== CURRENCY CLEAN BUILD OK ==="
+          echo "=== RESPONSES REBUILT ==="
 
-      - name: Patch runtime (kernel + responses + api for tokens/FX)
+      - name: Rebuild api.py (all endpoints: identity, verification, tokens, FX)
         run: |
           set -euo pipefail
-          python3 - <<'PYUPGRADE'
-          from pathlib import Path
+          cat > shared_engines/runtime/api.py <<'PYEOF'
+          """HTTP API over the kernel: stable routes, auth, envelopes.
 
-          # 1) kernel.py: register TokenEngine + CurrencyEngine and health
-          k = Path("shared_engines/runtime/kernel.py")
-          text = k.read_text(encoding="utf-8")
-          if "TokenEngine" not in text:
-              text = text.replace(
-                  "from shared_engines.runtime.config import RuntimeConfig",
-                  "from shared_engines.currency.engine import CurrencyEngine\n"
-                  "from shared_engines.currency.rates import StaticTableRateProvider\n"
-                  "from shared_engines.runtime.config import RuntimeConfig\n"
-                  "from shared_engines.tokenization.engine import TokenEngine",
-              )
-              text = text.replace(
-                  '                  self._health = HealthRegistry()',
-                  '                  self._tokens = TokenEngine(\n'
-                  '                      db=db,\n'
-                  '                      clock=clock,\n'
-                  '                      audit=self._audit,\n'
-                  '                      outbox=self._outbox,\n'
-                  '                      catalog=self._catalog,\n'
-                  '                      identity=self._identity,\n'
-                  '                      metrics=self._metrics,\n'
-                  '                  )\n'
-                  '                  self._currency = CurrencyEngine(\n'
-                  '                      db=db,\n'
-                  '                      clock=clock,\n'
-                  '                      providers=[\n'
-                  '                          StaticTableRateProvider(\n'
-                  '                              {"USD/EUR": "0.92",\n'
-                  '                               "USD/CNY": "7.25",\n'
-                  '                               "GTQ/USD": "0.128",\n'
-                  '                               "USD/MXN": "17.0"},\n'
-                  '                              clock,\n'
-                  '                          )\n'
-                  '                      ],\n'
-                  '                      signer=signer,\n'
-                  '                      audit=self._audit,\n'
-                  '                      outbox=self._outbox,\n'
-                  '                      catalog=self._catalog,\n'
-                  '                      identity=self._identity,\n'
-                  '                      metrics=self._metrics,\n'
-                  '                  )\n'
-                  '                  self._health = HealthRegistry()',
-              )
-              text = text.replace(
-                  '                  self._health.register("verification", self._verification)',
-                  '                  self._health.register("verification", self._verification)\n'
-                  '                  self._health.register("tokens", self._tokens)\n'
-                  '                  self._health.register("currency", self._currency)',
-              )
-              text = text.replace(
-                  '              def audit(self) -> AuditTrail:',
-                  '              @property\n'
-                  '              def tokens(self) -> TokenEngine:\n'
-                  '                  return self._tokens\n'
-                  '\n'
-                  '              @property\n'
-                  '              def currency(self) -> CurrencyEngine:\n'
-                  '                  return self._currency\n'
-                  '\n'
-                  '              @property\n'
-                  '              def audit(self) -> AuditTrail:',
-              )
-              k.write_text(text, encoding="utf-8")
-              print("kernel upgraded")
-          PYUPGRADE
+          Routes (all JSON):
+            GET  /health                                        (no auth)
+            POST /identity/register
+            GET  /identity/{zid}
+            POST /identity/transition
+            POST /verification/media
+            POST /verification/media/verify
+            GET  /verification/media/{media_id}
+            GET  /verification/media/{media_id}/history
+            POST /verification/credentials
+            GET  /verification/credentials/{credential_id}
+            POST /verification/credentials/revoke
+            GET  /verification/subjects/{zid}/credentials
+            POST /verification/attestations
+            POST /verification/attestations/verify
+            POST /tokens/rules
+            POST /tokens/items
+            GET  /tokens/items
+            POST /tokens/earn
+            POST /tokens/redeem
+            GET  /tokens/{zid}/balance
+            GET  /tokens/{zid}/history
+            POST /currency/quote
+            POST /currency/convert
+            POST /currency/settle
+            GET  /currency/conversions/{conversion_id}
 
-      - name: Add tokens/currency API tests
+          Auth: if a token is configured, every route except /health
+          requires ``Authorization: Bearer <token>`` compared in
+          constant time. Money amounts travel as decimal STRINGS.
+          """
+          from __future__ import annotations
+
+          import base64
+          import hmac
+          import json
+          from decimal import Decimal, InvalidOperation
+          from http.server import BaseHTTPRequestHandler
+          from typing import Any, ClassVar
+          from urllib.parse import urlparse
+
+          from shared_engines.common.errors import EngineError
+          from shared_engines.common.serialization import canonical_json_dumps
+          from shared_engines.currency.contracts import SignedQuote
+          from shared_engines.identity.contracts import (
+              Identity,
+              IdentityKind,
+              IdentityStatus,
+          )
+          from shared_engines.observability.health import ComponentHealth
+          from shared_engines.runtime.kernel import ZyraKernel
+          from shared_engines.runtime.responses import (
+              ApiError,
+              map_engine_error,
+          )
+          from shared_engines.tokenization.ledger import (
+              EmissionRule,
+              LedgerTransaction,
+              RedemptionItem,
+              RedemptionRecord,
+          )
+          from shared_engines.verification.attestations import Attestation
+          from shared_engines.verification.credentials import (
+              CredentialRecord,
+              CredentialType,
+          )
+          from shared_engines.verification.media import (
+              MediaKind,
+              MediaRecord,
+          )
+          from shared_engines.verification.provenance import ProvenanceEvent
+
+
+          class ZyraApiHandler(BaseHTTPRequestHandler):
+              """Thread-safe request handler bound to a shared kernel."""
+
+              kernel: ClassVar[ZyraKernel]
+
+              def log_message(self, format: str, *args: object) -> None:
+                  return None
+
+              def do_GET(self) -> None:
+                  self._dispatch("GET")
+
+              def do_POST(self) -> None:
+                  self._dispatch("POST")
+
+              def _dispatch(self, method: str) -> None:
+                  try:
+                      self._route(method)
+                  except ApiError as exc:
+                      self._send_json(exc.status, self._error_body(exc))
+                  except EngineError as exc:
+                      mapped = map_engine_error(exc)
+                      self._send_json(mapped.status, self._error_body(mapped))
+                  except Exception:
+                      self._send_json(
+                          500,
+                          {
+                              "ok": False,
+                              "error": {
+                                  "type": "internal_error",
+                                  "message": "internal error",
+                              },
+                          },
+                      )
+
+              def _route(self, method: str) -> None:
+                  path = urlparse(self.path).path
+                  segments = [s for s in path.split("/") if s]
+                  if segments == ["health"] and method == "GET":
+                      self._handle_health()
+                      return
+                  if not self._authorized():
+                      raise ApiError(
+                          401,
+                          "unauthorized",
+                          "valid bearer token required",
+                      )
+                  if method == "GET":
+                      self._route_get(segments)
+                  elif method == "POST":
+                      self._route_post(segments)
+                  else:
+                      raise ApiError(
+                          405, "method_not_allowed", "unsupported method"
+                      )
+
+              def _route_get(self, s: list[str]) -> None:
+                  if len(s) == 2 and s[0] == "identity":
+                      self._handle_get_identity(s[1])
+                  elif s == ["tokens", "items"]:
+                      self._handle_list_items()
+                  elif (
+                      len(s) == 3
+                      and s[0] == "tokens"
+                      and s[2] == "balance"
+                  ):
+                      self._handle_token_balance(s[1])
+                  elif (
+                      len(s) == 3
+                      and s[0] == "tokens"
+                      and s[2] == "history"
+                  ):
+                      self._handle_token_history(s[1])
+                  elif (
+                      len(s) == 3
+                      and s[0] == "verification"
+                      and s[1] == "media"
+                  ):
+                      self._handle_get_media(s[2])
+                  elif (
+                      len(s) == 4
+                      and s[0] == "verification"
+                      and s[1] == "media"
+                      and s[3] == "history"
+                  ):
+                      self._handle_media_history(s[2])
+                  elif (
+                      len(s) == 3
+                      and s[0] == "verification"
+                      and s[1] == "credentials"
+                  ):
+                      self._handle_get_credential(s[2])
+                  elif (
+                      len(s) == 4
+                      and s[0] == "verification"
+                      and s[1] == "subjects"
+                      and s[3] == "credentials"
+                  ):
+                      self._handle_subject_credentials(s[2])
+                  elif (
+                      len(s) == 3
+                      and s[0] == "currency"
+                      and s[1] == "conversions"
+                  ):
+                      self._handle_get_conversion(s[2])
+                  else:
+                      raise ApiError(404, "not_found", "unknown route")
+
+              def _route_post(self, s: list[str]) -> None:
+                  if s == ["identity", "register"]:
+                      self._handle_register_identity()
+                  elif s == ["identity", "transition"]:
+                      self._handle_transition()
+                  elif s == ["verification", "media"]:
+                      self._handle_register_media()
+                  elif s == ["verification", "media", "verify"]:
+                      self._handle_verify_media()
+                  elif s == ["verification", "credentials"]:
+                      self._handle_issue_credential()
+                  elif s == ["verification", "credentials", "revoke"]:
+                      self._handle_revoke_credential()
+                  elif s == ["verification", "attestations"]:
+                      self._handle_issue_attestation()
+                  elif s == ["verification", "attestations", "verify"]:
+                      self._handle_verify_attestation()
+                  elif s == ["tokens", "rules"]:
+                      self._handle_token_rule()
+                  elif s == ["tokens", "items"]:
+                      self._handle_token_item()
+                  elif s == ["tokens", "earn"]:
+                      self._handle_token_earn()
+                  elif s == ["tokens", "redeem"]:
+                      self._handle_token_redeem()
+                  elif s == ["currency", "quote"]:
+                      self._handle_currency_quote()
+                  elif s == ["currency", "convert"]:
+                      self._handle_currency_convert()
+                  elif s == ["currency", "settle"]:
+                      self._handle_currency_settle()
+                  else:
+                      raise ApiError(404, "not_found", "unknown route")
+
+              def _authorized(self) -> bool:
+                  token = type(self).kernel.config.api_token
+                  if token is None:
+                      return True
+                  header = self.headers.get("Authorization")
+                  if header is None:
+                      return False
+                  return hmac.compare_digest(header, f"Bearer {token}")
+
+              def _read_json(self) -> dict[str, Any]:
+                  length_header = self.headers.get("Content-Length")
+                  if length_header is None:
+                      raise ApiError(
+                          411, "length_required", "Content-Length required"
+                      )
+                  try:
+                      length = int(length_header)
+                  except ValueError as exc:
+                      raise ApiError(
+                          400, "invalid_request", "bad Content-Length"
+                      ) from exc
+                  max_body = type(self).kernel.config.max_body_bytes
+                  if length > max_body:
+                      raise ApiError(
+                          413, "payload_too_large", "body exceeds limit"
+                      )
+                  raw = self.rfile.read(length)
+                  try:
+                      doc: Any = json.loads(raw.decode("utf-8"))
+                  except (UnicodeDecodeError, ValueError) as exc:
+                      raise ApiError(
+                          400, "invalid_json", "body is not valid JSON"
+                      ) from exc
+                  if not isinstance(doc, dict):
+                      raise ApiError(
+                          400, "invalid_request", "body must be a JSON object"
+                      )
+                  typed: dict[str, Any] = {}
+                  for key, value in doc.items():
+                      typed[str(key)] = value
+                  return typed
+
+              @staticmethod
+              def _require_str(doc: dict[str, Any], key: str) -> str:
+                  value = doc.get(key)
+                  if not isinstance(value, str) or not value.strip():
+                      raise ApiError(
+                          400, "invalid_request", f"missing field: {key}"
+                      )
+                  return value
+
+              @staticmethod
+              def _require_optional_str(
+                  doc: dict[str, Any], key: str
+              ) -> str | None:
+                  value = doc.get(key)
+                  if value is None:
+                      return None
+                  if not isinstance(value, str) or not value.strip():
+                      raise ApiError(
+                          400, "invalid_request", f"invalid field: {key}"
+                      )
+                  return value
+
+              @staticmethod
+              def _require_int(doc: dict[str, Any], key: str) -> int:
+                  value = doc.get(key)
+                  if not isinstance(value, int) or isinstance(value, bool):
+                      raise ApiError(
+                          400, "invalid_request", f"missing field: {key}"
+                      )
+                  return value
+
+              @staticmethod
+              def _require_optional_int(
+                  doc: dict[str, Any], key: str
+              ) -> int | None:
+                  value = doc.get(key)
+                  if value is None:
+                      return None
+                  if not isinstance(value, int) or isinstance(value, bool):
+                      raise ApiError(
+                          400, "invalid_request", f"invalid field: {key}"
+                      )
+                  return value
+
+              @staticmethod
+              def _require_decimal_str(
+                  doc: dict[str, Any], key: str
+              ) -> Decimal:
+                  raw = ZyraApiHandler._require_str(doc, key)
+                  try:
+                      return Decimal(raw)
+                  except InvalidOperation as exc:
+                      raise ApiError(
+                          400,
+                          "invalid_request",
+                          f"{key} must be a decimal string",
+                      ) from exc
+
+              def _send_json(
+                  self, status: int, payload: dict[str, Any]
+              ) -> None:
+                  body = canonical_json_dumps(payload).encode("utf-8")
+                  self.send_response(status)
+                  self.send_header("Content-Type", "application/json")
+                  self.send_header("Content-Length", str(len(body)))
+                  self.end_headers()
+                  self.wfile.write(body)
+
+              @staticmethod
+              def _error_body(exc: ApiError) -> dict[str, Any]:
+                  return {
+                      "ok": False,
+                      "error": {"type": exc.code, "message": exc.message},
+                  }
+
+              def _ok(self, data: Any, status: int = 200) -> None:
+                  self._send_json(status, {"ok": True, "data": data})
+
+              def _handle_health(self) -> None:
+                  kernel = type(self).kernel
+                  self._ok(
+                      {
+                          "overall": _health_json(kernel.health()),
+                          "components": [
+                              _health_json(c)
+                              for c in kernel.health_components()
+                          ],
+                      }
+                  )
+
+              def _handle_register_identity(self) -> None:
+                  doc = self._read_json()
+                  kind_raw = self._require_str(doc, "kind")
+                  try:
+                      kind = IdentityKind(kind_raw)
+                  except ValueError as exc:
+                      raise ApiError(
+                          400, "invalid_request", "unknown kind"
+                      ) from exc
+                  identity = type(self).kernel.identity.register_identity(
+                      kind=kind,
+                      display_name=self._require_str(doc, "display_name"),
+                      actor=self._require_str(doc, "actor"),
+                  )
+                  self._ok(_identity_json(identity), status=201)
+
+              def _handle_get_identity(self, zid: str) -> None:
+                  identity = type(self).kernel.identity.get_identity(zid)
+                  if identity is None:
+                      raise ApiError(
+                          404, "not_found", f"unknown zid: {zid}"
+                      )
+                  self._ok(_identity_json(identity))
+
+              def _handle_transition(self) -> None:
+                  doc = self._read_json()
+                  zid = self._require_str(doc, "zid")
+                  try:
+                      target = IdentityStatus(
+                          self._require_str(doc, "to_status")
+                      )
+                  except ValueError as exc:
+                      raise ApiError(
+                          400, "invalid_request", "unknown to_status"
+                      ) from exc
+                  identity = type(self).kernel.identity.transition_identity(
+                      zid,
+                      target,
+                      actor=self._require_str(doc, "actor"),
+                      reason=self._require_str(doc, "reason"),
+                  )
+                  self._ok(_identity_json(identity))
+
+              def _handle_register_media(self) -> None:
+                  doc = self._read_json()
+                  kind_raw = self._require_str(doc, "kind")
+                  try:
+                      kind = MediaKind(kind_raw)
+                  except ValueError as exc:
+                      raise ApiError(
+                          400, "invalid_request", "unknown media kind"
+                      ) from exc
+                  content = self._decode_b64(
+                      self._require_str(doc, "content_b64")
+                  )
+                  record = type(self).kernel.verification.register_media(
+                      owner_zid=self._require_str(doc, "owner_zid"),
+                      kind=kind,
+                      title=self._require_str(doc, "title"),
+                      content=content,
+                      content_type=self._require_str(doc, "content_type"),
+                      actor=self._require_str(doc, "actor"),
+                  )
+                  self._ok(_media_json(record), status=201)
+
+              def _handle_verify_media(self) -> None:
+                  doc = self._read_json()
+                  content = self._decode_b64(
+                      self._require_str(doc, "content_b64")
+                  )
+                  record = type(self).kernel.verification.verify_media(
+                      self._require_str(doc, "media_id"), content
+                  )
+                  self._ok(_media_json(record))
+
+              def _handle_get_media(self, media_id: str) -> None:
+                  record = type(self).kernel.verification.get_media(media_id)
+                  if record is None:
+                      raise ApiError(
+                          404, "not_found", f"unknown media: {media_id}"
+                      )
+                  self._ok(_media_json(record))
+
+              def _handle_media_history(self, media_id: str) -> None:
+                  history = (
+                      type(self).kernel.verification.media_history(media_id)
+                  )
+                  self._ok([_provenance_json(e) for e in history])
+
+              def _handle_issue_credential(self) -> None:
+                  doc = self._read_json()
+                  type_raw = self._require_str(doc, "credential_type")
+                  try:
+                      credential_type = CredentialType(type_raw)
+                  except ValueError as exc:
+                      raise ApiError(
+                          400, "invalid_request", "unknown credential_type"
+                      ) from exc
+                  record = type(self).kernel.verification.issue_credential(
+                      subject_zid=self._require_str(doc, "subject_zid"),
+                      issuer_zid=self._require_str(doc, "issuer_zid"),
+                      credential_type=credential_type,
+                      title=self._require_str(doc, "title"),
+                      detail=self._require_str(doc, "detail"),
+                  )
+                  self._ok(_credential_json(record), status=201)
+
+              def _handle_get_credential(self, credential_id: str) -> None:
+                  record = type(self).kernel.verification.get_credential(
+                      credential_id
+                  )
+                  if record is None:
+                      raise ApiError(
+                          404,
+                          "not_found",
+                          f"unknown credential: {credential_id}",
+                      )
+                  self._ok(_credential_json(record))
+
+              def _handle_revoke_credential(self) -> None:
+                  doc = self._read_json()
+                  record = type(self).kernel.verification.revoke_credential(
+                      self._require_str(doc, "credential_id"),
+                      revoked_by=self._require_str(doc, "revoked_by"),
+                      reason=self._require_str(doc, "reason"),
+                  )
+                  self._ok(_credential_json(record))
+
+              def _handle_subject_credentials(self, zid: str) -> None:
+                  history = type(self).kernel.verification.subject_history(zid)
+                  self._ok([_credential_json(c) for c in history])
+
+              def _handle_issue_attestation(self) -> None:
+                  doc = self._read_json()
+                  attestation = (
+                      type(self).kernel.verification.issue_attestation(
+                          subject_zid=self._require_str(doc, "subject_zid"),
+                          claim=self._require_str(doc, "claim"),
+                          subject_sha256=self._require_optional_str(
+                              doc, "subject_sha256"
+                          ),
+                      )
+                  )
+                  self._ok(_attestation_json(attestation), status=201)
+
+              def _handle_verify_attestation(self) -> None:
+                  doc = self._read_json()
+                  ok = type(self).kernel.verification.verify_attestation(
+                      self._require_str(doc, "attestation_id")
+                  )
+                  self._ok({"valid": ok})
+
+              def _handle_token_rule(self) -> None:
+                  doc = self._read_json()
+                  rule = type(self).kernel.tokens.define_rule(
+                      activity=self._require_str(doc, "activity"),
+                      amount=self._require_int(doc, "amount"),
+                      daily_cap=self._require_optional_int(doc, "daily_cap"),
+                      lifetime_cap=self._require_optional_int(
+                          doc, "lifetime_cap"
+                      ),
+                  )
+                  self._ok(_rule_json(rule), status=201)
+
+              def _handle_token_item(self) -> None:
+                  doc = self._read_json()
+                  item = type(self).kernel.tokens.define_item(
+                      item_id=self._require_str(doc, "item_id"),
+                      title=self._require_str(doc, "title"),
+                      cost=self._require_int(doc, "cost"),
+                  )
+                  self._ok(_item_json(item), status=201)
+
+              def _handle_list_items(self) -> None:
+                  items = type(self).kernel.tokens.list_items()
+                  self._ok([_item_json(i) for i in items])
+
+              def _handle_token_earn(self) -> None:
+                  doc = self._read_json()
+                  tx = type(self).kernel.tokens.earn(
+                      subject_zid=self._require_str(doc, "subject_zid"),
+                      activity=self._require_str(doc, "activity"),
+                      ref_type=self._require_str(doc, "ref_type"),
+                      ref_id=self._require_str(doc, "ref_id"),
+                  )
+                  self._ok(_tx_json(tx), status=201)
+
+              def _handle_token_redeem(self) -> None:
+                  doc = self._read_json()
+                  record = type(self).kernel.tokens.redeem(
+                      self._require_str(doc, "subject_zid"),
+                      self._require_str(doc, "item_id"),
+                  )
+                  self._ok(_redemption_json(record))
+
+              def _handle_token_balance(self, zid: str) -> None:
+                  balance = type(self).kernel.tokens.balance(zid)
+                  self._ok({"zid": zid, "balance": balance})
+
+              def _handle_token_history(self, zid: str) -> None:
+                  history = type(self).kernel.tokens.history(zid)
+                  self._ok([_tx_json(t) for t in history])
+
+              def _handle_currency_quote(self) -> None:
+                  doc = self._read_json()
+                  signed = type(self).kernel.currency.quote(
+                      base=self._require_str(doc, "base"),
+                      quote_ccy=self._require_str(doc, "quote_ccy"),
+                      requester_zid=self._require_str(doc, "requester_zid"),
+                  )
+                  self._ok(_signed_quote_json(signed), status=201)
+
+              def _handle_currency_convert(self) -> None:
+                  doc = self._read_json()
+                  amount = self._require_decimal_str(doc, "amount")
+                  signed, conversion_id, exact = (
+                      type(self).kernel.currency.convert(
+                          subject_zid=self._require_str(doc, "subject_zid"),
+                          base=self._require_str(doc, "base"),
+                          quote_ccy=self._require_str(doc, "quote_ccy"),
+                          amount=amount,
+                      )
+                  )
+                  self._ok(
+                      {
+                          "conversion_id": conversion_id,
+                          "exact_amount": str(exact),
+                          "quote": _signed_quote_json(signed),
+                      },
+                      status=201,
+                  )
+
+              def _handle_currency_settle(self) -> None:
+                  doc = self._read_json()
+                  type(self).kernel.currency.record_settlement(
+                      self._require_str(doc, "conversion_id"),
+                      settlement_ref=self._require_str(doc, "settlement_ref"),
+                  )
+                  self._ok({"settled": True})
+
+              def _handle_get_conversion(self, conversion_id: str) -> None:
+                  record = type(self).kernel.currency.get_conversion(
+                      conversion_id
+                  )
+                  if record is None:
+                      raise ApiError(
+                          404,
+                          "not_found",
+                          f"unknown conversion: {conversion_id}",
+                      )
+                  self._ok(record)
+
+              @staticmethod
+              def _decode_b64(value: str) -> bytes:
+                  try:
+                      return base64.b64decode(value, validate=True)
+                  except ValueError as exc:
+                      raise ApiError(
+                          400,
+                          "invalid_request",
+                          "content_b64 is not valid base64",
+                      ) from exc
+
+
+          def _health_json(component: ComponentHealth) -> dict[str, object]:
+              return {
+                  "component": component.component,
+                  "status": component.status.value,
+                  "detail": component.detail,
+              }
+
+
+          def _identity_json(identity: Identity) -> dict[str, object]:
+              return {
+                  "zid": identity.zid,
+                  "kind": identity.kind.value,
+                  "status": identity.status.value,
+                  "display_name": identity.display_name,
+                  "created_at": identity.created_at,
+                  "updated_at": identity.updated_at,
+                  "contract_version": identity.contract_version,
+              }
+
+
+          def _media_json(record: MediaRecord) -> dict[str, object]:
+              return {
+                  "media_id": record.media_id,
+                  "owner_zid": record.owner_zid,
+                  "kind": record.kind.value,
+                  "title": record.title,
+                  "content_sha256": record.content_sha256,
+                  "content_size": record.content_size,
+                  "content_type": record.content_type,
+                  "created_at": record.created_at,
+                  "contract_version": record.contract_version,
+              }
+
+
+          def _provenance_json(event: ProvenanceEvent) -> dict[str, object]:
+              return {
+                  "sequence": event.sequence,
+                  "media_id": event.media_id,
+                  "actor_zid": event.actor_zid,
+                  "action": event.action,
+                  "detail": event.detail,
+                  "occurred_at": event.occurred_at,
+                  "previous_hash": event.previous_hash,
+                  "event_hash": event.event_hash,
+              }
+
+
+          def _credential_json(record: CredentialRecord) -> dict[str, object]:
+              return {
+                  "credential_id": record.credential_id,
+                  "subject_zid": record.subject_zid,
+                  "issuer_zid": record.issuer_zid,
+                  "credential_type": record.credential_type.value,
+                  "title": record.title,
+                  "detail": record.detail,
+                  "issued_at": record.issued_at,
+                  "valid_from": record.valid_from,
+                  "valid_until": record.valid_until,
+                  "revoked": record.revoked,
+                  "revoked_at": record.revoked_at,
+                  "revoked_reason": record.revoked_reason,
+                  "contract_version": record.contract_version,
+              }
+
+
+          def _attestation_json(attestation: Attestation) -> dict[str, object]:
+              return {
+                  "attestation_id": attestation.attestation_id,
+                  "subject_zid": attestation.subject_zid,
+                  "claim": attestation.claim,
+                  "subject_sha256": attestation.subject_sha256,
+                  "issued_at": attestation.issued_at,
+                  "signature_b64": base64.b64encode(
+                      attestation.signature
+                  ).decode("ascii"),
+                  "signer_public_pem": attestation.signer_public_pem.decode(
+                      "utf-8"
+                  ),
+                  "contract_version": attestation.contract_version,
+              }
+
+
+          def _rule_json(rule: EmissionRule) -> dict[str, object]:
+              return {
+                  "rule_id": rule.rule_id,
+                  "activity": rule.activity,
+                  "amount": rule.amount,
+                  "daily_cap": rule.daily_cap,
+                  "lifetime_cap": rule.lifetime_cap,
+                  "active": rule.active,
+              }
+
+
+          def _item_json(item: RedemptionItem) -> dict[str, object]:
+              return {
+                  "item_id": item.item_id,
+                  "title": item.title,
+                  "cost": item.cost,
+                  "active": item.active,
+              }
+
+
+          def _tx_json(tx: LedgerTransaction) -> dict[str, object]:
+              return {
+                  "tx_id": tx.tx_id,
+                  "kind": tx.kind,
+                  "debit_account": tx.debit_account,
+                  "credit_account": tx.credit_account,
+                  "amount": tx.amount,
+                  "reason": tx.reason,
+                  "ref_type": tx.ref_type,
+                  "ref_id": tx.ref_id,
+                  "actor": tx.actor,
+                  "created_at": tx.created_at,
+              }
+
+
+          def _redemption_json(record: RedemptionRecord) -> dict[str, object]:
+              return {
+                  "redemption_id": record.redemption_id,
+                  "subject_zid": record.subject_zid,
+                  "item_id": record.item_id,
+                  "cost": record.cost,
+                  "tx_id": record.tx_id,
+                  "created_at": record.created_at,
+              }
+
+
+          def _signed_quote_json(signed: SignedQuote) -> dict[str, object]:
+              return {
+                  "pair": signed.quote.pair.normalized,
+                  "rate": str(signed.quote.rate),
+                  "quoted_at": signed.quote.quoted_at,
+                  "expires_at": signed.quote.expires_at,
+                  "source": signed.quote.source,
+                  "issuer_zid": signed.issuer_zid,
+                  "signature_b64": base64.b64encode(
+                      signed.signature
+                  ).decode("ascii"),
+                  "signer_public_pem": signed.signer_public_pem.decode(
+                      "utf-8"
+                  ),
+                  "contract_version": signed.contract_version,
+              }
+          PYEOF
+
+          echo "=== API REBUILT ==="
+
+      - name: Write HTTP tests for tokens and FX endpoints
         run: |
           set -euo pipefail
           cat > shared_engines/runtime/tests/test_tokens_fx_api.py <<'PYEOF'
@@ -1485,17 +1627,97 @@ jobs:
               names = {
                   c["component"] for c in payload["data"]["components"]
               }
-              assert {"tokens", "currency"} <= names
+              assert {
+                  "tokens",
+                  "currency",
+                  "storage",
+                  "identity",
+                  "verification",
+              } <= names
               assert payload["data"]["overall"]["status"] == "healthy"
 
 
-          def test_token_balance_endpoint(cluster: _Cluster) -> None:
-              user = _user(cluster, "TokenUser")
-              status, payload = cluster.call(
+          def test_token_full_lifecycle_via_http(
+              cluster: _Cluster,
+          ) -> None:
+              user = _user(cluster, "Recycler")
+              rule_status, rule = cluster.call(
+                  "POST",
+                  "/tokens/rules",
+                  {
+                      "activity": "recycle.photo",
+                      "amount": 5,
+                      "daily_cap": 20,
+                  },
+              )
+              assert rule_status == 201
+              assert rule["data"]["active"] is True
+              earn_status, earned = cluster.call(
+                  "POST",
+                  "/tokens/earn",
+                  {
+                      "subject_zid": user["zid"],
+                      "activity": "recycle.photo",
+                      "ref_type": "media",
+                      "ref_id": "MED-1",
+                  },
+              )
+              assert earn_status == 201
+              assert earned["data"]["amount"] == 5
+              balance_status, balance = cluster.call(
                   "GET", f"/tokens/{user['zid']}/balance"
               )
-              assert status == 200
-              assert payload["data"]["balance"] == 0
+              assert balance_status == 200
+              assert balance["data"]["balance"] == 5
+              item_status, _ = cluster.call(
+                  "POST",
+                  "/tokens/items",
+                  {
+                      "item_id": "premium_space_1gb",
+                      "title": "1 GB premium space",
+                      "cost": 3,
+                  },
+              )
+              assert item_status == 201
+              redeem_status, redeemed = cluster.call(
+                  "POST",
+                  "/tokens/redeem",
+                  {
+                      "subject_zid": user["zid"],
+                      "item_id": "premium_space_1gb",
+                  },
+              )
+              assert redeem_status == 200
+              assert redeemed["data"]["cost"] == 3
+              final_status, final_balance = cluster.call(
+                  "GET", f"/tokens/{user['zid']}/balance"
+              )
+              assert final_status == 200
+              assert final_balance["data"]["balance"] == 2
+              history_status, history = cluster.call(
+                  "GET", f"/tokens/{user['zid']}/history"
+              )
+              assert history_status == 200
+              kinds = sorted(t["kind"] for t in history["data"])
+              assert kinds == ["mint", "redeem"]
+
+
+          def test_token_earn_without_rule_not_found(
+              cluster: _Cluster,
+          ) -> None:
+              user = _user(cluster, "NoRule")
+              status, payload = cluster.call(
+                  "POST",
+                  "/tokens/earn",
+                  {
+                      "subject_zid": user["zid"],
+                      "activity": "never.defined",
+                      "ref_type": "x",
+                      "ref_id": "1",
+                  },
+              )
+              assert status == 404
+              assert payload["error"]["type"] == "not_found"
 
 
           def test_token_balance_unknown_identity(
@@ -1508,27 +1730,24 @@ jobs:
               assert payload["error"]["type"] == "not_found"
 
 
-          def test_currency_quote_via_http(cluster: _Cluster) -> None:
-              user = _user(cluster, "FxUser")
-              status, payload = cluster.call(
+          def test_currency_quote_bridge_and_convert(
+              cluster: _Cluster,
+          ) -> None:
+              user = _user(cluster, "Importer")
+              quote_status, quote = cluster.call(
                   "POST",
                   "/currency/quote",
                   {
-                      "base": "USD",
+                      "base": "GTQ",
                       "quote_ccy": "CNY",
                       "requester_zid": user["zid"],
                   },
               )
-              assert status == 201
-              assert payload["data"]["rate"] == "7.25"
-              assert payload["data"]["signature_b64"]
-
-
-          def test_currency_convert_bridge_route(
-              cluster: _Cluster,
-          ) -> None:
-              user = _user(cluster, "Importer")
-              status, payload = cluster.call(
+              assert quote_status == 201
+              assert quote["data"]["rate"] == "0.928"
+              assert quote["data"]["source"].startswith("bridge:USD")
+              assert quote["data"]["signature_b64"]
+              convert_status, converted = cluster.call(
                   "POST",
                   "/currency/convert",
                   {
@@ -1538,9 +1757,9 @@ jobs:
                       "amount": "1000.00",
                   },
               )
-              assert status == 201
-              assert payload["data"]["exact_amount"] == "928.0000"
-              conversion_id = payload["data"]["conversion_id"]
+              assert convert_status == 201
+              conversion_id = converted["data"]["conversion_id"]
+              assert converted["data"]["exact_amount"] == "928.0000"
               settle_status, _ = cluster.call(
                   "POST",
                   "/currency/settle",
@@ -1555,9 +1774,37 @@ jobs:
               )
               assert get_status == 200
               assert record["data"]["fx_settlement_ref"] == "WIRE-ZY-001"
+
+
+          def test_currency_bad_amount_and_unknown_currency(
+              cluster: _Cluster,
+          ) -> None:
+              user = _user(cluster, "Fx")
+              bad_status, _ = cluster.call(
+                  "POST",
+                  "/currency/convert",
+                  {
+                      "subject_zid": user["zid"],
+                      "base": "USD",
+                      "quote_ccy": "EUR",
+                      "amount": "not-a-number",
+                  },
+              )
+              assert bad_status == 400
+              unknown_status, unknown = cluster.call(
+                  "POST",
+                  "/currency/quote",
+                  {
+                      "base": "USD",
+                      "quote_ccy": "ZZZ",
+                      "requester_zid": user["zid"],
+                  },
+              )
+              assert unknown_status == 404
+              assert unknown["error"]["type"] == "not_found"
           PYEOF
 
-          echo "=== API TESTS WRITTEN ==="
+          echo "=== HTTP TESTS READY ==="
 
       - name: Quality gates (mypy first; full regression all modules)
         run: |
@@ -1583,7 +1830,7 @@ jobs:
           if git diff --cached --quiet; then
             echo "No changes."
           else
-            git commit -m "zyra: module 09 clean CURRENCY (Decimal FX, bridge in engine, signed quotes, settlement adapter) + runtime tokens/FX wiring + API tests"
+            git commit -m "zyra: modules 09+10 complete (currency engine clean, kernel full wiring, API v2 with tokens+FX endpoints, full error mapping) + HTTP tests"
             git push origin "HEAD:${{ github.ref_name }}"
           fi
-          echo "=== MODULE 09+10 COMPLETE ==="
+          echo "=== MODULES 09+10 COMPLETE ==="

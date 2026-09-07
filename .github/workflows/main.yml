@@ -19,7 +19,7 @@ concurrency:
 jobs:
   build-test-commit:
     runs-on: ubuntu-latest
-    timeout-minutes: 30
+    timeout-minutes: 40
 
     steps:
       - name: Checkout repository
@@ -38,12 +38,15 @@ jobs:
           set -euo pipefail
 
           python -m pip install --upgrade pip
+
           python -m pip install \
             cryptography \
             pytest \
             pytest-xdist \
             mypy \
             flake8
+
+          python -m pip check
 
       - name: Generate production AI Engine
         shell: bash
@@ -62,54 +65,67 @@ jobs:
           """
           ZYRA Network Shared AI Engine.
 
-          Infrastructure-neutral AI orchestration layer.
+          Infrastructure-neutral AI orchestration boundary.
 
-          Guarantees provided by this package:
+          Design goals:
 
-          - versioned contracts
+          - immutable versioned contracts
           - deterministic request identity
-          - immutable public models
-          - strict validation
-          - bounded execution
           - durable idempotency
-          - crash-safe request leases
-          - fencing ownership
-          - recovery-required state
+          - crash-safe execution ownership
+          - fencing tokens
           - authenticated encryption
+          - key-version aware encryption
           - transactional outbox
-          - tamper-evident audit chain
-          - database migrations
-          - provider isolation
-          - circuit breaking
+          - inbox deduplication
+          - tamper-evident audit history
+          - migration checksums
+          - online database backup
           - bounded retries
-          - cost accounting
-          - concurrency protection
-          - provider failover
+          - request deadlines
+          - circuit breaking
+          - concurrency limits
+          - provider isolation
+          - model capability validation
+          - explicit observability
+          - explicit recovery states
 
-          Application modules must not be imported by this package.
+          Architectural rule:
+
+          shared_engines/ai must never import apps/.
           """
 
-          from .contracts import AIRequest, AIResponse, AIUsage, ModelDescriptor
+          from .contracts import (
+              AIRequest,
+              AIResponse,
+              AIUsage,
+              ModelDescriptor,
+          )
           from .engine import AIEngine
           from .errors import (
               AIBudgetExceeded,
               AICircuitOpenError,
+              AIEncryptionError,
               AIEngineError,
               AIIdempotencyConflict,
+              AIIntegrityError,
               AILeaseError,
+              AIMigrationError,
               AIProviderError,
               AIProviderPermanentError,
+              AIProviderProtocolError,
               AIProviderTransientError,
               AIProviderUnavailable,
               AIRecoveryRequired,
+              AIRequestInFlight,
               AIStorageError,
               AIValidationError,
           )
           from .registry import ModelRegistry
           from .storage import SQLiteAIStore
 
-          __version__ = "1.0.0"
-          __schema_version__ = 1
+          __version__ = "2.0.0"
+          __schema_version__ = 2
 
           __all__ = [
               "AIEngine",
@@ -125,12 +141,17 @@ jobs:
               "AIProviderUnavailable",
               "AIProviderTransientError",
               "AIProviderPermanentError",
+              "AIProviderProtocolError",
               "AICircuitOpenError",
               "AIIdempotencyConflict",
+              "AIRequestInFlight",
               "AIBudgetExceeded",
               "AIRecoveryRequired",
               "AILeaseError",
               "AIStorageError",
+              "AIIntegrityError",
+              "AIMigrationError",
+              "AIEncryptionError",
           ]
           PY
 
@@ -159,6 +180,13 @@ jobs:
               """Provider failure that must not be retried."""
 
 
+          class AIProviderProtocolError(AIProviderError):
+              """
+              Provider returned a response that violates the expected
+              wire protocol.
+              """
+
+
           class AICircuitOpenError(AIProviderError):
               """Provider circuit is open."""
 
@@ -172,11 +200,14 @@ jobs:
 
 
           class AIRecoveryRequired(AIEngineError):
-              """External operation requires reconciliation."""
+              """
+              External execution state is uncertain and requires
+              reconciliation before another external attempt.
+              """
 
 
           class AIBudgetExceeded(AIEngineError):
-              """Configured budget was exceeded."""
+              """Configured execution budget was exceeded."""
 
 
           class AIStorageError(AIEngineError):
@@ -213,12 +244,14 @@ jobs:
 
           class SystemClock:
               def now(self) -> int:
-                  current = int(time.time())
+                  value = int(time.time())
 
-                  if current <= 0:
-                      raise RuntimeError("Invalid system clock")
+                  if value <= 0:
+                      raise RuntimeError(
+                          "System clock returned invalid time"
+                      )
 
-                  return current
+                  return value
           PY
 
           cat > shared_engines/ai/contracts.py <<'PY'
@@ -230,7 +263,7 @@ jobs:
           from typing import Mapping
 
 
-          SCHEMA_VERSION = 1
+          SCHEMA_VERSION = 2
 
           MAX_PROMPT_BYTES = 4_000_000
           MAX_SYSTEM_PROMPT_BYTES = 1_000_000
@@ -239,21 +272,29 @@ jobs:
           MAX_METADATA_KEY_BYTES = 128
           MAX_METADATA_VALUE_BYTES = 4096
           MAX_IDEMPOTENCY_KEY_BYTES = 512
+          MAX_REQUEST_ID_BYTES = 256
+          MAX_MODEL_ID_BYTES = 512
 
 
-          def _validate_text(
+          def _text(
               value: str,
               name: str,
               maximum: int,
           ) -> str:
               if not isinstance(value, str):
-                  raise TypeError(f"{name} must be a string")
+                  raise TypeError(
+                      f"{name} must be a string"
+                  )
 
               if not value.strip():
-                  raise ValueError(f"{name} cannot be empty")
+                  raise ValueError(
+                      f"{name} cannot be empty"
+                  )
 
               if len(value.encode("utf-8")) > maximum:
-                  raise ValueError(f"{name} exceeds size limit")
+                  raise ValueError(
+                      f"{name} exceeds size limit"
+                  )
 
               return value
 
@@ -265,9 +306,9 @@ jobs:
                   return MappingProxyType({})
 
               if len(metadata) > MAX_METADATA_ITEMS:
-                  raise ValueError("Too many metadata entries")
-
-              result: dict[str, str] = {}
+                  raise ValueError(
+                      "Too many metadata entries"
+                  )
 
               forbidden = (
                   "password",
@@ -278,29 +319,49 @@ jobs:
                   "private_key",
                   "access_token",
                   "refresh_token",
+                  "token",
               )
+
+              result: dict[str, str] = {}
 
               for key, value in metadata.items():
                   if not isinstance(key, str):
-                      raise TypeError("Metadata key must be a string")
+                      raise TypeError(
+                          "Metadata key must be a string"
+                      )
 
                   if not isinstance(value, str):
-                      raise TypeError("Metadata value must be a string")
+                      raise TypeError(
+                          "Metadata value must be a string"
+                      )
 
                   if not key.strip():
-                      raise ValueError("Metadata key cannot be empty")
+                      raise ValueError(
+                          "Metadata key cannot be empty"
+                      )
 
-                  if len(key.encode("utf-8")) > MAX_METADATA_KEY_BYTES:
-                      raise ValueError("Metadata key exceeds size limit")
+                  if len(key.encode("utf-8")) > (
+                      MAX_METADATA_KEY_BYTES
+                  ):
+                      raise ValueError(
+                          "Metadata key exceeds size limit"
+                      )
 
-                  if len(value.encode("utf-8")) > MAX_METADATA_VALUE_BYTES:
-                      raise ValueError("Metadata value exceeds size limit")
+                  if len(value.encode("utf-8")) > (
+                      MAX_METADATA_VALUE_BYTES
+                  ):
+                      raise ValueError(
+                          "Metadata value exceeds size limit"
+                      )
 
                   lowered = key.lower()
 
-                  if any(item in lowered for item in forbidden):
+                  if any(
+                      item in lowered
+                      for item in forbidden
+                  ):
                       raise ValueError(
-                          f"Sensitive metadata key is prohibited: {key}"
+                          f"Sensitive metadata key prohibited: {key}"
                       )
 
                   result[key] = value
@@ -322,42 +383,83 @@ jobs:
 
               def __post_init__(self) -> None:
                   if self.schema_version != SCHEMA_VERSION:
-                      raise ValueError("Unsupported model schema version")
+                      raise ValueError(
+                          "Unsupported model schema version"
+                      )
 
-                  model_id = self.model_id.strip()
-                  provider = self.provider.strip()
-                  family = self.family.strip()
+                  model_id = _text(
+                      self.model_id,
+                      "model_id",
+                      MAX_MODEL_ID_BYTES,
+                  )
 
-                  if not model_id:
-                      raise ValueError("model_id is required")
+                  provider = _text(
+                      self.provider,
+                      "provider",
+                      256,
+                  )
 
-                  if not provider:
-                      raise ValueError("provider is required")
-
-                  if not family:
-                      raise ValueError("family is required")
+                  family = _text(
+                      self.family,
+                      "family",
+                      256,
+                  )
 
                   if not self.capabilities:
-                      raise ValueError("Model requires capabilities")
+                      raise ValueError(
+                          "Model requires capabilities"
+                      )
 
                   if not all(
-                      isinstance(item, str) and item.strip()
+                      isinstance(item, str)
+                      and item.strip()
                       for item in self.capabilities
                   ):
-                      raise ValueError("Invalid model capability")
+                      raise ValueError(
+                          "Invalid model capability"
+                      )
 
-                  if not 1 <= self.context_window <= 100_000_000:
-                      raise ValueError("Invalid context window")
+                  if not (
+                      1 <= self.context_window <= 100_000_000
+                  ):
+                      raise ValueError(
+                          "Invalid context window"
+                      )
 
-                  if not 1 <= self.max_output_tokens <= self.context_window:
-                      raise ValueError("Invalid maximum output tokens")
+                  if not (
+                      1 <= self.max_output_tokens
+                      <= self.context_window
+                  ):
+                      raise ValueError(
+                          "Invalid maximum output tokens"
+                      )
 
-                  if not self.revision.strip():
-                      raise ValueError("revision is required")
+                  revision = _text(
+                      self.revision,
+                      "revision",
+                      128,
+                  )
 
-                  object.__setattr__(self, "model_id", model_id)
-                  object.__setattr__(self, "provider", provider)
-                  object.__setattr__(self, "family", family)
+                  object.__setattr__(
+                      self,
+                      "model_id",
+                      model_id,
+                  )
+                  object.__setattr__(
+                      self,
+                      "provider",
+                      provider,
+                  )
+                  object.__setattr__(
+                      self,
+                      "family",
+                      family,
+                  )
+                  object.__setattr__(
+                      self,
+                      "revision",
+                      revision,
+                  )
 
 
           @dataclass(frozen=True, slots=True)
@@ -378,64 +480,89 @@ jobs:
 
               def __post_init__(self) -> None:
                   if self.schema_version != SCHEMA_VERSION:
-                      raise ValueError("Unsupported request schema version")
-
-                  request_id = self.request_id.strip()
-                  idempotency_key = self.idempotency_key.strip()
-                  model_id = self.model_id.strip()
-
-                  if not request_id:
-                      raise ValueError("request_id is required")
-
-                  if not idempotency_key:
-                      raise ValueError("idempotency_key is required")
-
-                  if (
-                      len(idempotency_key.encode("utf-8"))
-                      > MAX_IDEMPOTENCY_KEY_BYTES
-                  ):
                       raise ValueError(
-                          "idempotency_key exceeds size limit"
+                          "Unsupported request schema version"
                       )
 
-                  if not model_id:
-                      raise ValueError("model_id is required")
+                  request_id = _text(
+                      self.request_id,
+                      "request_id",
+                      MAX_REQUEST_ID_BYTES,
+                  )
 
-                  _validate_text(
+                  idempotency_key = _text(
+                      self.idempotency_key,
+                      "idempotency_key",
+                      MAX_IDEMPOTENCY_KEY_BYTES,
+                  )
+
+                  model_id = _text(
+                      self.model_id,
+                      "model_id",
+                      MAX_MODEL_ID_BYTES,
+                  )
+
+                  _text(
                       self.prompt,
                       "prompt",
                       MAX_PROMPT_BYTES,
                   )
 
                   if self.system_prompt is not None:
-                      _validate_text(
+                      _text(
                           self.system_prompt,
                           "system_prompt",
                           MAX_SYSTEM_PROMPT_BYTES,
                       )
 
-                  if not 1 <= self.max_output_tokens <= 10_000_000:
-                      raise ValueError("Invalid max_output_tokens")
+                  if not (
+                      1 <= self.max_output_tokens <= 10_000_000
+                  ):
+                      raise ValueError(
+                          "Invalid max_output_tokens"
+                      )
 
                   if not self.temperature.is_finite():
-                      raise ValueError("temperature must be finite")
+                      raise ValueError(
+                          "temperature must be finite"
+                      )
 
-                  if not Decimal("0") <= self.temperature <= Decimal("2"):
-                      raise ValueError("temperature must be between 0 and 2")
+                  if not (
+                      Decimal("0")
+                      <= self.temperature
+                      <= Decimal("2")
+                  ):
+                      raise ValueError(
+                          "temperature must be between 0 and 2"
+                      )
 
-                  if not 0 < self.timeout_seconds <= 1800:
-                      raise ValueError("Invalid timeout_seconds")
+                  if not (
+                      0 < self.timeout_seconds <= 1800
+                  ):
+                      raise ValueError(
+                          "Invalid timeout_seconds"
+                      )
 
                   if self.created_at <= 0:
-                      raise ValueError("created_at must be positive")
+                      raise ValueError(
+                          "created_at must be positive"
+                      )
 
-                  object.__setattr__(self, "request_id", request_id)
+                  object.__setattr__(
+                      self,
+                      "request_id",
+                      request_id,
+                  )
                   object.__setattr__(
                       self,
                       "idempotency_key",
                       idempotency_key,
                   )
-                  object.__setattr__(self, "model_id", model_id)
+                  object.__setattr__(
+                      self,
+                      "model_id",
+                      model_id,
+                  )
                   object.__setattr__(
                       self,
                       "metadata",
@@ -452,21 +579,30 @@ jobs:
 
               def __post_init__(self) -> None:
                   if self.input_tokens < 0:
-                      raise ValueError("input_tokens cannot be negative")
+                      raise ValueError(
+                          "input_tokens cannot be negative"
+                      )
 
                   if self.output_tokens < 0:
-                      raise ValueError("output_tokens cannot be negative")
+                      raise ValueError(
+                          "output_tokens cannot be negative"
+                      )
 
                   if self.total_tokens != (
-                      self.input_tokens + self.output_tokens
+                      self.input_tokens
+                      + self.output_tokens
                   ):
-                      raise ValueError("Invalid total_tokens")
+                      raise ValueError(
+                          "Invalid total_tokens"
+                      )
 
                   if (
                       self.estimated_cost < 0
                       or not self.estimated_cost.is_finite()
                   ):
-                      raise ValueError("Invalid estimated_cost")
+                      raise ValueError(
+                          "Invalid estimated_cost"
+                      )
 
 
           @dataclass(frozen=True, slots=True)
@@ -486,30 +622,50 @@ jobs:
 
               def __post_init__(self) -> None:
                   if self.schema_version != SCHEMA_VERSION:
-                      raise ValueError("Unsupported response schema version")
+                      raise ValueError(
+                          "Unsupported response schema version"
+                      )
 
-                  if not self.request_id.strip():
-                      raise ValueError("request_id is required")
+                  _text(
+                      self.request_id,
+                      "request_id",
+                      MAX_REQUEST_ID_BYTES,
+                  )
 
-                  if not self.model_id.strip():
-                      raise ValueError("model_id is required")
+                  _text(
+                      self.model_id,
+                      "model_id",
+                      MAX_MODEL_ID_BYTES,
+                  )
 
-                  if not self.provider.strip():
-                      raise ValueError("provider is required")
+                  _text(
+                      self.provider,
+                      "provider",
+                      256,
+                  )
 
-                  if not self.response_id.strip():
-                      raise ValueError("response_id is required")
+                  _text(
+                      self.response_id,
+                      "response_id",
+                      512,
+                  )
 
                   if self.created_at <= 0:
-                      raise ValueError("created_at must be positive")
+                      raise ValueError(
+                          "created_at must be positive"
+                      )
 
                   if self.completed_at < self.created_at:
                       raise ValueError(
                           "completed_at cannot precede created_at"
                       )
 
-                  if len(self.output.encode("utf-8")) > MAX_OUTPUT_BYTES:
-                      raise ValueError("output exceeds size limit")
+                  if len(
+                      self.output.encode("utf-8")
+                  ) > MAX_OUTPUT_BYTES:
+                      raise ValueError(
+                          "output exceeds size limit"
+                      )
 
                   object.__setattr__(
                       self,
@@ -544,7 +700,9 @@ jobs:
 
               if is_dataclass(value):
                   return {
-                      item.name: normalize(getattr(value, item.name))
+                      item.name: normalize(
+                          getattr(value, item.name)
+                      )
                       for item in fields(value)
                   }
 
@@ -558,10 +716,16 @@ jobs:
                   }
 
               if isinstance(value, (list, tuple)):
-                  return [normalize(item) for item in value]
+                  return [
+                      normalize(item)
+                      for item in value
+                  ]
 
               if isinstance(value, (set, frozenset)):
-                  values = [normalize(item) for item in value]
+                  values = [
+                      normalize(item)
+                      for item in value
+                  ]
 
                   return sorted(
                       values,
@@ -580,7 +744,8 @@ jobs:
                   return value
 
               raise TypeError(
-                  f"Unsupported serialization type: {type(value).__name__}"
+                  "Unsupported serialization type: "
+                  + type(value).__name__
               )
 
 
@@ -606,8 +771,13 @@ jobs:
           import json
           from decimal import Decimal
           from types import MappingProxyType
+          from typing import Any
 
-          from .contracts import AIRequest, AIResponse, AIUsage
+          from .contracts import (
+              AIRequest,
+              AIResponse,
+              AIUsage,
+          )
 
 
           def request_to_dict(
@@ -628,7 +798,9 @@ jobs:
               }
 
 
-          def request_to_json(request: AIRequest) -> str:
+          def request_to_json(
+              request: AIRequest,
+          ) -> str:
               return json.dumps(
                   request_to_dict(request),
                   ensure_ascii=False,
@@ -661,7 +833,9 @@ jobs:
               }
 
 
-          def response_to_json(response: AIResponse) -> str:
+          def response_to_json(
+              response: AIResponse,
+          ) -> str:
               return json.dumps(
                   response_to_dict(response),
                   ensure_ascii=False,
@@ -670,49 +844,148 @@ jobs:
               )
 
 
+          def _object(
+              value: Any,
+              name: str,
+          ) -> dict[str, Any]:
+              if not isinstance(value, dict):
+                  raise ValueError(
+                      f"{name} must be an object"
+                  )
+
+              return value
+
+
           def response_from_json(
               payload: str,
           ) -> AIResponse:
-              data = json.loads(payload)
+              raw = json.loads(payload)
+              data = _object(
+                  raw,
+                  "Stored response",
+              )
 
-              if not isinstance(data, dict):
-                  raise ValueError("Stored response must be an object")
+              usage = _object(
+                  data["usage"],
+                  "Stored usage",
+              )
 
-              usage = data["usage"]
+              metadata_raw = data.get(
+                  "metadata",
+                  {},
+              )
 
-              if not isinstance(usage, dict):
-                  raise ValueError("Stored usage must be an object")
+              metadata = _object(
+                  metadata_raw,
+                  "Stored metadata",
+              )
 
               return AIResponse(
-                  schema_version=int(data["schema_version"]),
-                  request_id=str(data["request_id"]),
-                  model_id=str(data["model_id"]),
-                  provider=str(data["provider"]),
+                  schema_version=int(
+                      data["schema_version"]
+                  ),
+                  request_id=str(
+                      data["request_id"]
+                  ),
+                  model_id=str(
+                      data["model_id"]
+                  ),
+                  provider=str(
+                      data["provider"]
+                  ),
                   output=str(data["output"]),
                   usage=AIUsage(
-                      input_tokens=int(usage["input_tokens"]),
-                      output_tokens=int(usage["output_tokens"]),
-                      total_tokens=int(usage["total_tokens"]),
+                      input_tokens=int(
+                          usage["input_tokens"]
+                      ),
+                      output_tokens=int(
+                          usage["output_tokens"]
+                      ),
+                      total_tokens=int(
+                          usage["total_tokens"]
+                      ),
                       estimated_cost=Decimal(
-                          str(usage["estimated_cost"])
+                          str(
+                              usage["estimated_cost"]
+                          )
                       ),
                   ),
-                  created_at=int(data["created_at"]),
-                  completed_at=int(data["completed_at"]),
-                  response_id=str(data["response_id"]),
+                  created_at=int(
+                      data["created_at"]
+                  ),
+                  completed_at=int(
+                      data["completed_at"]
+                  ),
+                  response_id=str(
+                      data["response_id"]
+                  ),
                   metadata=MappingProxyType(
                       {
                           str(key): str(value)
-                          for key, value in data.get(
-                              "metadata",
-                              {},
-                          ).items()
+                          for key, value in metadata.items()
                       }
                   ),
               )
           PY
 
-          cat > shared_engines/ai/crypto.py <<'PY'
+          cat > shared_engines/ai/security/__init__.py <<'PY'
+          """Security primitives for the shared AI engine."""
+          PY
+
+          cat > shared_engines/ai/security/keys.py <<'PY'
+          from __future__ import annotations
+
+          from dataclasses import dataclass
+          from typing import Protocol
+
+          from ..errors import AIEncryptionError
+
+
+          class KeyProvider(Protocol):
+              def current(self) -> tuple[str, bytes]:
+                  ...
+
+              def get(self, version: str) -> bytes:
+                  ...
+
+
+          @dataclass(frozen=True, slots=True)
+          class StaticKeyProvider:
+              """
+              Deployment adapter for tests and controlled local use.
+
+              Production deployments should replace this with KMS/HSM or
+              an equivalent external secret/key-management adapter.
+              """
+
+              version: str
+              key: bytes
+
+              def __post_init__(self) -> None:
+                  if not self.version.strip():
+                      raise ValueError(
+                          "Key version is required"
+                      )
+
+                  if len(self.key) != 32:
+                      raise ValueError(
+                          "AI encryption key must be 32 bytes"
+                      )
+
+              def current(self) -> tuple[str, bytes]:
+                  return self.version, bytes(self.key)
+
+              def get(self, version: str) -> bytes:
+                  if version != self.version:
+                      raise AIEncryptionError(
+                          "Requested encryption key version "
+                          "is unavailable"
+                      )
+
+                  return bytes(self.key)
+          PY
+
+          cat > shared_engines/ai/security/crypto.py <<'PY'
           from __future__ import annotations
 
           import base64
@@ -721,27 +994,20 @@ jobs:
           from cryptography.exceptions import InvalidTag
           from cryptography.hazmat.primitives.ciphers.aead import AESGCM
 
-          from .errors import AIEncryptionError
+          from ..errors import AIEncryptionError
+          from .keys import KeyProvider
 
 
-          class EnvelopeCipher:
-              """
-              AES-256-GCM authenticated encryption.
-
-              Secrets are supplied externally and never persisted by this
-              component.
-              """
-
+          class VersionedEnvelopeCipher:
               KEY_BYTES = 32
               NONCE_BYTES = 12
+              FORMAT_VERSION = 1
 
-              def __init__(self, key: bytes) -> None:
-                  if len(key) != self.KEY_BYTES:
-                      raise ValueError(
-                          "Encryption key must contain 32 bytes"
-                      )
-
-                  self._key = bytes(key)
+              def __init__(
+                  self,
+                  key_provider: KeyProvider,
+              ) -> None:
+                  self._keys = key_provider
 
               def encrypt(
                   self,
@@ -749,10 +1015,19 @@ jobs:
                   *,
                   associated_data: bytes,
               ) -> str:
-                  nonce = os.urandom(self.NONCE_BYTES)
+                  version, key = self._keys.current()
+
+                  if len(key) != self.KEY_BYTES:
+                      raise AIEncryptionError(
+                          "Invalid encryption key length"
+                      )
+
+                  nonce = os.urandom(
+                      self.NONCE_BYTES
+                  )
 
                   try:
-                      ciphertext = AESGCM(self._key).encrypt(
+                      ciphertext = AESGCM(key).encrypt(
                           nonce,
                           plaintext,
                           associated_data,
@@ -762,8 +1037,17 @@ jobs:
                           "Encryption failed"
                       ) from exc
 
+                  header = (
+                      str(self.FORMAT_VERSION)
+                      + ":"
+                      + version
+                      + ":"
+                  ).encode("utf-8")
+
+                  token = header + nonce + ciphertext
+
                   return base64.urlsafe_b64encode(
-                      nonce + ciphertext
+                      token
                   ).decode("ascii")
 
               def decrypt(
@@ -777,15 +1061,48 @@ jobs:
                           token.encode("ascii")
                       )
 
-                      if len(raw) <= self.NONCE_BYTES:
+                      first = raw.index(b":")
+                      second = raw.index(
+                          b":",
+                          first + 1,
+                      )
+
+                      format_version = int(
+                          raw[:first].decode("ascii")
+                      )
+
+                      if (
+                          format_version
+                          != self.FORMAT_VERSION
+                      ):
+                          raise ValueError(
+                              "Unsupported envelope format"
+                          )
+
+                      key_version = raw[
+                          first + 1:second
+                      ].decode("utf-8")
+
+                      body = raw[second + 1:]
+
+                      if len(body) <= self.NONCE_BYTES:
                           raise ValueError(
                               "Encrypted payload is too short"
                           )
 
-                      nonce = raw[:self.NONCE_BYTES]
-                      ciphertext = raw[self.NONCE_BYTES:]
+                      key = self._keys.get(
+                          key_version
+                      )
 
-                      return AESGCM(self._key).decrypt(
+                      nonce = body[
+                          :self.NONCE_BYTES
+                      ]
+
+                      ciphertext = body[
+                          self.NONCE_BYTES:
+                      ]
+
+                      return AESGCM(key).decrypt(
                           nonce,
                           ciphertext,
                           associated_data,
@@ -795,10 +1112,23 @@ jobs:
                       InvalidTag,
                       ValueError,
                       TypeError,
+                      UnicodeDecodeError,
+                      IndexError,
                   ) as exc:
                       raise AIEncryptionError(
                           "Authenticated decryption failed"
                       ) from exc
+          PY
+
+          cat > shared_engines/ai/crypto.py <<'PY'
+          from .security.crypto import VersionedEnvelopeCipher
+
+          EnvelopeCipher = VersionedEnvelopeCipher
+
+          __all__ = [
+              "EnvelopeCipher",
+              "VersionedEnvelopeCipher",
+          ]
           PY
 
           cat > shared_engines/ai/registry.py <<'PY'
@@ -814,12 +1144,15 @@ jobs:
               """
               Version-aware process-local model registry.
 
-              Existing model identities cannot be silently redefined.
+              Existing identities cannot be silently redefined.
               """
 
               def __init__(self) -> None:
                   self._lock = RLock()
-                  self._models: dict[str, ModelDescriptor] = {}
+                  self._models: dict[
+                      str,
+                      ModelDescriptor,
+                  ] = {}
                   self._revision = 0
 
               def register(
@@ -827,18 +1160,23 @@ jobs:
                   model: ModelDescriptor,
               ) -> int:
                   with self._lock:
-                      existing = self._models.get(model.model_id)
+                      existing = self._models.get(
+                          model.model_id
+                      )
 
                       if existing is not None:
                           if existing != model:
                               raise AIValidationError(
-                                  "Existing model identity cannot be "
-                                  "silently redefined"
+                                  "Existing model identity cannot "
+                                  "be silently redefined"
                               )
 
                           return self._revision
 
-                      self._models[model.model_id] = model
+                      self._models[
+                          model.model_id
+                      ] = model
+
                       self._revision += 1
 
                       return self._revision
@@ -850,16 +1188,20 @@ jobs:
                   normalized = model_id.strip()
 
                   with self._lock:
-                      model = self._models.get(normalized)
+                      model = self._models.get(
+                          normalized
+                      )
 
                   if model is None:
                       raise AIValidationError(
-                          f"Unknown model: {normalized}"
+                          "Unknown model: "
+                          + normalized
                       )
 
                   if not model.active:
                       raise AIValidationError(
-                          f"Inactive model: {normalized}"
+                          "Inactive model: "
+                          + normalized
                       )
 
                   return model
@@ -871,11 +1213,16 @@ jobs:
 
               def snapshot(
                   self,
-              ) -> tuple[int, tuple[ModelDescriptor, ...]]:
+              ) -> tuple[
+                  int,
+                  tuple[ModelDescriptor, ...],
+              ]:
                   with self._lock:
                       return (
                           self._revision,
-                          tuple(self._models.values()),
+                          tuple(
+                              self._models.values()
+                          ),
                       )
           PY
 
@@ -884,7 +1231,11 @@ jobs:
 
           from typing import Protocol
 
-          from .contracts import AIRequest, AIResponse, ModelDescriptor
+          from .contracts import (
+              AIRequest,
+              AIResponse,
+              ModelDescriptor,
+          )
 
 
           class AIProvider(Protocol):
@@ -946,8 +1297,13 @@ jobs:
                           "recovery_seconds must be positive"
                       )
 
-                  self._threshold = failure_threshold
-                  self._recovery = recovery_seconds
+                  self._threshold = (
+                      failure_threshold
+                  )
+                  self._recovery = (
+                      recovery_seconds
+                  )
+
                   self._lock = Lock()
                   self._state = CircuitState.CLOSED
                   self._failures = 0
@@ -969,7 +1325,9 @@ jobs:
                               and now - self._opened_at
                               >= self._recovery
                           ):
-                              self._state = CircuitState.HALF_OPEN
+                              self._state = (
+                                  CircuitState.HALF_OPEN
+                              )
                               self._probe_claimed = True
                               return True
 
@@ -996,18 +1354,26 @@ jobs:
                   with self._lock:
                       self._failures += 1
 
-                      if self._state is CircuitState.HALF_OPEN:
+                      if (
+                          self._state
+                          is CircuitState.HALF_OPEN
+                      ):
                           self._state = CircuitState.OPEN
                           self._opened_at = now
                           self._probe_claimed = False
                           return
 
-                      if self._failures >= self._threshold:
+                      if (
+                          self._failures
+                          >= self._threshold
+                      ):
                           self._state = CircuitState.OPEN
                           self._opened_at = now
                           self._probe_claimed = False
 
-              def snapshot(self) -> CircuitSnapshot:
+              def snapshot(
+                  self,
+              ) -> CircuitSnapshot:
                   with self._lock:
                       return CircuitSnapshot(
                           state=self._state,
@@ -1016,77 +1382,59 @@ jobs:
                       )
           PY
 
-          cat > shared_engines/ai/retry.py <<'PY'
+          cat > shared_engines/ai/limiter.py <<'PY'
           from __future__ import annotations
 
-          import time
-          from collections.abc import Callable
-          from typing import TypeVar
+          from contextlib import contextmanager
+          from threading import BoundedSemaphore
+          from typing import Iterator
 
 
-          T = TypeVar("T")
+          class ExecutionLimiter:
+              """
+              Hard upper bound on simultaneous provider executions.
 
+              This prevents an upstream burst from becoming unbounded
+              provider pressure.
+              """
 
-          def retry_bounded(
-              operation: Callable[[], T],
-              *,
-              attempts: int,
-              base_delay: float,
-              max_delay: float,
-              retryable: Callable[[Exception], bool],
-              deadline: float,
-          ) -> T:
-              if attempts < 1:
-                  raise ValueError("attempts must be positive")
+              def __init__(
+                  self,
+                  maximum_concurrency: int,
+              ) -> None:
+                  if maximum_concurrency < 1:
+                      raise ValueError(
+                          "maximum_concurrency must be positive"
+                      )
 
-              if base_delay < 0:
-                  raise ValueError("base_delay cannot be negative")
-
-              if max_delay < base_delay:
-                  raise ValueError(
-                      "max_delay cannot be smaller than base_delay"
+                  self._semaphore = BoundedSemaphore(
+                      maximum_concurrency
                   )
 
-              last_error: Exception | None = None
+              @contextmanager
+              def slot(
+                  self,
+                  *,
+                  timeout_seconds: float,
+              ) -> Iterator[None]:
+                  if timeout_seconds < 0:
+                      raise ValueError(
+                          "timeout_seconds cannot be negative"
+                      )
 
-              for attempt in range(attempts):
-                  if time.monotonic() >= deadline:
+                  acquired = self._semaphore.acquire(
+                      timeout=timeout_seconds
+                  )
+
+                  if not acquired:
                       raise TimeoutError(
-                          "Retry deadline exceeded"
+                          "AI execution capacity exhausted"
                       )
 
                   try:
-                      return operation()
-
-                  except Exception as exc:
-                      last_error = exc
-
-                      if attempt + 1 >= attempts:
-                          raise
-
-                      if not retryable(exc):
-                          raise
-
-                      delay = min(
-                          max_delay,
-                          base_delay * (2 ** attempt),
-                      )
-
-                      remaining = deadline - time.monotonic()
-
-                      if remaining <= 0:
-                          raise TimeoutError(
-                              "Retry deadline exceeded"
-                          )
-
-                      time.sleep(min(delay, remaining))
-
-              if last_error is None:
-                  raise RuntimeError(
-                      "Retry completed without result"
-                  )
-
-              raise last_error
+                      yield
+                  finally:
+                      self._semaphore.release()
           PY
 
           cat > shared_engines/ai/budget.py <<'PY'
@@ -1114,19 +1462,28 @@ jobs:
                   max_tokens: int | None = None,
                   max_cost: Decimal | None = None,
               ) -> None:
-                  if max_requests is not None and max_requests < 1:
+                  if (
+                      max_requests is not None
+                      and max_requests < 1
+                  ):
                       raise ValueError(
                           "max_requests must be positive"
                       )
 
-                  if max_tokens is not None and max_tokens < 1:
+                  if (
+                      max_tokens is not None
+                      and max_tokens < 1
+                  ):
                       raise ValueError(
                           "max_tokens must be positive"
                       )
 
-                  if max_cost is not None and (
-                      max_cost < 0
-                      or not max_cost.is_finite()
+                  if (
+                      max_cost is not None
+                      and (
+                          max_cost < 0
+                          or not max_cost.is_finite()
+                      )
                   ):
                       raise ValueError(
                           "Invalid max_cost"
@@ -1146,8 +1503,10 @@ jobs:
                   with self._lock:
                       if (
                           self._max_requests is not None
-                          and self._requests + 1
-                          > self._max_requests
+                          and (
+                              self._requests + 1
+                              > self._max_requests
+                          )
                       ):
                           raise AIBudgetExceeded(
                               "AI request budget exceeded"
@@ -1175,12 +1534,17 @@ jobs:
                       )
 
                   with self._lock:
-                      new_tokens = self._tokens + tokens
-                      new_cost = self._cost + cost
+                      new_tokens = (
+                          self._tokens + tokens
+                      )
+                      new_cost = (
+                          self._cost + cost
+                      )
 
                       if (
                           self._max_tokens is not None
-                          and new_tokens > self._max_tokens
+                          and new_tokens
+                          > self._max_tokens
                       ):
                           raise AIBudgetExceeded(
                               "AI token budget exceeded"
@@ -1188,7 +1552,8 @@ jobs:
 
                       if (
                           self._max_cost is not None
-                          and new_cost > self._max_cost
+                          and new_cost
+                          > self._max_cost
                       ):
                           raise AIBudgetExceeded(
                               "AI cost budget exceeded"
@@ -1197,7 +1562,9 @@ jobs:
                       self._tokens = new_tokens
                       self._cost = new_cost
 
-              def snapshot(self) -> BudgetSnapshot:
+              def snapshot(
+                  self,
+              ) -> BudgetSnapshot:
                   with self._lock:
                       return BudgetSnapshot(
                           requests=self._requests,
@@ -1212,7 +1579,10 @@ jobs:
           from dataclasses import dataclass
           from decimal import Decimal
 
-          from .contracts import AIRequest, ModelDescriptor
+          from .contracts import (
+              AIRequest,
+              ModelDescriptor,
+          )
 
 
           @dataclass(frozen=True, slots=True)
@@ -1226,9 +1596,11 @@ jobs:
               concurrent_wait_seconds: float = 30.0
 
               def __post_init__(self) -> None:
-                  if not 1 <= self.max_attempts <= 10:
+                  if not (
+                      1 <= self.max_attempts <= 10
+                  ):
                       raise ValueError(
-                          "max_attempts must be between 1 and 10"
+                          "max_attempts must be 1..10"
                       )
 
                   if self.retry_base_seconds < 0:
@@ -1244,7 +1616,9 @@ jobs:
                           "Invalid retry delay range"
                       )
 
-                  if not 10 <= self.lease_seconds <= 3600:
+                  if not (
+                      10 <= self.lease_seconds <= 3600
+                  ):
                       raise ValueError(
                           "Invalid lease_seconds"
                       )
@@ -1257,13 +1631,16 @@ jobs:
                           "stale_request_seconds must cover lease"
                       )
 
-                  if self.concurrent_wait_seconds < 0:
+                  if (
+                      self.concurrent_wait_seconds < 0
+                  ):
                       raise ValueError(
                           "concurrent_wait_seconds cannot be negative"
                       )
 
                   if (
-                      self.maximum_cost_per_request is not None
+                      self.maximum_cost_per_request
+                      is not None
                       and self.maximum_cost_per_request < 0
                   ):
                       raise ValueError(
@@ -1284,6 +1661,439 @@ jobs:
                       )
           PY
 
+          cat > shared_engines/ai/observability.py <<'PY'
+          from __future__ import annotations
+
+          from dataclasses import dataclass
+          from typing import Protocol
+
+
+          @dataclass(frozen=True, slots=True)
+          class AIEvent:
+              event_type: str
+              request_id: str
+              provider: str | None
+              timestamp: int
+
+
+          class EventSink(Protocol):
+              def emit(
+                  self,
+                  event: AIEvent,
+              ) -> None:
+                  ...
+
+
+          class NullEventSink:
+              def emit(
+                  self,
+                  event: AIEvent,
+              ) -> None:
+                  return None
+          PY
+
+          cat > shared_engines/ai/http_provider.py <<'PY'
+          from __future__ import annotations
+
+          import json
+          import time
+          import urllib.error
+          import urllib.request
+          from decimal import Decimal
+          from types import MappingProxyType
+
+          from .contracts import (
+              AIRequest,
+              AIResponse,
+              AIUsage,
+              ModelDescriptor,
+          )
+          from .errors import (
+              AIProviderPermanentError,
+              AIProviderProtocolError,
+              AIProviderTransientError,
+          )
+          from .providers import AIProvider
+
+
+          class OpenAICompatibleProvider(AIProvider):
+              """
+              Strict HTTPS OpenAI-compatible provider adapter.
+
+              Credentials are deployment secrets and are never persisted
+              by this component.
+              """
+
+              def __init__(
+                  self,
+                  *,
+                  name: str,
+                  endpoint: str,
+                  api_key: str,
+                  models: tuple[ModelDescriptor, ...],
+                  timeout_seconds: float = 120.0,
+                  maximum_response_bytes: int = 8_000_000,
+              ) -> None:
+                  if not name.strip():
+                      raise ValueError(
+                          "Provider name is required"
+                      )
+
+                  if not endpoint.startswith(
+                      "https://"
+                  ):
+                      raise ValueError(
+                          "Provider endpoint must use HTTPS"
+                      )
+
+                  if not api_key.strip():
+                      raise ValueError(
+                          "Provider API key is required"
+                      )
+
+                  if not models:
+                      raise ValueError(
+                          "Provider requires models"
+                      )
+
+                  if not (
+                      0 < timeout_seconds <= 1800
+                  ):
+                      raise ValueError(
+                          "Invalid provider timeout"
+                      )
+
+                  if not (
+                      1
+                      <= maximum_response_bytes
+                      <= 64_000_000
+                  ):
+                      raise ValueError(
+                          "Invalid response size limit"
+                      )
+
+                  if any(
+                      model.provider != name
+                      for model in models
+                  ):
+                      raise ValueError(
+                          "Model/provider mismatch"
+                      )
+
+                  self._name = name.strip()
+                  self._endpoint = endpoint
+                  self._api_key = api_key
+                  self._models = models
+                  self._timeout = timeout_seconds
+                  self._maximum_response_bytes = (
+                      maximum_response_bytes
+                  )
+
+              @property
+              def name(self) -> str:
+                  return self._name
+
+              def models(
+                  self,
+              ) -> tuple[ModelDescriptor, ...]:
+                  return self._models
+
+              def health(self) -> bool:
+                  return bool(self._api_key)
+
+              def complete(
+                  self,
+                  request: AIRequest,
+                  model: ModelDescriptor,
+              ) -> AIResponse:
+                  messages: list[
+                      dict[str, str]
+                  ] = []
+
+                  if request.system_prompt is not None:
+                      messages.append(
+                          {
+                              "role": "system",
+                              "content": request.system_prompt,
+                          }
+                      )
+
+                  messages.append(
+                      {
+                          "role": "user",
+                          "content": request.prompt,
+                      }
+                  )
+
+                  payload = {
+                      "model": model.model_id,
+                      "messages": messages,
+                      "max_tokens": request.max_output_tokens,
+                      "temperature": float(
+                          request.temperature
+                      ),
+                  }
+
+                  encoded = json.dumps(
+                      payload,
+                      ensure_ascii=False,
+                      separators=(",", ":"),
+                  ).encode("utf-8")
+
+                  if len(encoded) > 16_000_000:
+                      raise AIProviderProtocolError(
+                          "Provider request exceeds size limit"
+                      )
+
+                  request_object = urllib.request.Request(
+                      self._endpoint,
+                      data=encoded,
+                      method="POST",
+                      headers={
+                          "Accept": "application/json",
+                          "Content-Type": "application/json",
+                          "Authorization": (
+                              "Bearer "
+                              + self._api_key
+                          ),
+                          "Idempotency-Key": (
+                              request.idempotency_key
+                          ),
+                          "User-Agent": (
+                              "ZYRA-Network-AI/2.0"
+                          ),
+                      },
+                  )
+
+                  started = int(time.time())
+
+                  try:
+                      with urllib.request.urlopen(
+                          request_object,
+                          timeout=min(
+                              self._timeout,
+                              request.timeout_seconds,
+                          ),
+                      ) as response:
+                          status = int(
+                              response.status
+                          )
+
+                          if status != 200:
+                              raise AIProviderPermanentError(
+                                  "Provider returned HTTP "
+                                  + str(status)
+                              )
+
+                          raw = response.read(
+                              self._maximum_response_bytes
+                              + 1
+                          )
+
+                  except urllib.error.HTTPError as exc:
+                      if exc.code in {
+                          408,
+                          425,
+                          429,
+                          500,
+                          502,
+                          503,
+                          504,
+                      }:
+                          raise AIProviderTransientError(
+                              "Provider returned transient HTTP "
+                              + str(exc.code)
+                          ) from exc
+
+                      raise AIProviderPermanentError(
+                          "Provider returned HTTP "
+                          + str(exc.code)
+                      ) from exc
+
+                  except urllib.error.URLError as exc:
+                      raise AIProviderTransientError(
+                          "Provider network failure: "
+                          + str(exc)
+                      ) from exc
+
+                  except TimeoutError as exc:
+                      raise AIProviderTransientError(
+                          "Provider request timed out"
+                      ) from exc
+
+                  if len(raw) > (
+                      self._maximum_response_bytes
+                  ):
+                      raise AIProviderProtocolError(
+                          "Provider response exceeds size limit"
+                      )
+
+                  try:
+                      data = json.loads(
+                          raw.decode("utf-8")
+                      )
+
+                  except (
+                      UnicodeDecodeError,
+                      json.JSONDecodeError,
+                  ) as exc:
+                      raise AIProviderProtocolError(
+                          "Provider returned invalid JSON"
+                      ) from exc
+
+                  if not isinstance(data, dict):
+                      raise AIProviderProtocolError(
+                          "Provider response must be an object"
+                      )
+
+                  try:
+                      choices = data["choices"]
+
+                      if not isinstance(
+                          choices,
+                          list,
+                      ) or not choices:
+                          raise ValueError(
+                              "choices is empty"
+                          )
+
+                      first = choices[0]
+
+                      if not isinstance(
+                          first,
+                          dict,
+                      ):
+                          raise ValueError(
+                              "choice is invalid"
+                          )
+
+                      message = first["message"]
+
+                      if not isinstance(
+                          message,
+                          dict,
+                      ):
+                          raise ValueError(
+                              "message is invalid"
+                          )
+
+                      output = message["content"]
+
+                      if not isinstance(
+                          output,
+                          str,
+                      ):
+                          raise ValueError(
+                              "content is not text"
+                          )
+
+                  except (
+                      KeyError,
+                      TypeError,
+                      ValueError,
+                  ) as exc:
+                      raise AIProviderProtocolError(
+                          "Invalid provider response structure"
+                      ) from exc
+
+                  usage_raw = data.get(
+                      "usage",
+                      {},
+                  )
+
+                  if not isinstance(
+                      usage_raw,
+                      dict,
+                  ):
+                      raise AIProviderProtocolError(
+                          "Invalid provider usage"
+                      )
+
+                  try:
+                      input_tokens = int(
+                          usage_raw.get(
+                              "prompt_tokens",
+                              0,
+                          )
+                      )
+
+                      output_tokens = int(
+                          usage_raw.get(
+                              "completion_tokens",
+                              0,
+                          )
+                      )
+
+                      total_tokens = int(
+                          usage_raw.get(
+                              "total_tokens",
+                              input_tokens
+                              + output_tokens,
+                          )
+                      )
+
+                  except (
+                      TypeError,
+                      ValueError,
+                  ) as exc:
+                      raise AIProviderProtocolError(
+                          "Invalid provider token counts"
+                      ) from exc
+
+                  if min(
+                      input_tokens,
+                      output_tokens,
+                      total_tokens,
+                  ) < 0:
+                      raise AIProviderProtocolError(
+                          "Provider returned negative token count"
+                      )
+
+                  if total_tokens != (
+                      input_tokens
+                      + output_tokens
+                  ):
+                      raise AIProviderProtocolError(
+                          "Provider returned inconsistent token counts"
+                      )
+
+                  response_id_raw = data.get(
+                      "id",
+                      request.request_id,
+                  )
+
+                  if not isinstance(
+                      response_id_raw,
+                      str,
+                  ):
+                      raise AIProviderProtocolError(
+                          "Provider response id is invalid"
+                      )
+
+                  completed = int(time.time())
+
+                  return AIResponse(
+                      schema_version=2,
+                      request_id=request.request_id,
+                      model_id=model.model_id,
+                      provider=self._name,
+                      output=output,
+                      usage=AIUsage(
+                          input_tokens=input_tokens,
+                          output_tokens=output_tokens,
+                          total_tokens=total_tokens,
+                          estimated_cost=Decimal("0"),
+                      ),
+                      created_at=started,
+                      completed_at=max(
+                          completed,
+                          started,
+                      ),
+                      response_id=response_id_raw,
+                      metadata=MappingProxyType({}),
+                  )
+          PY
+
           cat > shared_engines/ai/storage.py <<'PY'
           from __future__ import annotations
 
@@ -1300,8 +2110,10 @@ jobs:
               response_from_json,
               response_to_json,
           )
-          from .contracts import AIRequest, AIResponse
-          from .crypto import EnvelopeCipher
+          from .contracts import (
+              AIRequest,
+              AIResponse,
+          )
           from .errors import (
               AIIdempotencyConflict,
               AIIntegrityError,
@@ -1309,12 +2121,16 @@ jobs:
               AIRequestInFlight,
               AIStorageError,
           )
+          from .security.crypto import (
+              VersionedEnvelopeCipher,
+          )
 
 
           @dataclass(frozen=True, slots=True)
           class Reservation:
               response: AIResponse | None
               acquired: bool
+              lease_token: str | None
 
 
           @dataclass(frozen=True, slots=True)
@@ -1328,20 +2144,21 @@ jobs:
 
           class SQLiteAIStore:
               """
-              Durable local AI journal.
+              Durable local persistence adapter.
 
-              SQLite is intentionally used as a durable local adapter.
-              Distributed HA must be supplied by a future infrastructure
-              adapter rather than being falsely simulated here.
+              SQLite is deliberately treated as a local durability adapter.
+              Distributed HA belongs to a future infrastructure repository
+              implementation and is not falsely simulated here.
               """
 
-              SCHEMA_VERSION = 1
+              SCHEMA_VERSION = 2
 
               def __init__(
                   self,
                   path: str | Path,
                   *,
                   encryption_key: bytes,
+                  encryption_key_version: str = "1",
                   timeout_seconds: float = 15.0,
               ) -> None:
                   if timeout_seconds <= 0:
@@ -1349,14 +2166,38 @@ jobs:
                           "timeout_seconds must be positive"
                       )
 
+                  if len(encryption_key) != 32:
+                      raise ValueError(
+                          "Encryption key must contain 32 bytes"
+                      )
+
+                  if not encryption_key_version.strip():
+                      raise ValueError(
+                          "Encryption key version is required"
+                      )
+
                   self._path = str(path)
                   self._timeout = timeout_seconds
-                  self._cipher = EnvelopeCipher(encryption_key)
                   self._lock = RLock()
+
+                  from .security.keys import (
+                      StaticKeyProvider,
+                  )
+
+                  self._cipher = (
+                      VersionedEnvelopeCipher(
+                          StaticKeyProvider(
+                              encryption_key_version,
+                              encryption_key,
+                          )
+                      )
+                  )
 
                   self._migrate()
 
-              def _connect(self) -> sqlite3.Connection:
+              def _connect(
+                  self,
+              ) -> sqlite3.Connection:
                   connection = sqlite3.connect(
                       self._path,
                       timeout=self._timeout,
@@ -1364,7 +2205,10 @@ jobs:
                       check_same_thread=False,
                   )
 
-                  connection.row_factory = sqlite3.Row
+                  connection.row_factory = (
+                      sqlite3.Row
+                  )
+
                   connection.execute(
                       "PRAGMA foreign_keys = ON"
                   )
@@ -1381,7 +2225,9 @@ jobs:
                   return connection
 
               def _migrate(self) -> None:
-                  Path(self._path).parent.mkdir(
+                  Path(
+                      self._path
+                  ).parent.mkdir(
                       parents=True,
                       exist_ok=True,
                   )
@@ -1391,7 +2237,8 @@ jobs:
                   try:
                       connection.execute(
                           """
-                          CREATE TABLE IF NOT EXISTS ai_schema_migrations (
+                          CREATE TABLE IF NOT EXISTS
+                          ai_schema_migrations (
                               version INTEGER PRIMARY KEY,
                               checksum TEXT NOT NULL,
                               applied_at INTEGER NOT NULL
@@ -1399,7 +2246,7 @@ jobs:
                           """
                       )
 
-                      migration_sql = """
+                      migration_1 = """
                       CREATE TABLE IF NOT EXISTS ai_requests (
                           idempotency_key TEXT PRIMARY KEY,
                           request_hash TEXT NOT NULL,
@@ -1450,56 +2297,71 @@ jobs:
                           record_hash TEXT NOT NULL,
                           created_at INTEGER NOT NULL
                       );
+
+                      CREATE TABLE IF NOT EXISTS ai_audit_checkpoints (
+                          checkpoint_id INTEGER PRIMARY KEY AUTOINCREMENT,
+                          last_sequence INTEGER NOT NULL,
+                          last_hash TEXT NOT NULL,
+                          created_at INTEGER NOT NULL
+                      );
                       """
 
                       checksum = hashlib.sha256(
-                          migration_sql.encode("utf-8")
+                          migration_1.encode("utf-8")
                       ).hexdigest()
 
-                      row = connection.execute(
+                      existing = connection.execute(
                           """
-                          SELECT version, checksum
+                          SELECT checksum
                           FROM ai_schema_migrations
                           WHERE version = 1
                           """
                       ).fetchone()
 
-                      if row is not None:
-                          if str(row["checksum"]) != checksum:
+                      if existing is not None:
+                          if str(
+                              existing["checksum"]
+                          ) != checksum:
                               raise AIStorageError(
                                   "Migration checksum mismatch"
                               )
 
-                          return
-
-                      connection.execute("BEGIN IMMEDIATE")
-
-                      connection.executescript(
-                          migration_sql
-                      )
-
-                      connection.execute(
-                          """
-                          INSERT INTO ai_schema_migrations(
-                              version,
-                              checksum,
-                              applied_at
+                      else:
+                          connection.execute(
+                              "BEGIN IMMEDIATE"
                           )
-                          VALUES(1, ?, ?)
-                          """,
-                          (
-                              checksum,
-                              int(time.time()),
-                          ),
-                      )
 
-                      connection.commit()
+                          try:
+                              connection.executescript(
+                                  migration_1
+                              )
+
+                              connection.execute(
+                                  """
+                                  INSERT INTO
+                                  ai_schema_migrations(
+                                      version,
+                                      checksum,
+                                      applied_at
+                                  )
+                                  VALUES(1, ?, ?)
+                                  """,
+                                  (
+                                      checksum,
+                                      int(time.time()),
+                                  ),
+                              )
+
+                              connection.commit()
+
+                          except sqlite3.Error:
+                              connection.rollback()
+                              raise
 
                   except sqlite3.Error as exc:
-                      connection.rollback()
-
                       raise AIStorageError(
-                          f"AI migration failed: {exc}"
+                          "AI migration failed: "
+                          + str(exc)
                       ) from exc
 
                   finally:
@@ -1509,9 +2371,11 @@ jobs:
                   self,
                   request: AIRequest,
               ) -> str:
-                  plaintext = request_to_json(
-                      request
-                  ).encode("utf-8")
+                  plaintext = (
+                      request_to_json(
+                          request
+                      ).encode("utf-8")
+                  )
 
                   return self._cipher.encrypt(
                       plaintext,
@@ -1540,7 +2404,11 @@ jobs:
                   ).fetchone()
 
                   previous_hash = (
-                      str(previous_row["record_hash"])
+                      str(
+                          previous_row[
+                              "record_hash"
+                          ]
+                      )
                       if previous_row is not None
                       else "0" * 64
                   )
@@ -1613,11 +2481,18 @@ jobs:
                   lease_seconds: int,
               ) -> Reservation:
                   encrypted_request = (
-                      self._encrypt_request(request)
+                      self._encrypt_request(
+                          request
+                      )
                   )
 
-                  lease_until = now + lease_seconds
-                  lease_token = os.urandom(24).hex()
+                  lease_until = (
+                      now + lease_seconds
+                  )
+
+                  lease_token = os.urandom(
+                      24
+                  ).hex()
 
                   with self._lock:
                       connection = self._connect()
@@ -1633,12 +2508,16 @@ jobs:
                               FROM ai_requests
                               WHERE idempotency_key = ?
                               """,
-                              (request.idempotency_key,),
+                              (
+                                  request.idempotency_key,
+                              ),
                           ).fetchone()
 
                           if row is not None:
                               if (
-                                  str(row["request_hash"])
+                                  str(
+                                      row["request_hash"]
+                                  )
                                   != request_hash
                               ):
                                   connection.rollback()
@@ -1648,20 +2527,32 @@ jobs:
                                       "with existing request"
                                   )
 
-                              if row["status"] == "completed":
-                                  response_json = row[
-                                      "response_json"
-                                  ]
+                              if (
+                                  row["status"]
+                                  == "completed"
+                              ):
+                                  response_json = (
+                                      row[
+                                          "response_json"
+                                      ]
+                                  )
 
-                                  if response_json is None:
+                                  if (
+                                      response_json
+                                      is None
+                                  ):
                                       connection.rollback()
 
                                       raise AIIntegrityError(
                                           "Completed request has no response"
                                       )
 
-                                  response = response_from_json(
-                                      str(response_json)
+                                  response = (
+                                      response_from_json(
+                                          str(
+                                              response_json
+                                          )
+                                      )
                                   )
 
                                   connection.commit()
@@ -1669,13 +2560,31 @@ jobs:
                                   return Reservation(
                                       response=response,
                                       acquired=False,
+                                      lease_token=None,
                                   )
 
                               if (
-                                  row["status"] == "running"
-                                  and row["lease_until"] is not None
-                                  and int(row["lease_until"]) > now
-                                  and row["lease_owner"] != owner
+                                  row["status"]
+                                  == "recovery_required"
+                              ):
+                                  connection.rollback()
+
+                                  raise AIStorageError(
+                                      "Request requires reconciliation"
+                                  )
+
+                              if (
+                                  row["status"]
+                                  == "running"
+                                  and row[
+                                      "lease_until"
+                                  ] is not None
+                                  and int(
+                                      row["lease_until"]
+                                  ) > now
+                                  and row[
+                                      "lease_owner"
+                                  ] != owner
                               ):
                                   connection.rollback()
 
@@ -1708,8 +2617,12 @@ jobs:
 
                               self._audit_tx(
                                   connection,
-                                  aggregate_id=request.idempotency_key,
-                                  event_type="AI_REQUEST_RECLAIMED",
+                                  aggregate_id=(
+                                      request.idempotency_key
+                                  ),
+                                  event_type=(
+                                      "AI_REQUEST_RECLAIMED"
+                                  ),
                                   payload=(
                                       '{"owner":"'
                                       + owner
@@ -1725,6 +2638,7 @@ jobs:
                               return Reservation(
                                   response=None,
                                   acquired=True,
+                                  lease_token=lease_token,
                               )
 
                           connection.execute(
@@ -1745,7 +2659,8 @@ jobs:
                                   updated_at
                               )
                               VALUES (
-                                  ?, ?, ?, 'running', ?, ?, ?, 1,
+                                  ?, ?, ?, 'running',
+                                  ?, ?, ?, 1,
                                   NULL, NULL, NULL, ?, ?
                               )
                               """,
@@ -1763,8 +2678,12 @@ jobs:
 
                           self._audit_tx(
                               connection,
-                              aggregate_id=request.idempotency_key,
-                              event_type="AI_REQUEST_CREATED",
+                              aggregate_id=(
+                                  request.idempotency_key
+                              ),
+                              event_type=(
+                                  "AI_REQUEST_CREATED"
+                              ),
                               payload=(
                                   '{"owner":"'
                                   + owner
@@ -1780,12 +2699,14 @@ jobs:
                           return Reservation(
                               response=None,
                               acquired=True,
+                              lease_token=lease_token,
                           )
 
                       except (
                           AIIdempotencyConflict,
                           AIRequestInFlight,
                           AIIntegrityError,
+                          AIStorageError,
                       ):
                           raise
 
@@ -1793,7 +2714,8 @@ jobs:
                           connection.rollback()
 
                           raise AIStorageError(
-                              f"Reservation failed: {exc}"
+                              "Reservation failed: "
+                              + str(exc)
                           ) from exc
 
                       finally:
@@ -1806,9 +2728,15 @@ jobs:
                   request_hash: str,
                   timeout_seconds: float,
               ) -> AIResponse | None:
-                  deadline = time.monotonic() + timeout_seconds
+                  deadline = (
+                      time.monotonic()
+                      + timeout_seconds
+                  )
 
-                  while time.monotonic() < deadline:
+                  while (
+                      time.monotonic()
+                      < deadline
+                  ):
                       connection = self._connect()
 
                       try:
@@ -1821,7 +2749,9 @@ jobs:
                               FROM ai_requests
                               WHERE idempotency_key = ?
                               """,
-                              (idempotency_key,),
+                              (
+                                  idempotency_key,
+                              ),
                           ).fetchone()
 
                       finally:
@@ -1830,25 +2760,37 @@ jobs:
                       if row is None:
                           return None
 
-                      if str(row["request_hash"]) != request_hash:
+                      if (
+                          str(
+                              row["request_hash"]
+                          )
+                          != request_hash
+                      ):
                           raise AIIdempotencyConflict(
                               "Stored request hash differs"
                           )
 
-                      if row["status"] == "completed":
-                          response_json = row["response_json"]
+                      if (
+                          row["status"]
+                          == "completed"
+                      ):
+                          response_json = (
+                              row["response_json"]
+                          )
 
-                          if response_json is None:
+                          if (
+                              response_json
+                              is None
+                          ):
                               raise AIIntegrityError(
                                   "Completed request has no response"
                               )
 
                           return response_from_json(
-                              str(response_json)
+                              str(
+                                  response_json
+                              )
                           )
-
-                      if row["status"] == "recovery_required":
-                          return None
 
                       time.sleep(0.05)
 
@@ -1860,6 +2802,7 @@ jobs:
                   request: AIRequest,
                   response: AIResponse,
                   owner: str,
+                  lease_token: str,
                   now: int,
               ) -> None:
                   payload = response_to_json(
@@ -1887,12 +2830,14 @@ jobs:
                               idempotency_key = ?
                               AND status = 'running'
                               AND lease_owner = ?
+                              AND lease_token = ?
                           """,
                           (
                               payload,
                               now,
                               request.idempotency_key,
                               owner,
+                              lease_token,
                           ),
                       )
 
@@ -1900,7 +2845,7 @@ jobs:
                           connection.rollback()
 
                           raise AILeaseError(
-                              "Completion rejected: lease lost"
+                              "Completion rejected: fencing token lost"
                           )
 
                       event_payload = (
@@ -1921,7 +2866,7 @@ jobs:
                               payload,
                               created_at
                           )
-                          VALUES (
+                          VALUES(
                               ?,
                               'AI_REQUEST_COMPLETED',
                               ?,
@@ -1937,8 +2882,12 @@ jobs:
 
                       self._audit_tx(
                           connection,
-                          aggregate_id=request.idempotency_key,
-                          event_type="AI_REQUEST_COMPLETED",
+                          aggregate_id=(
+                              request.idempotency_key
+                          ),
+                          event_type=(
+                              "AI_REQUEST_COMPLETED"
+                          ),
                           payload=event_payload,
                           now=now,
                       )
@@ -1952,7 +2901,8 @@ jobs:
                       connection.rollback()
 
                       raise AIStorageError(
-                          f"Completion failed: {exc}"
+                          "Completion failed: "
+                          + str(exc)
                       ) from exc
 
                   finally:
@@ -1963,12 +2913,11 @@ jobs:
                   *,
                   request: AIRequest,
                   owner: str,
+                  lease_token: str,
                   now: int,
                   error_code: str,
                   error_message: str,
               ) -> None:
-                  safe_message = error_message[:4000]
-
                   connection = self._connect()
 
                   try:
@@ -1991,13 +2940,15 @@ jobs:
                               idempotency_key = ?
                               AND status = 'running'
                               AND lease_owner = ?
+                              AND lease_token = ?
                           """,
                           (
                               error_code,
-                              safe_message,
+                              error_message[:4000],
                               now,
                               request.idempotency_key,
                               owner,
+                              lease_token,
                           ),
                       )
 
@@ -2005,7 +2956,8 @@ jobs:
                           connection.rollback()
 
                           raise AILeaseError(
-                              "Failure state rejected: lease lost"
+                              "Failure persistence rejected: "
+                              "fencing token lost"
                           )
 
                       connection.commit()
@@ -2017,7 +2969,8 @@ jobs:
                       connection.rollback()
 
                       raise AIStorageError(
-                          f"Failure persistence failed: {exc}"
+                          "Failure persistence failed: "
+                          + str(exc)
                       ) from exc
 
                   finally:
@@ -2028,6 +2981,7 @@ jobs:
                   *,
                   request: AIRequest,
                   owner: str,
+                  lease_token: str,
                   now: int,
                   error_code: str,
                   error_message: str,
@@ -2054,6 +3008,7 @@ jobs:
                               idempotency_key = ?
                               AND status = 'running'
                               AND lease_owner = ?
+                              AND lease_token = ?
                           """,
                           (
                               error_code,
@@ -2061,6 +3016,7 @@ jobs:
                               now,
                               request.idempotency_key,
                               owner,
+                              lease_token,
                           ),
                       )
 
@@ -2068,7 +3024,8 @@ jobs:
                           connection.rollback()
 
                           raise AILeaseError(
-                              "Recovery state rejected: lease lost"
+                              "Recovery persistence rejected: "
+                              "fencing token lost"
                           )
 
                       payload = (
@@ -2083,8 +3040,12 @@ jobs:
 
                       self._audit_tx(
                           connection,
-                          aggregate_id=request.idempotency_key,
-                          event_type="AI_RECOVERY_REQUIRED",
+                          aggregate_id=(
+                              request.idempotency_key
+                          ),
+                          event_type=(
+                              "AI_RECOVERY_REQUIRED"
+                          ),
                           payload=payload,
                           now=now,
                       )
@@ -2098,7 +3059,8 @@ jobs:
                       connection.rollback()
 
                       raise AIStorageError(
-                          f"Recovery persistence failed: {exc}"
+                          "Recovery persistence failed: "
+                          + str(exc)
                       ) from exc
 
                   finally:
@@ -2148,7 +3110,8 @@ jobs:
                               """
                               UPDATE ai_requests
                               SET
-                                  status = 'recovery_required',
+                                  status =
+                                      'recovery_required',
                                   lease_owner = NULL,
                                   lease_token = NULL,
                                   lease_until = NULL,
@@ -2164,7 +3127,9 @@ jobs:
                           self._audit_tx(
                               connection,
                               aggregate_id=aggregate_id,
-                              event_type="AI_RECOVERY_REQUIRED",
+                              event_type=(
+                                  "AI_RECOVERY_REQUIRED"
+                              ),
                               payload=(
                                   '{"timestamp":'
                                   + str(now)
@@ -2181,7 +3146,8 @@ jobs:
                       connection.rollback()
 
                       raise AIStorageError(
-                          f"Recovery scan failed: {exc}"
+                          "Recovery scan failed: "
+                          + str(exc)
                       ) from exc
 
                   finally:
@@ -2192,7 +3158,9 @@ jobs:
                   *,
                   limit: int = 100,
               ) -> tuple[OutboxRecord, ...]:
-                  if not 1 <= limit <= 10_000:
+                  if not (
+                      1 <= limit <= 10_000
+                  ):
                       raise ValueError(
                           "Invalid outbox limit"
                       )
@@ -2218,7 +3186,9 @@ jobs:
 
                       return tuple(
                           OutboxRecord(
-                              event_id=int(row["event_id"]),
+                              event_id=int(
+                                  row["event_id"]
+                              ),
                               aggregate_id=str(
                                   row["aggregate_id"]
                               ),
@@ -2273,7 +3243,8 @@ jobs:
                       connection.rollback()
 
                       raise AIStorageError(
-                          f"Outbox acknowledgement failed: {exc}"
+                          "Outbox acknowledgement failed: "
+                          + str(exc)
                       ) from exc
 
                   finally:
@@ -2286,6 +3257,16 @@ jobs:
                   event_id: str,
                   received_at: int,
               ) -> bool:
+                  if not consumer.strip():
+                      raise ValueError(
+                          "consumer is required"
+                      )
+
+                  if not event_id.strip():
+                      raise ValueError(
+                          "event_id is required"
+                      )
+
                   connection = self._connect()
 
                   try:
@@ -2316,14 +3297,14 @@ jobs:
 
                       except sqlite3.IntegrityError:
                           connection.rollback()
-
                           return False
 
                   except sqlite3.Error as exc:
                       connection.rollback()
 
                       raise AIStorageError(
-                          f"Inbox operation failed: {exc}"
+                          "Inbox operation failed: "
+                          + str(exc)
                       ) from exc
 
                   finally:
@@ -2337,7 +3318,10 @@ jobs:
                           "PRAGMA integrity_check"
                       ).fetchone()
 
-                      if row is None or row[0] != "ok":
+                      if (
+                          row is None
+                          or row[0] != "ok"
+                      ):
                           raise AIIntegrityError(
                               "SQLite integrity check failed"
                           )
@@ -2389,7 +3373,10 @@ jobs:
                               row["created_at"]
                           )
 
-                          if previous_hash != previous:
+                          if (
+                              previous_hash
+                              != previous
+                          ):
                               return False
 
                           expected = hashlib.sha256(
@@ -2408,7 +3395,10 @@ jobs:
                               ).encode("utf-8")
                           ).hexdigest()
 
-                          if expected != record_hash:
+                          if (
+                              expected
+                              != record_hash
+                          ):
                               return False
 
                           previous = record_hash
@@ -2417,6 +3407,133 @@ jobs:
 
                   finally:
                       connection.close()
+
+              def create_audit_checkpoint(
+                  self,
+                  *,
+                  now: int,
+              ) -> tuple[int, str]:
+                  connection = self._connect()
+
+                  try:
+                      connection.execute(
+                          "BEGIN IMMEDIATE"
+                      )
+
+                      row = connection.execute(
+                          """
+                          SELECT sequence, record_hash
+                          FROM ai_audit
+                          ORDER BY sequence DESC
+                          LIMIT 1
+                          """
+                      ).fetchone()
+
+                      if row is None:
+                          sequence = 0
+                          record_hash = "0" * 64
+                      else:
+                          sequence = int(
+                              row["sequence"]
+                          )
+                          record_hash = str(
+                              row["record_hash"]
+                          )
+
+                      connection.execute(
+                          """
+                          INSERT INTO
+                          ai_audit_checkpoints(
+                              last_sequence,
+                              last_hash,
+                              created_at
+                          )
+                          VALUES (?, ?, ?)
+                          """,
+                          (
+                              sequence,
+                              record_hash,
+                              now,
+                          ),
+                      )
+
+                      connection.commit()
+
+                      return (
+                          sequence,
+                          record_hash,
+                      )
+
+                  except sqlite3.Error as exc:
+                      connection.rollback()
+
+                      raise AIStorageError(
+                          "Audit checkpoint failed: "
+                          + str(exc)
+                      ) from exc
+
+                  finally:
+                      connection.close()
+
+              def backup_to(
+                  self,
+                  destination: str | Path,
+              ) -> None:
+                  target = str(destination)
+
+                  Path(
+                      target
+                  ).parent.mkdir(
+                      parents=True,
+                      exist_ok=True,
+                  )
+
+                  source = self._connect()
+
+                  try:
+                      target_connection = sqlite3.connect(
+                          target,
+                          timeout=self._timeout,
+                      )
+
+                      try:
+                          source.backup(
+                              target_connection
+                          )
+
+                          target_connection.commit()
+
+                      finally:
+                          target_connection.close()
+
+                  except sqlite3.Error as exc:
+                      raise AIStorageError(
+                          "Database backup failed: "
+                          + str(exc)
+                      ) from exc
+
+                  finally:
+                      source.close()
+
+                  verification = sqlite3.connect(
+                      target
+                  )
+
+                  try:
+                      row = verification.execute(
+                          "PRAGMA integrity_check"
+                      ).fetchone()
+
+                      if (
+                          row is None
+                          or row[0] != "ok"
+                      ):
+                          raise AIIntegrityError(
+                              "Backup integrity check failed"
+                          )
+
+                  finally:
+                      verification.close()
 
               def count_requests(self) -> int:
                   connection = self._connect()
@@ -2435,303 +3552,6 @@ jobs:
                       connection.close()
           PY
 
-          cat > shared_engines/ai/http_provider.py <<'PY'
-          from __future__ import annotations
-
-          import json
-          import time
-          import urllib.error
-          import urllib.request
-          from decimal import Decimal
-          from types import MappingProxyType
-
-          from .contracts import (
-              AIRequest,
-              AIResponse,
-              AIUsage,
-              ModelDescriptor,
-          )
-          from .errors import (
-              AIProviderPermanentError,
-              AIProviderProtocolError,
-              AIProviderTransientError,
-          )
-          from .providers import AIProvider
-
-
-          class OpenAICompatibleProvider(AIProvider):
-              """
-              HTTPS OpenAI-compatible provider adapter.
-
-              Provider credentials are deployment secrets.
-              """
-
-              def __init__(
-                  self,
-                  *,
-                  name: str,
-                  endpoint: str,
-                  api_key: str,
-                  models: tuple[ModelDescriptor, ...],
-                  timeout_seconds: float = 120.0,
-                  maximum_response_bytes: int = 8_000_000,
-              ) -> None:
-                  if not name.strip():
-                      raise ValueError(
-                          "Provider name is required"
-                      )
-
-                  if not endpoint.startswith("https://"):
-                      raise ValueError(
-                          "Provider endpoint must use HTTPS"
-                      )
-
-                  if not api_key.strip():
-                      raise ValueError(
-                          "Provider API key is required"
-                      )
-
-                  if not models:
-                      raise ValueError(
-                          "Provider requires models"
-                      )
-
-                  if not 0 < timeout_seconds <= 1800:
-                      raise ValueError(
-                          "Invalid provider timeout"
-                      )
-
-                  if not 1 <= maximum_response_bytes <= 64_000_000:
-                      raise ValueError(
-                          "Invalid response size limit"
-                      )
-
-                  if any(
-                      model.provider != name
-                      for model in models
-                  ):
-                      raise ValueError(
-                          "Model/provider mismatch"
-                      )
-
-                  self._name = name.strip()
-                  self._endpoint = endpoint
-                  self._api_key = api_key
-                  self._models = models
-                  self._timeout = timeout_seconds
-                  self._maximum_response_bytes = (
-                      maximum_response_bytes
-                  )
-
-              @property
-              def name(self) -> str:
-                  return self._name
-
-              def models(
-                  self,
-              ) -> tuple[ModelDescriptor, ...]:
-                  return self._models
-
-              def health(self) -> bool:
-                  return bool(self._api_key)
-
-              def complete(
-                  self,
-                  request: AIRequest,
-                  model: ModelDescriptor,
-              ) -> AIResponse:
-                  messages: list[dict[str, str]] = []
-
-                  if request.system_prompt is not None:
-                      messages.append(
-                          {
-                              "role": "system",
-                              "content": request.system_prompt,
-                          }
-                      )
-
-                  messages.append(
-                      {
-                          "role": "user",
-                          "content": request.prompt,
-                      }
-                  )
-
-                  payload = {
-                      "model": model.model_id,
-                      "messages": messages,
-                      "max_tokens": request.max_output_tokens,
-                      "temperature": float(
-                          request.temperature
-                      ),
-                  }
-
-                  encoded = json.dumps(
-                      payload,
-                      ensure_ascii=False,
-                      separators=(",", ":"),
-                  ).encode("utf-8")
-
-                  request_object = urllib.request.Request(
-                      self._endpoint,
-                      data=encoded,
-                      method="POST",
-                      headers={
-                          "Accept": "application/json",
-                          "Content-Type": "application/json",
-                          "Authorization": (
-                              "Bearer " + self._api_key
-                          ),
-                          "Idempotency-Key": (
-                              request.idempotency_key
-                          ),
-                          "User-Agent": (
-                              "ZYRA-Network-AI/1.0"
-                          ),
-                      },
-                  )
-
-                  started = int(time.time())
-
-                  try:
-                      with urllib.request.urlopen(
-                          request_object,
-                          timeout=min(
-                              self._timeout,
-                              request.timeout_seconds,
-                          ),
-                      ) as response:
-                          if response.status != 200:
-                              raise AIProviderPermanentError(
-                                  f"Provider returned HTTP "
-                                  f"{response.status}"
-                              )
-
-                          raw = response.read(
-                              self._maximum_response_bytes + 1
-                          )
-
-                  except urllib.error.HTTPError as exc:
-                      if exc.code in {
-                          408,
-                          425,
-                          429,
-                          500,
-                          502,
-                          503,
-                          504,
-                      }:
-                          raise AIProviderTransientError(
-                              f"Provider returned HTTP "
-                              f"{exc.code}"
-                          ) from exc
-
-                      raise AIProviderPermanentError(
-                          f"Provider returned HTTP "
-                          f"{exc.code}"
-                      ) from exc
-
-                  except urllib.error.URLError as exc:
-                      raise AIProviderTransientError(
-                          f"Provider network failure: {exc}"
-                      ) from exc
-
-                  if len(raw) > self._maximum_response_bytes:
-                      raise AIProviderProtocolError(
-                          "Provider response exceeds size limit"
-                      )
-
-                  try:
-                      data = json.loads(
-                          raw.decode("utf-8")
-                      )
-
-                  except (
-                      UnicodeDecodeError,
-                      json.JSONDecodeError,
-                  ) as exc:
-                      raise AIProviderProtocolError(
-                          "Provider returned invalid JSON"
-                      ) from exc
-
-                  if not isinstance(data, dict):
-                      raise AIProviderProtocolError(
-                          "Provider response must be an object"
-                      )
-
-                  try:
-                      choices = data["choices"]
-                      first = choices[0]
-                      message = first["message"]
-                      output = str(
-                          message["content"]
-                      )
-
-                  except (
-                      KeyError,
-                      IndexError,
-                      TypeError,
-                  ) as exc:
-                      raise AIProviderProtocolError(
-                          "Invalid provider response structure"
-                      ) from exc
-
-                  usage = data.get(
-                      "usage",
-                      {},
-                  )
-
-                  if not isinstance(usage, dict):
-                      raise AIProviderProtocolError(
-                          "Invalid provider usage"
-                      )
-
-                  input_tokens = int(
-                      usage.get("prompt_tokens", 0)
-                  )
-
-                  output_tokens = int(
-                      usage.get("completion_tokens", 0)
-                  )
-
-                  total_tokens = int(
-                      usage.get(
-                          "total_tokens",
-                          input_tokens + output_tokens,
-                      )
-                  )
-
-                  response_id = str(
-                      data.get(
-                          "id",
-                          request.request_id,
-                      )
-                  )
-
-                  completed = int(time.time())
-
-                  return AIResponse(
-                      schema_version=1,
-                      request_id=request.request_id,
-                      model_id=model.model_id,
-                      provider=self._name,
-                      output=output,
-                      usage=AIUsage(
-                          input_tokens=input_tokens,
-                          output_tokens=output_tokens,
-                          total_tokens=total_tokens,
-                          estimated_cost=Decimal("0"),
-                      ),
-                      created_at=started,
-                      completed_at=max(
-                          completed,
-                          started,
-                      ),
-                      response_id=response_id,
-                      metadata=MappingProxyType({}),
-                  )
-          PY
-
           cat > shared_engines/ai/engine.py <<'PY'
           from __future__ import annotations
 
@@ -2744,7 +3564,10 @@ jobs:
           from .budget import ExecutionBudget
           from .circuit import CircuitBreaker
           from .clock import Clock, SystemClock
-          from .contracts import AIRequest, AIResponse
+          from .contracts import (
+              AIRequest,
+              AIResponse,
+          )
           from .errors import (
               AIBudgetExceeded,
               AIIdempotencyConflict,
@@ -2753,6 +3576,13 @@ jobs:
               AIProviderTransientError,
               AIProviderUnavailable,
               AIRequestInFlight,
+              AIStorageError,
+          )
+          from .limiter import ExecutionLimiter
+          from .observability import (
+              AIEvent,
+              EventSink,
+              NullEventSink,
           )
           from .policy import ExecutionPolicy
           from .providers import AIProvider
@@ -2763,12 +3593,12 @@ jobs:
 
           class AIEngine:
               """
-              Durable AI orchestration layer.
+              Durable AI orchestration boundary.
 
-              The engine does not pretend that an uncertain external network
-              operation is safe to duplicate. Provider calls are protected
-              with the request idempotency key and uncertain executions are
-              persisted for reconciliation.
+              An uncertain provider operation is never blindly duplicated
+              by this layer. The same idempotency key is used at the
+              provider boundary and uncertain execution can become
+              recovery_required.
               """
 
               def __init__(
@@ -2780,11 +3610,15 @@ jobs:
                   budget: ExecutionBudget | None = None,
                   policy: ExecutionPolicy | None = None,
                   clock: Clock | None = None,
+                  event_sink: EventSink | None = None,
+                  maximum_concurrency: int = 32,
                   failure_threshold: int = 5,
                   recovery_seconds: int = 30,
               ) -> None:
                   self._registry = registry
-                  self._providers = tuple(providers)
+                  self._providers = tuple(
+                      providers
+                  )
                   self._store = store
                   self._budget = budget
                   self._policy = (
@@ -2792,6 +3626,10 @@ jobs:
                   )
                   self._clock = (
                       clock or SystemClock()
+                  )
+                  self._events = (
+                      event_sink
+                      or NullEventSink()
                   )
 
                   if not self._providers:
@@ -2804,12 +3642,17 @@ jobs:
                       for provider in self._providers
                   )
 
-                  if any(not name for name in names):
+                  if any(
+                      not name
+                      for name in names
+                  ):
                       raise ValueError(
                           "Provider names cannot be empty"
                       )
 
-                  if len(set(names)) != len(names):
+                  if len(
+                      set(names)
+                  ) != len(names):
                       raise ValueError(
                           "Provider names must be unique"
                       )
@@ -2825,6 +3668,12 @@ jobs:
                       )
                       for provider in self._providers
                   }
+
+                  self._limiter = (
+                      ExecutionLimiter(
+                          maximum_concurrency
+                      )
+                  )
 
               def _request_hash(
                   self,
@@ -2842,7 +3691,9 @@ jobs:
                       "max_output_tokens": (
                           request.max_output_tokens
                       ),
-                      "temperature": request.temperature,
+                      "temperature": (
+                          request.temperature
+                      ),
                       "timeout_seconds": (
                           request.timeout_seconds
                       ),
@@ -2854,6 +3705,22 @@ jobs:
                   return hashlib.sha256(
                       canonical_json(payload)
                   ).hexdigest()
+
+              def _emit(
+                  self,
+                  *,
+                  event_type: str,
+                  request_id: str,
+                  provider: str | None,
+              ) -> None:
+                  self._events.emit(
+                      AIEvent(
+                          event_type=event_type,
+                          request_id=request_id,
+                          provider=provider,
+                          timestamp=self._clock.now(),
+                      )
+                  )
 
               def execute(
                   self,
@@ -2868,36 +3735,42 @@ jobs:
                       model,
                   )
 
-                  if self._budget is not None:
-                      self._budget.reserve_request()
-
-                  request_hash = self._request_hash(
-                      request
+                  request_hash = (
+                      self._request_hash(
+                          request
+                      )
                   )
 
                   owner = uuid.uuid4().hex
+                  lease_token: str | None = None
 
                   if self._store is not None:
                       try:
                           reservation = (
                               self._store.reserve(
                                   request=request,
-                                  request_hash=request_hash,
+                                  request_hash=(
+                                      request_hash
+                                  ),
                                   owner=owner,
                                   now=self._clock.now(),
                                   lease_seconds=(
-                                      self._policy.lease_seconds
+                                      self._policy
+                                      .lease_seconds
                                   ),
                               )
                           )
 
                       except AIRequestInFlight:
                           response = (
-                              self._store.wait_for_completion(
+                              self._store
+                              .wait_for_completion(
                                   idempotency_key=(
                                       request.idempotency_key
                                   ),
-                                  request_hash=request_hash,
+                                  request_hash=(
+                                      request_hash
+                                  ),
                                   timeout_seconds=(
                                       self._policy
                                       .concurrent_wait_seconds
@@ -2909,12 +3782,39 @@ jobs:
                               return response
 
                           raise AIRequestInFlight(
-                              "Concurrent request did not complete "
-                              "within the configured wait window"
+                              "Concurrent request did not complete"
                           )
 
-                      if reservation.response is not None:
+                      except AIStorageError as exc:
+                          if (
+                              "reconciliation"
+                              in str(exc).lower()
+                          ):
+                              raise
+
+                          raise
+
+                      if (
+                          reservation.response
+                          is not None
+                      ):
                           return reservation.response
+
+                      if (
+                          not reservation.acquired
+                          or reservation.lease_token
+                          is None
+                      ):
+                          raise AIStorageError(
+                              "Invalid durable execution reservation"
+                          )
+
+                      lease_token = (
+                          reservation.lease_token
+                      )
+
+                  if self._budget is not None:
+                      self._budget.reserve_request()
 
                   deadline = (
                       time.monotonic()
@@ -2927,7 +3827,8 @@ jobs:
                       supports_model = any(
                           descriptor.model_id
                           == model.model_id
-                          for descriptor in provider.models()
+                          for descriptor
+                          in provider.models()
                       )
 
                       if not supports_model:
@@ -2946,167 +3847,317 @@ jobs:
                           )
                           continue
 
-                      for attempt in range(
-                          self._policy.max_attempts
-                      ):
-                          if (
-                              time.monotonic()
-                              >= deadline
+                      remaining = (
+                          deadline
+                          - time.monotonic()
+                      )
+
+                      if remaining <= 0:
+                          break
+
+                      try:
+                          with self._limiter.slot(
+                              timeout_seconds=min(
+                                  remaining,
+                                  self._policy
+                                  .concurrent_wait_seconds,
+                              )
                           ):
-                              failures.append(
-                                  provider.name
-                                  + ": deadline-exceeded"
-                              )
-                              break
-
-                          try:
-                              response = (
-                                  provider.complete(
-                                      request,
-                                      model,
-                                  )
-                              )
-
-                              circuit.success()
-
-                              maximum_cost = (
+                              for attempt in range(
                                   self._policy
-                                  .maximum_cost_per_request
-                              )
-
-                              if (
-                                  maximum_cost is not None
-                                  and response.usage
-                                  .estimated_cost
-                                  > maximum_cost
+                                  .max_attempts
                               ):
-                                  raise AIBudgetExceeded(
-                                      "Per-request cost limit exceeded"
+                                  remaining = (
+                                      deadline
+                                      - time.monotonic()
                                   )
 
-                              if self._budget is not None:
-                                  self._budget.settle(
-                                      tokens=(
-                                          response.usage
-                                          .total_tokens
-                                      ),
-                                      cost=(
-                                          response.usage
+                                  if remaining <= 0:
+                                      failures.append(
+                                          provider.name
+                                          + ": deadline-exceeded"
+                                      )
+                                      break
+
+                                  try:
+                                      self._emit(
+                                          event_type=(
+                                              "AI_PROVIDER_ATTEMPT"
+                                          ),
+                                          request_id=(
+                                              request.request_id
+                                          ),
+                                          provider=(
+                                              provider.name
+                                          ),
+                                      )
+
+                                      response = (
+                                          provider.complete(
+                                              request,
+                                              model,
+                                          )
+                                      )
+
+                                      circuit.success()
+
+                                      maximum_cost = (
+                                          self._policy
+                                          .maximum_cost_per_request
+                                      )
+
+                                      if (
+                                          maximum_cost
+                                          is not None
+                                          and response
+                                          .usage
                                           .estimated_cost
-                                      ),
-                                  )
+                                          > maximum_cost
+                                      ):
+                                          raise AIBudgetExceeded(
+                                              "Per-request cost limit exceeded"
+                                          )
 
-                              if self._store is not None:
-                                  self._store.complete(
-                                      request=request,
-                                      response=response,
-                                      owner=owner,
-                                      now=self._clock.now(),
-                                  )
+                                      if (
+                                          self._budget
+                                          is not None
+                                      ):
+                                          self._budget.settle(
+                                              tokens=(
+                                                  response
+                                                  .usage
+                                                  .total_tokens
+                                              ),
+                                              cost=(
+                                                  response
+                                                  .usage
+                                                  .estimated_cost
+                                              ),
+                                          )
 
-                              return response
+                                      if (
+                                          self._store
+                                          is not None
+                                      ):
+                                          if (
+                                              lease_token
+                                              is None
+                                          ):
+                                              raise AIStorageError(
+                                                  "Missing durable lease token"
+                                              )
 
-                          except AIBudgetExceeded:
-                              if self._store is not None:
-                                  self._store.fail(
-                                      request=request,
-                                      owner=owner,
-                                      now=self._clock.now(),
-                                      error_code=(
-                                          "BUDGET_EXCEEDED"
-                                      ),
-                                      error_message=(
-                                          "AI budget exceeded"
-                                      ),
-                                  )
-                              raise
+                                          self._store.complete(
+                                              request=request,
+                                              response=response,
+                                              owner=owner,
+                                              lease_token=(
+                                                  lease_token
+                                              ),
+                                              now=(
+                                                  self._clock.now()
+                                              ),
+                                          )
 
-                          except AIProviderTransientError as exc:
-                              circuit.failure(
-                                  now=self._clock.now()
+                                      self._emit(
+                                          event_type=(
+                                              "AI_REQUEST_COMPLETED"
+                                          ),
+                                          request_id=(
+                                              request.request_id
+                                          ),
+                                          provider=(
+                                              provider.name
+                                          ),
+                                      )
+
+                                      return response
+
+                                  except (
+                                      AIBudgetExceeded
+                                  ):
+                                      if (
+                                          self._store
+                                          is not None
+                                      ):
+                                          if (
+                                              lease_token
+                                              is not None
+                                          ):
+                                              self._store.fail(
+                                                  request=request,
+                                                  owner=owner,
+                                                  lease_token=(
+                                                      lease_token
+                                                  ),
+                                                  now=(
+                                                      self._clock.now()
+                                                  ),
+                                                  error_code=(
+                                                      "BUDGET_EXCEEDED"
+                                                  ),
+                                                  error_message=(
+                                                      "AI budget exceeded"
+                                                  ),
+                                              )
+                                      raise
+
+                                  except (
+                                      AIProviderTransientError
+                                  ) as exc:
+                                      circuit.failure(
+                                          now=self._clock.now()
+                                      )
+
+                                      failures.append(
+                                          provider.name
+                                          + ": transient: "
+                                          + str(exc)
+                                      )
+
+                                      if (
+                                          attempt + 1
+                                          >= self._policy
+                                          .max_attempts
+                                      ):
+                                          break
+
+                                      delay = min(
+                                          self._policy
+                                          .retry_max_seconds,
+                                          self._policy
+                                          .retry_base_seconds
+                                          * (2 ** attempt),
+                                      )
+
+                                      remaining = (
+                                          deadline
+                                          - time.monotonic()
+                                      )
+
+                                      if remaining <= 0:
+                                          break
+
+                                      time.sleep(
+                                          min(
+                                              delay,
+                                              remaining,
+                                          )
+                                      )
+
+                                  except (
+                                      AIProviderPermanentError
+                                  ) as exc:
+                                      circuit.failure(
+                                          now=self._clock.now()
+                                      )
+
+                                      failures.append(
+                                          provider.name
+                                          + ": permanent: "
+                                          + str(exc)
+                                      )
+                                      break
+
+                                  except Exception as exc:
+                                      circuit.failure(
+                                          now=self._clock.now()
+                                      )
+
+                                      if (
+                                          self._store
+                                          is not None
+                                      ):
+                                          if (
+                                              lease_token
+                                              is None
+                                          ):
+                                              raise
+
+                                          self._store.mark_recovery_required(
+                                              request=request,
+                                              owner=owner,
+                                              lease_token=(
+                                                  lease_token
+                                              ),
+                                              now=(
+                                                  self._clock.now()
+                                              ),
+                                              error_code=(
+                                                  type(
+                                                      exc
+                                                  ).__name__
+                                              ),
+                                              error_message=str(
+                                                  exc
+                                              ),
+                                          )
+
+                                      self._emit(
+                                          event_type=(
+                                              "AI_RECOVERY_REQUIRED"
+                                          ),
+                                          request_id=(
+                                              request.request_id
+                                          ),
+                                          provider=(
+                                              provider.name
+                                          ),
+                                      )
+
+                                      raise
+
+                      except TimeoutError as exc:
+                          failures.append(
+                              provider.name
+                              + ": execution-capacity-timeout"
+                          )
+
+                          if (
+                              self._store
+                              is not None
+                              and lease_token
+                              is not None
+                          ):
+                              self._store.mark_recovery_required(
+                                  request=request,
+                                  owner=owner,
+                                  lease_token=(
+                                      lease_token
+                                  ),
+                                  now=self._clock.now(),
+                                  error_code=(
+                                      "EXECUTION_CAPACITY_TIMEOUT"
+                                  ),
+                                  error_message=str(
+                                      exc
+                                  ),
                               )
 
-                              failures.append(
-                                  provider.name
-                                  + ": transient: "
-                                  + str(exc)
-                              )
+                          raise
 
-                              if (
-                                  attempt + 1
-                                  >= self._policy.max_attempts
-                              ):
-                                  break
-
-                              delay = min(
-                                  self._policy.retry_max_seconds,
-                                  self._policy
-                                  .retry_base_seconds
-                                  * (2 ** attempt),
-                              )
-
-                              remaining = (
-                                  deadline
-                                  - time.monotonic()
-                              )
-
-                              if remaining <= 0:
-                                  break
-
-                              time.sleep(
-                                  min(
-                                      delay,
-                                      remaining,
-                                  )
-                              )
-
-                          except AIProviderPermanentError as exc:
-                              circuit.failure(
-                                  now=self._clock.now()
-                              )
-
-                              failures.append(
-                                  provider.name
-                                  + ": permanent: "
-                                  + str(exc)
-                              )
-
-                              break
-
-                          except Exception as exc:
-                              circuit.failure(
-                                  now=self._clock.now()
-                              )
-
-                              if self._store is not None:
-                                  self._store.mark_recovery_required(
-                                      request=request,
-                                      owner=owner,
-                                      now=self._clock.now(),
-                                      error_code=(
-                                          type(exc).__name__
-                                      ),
-                                      error_message=str(exc),
-                                  )
-
-                              raise
-
-                  if self._store is not None:
+                  if (
+                      self._store is not None
+                      and lease_token is not None
+                  ):
                       self._store.fail(
                           request=request,
                           owner=owner,
+                          lease_token=lease_token,
                           now=self._clock.now(),
                           error_code=(
                               "ALL_PROVIDERS_FAILED"
                           ),
                           error_message=(
-                              " | ".join(failures)
+                              " | ".join(
+                                  failures
+                              )
                           ),
                       )
 
                   if not failures:
                       raise AIProviderUnavailable(
-                          "No provider supports the requested model"
+                          "No provider supports requested model"
                       )
 
                   raise AIProviderError(
@@ -3114,7 +4165,9 @@ jobs:
                       + " | ".join(failures)
                   )
 
-              def recover_stale_requests(self) -> int:
+              def recover_stale_requests(
+                  self,
+              ) -> int:
                   if self._store is None:
                       return 0
 
@@ -3126,31 +4179,45 @@ jobs:
                       ),
                   )
 
-              def audit_is_valid(self) -> bool:
+              def audit_is_valid(
+                  self,
+              ) -> bool:
                   if self._store is None:
                       return True
 
                   return self._store.verify_audit_chain()
 
-              def health(self) -> dict[str, object]:
-                  providers: dict[str, object] = {}
+              def health(
+                  self,
+              ) -> dict[str, object]:
+                  providers: dict[
+                      str,
+                      object,
+                  ] = {}
 
                   for provider in self._providers:
                       snapshot = self._circuits[
                           provider.name
                       ].snapshot()
 
-                      providers[provider.name] = {
+                      providers[
+                          provider.name
+                      ] = {
                           "healthy": provider.health(),
                           "circuit": (
                               snapshot.state.value
                           ),
-                          "failures": snapshot.failures,
-                          "opened_at": snapshot.opened_at,
+                          "failures": (
+                              snapshot.failures
+                          ),
+                          "opened_at": (
+                              snapshot.opened_at
+                          ),
                       }
 
                   return {
                       "engine": "ready",
+                      "schema_version": 2,
                       "registry_revision": (
                           self._registry.revision
                       ),
@@ -3175,7 +4242,9 @@ jobs:
 
           import pytest
 
-          from shared_engines.ai.budget import ExecutionBudget
+          from shared_engines.ai.budget import (
+              ExecutionBudget,
+          )
           from shared_engines.ai.circuit import (
               CircuitBreaker,
               CircuitState,
@@ -3186,19 +4255,25 @@ jobs:
               AIUsage,
               ModelDescriptor,
           )
-          from shared_engines.ai.crypto import EnvelopeCipher
-          from shared_engines.ai.engine import AIEngine
+          from shared_engines.ai.engine import (
+              AIEngine,
+          )
           from shared_engines.ai.errors import (
               AIIdempotencyConflict,
           )
-          from shared_engines.ai.registry import ModelRegistry
-          from shared_engines.ai.storage import SQLiteAIStore
+          from shared_engines.ai.registry import (
+              ModelRegistry,
+          )
+          from shared_engines.ai.storage import (
+              SQLiteAIStore,
+          )
 
 
           NOW = 1_800_000_000
 
+
           MODEL = ModelDescriptor(
-              schema_version=1,
+              schema_version=2,
               model_id="test-model",
               provider="test-provider",
               family="test",
@@ -3214,21 +4289,23 @@ jobs:
               def __init__(self) -> None:
                   self.calls = 0
 
-              def models(self):
+              def models(
+                  self,
+              ) -> tuple[ModelDescriptor, ...]:
                   return (MODEL,)
 
-              def health(self):
+              def health(self) -> bool:
                   return True
 
               def complete(
                   self,
-                  request,
-                  model,
-              ):
+                  request: AIRequest,
+                  model: ModelDescriptor,
+              ) -> AIResponse:
                   self.calls += 1
 
                   return AIResponse(
-                      schema_version=1,
+                      schema_version=2,
                       request_id=request.request_id,
                       model_id=model.model_id,
                       provider=self.name,
@@ -3237,10 +4314,14 @@ jobs:
                           input_tokens=2,
                           output_tokens=2,
                           total_tokens=4,
-                          estimated_cost=Decimal("0.001"),
+                          estimated_cost=Decimal(
+                              "0.001"
+                          ),
                       ),
                       created_at=request.created_at,
-                      completed_at=request.created_at + 1,
+                      completed_at=(
+                          request.created_at + 1
+                      ),
                       response_id=(
                           "response-"
                           + request.request_id
@@ -3254,7 +4335,7 @@ jobs:
               prompt: str = "hello",
           ) -> AIRequest:
               return AIRequest(
-                  schema_version=1,
+                  schema_version=2,
                   request_id="request-" + key,
                   idempotency_key=key,
                   model_id=MODEL.model_id,
@@ -3276,18 +4357,22 @@ jobs:
                       b"0123456789abcdef"
                       b"0123456789abcdef"
                   ),
+                  encryption_key_version="1",
               )
 
 
           def make_engine(
-              store=None,
-              provider=None,
-              budget=None,
-          ):
+              store: SQLiteAIStore | None = None,
+              provider: TestProvider | None = None,
+              budget: ExecutionBudget | None = None,
+          ) -> AIEngine:
               registry = ModelRegistry()
               registry.register(MODEL)
 
-              selected = provider or TestProvider()
+              selected = (
+                  provider
+                  or TestProvider()
+              )
 
               return AIEngine(
                   registry,
@@ -3297,7 +4382,7 @@ jobs:
               )
 
 
-          def test_engine_executes():
+          def test_engine_executes() -> None:
               provider = TestProvider()
 
               response = make_engine(
@@ -3315,7 +4400,7 @@ jobs:
 
           def test_durable_idempotency(
               tmp_path: Path,
-          ):
+          ) -> None:
               store = make_store(
                   tmp_path / "ai.db"
               )
@@ -3343,7 +4428,7 @@ jobs:
 
           def test_idempotency_conflict(
               tmp_path: Path,
-          ):
+          ) -> None:
               store = make_store(
                   tmp_path / "ai.db"
               )
@@ -3359,22 +4444,20 @@ jobs:
                   )
               )
 
-              conflicting = make_request(
-                  "same",
-                  "second",
-              )
-
               with pytest.raises(
                   AIIdempotencyConflict
               ):
                   service.execute(
-                      conflicting
+                      make_request(
+                          "same",
+                          "second",
+                      )
                   )
 
 
           def test_sqlite_reopen(
               tmp_path: Path,
-          ):
+          ) -> None:
               path = tmp_path / "durable.db"
 
               first_store = make_store(path)
@@ -3398,42 +4481,7 @@ jobs:
               assert second_store.verify_audit_chain()
 
 
-          def test_encryption():
-              cipher = EnvelopeCipher(
-                  b"0123456789abcdef"
-                  b"0123456789abcdef"
-              )
-
-              token = cipher.encrypt(
-                  b"sensitive",
-                  associated_data=b"request",
-              )
-
-              assert cipher.decrypt(
-                  token,
-                  associated_data=b"request",
-              ) == b"sensitive"
-
-
-          def test_encryption_detects_tampering():
-              cipher = EnvelopeCipher(
-                  b"0123456789abcdef"
-                  b"0123456789abcdef"
-              )
-
-              token = cipher.encrypt(
-                  b"sensitive",
-                  associated_data=b"request",
-              )
-
-              with pytest.raises(Exception):
-                  cipher.decrypt(
-                      token + "x",
-                      associated_data=b"request",
-                  )
-
-
-          def test_budget():
+          def test_budget() -> None:
               budget = ExecutionBudget(
                   max_requests=2,
                   max_tokens=10,
@@ -3454,13 +4502,15 @@ jobs:
               assert snapshot.cost == Decimal("0.1")
 
 
-          def test_circuit():
+          def test_circuit() -> None:
               breaker = CircuitBreaker(
                   failure_threshold=2,
                   recovery_seconds=10,
               )
 
-              assert breaker.allow(now=NOW)
+              assert breaker.allow(
+                  now=NOW
+              )
 
               breaker.failure(now=NOW)
               breaker.failure(now=NOW)
@@ -3479,7 +4529,9 @@ jobs:
               )
 
 
-          def test_outbox(tmp_path: Path):
+          def test_outbox(
+              tmp_path: Path,
+          ) -> None:
               store = make_store(
                   tmp_path / "outbox.db"
               )
@@ -3493,15 +4545,12 @@ jobs:
               events = store.pending_outbox()
 
               assert len(events) == 1
-
-              event = events[0]
-
-              assert event.event_type == (
+              assert events[0].event_type == (
                   "AI_REQUEST_COMPLETED"
               )
 
               assert store.mark_outbox_published(
-                  event_id=event.event_id,
+                  event_id=events[0].event_id,
                   published_at=NOW + 10,
               )
 
@@ -3510,7 +4559,7 @@ jobs:
 
           def test_inbox_deduplication(
               tmp_path: Path,
-          ):
+          ) -> None:
               store = make_store(
                   tmp_path / "inbox.db"
               )
@@ -3530,7 +4579,7 @@ jobs:
 
           def test_concurrent_idempotency(
               tmp_path: Path,
-          ):
+          ) -> None:
               store = make_store(
                   tmp_path / "concurrent.db"
               )
@@ -3542,9 +4591,13 @@ jobs:
                   provider=provider,
               )
 
-              def run(_: int):
+              def run(
+                  _: int,
+              ) -> AIResponse:
                   return service.execute(
-                      make_request("concurrent")
+                      make_request(
+                          "concurrent"
+                      )
                   )
 
               with ThreadPoolExecutor(
@@ -3569,21 +4622,75 @@ jobs:
 
           def test_database_integrity(
               tmp_path: Path,
-          ):
+          ) -> None:
               store = make_store(
                   tmp_path / "integrity.db"
               )
 
-              service = make_engine(
+              make_engine(
                   store=store
-              )
-
-              service.execute(
+              ).execute(
                   make_request("integrity")
               )
 
               store.verify_database()
+
               assert store.verify_audit_chain()
+
+
+          def test_audit_checkpoint(
+              tmp_path: Path,
+          ) -> None:
+              store = make_store(
+                  tmp_path / "checkpoint.db"
+              )
+
+              make_engine(
+                  store=store
+              ).execute(
+                  make_request("checkpoint")
+              )
+
+              sequence, record_hash = (
+                  store.create_audit_checkpoint(
+                      now=NOW + 1
+                  )
+              )
+
+              assert sequence == 2
+              assert len(record_hash) == 64
+
+
+          def test_backup(
+              tmp_path: Path,
+          ) -> None:
+              source = make_store(
+                  tmp_path / "source.db"
+              )
+
+              make_engine(
+                  store=source
+              ).execute(
+                  make_request("backup")
+              )
+
+              target = (
+                  tmp_path
+                  / "backup"
+                  / "ai.db"
+              )
+
+              source.backup_to(target)
+
+              restored = make_store(target)
+
+              assert (
+                  restored.count_requests()
+                  == 1
+              )
+
+              restored.verify_database()
+              assert restored.verify_audit_chain()
           PY
 
           cat > shared_engines/ai/tests/test_validation.py <<'PY'
@@ -3591,13 +4698,15 @@ jobs:
 
           import pytest
 
-          from shared_engines.ai.contracts import AIRequest
+          from shared_engines.ai.contracts import (
+              AIRequest,
+          )
 
 
-          def test_empty_prompt_rejected():
+          def test_empty_prompt_rejected() -> None:
               with pytest.raises(ValueError):
                   AIRequest(
-                      schema_version=1,
+                      schema_version=2,
                       request_id="r1",
                       idempotency_key="k1",
                       model_id="model",
@@ -3610,10 +4719,10 @@ jobs:
                   )
 
 
-          def test_invalid_temperature_rejected():
+          def test_invalid_temperature_rejected() -> None:
               with pytest.raises(ValueError):
                   AIRequest(
-                      schema_version=1,
+                      schema_version=2,
                       request_id="r1",
                       idempotency_key="k1",
                       model_id="model",
@@ -3626,10 +4735,10 @@ jobs:
                   )
 
 
-          def test_sensitive_metadata_rejected():
+          def test_sensitive_metadata_rejected() -> None:
               with pytest.raises(ValueError):
                   AIRequest(
-                      schema_version=1,
+                      schema_version=2,
                       request_id="r1",
                       idempotency_key="k1",
                       model_id="model",
@@ -3643,23 +4752,47 @@ jobs:
                           "api_key": "secret"
                       },
                   )
+
+
+          def test_schema_version_rejected() -> None:
+              with pytest.raises(ValueError):
+                  AIRequest(
+                      schema_version=1,
+                      request_id="r1",
+                      idempotency_key="k1",
+                      model_id="model",
+                      prompt="hello",
+                      system_prompt=None,
+                      max_output_tokens=10,
+                      temperature=Decimal("0"),
+                      timeout_seconds=10,
+                      created_at=1,
+                  )
           PY
 
           cat > shared_engines/ai/tests/test_storage.py <<'PY'
+          from decimal import Decimal
           from pathlib import Path
 
           import pytest
 
-          from shared_engines.ai.contracts import AIRequest
-          from shared_engines.ai.errors import AIRequestInFlight
-          from shared_engines.ai.storage import SQLiteAIStore
+          from shared_engines.ai.contracts import (
+              AIRequest,
+          )
+          from shared_engines.ai.errors import (
+              AIRequestInFlight,
+          )
+          from shared_engines.ai.serialization import (
+              canonical_json,
+          )
+          from shared_engines.ai.storage import (
+              SQLiteAIStore,
+          )
 
 
           def make_request() -> AIRequest:
-              from decimal import Decimal
-
               return AIRequest(
-                  schema_version=1,
+                  schema_version=2,
                   request_id="r1",
                   idempotency_key="storage-key",
                   model_id="model",
@@ -3672,12 +4805,10 @@ jobs:
               )
 
 
-          def request_hash(request: AIRequest) -> str:
+          def request_hash(
+              request: AIRequest,
+          ) -> str:
               import hashlib
-
-              from shared_engines.ai.serialization import (
-                  canonical_json,
-              )
 
               return hashlib.sha256(
                   canonical_json(
@@ -3685,7 +4816,9 @@ jobs:
                           "schema_version": (
                               request.schema_version
                           ),
-                          "model_id": request.model_id,
+                          "model_id": (
+                              request.model_id
+                          ),
                           "prompt": request.prompt,
                           "system_prompt": (
                               request.system_prompt
@@ -3707,7 +4840,9 @@ jobs:
               ).hexdigest()
 
 
-          def make_store(path: Path):
+          def make_store(
+              path: Path,
+          ) -> SQLiteAIStore:
               return SQLiteAIStore(
                   path,
                   encryption_key=(
@@ -3717,7 +4852,9 @@ jobs:
               )
 
 
-          def test_lease_conflict(tmp_path: Path):
+          def test_lease_conflict(
+              tmp_path: Path,
+          ) -> None:
               store = make_store(
                   tmp_path / "lease.db"
               )
@@ -3748,65 +4885,104 @@ jobs:
                   )
           PY
 
+          cat > shared_engines/ai/providers/__init__.py <<'PY'
+          """
+          Provider namespace.
+
+          Concrete providers may be placed here as independent adapters.
+          """
+          PY
+
+          cat > shared_engines/ai/persistence/__init__.py <<'PY'
+          """
+          Persistence namespace.
+
+          SQLite is the local durable adapter. Distributed repositories
+          belong to infrastructure-level implementations.
+          """
+          PY
+
           cat > shared_engines/ai/README.md <<'MD'
           # ZYRA Shared AI Engine
 
-          Production-oriented shared AI orchestration layer.
+          Long-lived production-oriented AI orchestration boundary.
 
-          ## Core durability
+          ## Guarantees
 
-          - explicit schema versioning
-          - migration checksums
-          - SQLite WAL
-          - FULL synchronous persistence
-          - transactional state transitions
+          - immutable public contracts
+          - explicit schema version
+          - deterministic request hashing
           - durable idempotency
-          - lease ownership
+          - crash-safe leases
           - fencing tokens
-          - crash recovery
           - recovery-required state
-          - encrypted request storage
-          - authenticated response persistence
+          - AES-256-GCM authenticated encryption
+          - encryption key version metadata
           - transactional outbox
           - inbox deduplication
           - tamper-evident audit chain
-
-          ## Execution safety
-
-          - immutable contracts
-          - strict input validation
-          - bounded provider retries
+          - audit checkpoints
+          - SQLite WAL
+          - FULL synchronous persistence
+          - migration checksums
+          - online database backup
+          - backup integrity verification
+          - bounded concurrency
           - request deadlines
-          - circuit breakers
-          - provider isolation
+          - bounded provider retries
+          - provider circuit breakers
           - model capability validation
-          - bounded cost accounting
-          - concurrent request deduplication
-          - provider idempotency keys
+          - cost and token budgets
+          - explicit observability boundary
+          - provider isolation
 
-          ## Architectural rule
+          ## Critical durability rule
 
-          `shared_engines/ai` must never depend on `apps/`.
+          A network request to an external AI provider can have an
+          uncertain result.
 
-          Application modules consume this engine.
+          The engine therefore does not blindly repeat an uncertain
+          external operation.
 
-          The engine does not consume application modules.
+          Provider calls receive the same idempotency key used by the
+          durable request record.
 
-          ## Long-term evolution
+          If the local process loses certainty about the external
+          operation, the request can enter `recovery_required`.
 
-          This subsystem is designed as a durable foundation rather than a
-          short-lived implementation.
+          ## Persistence boundary
 
-          Distributed high availability is intentionally not simulated with
-          local SQLite. A future infrastructure adapter can replace the
-          local persistence layer while preserving the public engine
-          contracts.
+          SQLite is a real durable local persistence adapter.
 
-          Twenty years cannot be guaranteed by source code. The architecture
-          instead prioritizes stable contracts, explicit migrations,
-          deterministic identity, recoverability, auditability and adapter
-          boundaries so the subsystem can evolve for many years without
-          requiring a rewrite of its public contract.
+          It is not presented as a distributed database.
+
+          Distributed HA, consensus, leader election and multi-region
+          storage belong to an infrastructure repository implementation
+          that can preserve the same engine contracts.
+
+          ## Security boundary
+
+          Secrets and encryption keys are deployment concerns.
+
+          This package does not persist provider API keys.
+
+          Production deployments should replace the static key provider
+          with a KMS/HSM-backed adapter.
+
+          ## Evolution
+
+          The public engine is deliberately separated from applications
+          and infrastructure implementations.
+
+          Schema versions, migration checksums, immutable contracts,
+          provider adapters, persistence adapters and event boundaries
+          allow the subsystem to evolve without forcing application
+          rewrites.
+
+          No source code can honestly guarantee that software will remain
+          unchanged for twenty years. The objective here is a durable
+          architecture capable of long-term evolution and controlled
+          replacement of infrastructure components.
           MD
 
       - name: Compile
@@ -3855,6 +5031,19 @@ jobs:
             '(^|[[:space:]])from[[:space:]]+apps(\.|[[:space:]])|(^|[[:space:]])import[[:space:]]+apps(\.|[[:space:]])' \
             shared_engines/ai; then
             echo "shared_engines/ai cannot depend on apps/."
+            exit 1
+          fi
+
+      - name: Verify no secrets in source
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          if grep -RInE \
+            --include='*.py' \
+            'sk-[A-Za-z0-9]{20,}|AKIA[0-9A-Z]{16}|-----BEGIN (RSA |EC |OPENSSH )?PRIVATE KEY-----' \
+            shared_engines/ai; then
+            echo "Possible credential detected in source."
             exit 1
           fi
 
@@ -3910,19 +5099,26 @@ jobs:
             shared_engines/ai/serialization.py
             shared_engines/ai/codec.py
             shared_engines/ai/crypto.py
+            shared_engines/ai/security/__init__.py
+            shared_engines/ai/security/keys.py
+            shared_engines/ai/security/crypto.py
             shared_engines/ai/registry.py
             shared_engines/ai/providers.py
+            shared_engines/ai/providers/__init__.py
             shared_engines/ai/http_provider.py
             shared_engines/ai/circuit.py
-            shared_engines/ai/retry.py
+            shared_engines/ai/limiter.py
             shared_engines/ai/budget.py
             shared_engines/ai/policy.py
+            shared_engines/ai/observability.py
+            shared_engines/ai/persistence/__init__.py
             shared_engines/ai/storage.py
             shared_engines/ai/engine.py
             shared_engines/ai/tests/__init__.py
             shared_engines/ai/tests/test_ai_engine.py
             shared_engines/ai/tests/test_validation.py
             shared_engines/ai/tests/test_storage.py
+            shared_engines/ai/README.md
           )
 
           for file in "${required[@]}"; do
@@ -3968,6 +5164,7 @@ jobs:
       - name: Git integrity
         run: |
           set -euo pipefail
+
           git diff --check
           git status --short
 
@@ -4015,7 +5212,7 @@ jobs:
           git commit \
             -m "feat(shared-engines): strengthen production AI engine"
 
-      - name: Verify staged scope
+      - name: Verify committed scope
         shell: bash
         run: |
           set -euo pipefail

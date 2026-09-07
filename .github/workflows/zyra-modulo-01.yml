@@ -1,4 +1,4 @@
-name: zyra-modulo-03-events
+name: zyra-modulo-04-trust
 
 "on":
   workflow_dispatch:
@@ -9,13 +9,13 @@ permissions:
   contents: write
 
 concurrency:
-  group: zyra-modulo-03-${{ github.ref }}
+  group: zyra-modulo-04-${{ github.ref }}
   cancel-in-progress: false
 
 jobs:
   build:
     runs-on: ubuntu-latest
-    timeout-minutes: 15
+    timeout-minutes: 20
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -29,500 +29,1208 @@ jobs:
         run: |
           set -euo pipefail
           python -m pip install --upgrade pip
-          python -m pip install "flake8>=7,<8" "mypy>=1.10,<2" "pytest>=8,<9"
+          python -m pip install "cryptography>=42,<45" "flake8>=7,<8" "mypy>=1.10,<2" "pytest>=8,<9"
 
-      - name: Check modules 01+02 present
+      - name: Check modules 01+02+03 present
         run: |
           set -euo pipefail
           test -f shared_engines/common/errors.py
           test -f shared_engines/storage/database.py
-          echo "modules 01+02 present: OK"
+          test -f shared_engines/events/outbox.py
+          echo "modules 01+02+03 present: OK"
 
-      - name: Build shared_engines/events
+      - name: Build observability + audit + security
         run: |
           set -euo pipefail
-          mkdir -p shared_engines/events/tests
+          mkdir -p shared_engines/observability/tests shared_engines/audit/tests \
+            shared_engines/security/tests
 
-          cat > shared_engines/events/__init__.py <<'PYEOF'
-          """Versioned events, transactional outbox and consumer inbox."""
+          cat > shared_engines/observability/__init__.py <<'PYEOF'
+          """Shared observability: metrics backends and health checks."""
           from __future__ import annotations
 
-          from shared_engines.events.contracts import Event, EventCatalog
-          from shared_engines.events.inbox import Inbox
-          from shared_engines.events.outbox import Outbox
+          from shared_engines.observability.backend import (
+              CompositeMetrics,
+              InMemoryMetrics,
+              MetricsBackend,
+              NoopMetrics,
+              engine_logger,
+          )
+          from shared_engines.observability.health import (
+              ComponentHealth,
+              HealthCheck,
+              HealthRegistry,
+              HealthStatus,
+          )
 
-          __all__ = ["Event", "EventCatalog", "Inbox", "Outbox"]
+          __all__ = [
+              "ComponentHealth", "CompositeMetrics", "HealthCheck",
+              "HealthRegistry", "HealthStatus", "InMemoryMetrics",
+              "MetricsBackend", "NoopMetrics", "engine_logger",
+          ]
           PYEOF
 
-          cat > shared_engines/events/contracts.py <<'PYEOF'
-          """Versioned event contracts and the central catalog.
+          cat > shared_engines/observability/backend.py <<'PYEOF'
+          """Pluggable metrics and logging backends.
 
-          Every event carries: event_id, event_type, aggregate_id,
-          schema_version, envelope_version, timestamp, payload and a
-          stable fingerprint. Evolving an event means registering a new
-          schema_version, never mutating the old one.
+          Engines depend only on these protocols; OpenTelemetry or
+          Prometheus adapters plug in at the composition root without
+          touching domain code.
           """
           from __future__ import annotations
 
-          from collections.abc import Callable, Mapping
+          import logging
+          import threading
+          from collections.abc import Mapping, Sequence
+          from typing import Protocol
+
+          TagMap = Mapping[str, str] | None
+
+
+          class MetricsBackend(Protocol):
+              def increment(self, name: str, *, tags: TagMap = None) -> None:
+                  ...
+
+              def observe(self, name: str, value: float, *, tags: TagMap = None) -> None:
+                  ...
+
+
+          class NoopMetrics:
+              """Discards metrics; default when no backend is configured."""
+
+              def increment(self, name: str, *, tags: TagMap = None) -> None:
+                  return None
+
+              def observe(self, name: str, value: float, *, tags: TagMap = None) -> None:
+                  return None
+
+
+          class InMemoryMetrics:
+              """Thread-safe backend for tests and local introspection."""
+
+              def __init__(self) -> None:
+                  self._lock = threading.Lock()
+                  self._counters: dict[
+                      tuple[str, tuple[tuple[str, str], ...]], int
+                  ] = {}
+                  self._series: dict[str, list[float]] = {}
+
+              def increment(self, name: str, *, tags: TagMap = None) -> None:
+                  key = (name, tuple(sorted((tags or {}).items())))
+                  with self._lock:
+                      self._counters[key] = self._counters.get(key, 0) + 1
+
+              def observe(self, name: str, value: float, *, tags: TagMap = None) -> None:
+                  with self._lock:
+                      series = self._series.setdefault(name, [])
+                      series.append(value)
+
+              def counter_value(self, name: str, tags: TagMap = None) -> int:
+                  key = (name, tuple(sorted((tags or {}).items())))
+                  with self._lock:
+                      return self._counters.get(key, 0)
+
+              def values(self, name: str) -> tuple[float, ...]:
+                  with self._lock:
+                      return tuple(self._series.get(name, ()))
+
+
+          class CompositeMetrics:
+              """Fans out to several registered backends."""
+
+              def __init__(self, backends: Sequence[MetricsBackend]) -> None:
+                  self._backends = tuple(backends)
+
+              def increment(self, name: str, *, tags: TagMap = None) -> None:
+                  for backend in self._backends:
+                      backend.increment(name, tags=tags)
+
+              def observe(self, name: str, value: float, *, tags: TagMap = None) -> None:
+                  for backend in self._backends:
+                      backend.observe(name, value, tags=tags)
+
+
+          def engine_logger(engine: str) -> logging.Logger:
+              """Namespaced logger; call sites log ids and kinds only."""
+              return logging.getLogger(f"zyra.shared_engines.{engine}")
+          PYEOF
+
+          cat > shared_engines/observability/health.py <<'PYEOF'
+          """Health and readiness contracts.
+
+          Component statuses distinguish process health from dependency
+          availability. Overall status is the worst across registered
+          components; a crashed check reports unhealthy, never crashes
+          the registry.
+          """
+          from __future__ import annotations
+
           from dataclasses import dataclass
+          from enum import Enum
+          from typing import Protocol
 
-          from shared_engines.common.clocks import Clock
-          from shared_engines.common.errors import (
-              ConfigurationError,
-              UnsupportedVersionError,
-              ValidationError,
-          )
-          from shared_engines.common.identifiers import new_id, stable_hash
-          from shared_engines.common.serialization import canonical_json_dumps
+          from shared_engines.common.errors import ConfigurationError
 
-          EVENT_ENVELOPE_VERSION = 1
-          PayloadValidator = Callable[[Mapping[str, object]], None]
+
+          class HealthStatus(Enum):
+              HEALTHY = "healthy"
+              DEGRADED = "degraded"
+              UNHEALTHY = "unhealthy"
 
 
           @dataclass(frozen=True)
-          class Event:
-              event_id: str
-              event_type: str
-              aggregate_id: str
-              schema_version: int
-              envelope_version: int
-              timestamp: float
-              payload: Mapping[str, object]
-              fingerprint: str
+          class ComponentHealth:
+              component: str
+              status: HealthStatus
+              detail: str
 
 
-          def _default_validator(payload: Mapping[str, object]) -> None:
-              if not isinstance(payload, dict):
-                  raise ValidationError("event payload must be a mapping")
+          class HealthCheck(Protocol):
+              def check_health(self) -> ComponentHealth:
+                  ...
 
 
-          class EventCatalog:
-              """Central registry: type -> version -> validator.
+          _SEVERITY: dict[HealthStatus, int] = {
+              HealthStatus.HEALTHY: 0,
+              HealthStatus.DEGRADED: 1,
+              HealthStatus.UNHEALTHY: 2,
+          }
 
-              Registering the same type and version twice is an
-              idempotent no-op so several engines can share one catalog.
-              """
 
+          class HealthRegistry:
               def __init__(self) -> None:
-                  self._schemas: dict[str, dict[int, PayloadValidator]] = {}
+                  self._checks: dict[str, HealthCheck] = {}
 
-              def register(
-                  self,
-                  event_type: str,
-                  *,
-                  schema_version: int = 1,
-                  validator: PayloadValidator | None = None,
-              ) -> None:
-                  if not event_type:
-                      raise ConfigurationError("event_type must be non-empty")
-                  if schema_version <= 0:
-                      raise ConfigurationError("schema_version must be positive")
-                  validators = self._schemas.setdefault(event_type, {})
-                  if schema_version in validators:
-                      return
-                  validators[schema_version] = validator or _default_validator
-
-              def build(
-                  self,
-                  event_type: str,
-                  *,
-                  aggregate_id: str,
-                  payload: Mapping[str, object],
-                  clock: Clock,
-                  schema_version: int | None = None,
-              ) -> Event:
-                  versions = self._schemas.get(event_type)
-                  if not versions:
-                      raise ValidationError(
-                          f"event type not registered: {event_type}"
+              def register(self, name: str, check: HealthCheck) -> None:
+                  if name in self._checks:
+                      raise ConfigurationError(
+                          f"health check already registered: {name}"
                       )
-                  version = (
-                      schema_version if schema_version is not None else max(versions)
-                  )
-                  validator = versions.get(version)
-                  if validator is None:
-                      raise UnsupportedVersionError(
-                          f"unsupported version {version} for {event_type}"
-                      )
-                  validator(payload)
-                  fingerprint = stable_hash(
-                      event_type,
-                      aggregate_id,
-                      str(version),
-                      canonical_json_dumps(dict(payload)),
-                  )
-                  return Event(
-                      event_id=new_id(),
-                      event_type=event_type,
-                      aggregate_id=aggregate_id,
-                      schema_version=version,
-                      envelope_version=EVENT_ENVELOPE_VERSION,
-                      timestamp=clock.now(),
-                      payload=dict(payload),
-                      fingerprint=fingerprint,
-                  )
+                  self._checks[name] = check
 
-              @property
-              def registered_types(self) -> tuple[str, ...]:
-                  return tuple(sorted(self._schemas))
-          PYEOF
-
-          cat > shared_engines/events/outbox.py <<'PYEOF'
-          """Transactional outbox with at-least-once dispatch.
-
-          ``enqueue_in_transaction`` runs inside the SAME transaction as
-          the state change; delivery happens afterwards. A crash between
-          handler and mark causes redelivery; consumers suppress
-          duplicates via the Inbox.
-          """
-          from __future__ import annotations
-
-          import sqlite3
-          from collections.abc import Callable
-
-          from shared_engines.common.clocks import Clock
-          from shared_engines.common.serialization import (
-              canonical_json_dumps,
-              canonical_json_loads,
-          )
-          from shared_engines.events.contracts import Event
-          from shared_engines.storage.database import Database
-          from shared_engines.storage.migrations import Migration, MigrationRunner
-
-          MIGRATIONS = (
-              Migration(
-                  1,
-                  "events_outbox",
-                  (
-                      "CREATE TABLE events_outbox ("
-                      " event_id TEXT PRIMARY KEY,"
-                      " event_type TEXT NOT NULL,"
-                      " aggregate_id TEXT NOT NULL,"
-                      " schema_version INTEGER NOT NULL,"
-                      " envelope_version INTEGER NOT NULL,"
-                      " created_at REAL NOT NULL,"
-                      " payload TEXT NOT NULL,"
-                      " fingerprint TEXT NOT NULL,"
-                      " published_at REAL)",
-                      "CREATE INDEX events_outbox_pending"
-                      " ON events_outbox (published_at, created_at)",
-                  ),
-              ),
-          )
-
-
-          class Outbox:
-              """Persists events atomically with the state producing them."""
-
-              def __init__(self, db: Database, clock: Clock) -> None:
-                  self._db = db
-                  self._clock = clock
-
-              def ensure_schema(self) -> None:
-                  MigrationRunner(self._db, "events.outbox", MIGRATIONS).run(
-                      self._clock
-                  )
-
-              def enqueue_in_transaction(
-                  self, cursor: sqlite3.Cursor, event: Event
-              ) -> None:
-                  cursor.execute(
-                      "INSERT INTO events_outbox"
-                      " (event_id, event_type, aggregate_id, schema_version,"
-                      "  envelope_version, created_at, payload, fingerprint,"
-                      "  published_at)"
-                      " VALUES (?, ?, ?, ?, ?, ?, ?, ?, NULL)",
-                      (
-                          event.event_id,
-                          event.event_type,
-                          event.aggregate_id,
-                          event.schema_version,
-                          event.envelope_version,
-                          event.timestamp,
-                          canonical_json_dumps(dict(event.payload)),
-                          event.fingerprint,
-                      ),
-                  )
-
-              def enqueue(self, event: Event) -> None:
-                  with self._db.transaction() as cursor:
-                      self.enqueue_in_transaction(cursor, event)
-
-              def pending(self, limit: int = 100) -> tuple[Event, ...]:
-                  rows = self._db.query_all(
-                      "SELECT * FROM events_outbox WHERE published_at IS NULL"
-                      " ORDER BY created_at, event_id LIMIT ?",
-                      (limit,),
-                  )
-                  return tuple(self._to_event(row) for row in rows)
-
-              def dispatch_pending(
-                  self,
-                  handler: Callable[[Event], None],
-                  *,
-                  batch_size: int = 100,
-              ) -> int:
-                  delivered = 0
-                  for event in self.pending(batch_size):
-                      handler(event)
-                      self._db.execute(
-                          "UPDATE events_outbox SET published_at = ?"
-                          " WHERE event_id = ? AND published_at IS NULL",
-                          (self._clock.now(), event.event_id),
-                      )
-                      delivered += 1
-                  return delivered
-
-              @staticmethod
-              def _to_event(row: sqlite3.Row) -> Event:
-                  return Event(
-                      event_id=str(row["event_id"]),
-                      event_type=str(row["event_type"]),
-                      aggregate_id=str(row["aggregate_id"]),
-                      schema_version=int(row["schema_version"]),
-                      envelope_version=int(row["envelope_version"]),
-                      timestamp=float(row["created_at"]),
-                      payload=canonical_json_loads(str(row["payload"])),
-                      fingerprint=str(row["fingerprint"]),
-                  )
-          PYEOF
-
-          cat > shared_engines/events/inbox.py <<'PYEOF'
-          """Consumer-side deduplication (inbox pattern).
-
-          ``process`` records the event and runs the handler inside ONE
-          transaction: the dedup record and the business effect commit
-          atomically, so at-least-once delivery never becomes a
-          duplicated effect.
-          """
-          from __future__ import annotations
-
-          import sqlite3
-          from collections.abc import Callable
-
-          from shared_engines.common.clocks import Clock
-          from shared_engines.events.contracts import Event
-          from shared_engines.storage.database import Database
-          from shared_engines.storage.migrations import Migration, MigrationRunner
-
-          MIGRATIONS = (
-              Migration(
-                  1,
-                  "events_inbox",
-                  (
-                      "CREATE TABLE events_inbox ("
-                      " event_id TEXT PRIMARY KEY,"
-                      " event_type TEXT NOT NULL,"
-                      " processed_at REAL NOT NULL)",
-                  ),
-              ),
-          )
-
-
-          class Inbox:
-              """Deduplicates deliveries: record and effect commit together."""
-
-              def __init__(self, db: Database, clock: Clock) -> None:
-                  self._db = db
-                  self._clock = clock
-                  MigrationRunner(db, "events.inbox", MIGRATIONS).run(clock)
-
-              def process(
-                  self, event: Event, handler: Callable[[Event], None]
-              ) -> bool:
-                  """Applies handler once per event_id; False for duplicates."""
-                  try:
-                      with self._db.transaction() as cursor:
-                          cursor.execute(
-                              "INSERT INTO events_inbox"
-                              " (event_id, event_type, processed_at)"
-                              " VALUES (?, ?, ?)",
-                              (
-                                  event.event_id,
-                                  event.event_type,
-                                  self._clock.now(),
-                              ),
+              def snapshot(self) -> tuple[ComponentHealth, ...]:
+                  results: list[ComponentHealth] = []
+                  for name, check in self._checks.items():
+                      try:
+                          results.append(check.check_health())
+                      except Exception as exc:
+                          results.append(
+                              ComponentHealth(
+                                  name,
+                                  HealthStatus.UNHEALTHY,
+                                  f"check crashed: {type(exc).__name__}",
+                              )
                           )
-                          handler(event)
-                  except sqlite3.IntegrityError:
-                      return False
-                  return True
+                  return tuple(results)
+
+              def overall(self) -> ComponentHealth:
+                  components = self.snapshot()
+                  if not components:
+                      return ComponentHealth(
+                          "overall",
+                          HealthStatus.UNHEALTHY,
+                          "no components registered",
+                      )
+                  worst = max(
+                      components, key=lambda c: _SEVERITY[c.status]
+                  )
+                  healthy = sum(
+                      1 for c in components if c.status is HealthStatus.HEALTHY
+                  )
+                  return ComponentHealth(
+                      "overall",
+                      worst.status,
+                      f"{healthy}/{len(components)} components healthy",
+                  )
           PYEOF
 
-          cat > shared_engines/events/tests/test_events.py <<'PYEOF'
+          cat > shared_engines/observability/tests/test_observability.py <<'PYEOF'
+          from __future__ import annotations
+
+          import pytest
+
+          from shared_engines.common.errors import ConfigurationError
+          from shared_engines.observability.backend import (
+              CompositeMetrics,
+              InMemoryMetrics,
+          )
+          from shared_engines.observability.health import (
+              ComponentHealth,
+              HealthRegistry,
+              HealthStatus,
+          )
+
+
+          class _Up:
+              def check_health(self) -> ComponentHealth:
+                  return ComponentHealth("up", HealthStatus.HEALTHY, "ok")
+
+
+          class _Degraded:
+              def check_health(self) -> ComponentHealth:
+                  return ComponentHealth("dep", HealthStatus.DEGRADED, "slow")
+
+
+          class _Broken:
+              def check_health(self) -> ComponentHealth:
+                  raise RuntimeError("boom")
+
+
+          def test_registry_aggregates_worst_status() -> None:
+              registry = HealthRegistry()
+              registry.register("a", _Up())
+              registry.register("b", _Broken())
+              overall = registry.overall()
+              assert overall.status is HealthStatus.UNHEALTHY
+              assert overall.detail == "1/2 components healthy"
+
+
+          def test_registry_reports_degraded_middle() -> None:
+              registry = HealthRegistry()
+              registry.register("a", _Up())
+              registry.register("b", _Degraded())
+              assert registry.overall().status is HealthStatus.DEGRADED
+
+
+          def test_duplicate_registration_rejected() -> None:
+              registry = HealthRegistry()
+              registry.register("a", _Up())
+              with pytest.raises(ConfigurationError):
+                  registry.register("a", _Up())
+
+
+          def test_metrics_record_and_fan_out() -> None:
+              memory = InMemoryMetrics()
+              composite = CompositeMetrics((memory,))
+              composite.increment("test.counter")
+              composite.increment("test.counter", tags={"r": "ok"})
+              composite.observe("latency", 0.25)
+              assert memory.counter_value("test.counter") == 1
+              assert memory.counter_value("test.counter", {"r": "ok"}) == 1
+              assert memory.values("latency") == (0.25,)
+          PYEOF
+
+          cat > shared_engines/audit/__init__.py <<'PYEOF'
+          """Shared audit capability: append-only hash chain."""
+          from __future__ import annotations
+
+          from shared_engines.audit.chain import AuditRecord, AuditTrail
+
+          __all__ = ["AuditRecord", "AuditTrail"]
+          PYEOF
+
+          cat > shared_engines/audit/chain.py <<'PYEOF'
+          """Append-only hash-chained audit trail with checkpoints.
+
+          Each record commits to the previous record's hash; any later
+          mutation breaks verification from that point. Checkpoints pin
+          (sequence, chain_hash) for external anchoring later. This
+          local chain is tamper-EVIDENT; it is not cryptographic proof
+          against an attacker with full database control.
+          """
           from __future__ import annotations
 
           from collections.abc import Mapping
+          from dataclasses import dataclass
+          from typing import Any
+
+          from shared_engines.common.clocks import Clock
+          from shared_engines.common.errors import IntegrityError, ValidationError
+          from shared_engines.common.identifiers import (
+              payload_fingerprint,
+              stable_hash,
+          )
+          from shared_engines.common.validation import require_non_empty_str
+          from shared_engines.storage.database import Database
+          from shared_engines.storage.migrations import Migration, MigrationRunner
+
+          GENESIS_HASH = "0" * 64
+
+          MIGRATIONS = (
+              Migration(
+                  1,
+                  "audit_chain",
+                  (
+                      "CREATE TABLE audit_records ("
+                      " sequence INTEGER PRIMARY KEY,"
+                      " timestamp REAL NOT NULL,"
+                      " event_type TEXT NOT NULL,"
+                      " actor TEXT NOT NULL,"
+                      " subject TEXT NOT NULL,"
+                      " payload_hash TEXT NOT NULL,"
+                      " previous_hash TEXT NOT NULL,"
+                      " record_hash TEXT NOT NULL)",
+                      "CREATE TABLE audit_checkpoints ("
+                      " sequence INTEGER PRIMARY KEY,"
+                      " chain_hash TEXT NOT NULL,"
+                      " checkpoint_hash TEXT NOT NULL,"
+                      " created_at REAL NOT NULL)",
+                  ),
+              ),
+          )
+
+
+          @dataclass(frozen=True)
+          class AuditRecord:
+              sequence: int
+              timestamp: float
+              event_type: str
+              actor: str
+              subject: str
+              payload_hash: str
+              previous_hash: str
+              record_hash: str
+
+
+          def _compute_record_hash(
+              sequence: int,
+              timestamp: float,
+              event_type: str,
+              actor: str,
+              subject: str,
+              payload_hash: str,
+              previous_hash: str,
+          ) -> str:
+              return stable_hash(
+                  str(sequence),
+                  f"{timestamp:.6f}",
+                  event_type,
+                  actor,
+                  subject,
+                  payload_hash,
+                  previous_hash,
+              )
+
+
+          class AuditTrail:
+              """Tamper-evident chain; checkpoints pin the chain head."""
+
+              def __init__(self, db: Database, clock: Clock) -> None:
+                  self._db = db
+                  self._clock = clock
+                  MigrationRunner(db, "audit", MIGRATIONS).run(clock)
+
+              def append(
+                  self,
+                  *,
+                  event_type: str,
+                  actor: str,
+                  subject: str,
+                  payload: Mapping[str, Any],
+              ) -> AuditRecord:
+                  require_non_empty_str(event_type, "event_type")
+                  require_non_empty_str(actor, "actor")
+                  require_non_empty_str(subject, "subject")
+                  payload_hash = payload_fingerprint(dict(payload))
+                  with self._db.transaction() as cursor:
+                      last: sqlite3_Row_or_None = cursor.execute(
+                          "SELECT sequence, record_hash FROM audit_records"
+                          " ORDER BY sequence DESC LIMIT 1"
+                      ).fetchone()
+                      sequence = int(last["sequence"]) + 1 if last is not None else 1
+                      previous_hash = (
+                          str(last["record_hash"])
+                          if last is not None
+                          else GENESIS_HASH
+                      )
+                      timestamp = self._clock.now()
+                      record_hash = _compute_record_hash(
+                          sequence,
+                          timestamp,
+                          event_type,
+                          actor,
+                          subject,
+                          payload_hash,
+                          previous_hash,
+                      )
+                      cursor.execute(
+                          "INSERT INTO audit_records"
+                          " (sequence, timestamp, event_type, actor, subject,"
+                          "  payload_hash, previous_hash, record_hash)"
+                          " VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+                          (
+                              sequence,
+                              timestamp,
+                              event_type,
+                              actor,
+                              subject,
+                              payload_hash,
+                              previous_hash,
+                              record_hash,
+                          ),
+                      )
+                  return AuditRecord(
+                      sequence=sequence,
+                      timestamp=timestamp,
+                      event_type=event_type,
+                      actor=actor,
+                      subject=subject,
+                      payload_hash=payload_hash,
+                      previous_hash=previous_hash,
+                      record_hash=record_hash,
+                  )
+
+              def verify(self) -> int:
+                  """Recomputes the whole chain; raises on any break."""
+                  previous = GENESIS_HASH
+                  count = 0
+                  for row in self._db.query_all(
+                      "SELECT * FROM audit_records ORDER BY sequence"
+                  ):
+                      expected_sequence = count + 1
+                      if int(row["sequence"]) != expected_sequence:
+                          raise IntegrityError(
+                              f"audit chain gap at sequence {expected_sequence}"
+                          )
+                      expected = _compute_record_hash(
+                          expected_sequence,
+                          float(row["timestamp"]),
+                          str(row["event_type"]),
+                          str(row["actor"]),
+                          str(row["subject"]),
+                          str(row["payload_hash"]),
+                          previous,
+                      )
+                      if str(row["previous_hash"]) != previous:
+                          raise IntegrityError(
+                              f"chain broken at sequence {expected_sequence}:"
+                              " previous hash mismatch"
+                          )
+                      if str(row["record_hash"]) != expected:
+                          raise IntegrityError(
+                              f"record modified at sequence {expected_sequence}"
+                          )
+                      previous = str(row["record_hash"])
+                      count = expected_sequence
+                  return count
+
+              def checkpoint(self) -> tuple[int, str]:
+                  count = self.verify()
+                  if count == 0:
+                      raise ValidationError(
+                          "cannot checkpoint an empty audit trail"
+                      )
+                  last = self._db.query_one(
+                      "SELECT sequence, record_hash FROM audit_records"
+                      " ORDER BY sequence DESC LIMIT 1"
+                  )
+                  if last is None:
+                      raise IntegrityError("audit trail vanished")
+                  sequence = int(last["sequence"])
+                  chain_hash = str(last["record_hash"])
+                  checkpoint_hash = stable_hash(
+                      "audit-checkpoint", str(sequence), chain_hash
+                  )
+                  self._db.execute(
+                      "INSERT INTO audit_checkpoints"
+                      " (sequence, chain_hash, checkpoint_hash, created_at)"
+                      " VALUES (?, ?, ?, ?)",
+                      (sequence, chain_hash, checkpoint_hash, self._clock.now()),
+                  )
+                  return sequence, checkpoint_hash
+
+              def verify_checkpoints(self) -> int:
+                  """Re-verifies the chain and every checkpoint binding."""
+                  self.verify()
+                  rows = self._db.query_all(
+                      "SELECT * FROM audit_checkpoints ORDER BY sequence"
+                  )
+                  for row in rows:
+                      sequence = int(row["sequence"])
+                      record = self._db.query_one(
+                          "SELECT record_hash FROM audit_records"
+                          " WHERE sequence = ?",
+                          (sequence,),
+                      )
+                      if record is None or str(record["record_hash"]) != str(
+                          row["chain_hash"]
+                      ):
+                          raise IntegrityError(
+                              f"checkpoint at {sequence} no longer matches chain"
+                          )
+                      expected = stable_hash(
+                          "audit-checkpoint", str(sequence), str(row["chain_hash"])
+                      )
+                      if expected != str(row["checkpoint_hash"]):
+                          raise IntegrityError(
+                              f"checkpoint modified at sequence {sequence}"
+                          )
+                  return len(rows)
+          PYEOF
+
+          cat > shared_engines/audit/tests/test_audit.py <<'PYEOF'
+          from __future__ import annotations
+
+          from concurrent.futures import ThreadPoolExecutor
           from pathlib import Path
 
           import pytest
 
+          from shared_engines.audit.chain import AuditTrail
           from shared_engines.common.clocks import FrozenClock
-          from shared_engines.common.errors import ValidationError
-          from shared_engines.events.contracts import Event, EventCatalog
-          from shared_engines.events.inbox import Inbox
-          from shared_engines.events.outbox import Outbox
+          from shared_engines.common.errors import IntegrityError, ValidationError
           from shared_engines.storage.database import SQLiteAdapter
 
 
-          class SimulatedCrash(Exception):
-              """Local failure to prove redelivery semantics."""
+          def _trail(tmp_path: Path) -> tuple[AuditTrail, SQLiteAdapter]:
+              db = SQLiteAdapter(tmp_path / "audit.db")
+              return AuditTrail(db, FrozenClock()), db
 
 
-          def _outbox(adapter: SQLiteAdapter) -> Outbox:
-              outbox = Outbox(adapter, FrozenClock())
-              outbox.ensure_schema()
-              return outbox
-
-
-          def _event(catalog: EventCatalog, clock: FrozenClock) -> Event:
-              return catalog.build(
-                  "test.ping", aggregate_id="agg-1", payload={"n": 1}, clock=clock
-              )
-
-
-          def test_outbox_dispatch_marks_published(tmp_path: Path) -> None:
-              adapter = SQLiteAdapter(tmp_path / "events.db")
-              catalog = EventCatalog()
-              catalog.register("test.ping")
-              outbox = _outbox(adapter)
-              event = _event(catalog, FrozenClock())
-              outbox.enqueue(event)
-              assert len(outbox.pending()) == 1
-              seen: list[str] = []
-
-              def collect(seen_event: Event) -> None:
-                  seen.append(seen_event.event_id)
-
-              assert outbox.dispatch_pending(collect) == 1
-              assert outbox.dispatch_pending(collect) == 0
-              assert seen == [event.event_id]
-              adapter.close()
-
-
-          def test_outbox_redelivers_on_handler_failure(tmp_path: Path) -> None:
-              adapter = SQLiteAdapter(tmp_path / "events.db")
-              catalog = EventCatalog()
-              catalog.register("test.ping")
-              outbox = _outbox(adapter)
-              outbox.enqueue(_event(catalog, FrozenClock()))
-
-              def failing(received: Event) -> None:
-                  raise SimulatedCrash("consumer crashed mid-dispatch")
-
-              with pytest.raises(SimulatedCrash):
-                  outbox.dispatch_pending(failing)
-              assert len(outbox.pending()) == 1
-              adapter.close()
-
-
-          def test_inbox_deduplicates_deliveries(tmp_path: Path) -> None:
-              adapter = SQLiteAdapter(tmp_path / "events.db")
-              clock = FrozenClock()
-              catalog = EventCatalog()
-              catalog.register("test.ping")
-              inbox = Inbox(adapter, clock)
-              event = _event(catalog, clock)
-              calls: list[int] = []
-
-              def handle(received: Event) -> None:
-                  calls.append(1)
-
-              assert inbox.process(event, handle) is True
-              assert inbox.process(event, handle) is False
-              assert calls == [1]
-              adapter.close()
-
-
-          def test_inbox_rolls_back_record_and_effect(tmp_path: Path) -> None:
-              adapter = SQLiteAdapter(tmp_path / "events.db")
-              clock = FrozenClock()
-              adapter.execute(
-                  "CREATE TABLE effects (event_id TEXT NOT NULL,"
-                  " applied_at REAL NOT NULL)"
-              )
-              inbox = Inbox(adapter, clock)
-              catalog = EventCatalog()
-              catalog.register("test.effect")
-              event = catalog.build(
-                  "test.effect", aggregate_id="agg", payload={}, clock=clock
-              )
-
-              def failing_effect(received: Event) -> None:
-                  adapter.execute(
-                      "INSERT INTO effects (event_id, applied_at) VALUES (?, ?)",
-                      (received.event_id, clock.now()),
+          def test_chain_verifies_and_detects_tampering(tmp_path: Path) -> None:
+              trail, db = _trail(tmp_path)
+              for index in range(3):
+                  trail.append(
+                      event_type="test.event",
+                      actor="tester",
+                      subject=f"s{index}",
+                      payload={"i": index},
                   )
-                  raise SimulatedCrash("effect crashed")
-
-              with pytest.raises(SimulatedCrash):
-                  inbox.process(event, failing_effect)
-              row = adapter.query_one("SELECT COUNT(*) AS n FROM effects")
-              assert row is not None
-              assert int(row["n"]) == 0
-              assert inbox.process(event, lambda e: None) is True
-              adapter.close()
-
-
-          def test_catalog_rejects_and_fingerprints_stable() -> None:
-              catalog = EventCatalog()
-              clock = FrozenClock()
-              with pytest.raises(ValidationError):
-                  _event(catalog, clock)
-              catalog.register("test.ping")
-              first = _event(catalog, clock)
-              second = _event(catalog, clock)
-              assert first.fingerprint == second.fingerprint
-              assert first.event_id != second.event_id
-              assert "test.ping" in catalog.registered_types
-
-
-          def test_catalog_versions_are_selectable() -> None:
-              catalog = EventCatalog()
-              clock = FrozenClock()
-
-              def v1_validator(payload: Mapping[str, object]) -> None:
-                  if "v1_field" not in payload:
-                      raise ValidationError("v1 requires v1_field")
-
-              def v2_validator(payload: Mapping[str, object]) -> None:
-                  if "v2_field" not in payload:
-                      raise ValidationError("v2 requires v2_field")
-
-              catalog.register("test.v", schema_version=1, validator=v1_validator)
-              catalog.register("test.v", schema_version=2, validator=v2_validator)
-              event_v2 = catalog.build(
-                  "test.v",
-                  aggregate_id="a",
-                  payload={"v2_field": 1},
-                  clock=clock,
+              assert trail.verify() == 3
+              db.execute(
+                  "UPDATE audit_records SET event_type = 'evil'"
+                  " WHERE sequence = 2"
               )
-              assert event_v2.schema_version == 2
-              event_v1 = catalog.build(
-                  "test.v",
-                  aggregate_id="a",
-                  payload={"v1_field": 1},
-                  clock=clock,
-                  schema_version=1,
-              )
-              assert event_v1.schema_version == 1
-              with pytest.raises(ValidationError):
-                  catalog.build(
-                      "test.v",
-                      aggregate_id="a",
-                      payload={"v2_field": 1},
-                      clock=clock,
-                      schema_version=1,
+              with pytest.raises(IntegrityError):
+                  trail.verify()
+              db.close()
+
+
+          def test_chain_detects_row_deletion(tmp_path: Path) -> None:
+              trail, db = _trail(tmp_path)
+              for index in range(3):
+                  trail.append(
+                      event_type="t", actor="a", subject=f"s{index}", payload={}
                   )
+              db.execute("DELETE FROM audit_records WHERE sequence = 2")
+              with pytest.raises(IntegrityError):
+                  trail.verify()
+              db.close()
+
+
+          def test_checkpoint_binds_chain(tmp_path: Path) -> None:
+              trail, db = _trail(tmp_path)
+              trail.append(event_type="t", actor="a", subject="s", payload={"n": 1})
+              sequence, checkpoint_hash = trail.checkpoint()
+              assert sequence == 1
+              assert len(checkpoint_hash) == 64
+              trail.append(event_type="t", actor="a", subject="s2", payload={})
+              assert trail.verify_checkpoints() == 1
+              db.execute(
+                  "UPDATE audit_records SET subject = 'rewritten'"
+                  " WHERE sequence = 1"
+              )
+              with pytest.raises(IntegrityError):
+                  trail.verify_checkpoints()
+              db.close()
+
+
+          def test_checkpoint_requires_records(tmp_path: Path) -> None:
+              trail, _ = _trail(tmp_path)
+              with pytest.raises(ValidationError):
+                  trail.checkpoint()
+
+
+          def test_chain_gap_free_under_concurrency(tmp_path: Path) -> None:
+              trail, db = _trail(tmp_path)
+
+              def write(index: int) -> None:
+                  trail.append(
+                      event_type="t",
+                      actor="worker",
+                      subject=f"s{index}",
+                      payload={"i": index},
+                  )
+
+              with ThreadPoolExecutor(max_workers=4) as pool:
+                  list(pool.map(write, range(24)))
+              assert trail.verify() == 24
+              db.close()
           PYEOF
 
-          echo "=== EVENTS BUILD OK ==="
+          cat > shared_engines/security/__init__.py <<'PYEOF'
+          """Security capability: envelope crypto, key providers, engine."""
+          from __future__ import annotations
 
-      - name: Quality gates (mypy first so errors are visible at top)
+          from shared_engines.security.crypto import EncryptedEnvelope, EnvelopeCrypto
+          from shared_engines.security.engine import SecurityEngine
+          from shared_engines.security.keys import (
+              EnvironmentKeyProvider,
+              KeyProvider,
+              StaticKeyProvider,
+              crypto_from_provider,
+          )
+
+          __all__ = [
+              "EncryptedEnvelope", "EnvelopeCrypto", "EnvironmentKeyProvider",
+              "KeyProvider", "SecurityEngine", "StaticKeyProvider",
+              "crypto_from_provider",
+          ]
+          PYEOF
+
+          cat > shared_engines/security/crypto.py <<'PYEOF'
+          """AES-256-GCM authenticated encryption with key versioning.
+
+          Sealed bytes are canonical JSON: format, key_version, nonce
+          and ciphertext (the 16-byte GCM tag is appended by AESGCM).
+          AAD binds an envelope to its storage context so captured bytes
+          cannot be replayed under another record. Keys live in memory
+          only and come from a KeyProvider; rotation adds versions, it
+          never rewrites the past.
+          """
+          from __future__ import annotations
+
+          import base64
+          import os
+          import threading
+          from collections.abc import Mapping
+          from dataclasses import dataclass
+
+          from cryptography.hazmat.primitives.ciphers.aead import AESGCM
+
+          from shared_engines.common.errors import (
+              ConfigurationError,
+              IntegrityError,
+              SerializationError,
+          )
+          from shared_engines.common.serialization import (
+              canonical_json_dumps,
+              canonical_json_loads,
+          )
+
+          KEY_SIZE_BYTES = 32
+          NONCE_SIZE_BYTES = 12
+          _ENVELOPE_FORMAT = "zyra.enc.v1"
+
+
+          @dataclass(frozen=True)
+          class EncryptedEnvelope:
+              key_version: int
+              nonce: bytes
+              ciphertext: bytes
+
+
+          class EnvelopeCrypto:
+              def __init__(
+                  self, keys: Mapping[int, bytes], current_version: int
+              ) -> None:
+                  if not keys:
+                      raise ConfigurationError("at least one key version required")
+                  clean: dict[int, bytes] = {}
+                  for version, key in keys.items():
+                      if not isinstance(version, int) or version <= 0:
+                          raise ConfigurationError(
+                              "key versions must be positive integers"
+                          )
+                      if len(key) != KEY_SIZE_BYTES:
+                          raise ConfigurationError(
+                              f"key v{version} must be {KEY_SIZE_BYTES} bytes"
+                          )
+                      clean[version] = bytes(key)
+                  if current_version not in clean:
+                      raise ConfigurationError(
+                          "current_version must be present in keys"
+                      )
+                  self._lock = threading.Lock()
+                  self._keys = clean
+                  self._current = current_version
+
+              @property
+              def current_version(self) -> int:
+                  with self._lock:
+                      return self._current
+
+              def encrypt(
+                  self,
+                  plaintext: bytes,
+                  *,
+                  aad: bytes = b"",
+                  key_version: int | None = None,
+              ) -> EncryptedEnvelope:
+                  with self._lock:
+                      version = (
+                          key_version if key_version is not None else self._current
+                      )
+                      key = self._keys.get(version)
+                  if key is None:
+                      raise ConfigurationError(
+                          f"no key configured for version {version}"
+                      )
+                  nonce = os.urandom(NONCE_SIZE_BYTES)
+                  ciphertext = AESGCM(key).encrypt(nonce, plaintext, aad)
+                  return EncryptedEnvelope(
+                      key_version=version, nonce=nonce, ciphertext=ciphertext
+                  )
+
+              def decrypt(
+                  self, envelope: EncryptedEnvelope, *, aad: bytes = b""
+              ) -> bytes:
+                  with self._lock:
+                      key = self._keys.get(envelope.key_version)
+                  if key is None:
+                      raise IntegrityError(
+                          "cannot decrypt: key version"
+                          f" {envelope.key_version} is unknown"
+                      )
+                  try:
+                      return AESGCM(key).decrypt(
+                          envelope.nonce, envelope.ciphertext, aad
+                      )
+                  except Exception as exc:
+                      raise IntegrityError(
+                          "decryption failed: wrong key, wrong AAD"
+                          " or tampered ciphertext"
+                      ) from exc
+
+              def rotate(self, new_version: int, new_key: bytes) -> None:
+                  if len(new_key) != KEY_SIZE_BYTES:
+                      raise ConfigurationError(
+                          f"new key must be {KEY_SIZE_BYTES} bytes"
+                      )
+                  with self._lock:
+                      if new_version in self._keys:
+                          raise ConfigurationError(
+                              f"key version {new_version} already exists"
+                          )
+                      self._keys[new_version] = bytes(new_key)
+                      self._current = new_version
+
+              def reseal(self, sealed: bytes, *, aad: bytes = b"") -> bytes:
+                  """Decrypts and re-encrypts to the current key version."""
+                  return self.seal(self.open(sealed, aad=aad), aad=aad)
+
+              def inspect_key_version(self, sealed: bytes) -> int:
+                  """Returns the key version without decrypting."""
+                  return self._parse_sealed(sealed).key_version
+
+              def seal(self, plaintext: bytes, *, aad: bytes = b"") -> bytes:
+                  envelope = self.encrypt(plaintext, aad=aad)
+                  token = canonical_json_dumps(
+                      {
+                          "format": _ENVELOPE_FORMAT,
+                          "key_version": envelope.key_version,
+                          "nonce": base64.b64encode(envelope.nonce).decode("ascii"),
+                          "ciphertext": base64.b64encode(
+                              envelope.ciphertext
+                          ).decode("ascii"),
+                      }
+                  )
+                  return token.encode("utf-8")
+
+              def open(self, sealed: bytes, *, aad: bytes = b"") -> bytes:
+                  envelope = self._parse_sealed(sealed)
+                  return self.decrypt(envelope, aad=aad)
+
+              @staticmethod
+              def _parse_sealed(sealed: bytes) -> EncryptedEnvelope:
+                  try:
+                      doc = canonical_json_loads(sealed.decode("utf-8"))
+                  except (UnicodeDecodeError, SerializationError) as exc:
+                      raise IntegrityError("sealed payload is not decodable") from exc
+                  if not isinstance(doc, dict) or doc.get("format") != _ENVELOPE_FORMAT:
+                      raise IntegrityError("unknown envelope format")
+                  try:
+                      return EncryptedEnvelope(
+                          key_version=int(doc["key_version"]),
+                          nonce=base64.b64decode(str(doc["nonce"]), validate=True),
+                          ciphertext=base64.b64decode(
+                              str(doc["ciphertext"]), validate=True
+                          ),
+                      )
+                  except (KeyError, TypeError, ValueError) as exc:
+                      raise IntegrityError("malformed sealed envelope") from exc
+          PYEOF
+
+          cat > shared_engines/security/keys.py <<'PYEOF'
+          """Key providers feeding ``EnvelopeCrypto`` from managed sources.
+
+          This is the KMS/HSM/secret-manager adapter point: implement
+          ``KeyProvider`` against the real service at the composition
+          root. Secrets are read at runtime and never logged or
+          persisted here.
+          """
+          from __future__ import annotations
+
+          import os
+          from collections.abc import Mapping
+          from typing import Protocol
+
+          from shared_engines.common.errors import ConfigurationError
+          from shared_engines.security.crypto import EnvelopeCrypto
+
+
+          class KeyProvider(Protocol):
+              def load_keys(self) -> Mapping[int, bytes]:
+                  ...
+
+              @property
+              def current_version(self) -> int:
+                  ...
+
+
+          class StaticKeyProvider:
+              """Explicit mapping; useful for tests and in-memory use."""
+
+              def __init__(
+                  self, keys: Mapping[int, bytes], current_version: int
+              ) -> None:
+                  self._keys = dict(keys)
+                  self._current = current_version
+
+              def load_keys(self) -> Mapping[int, bytes]:
+                  return dict(self._keys)
+
+              @property
+              def current_version(self) -> int:
+                  return self._current
+
+
+          class EnvironmentKeyProvider:
+              """Reads 32-byte hex keys from ``<prefix>_V<version>`` env
+              variables; ``<prefix>_CURRENT`` names the active version."""
+
+              def __init__(
+                  self,
+                  prefix: str = "ZYRA_MASTER_KEY",
+                  env: Mapping[str, str] | None = None,
+              ) -> None:
+                  self._prefix = prefix
+                  self._env = dict(os.environ if env is None else env)
+                  self._current: int | None = None
+
+              def load_keys(self) -> Mapping[int, bytes]:
+                  keys: dict[int, bytes] = {}
+                  prefix = f"{self._prefix}_V"
+                  for name, value in self._env.items():
+                      if not name.startswith(prefix):
+                          continue
+                      suffix = name[len(prefix):]
+                      if not suffix.isdigit():
+                          continue
+                      try:
+                          keys[int(suffix)] = bytes.fromhex(value)
+                      except ValueError as exc:
+                          raise ConfigurationError(
+                              f"key env var {name} is not valid hex"
+                          ) from exc
+                  if not keys:
+                      raise ConfigurationError(
+                          f"no keys configured via {self._prefix}_V<version>"
+                      )
+                  current_raw = self._env.get(f"{self._prefix}_CURRENT")
+                  if (
+                      current_raw is None
+                      or not current_raw.isdigit()
+                      or int(current_raw) not in keys
+                  ):
+                      raise ConfigurationError(
+                          f"{self._prefix}_CURRENT must name a configured version"
+                      )
+                  self._current = int(current_raw)
+                  return keys
+
+              @property
+              def current_version(self) -> int:
+                  if self._current is None:
+                      self.load_keys()
+                  if self._current is None:
+                      raise ConfigurationError("no current key version available")
+                  return self._current
+
+
+          def crypto_from_provider(provider: KeyProvider) -> EnvelopeCrypto:
+              keys = provider.load_keys()
+              return EnvelopeCrypto(keys, provider.current_version)
+          PYEOF
+
+          cat > shared_engines/security/engine.py <<'PYEOF'
+          """Security engine: sealed records, security events, rotation.
+
+          Every path exercises real infrastructure: writes go through
+          the audit hash chain, rotation publishes through the
+          transactional outbox, counters go through the metrics backend.
+          No secrets or plaintext are ever logged.
+          """
+          from __future__ import annotations
+
+          from shared_engines.audit.chain import AuditTrail
+          from shared_engines.common.clocks import Clock
+          from shared_engines.common.errors import IntegrityError
+          from shared_engines.common.validation import require_non_empty_str
+          from shared_engines.events.contracts import EventCatalog
+          from shared_engines.events.outbox import Outbox
+          from shared_engines.observability.backend import (
+              MetricsBackend,
+              NoopMetrics,
+              engine_logger,
+          )
+          from shared_engines.observability.health import (
+              ComponentHealth,
+              HealthStatus,
+          )
+          from shared_engines.security.crypto import EnvelopeCrypto
+          from shared_engines.storage.database import Database
+
+          SECURITY_EVENT_TYPES = (
+              "security.record.sealed",
+              "security.record.tamper_detected",
+              "security.key.rotated",
+          )
+
+
+          def register_security_events(catalog: EventCatalog) -> None:
+              for event_type in SECURITY_EVENT_TYPES:
+                  catalog.register(event_type)
+
+
+          class SecurityEngine:
+              def __init__(
+                  self,
+                  *,
+                  crypto: EnvelopeCrypto,
+                  audit: AuditTrail,
+                  db: Database,
+                  clock: Clock,
+                  metrics: MetricsBackend | None = None,
+              ) -> None:
+                  self._crypto = crypto
+                  self._audit = audit
+                  self._clock = clock
+                  self._metrics = metrics if metrics is not None else NoopMetrics()
+                  self._log = engine_logger("security")
+                  self._catalog = EventCatalog()
+                  register_security_events(self._catalog)
+                  self._outbox = Outbox(db, self._clock)
+                  self._outbox.ensure_schema()
+
+              def _aad(self, context: str) -> bytes:
+                  return f"security-record:{context}".encode("utf-8")
+
+              def seal_record(self, plaintext: bytes, *, context: str) -> str:
+                  require_non_empty_str(context, "context")
+                  sealed = self._crypto.seal(plaintext, aad=self._aad(context))
+                  self._audit.append(
+                      event_type="security.record.sealed",
+                      actor="security-engine",
+                      subject=context,
+                      payload={"key_version": self._crypto.current_version},
+                  )
+                  self._metrics.increment(
+                      "security.record.sealed", tags={"result": "ok"}
+                  )
+                  self._log.info(
+                      "sealed record subject=%s key_version=%d",
+                      context,
+                      self._crypto.current_version,
+                  )
+                  return sealed.decode("utf-8")
+
+              def open_record(self, sealed: str, *, context: str) -> bytes:
+                  require_non_empty_str(context, "context")
+                  try:
+                      return self._crypto.open(
+                          sealed.encode("utf-8"), aad=self._aad(context)
+                      )
+                  except IntegrityError:
+                      self._audit.append(
+                          event_type="security.record.tamper_detected",
+                          actor="security-engine",
+                          subject=context,
+                          payload={},
+                      )
+                      self._metrics.increment(
+                          "security.record.tamper_detected",
+                          tags={"context": context},
+                      )
+                      self._log.warning(
+                          "tamper detected on record subject=%s", context
+                      )
+                      raise
+
+              def rotate_key(self, new_version: int, new_key: bytes) -> None:
+                  self._crypto.rotate(new_version, new_key)
+                  self._audit.append(
+                      event_type="security.key.rotated",
+                      actor="security-engine",
+                      subject=f"key-v{new_version}",
+                      payload={"key_version": new_version},
+                  )
+                  event = self._catalog.build(
+                      "security.key.rotated",
+                      aggregate_id=f"key-v{new_version}",
+                      payload={"key_version": new_version},
+                      clock=self._clock,
+                  )
+                  self._outbox.enqueue(event)
+                  self._metrics.increment(
+                      "security.key.rotated",
+                      tags={"key_version": str(new_version)},
+                  )
+                  self._log.info("rotated key to version=%d", new_version)
+
+              def check_health(self) -> ComponentHealth:
+                  try:
+                      probe = b"healthcheck"
+                      sealed = self._crypto.seal(probe, aad=b"healthcheck-probe")
+                      ok = self._crypto.open(
+                          sealed, aad=b"healthcheck-probe"
+                      ) == probe
+                  except Exception:
+                      return ComponentHealth(
+                          "security",
+                          HealthStatus.UNHEALTHY,
+                          "crypto self-test failed",
+                      )
+                  status = HealthStatus.HEALTHY if ok else HealthStatus.UNHEALTHY
+                  return ComponentHealth("security", status, "crypto self-test")
+          PYEOF
+
+          cat > shared_engines/security/tests/test_security.py <<'PYEOF'
+          from __future__ import annotations
+
+          import os
+          from pathlib import Path
+
+          import pytest
+
+          from shared_engines.audit.chain import AuditTrail
+          from shared_engines.common.clocks import FrozenClock
+          from shared_engines.common.errors import ConfigurationError, IntegrityError
+          from shared_engines.events.contracts import Event
+          from shared_engines.events.outbox import Outbox
+          from shared_engines.observability.backend import InMemoryMetrics
+          from shared_engines.observability.health import HealthStatus
+          from shared_engines.security.crypto import EnvelopeCrypto
+          from shared_engines.security.engine import SecurityEngine
+          from shared_engines.security.keys import (
+              EnvironmentKeyProvider,
+              StaticKeyProvider,
+              crypto_from_provider,
+          )
+          from shared_engines.storage.database import SQLiteAdapter
+
+          KEY1 = os.urandom(32)
+          KEY2 = os.urandom(32)
+
+
+          def test_seal_open_roundtrip() -> None:
+              crypto = EnvelopeCrypto({1: KEY1}, 1)
+              sealed = crypto.seal(b"secret-payload", aad=b"context-1")
+              assert crypto.open(sealed, aad=b"context-1") == b"secret-payload"
+
+
+          def test_tampered_ciphertext_rejected() -> None:
+              crypto = EnvelopeCrypto({1: KEY1}, 1)
+              sealed = crypto.seal(b"secret", aad=b"ctx")
+              tampered = sealed[:-4] + b"AAAA"
+              with pytest.raises(IntegrityError):
+                  crypto.open(tampered, aad=b"ctx")
+
+
+          def test_wrong_aad_rejected() -> None:
+              crypto = EnvelopeCrypto({1: KEY1}, 1)
+              sealed = crypto.seal(b"secret", aad=b"ctx-a")
+              with pytest.raises(IntegrityError):
+                  crypto.open(sealed, aad=b"ctx-b")
+
+
+          def test_wrong_key_rejected() -> None:
+              sealed = EnvelopeCrypto({1: KEY1}, 1).seal(b"secret", aad=b"ctx")
+              other = EnvelopeCrypto({1: KEY2}, 1)
+              with pytest.raises(IntegrityError):
+                  other.open(sealed, aad=b"ctx")
+
+
+          def test_rotation_keeps_history_and_reseal_upgrades() -> None:
+              crypto = EnvelopeCrypto({1: KEY1}, 1)
+              sealed_v1 = crypto.seal(b"secret", aad=b"ctx")
+              assert crypto.inspect_key_version(sealed_v1) == 1
+              crypto.rotate(2, KEY2)
+              assert crypto.current_version == 2
+              assert crypto.open(sealed_v1, aad=b"ctx") == b"secret"
+              sealed_v2 = crypto.reseal(sealed_v1, aad=b"ctx")
+              assert crypto.inspect_key_version(sealed_v2) == 2
+              assert crypto.open(sealed_v2, aad=b"ctx") == b"secret"
+              with pytest.raises(ConfigurationError):
+                  crypto.rotate(2, KEY2)
+
+
+          def test_key_providers() -> None:
+              crypto = crypto_from_provider(StaticKeyProvider({1: KEY1}, 1))
+              sealed = crypto.seal(b"x", aad=b"a")
+              assert crypto.open(sealed, aad=b"a") == b"x"
+              env = {
+                  "ZYRA_MASTER_KEY_V1": KEY1.hex(),
+                  "ZYRA_MASTER_KEY_V2": KEY2.hex(),
+                  "ZYRA_MASTER_KEY_CURRENT": "2",
+              }
+              from_env = crypto_from_provider(EnvironmentKeyProvider(env=env))
+              assert from_env.current_version == 2
+              bad_current = {
+                  "ZYRA_MASTER_KEY_V1": KEY1.hex(),
+                  "ZYRA_MASTER_KEY_CURRENT": "9",
+              }
+              with pytest.raises(ConfigurationError):
+                  crypto_from_provider(EnvironmentKeyProvider(env=bad_current))
+              bad_hex = dict(env)
+              bad_hex["ZYRA_MASTER_KEY_V3"] = "not-hex"
+              with pytest.raises(ConfigurationError):
+                  crypto_from_provider(EnvironmentKeyProvider(env=bad_hex))
+
+
+          def test_security_engine_end_to_end(tmp_path: Path) -> None:
+              db = SQLiteAdapter(tmp_path / "sec.db")
+              clock = FrozenClock()
+              audit = AuditTrail(db, clock)
+              crypto = EnvelopeCrypto({1: KEY1}, 1)
+              metrics = InMemoryMetrics()
+              engine = SecurityEngine(
+                  crypto=crypto, audit=audit, db=db, clock=clock, metrics=metrics
+              )
+              sealed = engine.seal_record(b"payload-secret", context="vault-1")
+              assert engine.open_record(sealed, context="vault-1") == b"payload-secret"
+              with pytest.raises(IntegrityError):
+                  engine.open_record(sealed, context="vault-2")
+              engine.rotate_key(2, KEY2)
+              assert crypto.current_version == 2
+              assert metrics.counter_value("security.record.sealed") == 1
+              assert metrics.counter_value("security.record.tamper_detected") == 1
+              assert metrics.counter_value("security.key.rotated") == 1
+              assert audit.verify() == 3
+              outbox = Outbox(db, clock)
+              outbox.ensure_schema()
+              delivered: list[str] = []
+
+              def collect(event: Event) -> None:
+                  delivered.append(event.event_type)
+
+              assert outbox.dispatch_pending(collect) == 1
+              assert delivered == ["security.key.rotated"]
+              assert engine.check_health().status is HealthStatus.HEALTHY
+              db.close()
+          PYEOF
+
+          echo "=== TRUST BUILD OK ==="
+
+      - name: Fix placeholder token (replaced by typed fetchone below)
         run: |
           set -euo pipefail
-          M="shared_engines/common shared_engines/storage shared_engines/events"
+          python3 - <<'PYFIX'
+          from pathlib import Path
+          p = Path("shared_engines/audit/chain.py")
+          text = p.read_text(encoding="utf-8")
+          text = text.replace(
+              "                      last: sqlite3_Row_or_None = cursor.execute(",
+              "                      last: object | None = cursor.execute(",
+          )
+          p.write_text(text, encoding="utf-8")
+          print("chain.py fetchone annotation fixed")
+          PYFIX
+
+      - name: Quality gates (mypy first; full regression all modules)
+        run: |
+          set -euo pipefail
+          M="shared_engines/common shared_engines/storage shared_engines/events shared_engines/observability shared_engines/audit shared_engines/security"
           python -m compileall -q $M
           echo "compile OK"
           find $M -name '__pycache__' -type d -prune -exec rm -rf {} +
@@ -543,7 +1251,7 @@ jobs:
           if git diff --cached --quiet; then
             echo "No changes."
           else
-            git commit -m "zyra: module 03 events (catalog, outbox, inbox) + tests"
+            git commit -m "zyra: module 04 trust (observability, audit hash-chain, AES-256-GCM security) + tests"
             git push origin "HEAD:${{ github.ref_name }}"
           fi
-          echo "=== MODULE 03 EVENTS COMPLETE ==="
+          echo "=== MODULE 04 COMPLETE ==="

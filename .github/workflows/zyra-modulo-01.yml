@@ -1,4 +1,4 @@
-name: zyra-w12-engine-certification
+name: zyra-w13-engine-search
 
 "on":
   workflow_dispatch:
@@ -9,7 +9,7 @@ permissions:
   contents: write
 
 concurrency:
-  group: zyra-w12-${{ github.ref }}
+  group: zyra-w13-${{ github.ref }}
   cancel-in-progress: false
 
 jobs:
@@ -34,15 +34,15 @@ jobs:
       - name: Clean engine init (W391)
         run: |
           set -euo pipefail
-          f="shared_engines/certification/__init__.py"
+          f="shared_engines/search/__init__.py"
           [ -f "$f" ] && printf '"""ZYRA Network engine package."""\n' > "$f"
           echo "init cleaned"
 
-      - name: Fill certification engine (integration layer)
+      - name: Fill search engine (transversal authorized queries)
         run: |
           set -euo pipefail
-          cat > shared_engines/certification/errors.py <<'PYEOF'
-          """Typed certification errors."""
+          cat > shared_engines/search/errors.py <<'PYEOF'
+          """Typed search errors."""
           from __future__ import annotations
 
           from shared_engines.common.errors import (
@@ -50,311 +50,85 @@ jobs:
           )
 
 
-          class IssuerNotRegisteredError(EngineError):
-              """Entity is not an accredited certifier."""
+          class SearchNotAuthorizedError(EngineError):
+              """Querying app is not registered."""
 
 
-          class ScopeNotAuthorizedError(EngineError):
-              """Issuer lacks authority for this scope."""
-
-
-          class CertificateNotFoundError(EngineError):
-              """Unknown certificate id."""
-
-
-          class AlreadyRevokedError(EngineError):
-              """Certificate was already revoked."""
+          class UnknownSourceError(EngineError):
+              """Requested search source does not exist."""
           PYEOF
 
-          cat > shared_engines/certification/contracts.py <<'PYEOF'
-          """Certification contracts."""
+          cat > shared_engines/search/contracts.py <<'PYEOF'
+          """Search contracts."""
           from __future__ import annotations
 
           from dataclasses import dataclass
 
 
           @dataclass(frozen=True)
-          class IssuerRecord:
-              issuer_id: str
-              display_name: str
-              scopes: tuple[str, ...]
-              registered_at: float
-              active: bool
+          class SearchHit:
+              """One ranked result from one source."""
 
-
-          @dataclass(frozen=True)
-          class CertificateRecord:
-              certificate_id: str
-              subject_zid: str
-              issuer_id: str
-              scope: str
+              source: str
+              ref_id: str
               title: str
-              detail: str
-              evidence: tuple[str, ...]
-              credential_id: str
-              signature: bytes
-              public_pem: bytes
-              issued_at: float
-              valid_until: float | None
-              revoked: bool
-
-
-          @dataclass(frozen=True)
-          class CertificationVerdict:
-              """Evidence-backed certification answer."""
-
-              certificate_id: str
-              signature_valid: bool
-              within_validity: bool
-              issuer_authorized: bool
-              not_revoked: bool
-              valid: bool
-              credential_id: str
-              evidence: dict[str, object]
+              snippet: str
+              score: int
           PYEOF
 
-          cat > shared_engines/certification/registry.py <<'PYEOF'
-          """Accredited certifier registry: WHO may certify
-          WHAT. An issuer is a Network identity (ZID) formally
-          accredited for explicit certification scopes;
-          issuing outside accredited scopes is impossible by
-          construction."""
-          from __future__ import annotations
+          cat > shared_engines/search/engine.py <<'PYEOF'
+          """Search engine: the transversal query layer.
 
-          from shared_engines.common.clocks import Clock
-          from shared_engines.common.validation import (
-              require_non_empty_str,
-          )
-          from shared_engines.certification.contracts import (
-              IssuerRecord,
-          )
-          from shared_engines.storage.database import (
-              Database,
-          )
-          from shared_engines.storage.migrations import (
-              Migration,
-              MigrationRunner,
-          )
+          Composes EXISTING tables as sources - never
+          duplicating engines or creating parallel indexes:
 
-          _MIGRATIONS = (
-              Migration(
-                  1,
-                  "certification_issuers",
-                  (
-                      "CREATE TABLE"
-                      " certification_issuers ("
-                      " issuer_id TEXT PRIMARY KEY,"
-                      " display_name TEXT NOT NULL,"
-                      " scopes TEXT NOT NULL,"
-                      " registered_at REAL NOT NULL,"
-                      " active INTEGER NOT NULL"
-                      " DEFAULT 1)",
-                  ),
-              ),
-          )
+              identity    -> identities (display_name)
+              credential  -> credentials (title, not revoked)
+              document    -> sealed_documents (title)
+              certificate -> certificates (title, not revoked)
+              history     -> life_history_entries (payload)
 
+          Guarantees:
 
-          class IssuerRegistry:
-              """Durable accreditation of certifiers."""
+          - Authorized: only apps registered via
+            ProfileRegistry (app_registry) may search.
+          - Auditable: every query is written to the
+            durable search log, appended to the audit
+            chain and emitted as network.search.performed.
+          - Ranked: exact title match (3) > prefix (2) >
+            substring (1); stable tiebreak by title.
+          - Paginated with the existing common Page.
+          - Case-insensitive matching via lower() +
+            instr(); no LIKE escaping issues.
+          - Missing source tables are skipped, so the
+            engine works on partial deployments.
 
-              def __init__(
-                  self,
-                  db: Database,
-                  clock: Clock,
-              ) -> None:
-                  self._db = db
-                  self._clock = clock
-                  MigrationRunner(
-                      db,
-                      "certification.issuers",
-                      _MIGRATIONS,
-                  ).run(clock)
-
-              def register_issuer(
-                  self,
-                  *,
-                  issuer_id: str,
-                  display_name: str,
-                  scopes: tuple[str, ...],
-              ) -> IssuerRecord:
-                  require_non_empty_str(
-                      issuer_id, "issuer_id"
-                  )
-                  require_non_empty_str(
-                      display_name,
-                      "display_name",
-                  )
-                  clean: list[str] = []
-                  for scope in scopes:
-                      require_non_empty_str(
-                          scope, "scope"
-                      )
-                      if scope not in clean:
-                          clean.append(scope)
-                  if not clean:
-                      raise ValueError(
-                          "at least one scope"
-                          " required"
-                      )
-                  now = self._clock.now()
-                  with (
-                      self._db.transaction()
-                      as cursor
-                  ):
-                      cursor.execute(
-                          "INSERT INTO"
-                          " certification_issuers"
-                          " (issuer_id,"
-                          " display_name, scopes,"
-                          " registered_at, active)"
-                          " VALUES (?, ?, ?, ?, 1)"
-                          " ON CONFLICT(issuer_id)"
-                          " DO UPDATE SET"
-                          " display_name ="
-                          " excluded.display_name,"
-                          " scopes ="
-                          " excluded.scopes,"
-                          " active = 1",
-                          (
-                              issuer_id,
-                              display_name,
-                              ",".join(clean),
-                              now,
-                          ),
-                      )
-                  return IssuerRecord(
-                      issuer_id=issuer_id,
-                      display_name=(
-                          display_name
-                      ),
-                      scopes=tuple(clean),
-                      registered_at=now,
-                      active=True,
-                  )
-
-              def deactivate_issuer(
-                  self, issuer_id: str
-              ) -> None:
-                  require_non_empty_str(
-                      issuer_id, "issuer_id"
-                  )
-                  with (
-                      self._db.transaction()
-                      as cursor
-                  ):
-                      cursor.execute(
-                          "UPDATE"
-                          " certification_issuers"
-                          " SET active = 0"
-                          " WHERE issuer_id = ?",
-                          (issuer_id,),
-                      )
-
-              def get_issuer(
-                  self, issuer_id: str
-              ) -> IssuerRecord | None:
-                  row = self._db.query_one(
-                      "SELECT * FROM"
-                      " certification_issuers"
-                      " WHERE issuer_id = ?",
-                      (issuer_id,),
-                  )
-                  if row is None:
-                      return None
-                  return IssuerRecord(
-                      issuer_id=str(
-                          row["issuer_id"]
-                      ),
-                      display_name=str(
-                          row["display_name"]
-                      ),
-                      scopes=tuple(
-                          s
-                          for s in str(
-                              row["scopes"]
-                          ).split(",")
-                          if s
-                      ),
-                      registered_at=float(
-                          row["registered_at"]
-                      ),
-                      active=bool(
-                          int(row["active"])
-                      ),
-                  )
-
-              def has_scope(
-                  self,
-                  *,
-                  issuer_id: str,
-                  scope: str,
-              ) -> bool:
-                  issuer = self.get_issuer(
-                      issuer_id
-                  )
-                  if issuer is None:
-                      return False
-                  return (
-                      issuer.active
-                      and scope
-                      in issuer.scopes
-                  )
-          PYEOF
-
-          cat > shared_engines/certification/engine.py <<'PYEOF'
-          """Certification engine: the integration layer.
-
-          Composes EXISTING network capabilities into formal
-          certifications - never duplicating them:
-
-              IssuerRegistry     who may certify what (new)
-              IdentityEngine     subject + issuer exist (reuse)
-              CredentialRegistry durable credential per
-                                 certificate, revocable
-                                 (reuse, CERTIFICATION type)
-              Ed25519Signer      network-notarized signature
-                                 (reuse)
-
-          A certificate is a signed, durable, verifiable
-          statement bound to its underlying credential:
-          revoke certificate -> credential revoked too.
+          Transactions never nest: the log entry and
+          outbox event share one short transaction; the
+          audit append runs afterwards on its own.
           """
           from __future__ import annotations
 
           import hashlib
-          import json
           import sqlite3
 
           from shared_engines.audit.chain import AuditTrail
           from shared_engines.common.clocks import Clock
-          from shared_engines.common.errors import (
-              NotFoundError,
-          )
-          from shared_engines.common.identifiers import (
-              new_id,
-          )
+          from shared_engines.common.pagination import Page
           from shared_engines.common.serialization import (
               canonical_json_dumps,
           )
           from shared_engines.common.validation import (
+              require_int_range,
               require_non_empty_str,
           )
           from shared_engines.events.outbox import Outbox
-          from shared_engines.identity.engine import (
-              IdentityEngine,
+          from shared_engines.search.contracts import (
+              SearchHit,
           )
-          from shared_engines.certification.contracts import (
-              CertificateRecord,
-              CertificationVerdict,
-          )
-          from shared_engines.certification.errors import (
-              AlreadyRevokedError,
-              CertificateNotFoundError,
-              IssuerNotRegisteredError,
-              ScopeNotAuthorizedError,
-          )
-          from shared_engines.certification.registry import (
-              IssuerRegistry,
+          from shared_engines.search.errors import (
+              SearchNotAuthorizedError,
+              UnknownSourceError,
           )
           from shared_engines.storage.database import (
               Database,
@@ -363,144 +137,285 @@ jobs:
               Migration,
               MigrationRunner,
           )
-          from shared_engines.verification.credentials import (
-              CredentialRegistry,
-              CredentialType,
-          )
-          from shared_engines.verification.signatures import (
-              Ed25519Signer,
-              Ed25519Verifier,
+
+          EVENT_SEARCH_PERFORMED = (
+              "network.search.performed"
           )
 
-          EVENT_CERT_ISSUED = (
-              "certification.certificate.issued"
-          )
-          EVENT_CERT_REVOKED = (
-              "certification.certificate.revoked"
+          SOURCE_IDENTITY = "identity"
+          SOURCE_CREDENTIAL = "credential"
+          SOURCE_DOCUMENT = "document"
+          SOURCE_CERTIFICATE = "certificate"
+          SOURCE_HISTORY = "history"
+
+          ALL_SOURCES = (
+              SOURCE_IDENTITY,
+              SOURCE_CREDENTIAL,
+              SOURCE_DOCUMENT,
+              SOURCE_CERTIFICATE,
+              SOURCE_HISTORY,
           )
 
           _MIGRATIONS = (
               Migration(
                   1,
-                  "certificates",
+                  "search_log",
                   (
-                      "CREATE TABLE certificates ("
-                      " certificate_id TEXT"
-                      " PRIMARY KEY,"
-                      " subject_zid TEXT NOT NULL,"
-                      " issuer_id TEXT NOT NULL,"
-                      " scope TEXT NOT NULL,"
-                      " title TEXT NOT NULL,"
-                      " detail TEXT NOT NULL,"
-                      " evidence_json TEXT"
-                      " NOT NULL,"
-                      " content_sha TEXT NOT NULL,"
-                      " credential_id TEXT"
-                      " NOT NULL,"
-                      " signature BLOB NOT NULL,"
-                      " public_pem BLOB NOT NULL,"
-                      " issued_at REAL NOT NULL,"
-                      " valid_until REAL,"
-                      " revoked INTEGER NOT NULL"
-                      " DEFAULT 0,"
-                      " revoked_at REAL,"
-                      " revoked_reason TEXT)",
-                      "CREATE INDEX certs_subject"
-                      " ON certificates"
-                      " (subject_zid)",
-                      "CREATE INDEX certs_scope"
-                      " ON certificates (scope)",
+                      "CREATE TABLE search_log ("
+                      " search_id INTEGER PRIMARY KEY"
+                      " AUTOINCREMENT,"
+                      " app_id TEXT NOT NULL,"
+                      " query TEXT NOT NULL,"
+                      " sources TEXT NOT NULL,"
+                      " result_count INTEGER NOT NULL,"
+                      " performed_at REAL NOT NULL)",
                   ),
               ),
           )
 
+          _SOURCE_QUERIES: dict[str, str] = {
+              SOURCE_IDENTITY: (
+                  "SELECT zid AS ref_id,"
+                  " display_name AS title,"
+                  " display_name AS snippet"
+                  " FROM identities"
+                  " WHERE instr(lower(display_name),"
+                  " ?) > 0 LIMIT 500"
+              ),
+              SOURCE_CREDENTIAL: (
+                  "SELECT credential_id AS ref_id,"
+                  " title AS title,"
+                  " detail AS snippet"
+                  " FROM credentials"
+                  " WHERE revoked = 0"
+                  " AND instr(lower(title), ?) > 0"
+                  " LIMIT 500"
+              ),
+              SOURCE_DOCUMENT: (
+                  "SELECT document_id AS ref_id,"
+                  " title AS title,"
+                  " title AS snippet"
+                  " FROM sealed_documents"
+                  " WHERE instr(lower(title), ?)"
+                  " > 0 LIMIT 500"
+              ),
+              SOURCE_CERTIFICATE: (
+                  "SELECT certificate_id AS ref_id,"
+                  " title AS title,"
+                  " scope AS snippet"
+                  " FROM certificates"
+                  " WHERE revoked = 0"
+                  " AND instr(lower(title), ?) > 0"
+                  " LIMIT 500"
+              ),
+              SOURCE_HISTORY: (
+                  "SELECT zid || '#' || entry_seq"
+                  " AS ref_id,"
+                  " entry_type AS title,"
+                  " substr(payload, 1, 120)"
+                  " AS snippet"
+                  " FROM life_history_entries"
+                  " WHERE instr("
+                  " lower(payload), ?) > 0"
+                  " LIMIT 500"
+              ),
+          }
 
-          def _content_sha(
-              *,
-              title: str,
-              detail: str,
-              evidence: tuple[str, ...],
-              issued_at: float,
-              valid_until: float | None,
-          ) -> str:
-              src = canonical_json_dumps(
-                  {
-                      "title": title,
-                      "detail": detail,
-                      "evidence": list(evidence),
-                      "issued_at": issued_at,
-                      "valid_until": valid_until,
-                  }
-              )
-              return hashlib.sha256(
-                  src.encode("utf-8")
-              ).hexdigest()
+          _SOURCE_TABLES: dict[str, str] = {
+              SOURCE_IDENTITY: "identities",
+              SOURCE_CREDENTIAL: "credentials",
+              SOURCE_DOCUMENT: "sealed_documents",
+              SOURCE_CERTIFICATE: "certificates",
+              SOURCE_HISTORY: (
+                  "life_history_entries"
+              ),
+          }
 
 
-          def _sig_payload(
-              *,
-              certificate_id: str,
-              subject_zid: str,
-              issuer_id: str,
-              scope: str,
-              content_sha: str,
-          ) -> bytes:
-              return (
-                  f"CERT:{certificate_id}:"
-                  f"{subject_zid}:{issuer_id}:"
-                  f"{scope}:{content_sha}"
-              ).encode("utf-8")
-
-
-          class CertificationEngine:
-              """Formal certifications over existing
-              engines."""
+          class SearchEngine:
+              """Authorized, audited, ranked global
+              search over existing tables."""
 
               def __init__(
                   self,
                   db: Database,
                   clock: Clock,
                   *,
-                  issuers: IssuerRegistry,
-                  identity: IdentityEngine,
-                  credentials: CredentialRegistry,
-                  signer: Ed25519Signer,
                   audit: AuditTrail,
                   outbox: Outbox,
               ) -> None:
                   self._db = db
                   self._clock = clock
-                  self._issuers = issuers
-                  self._identity = identity
-                  self._credentials = (
-                      credentials
-                  )
-                  self._signer = signer
                   self._audit = audit
                   self._outbox = outbox
-                  self._public_pem = (
-                      signer.public_pem
-                  )
                   MigrationRunner(
-                      db,
-                      "certification.certs",
-                      _MIGRATIONS,
+                      db, "search", _MIGRATIONS
                   ).run(clock)
+
+              def _require_app(
+                  self, app_id: str
+              ) -> None:
+                  row = self._db.query_one(
+                      "SELECT 1 FROM app_registry"
+                      " WHERE app_id = ?",
+                      (app_id,),
+                  )
+                  if row is None:
+                      raise (
+                          SearchNotAuthorizedError(
+                              "app not registered:"
+                              f" {app_id}"
+                          )
+                      )
+
+              def _table_exists(
+                  self, table: str
+              ) -> bool:
+                  row = self._db.query_one(
+                      "SELECT 1 FROM sqlite_master"
+                      " WHERE type = 'table'"
+                      " AND name = ?",
+                      (table,),
+                  )
+                  return row is not None
+
+              def _score(
+                  self, title: str, q: str
+              ) -> int:
+                  t = title.lower()
+                  if t == q:
+                      return 3
+                  if t.startswith(q):
+                      return 2
+                  return 1
+
+              def search(
+                  self,
+                  *,
+                  app_id: str,
+                  query: str,
+                  sources: tuple[str, ...] | None = None,
+                  offset: int = 0,
+                  limit: int = 20,
+              ) -> Page[SearchHit]:
+                  """Global authorized search."""
+                  require_int_range(
+                      offset, "offset", 0, 10**12
+                  )
+                  require_int_range(
+                      limit, "limit", 1, 100
+                  )
+                  self._require_app(app_id)
+                  require_non_empty_str(
+                      query, "query"
+                  )
+                  q = query.strip().lower()
+                  if sources is None:
+                      chosen = ALL_SOURCES
+                  else:
+                      for s in sources:
+                          if s not in ALL_SOURCES:
+                              raise (
+                                  UnknownSourceError(
+                                      "unknown"
+                                      " source:"
+                                      f" {s}"
+                                  )
+                              )
+                      chosen = sources
+                  hits: list[SearchHit] = []
+                  for source in chosen:
+                      table = _SOURCE_TABLES[
+                          source
+                      ]
+                      if not self._table_exists(
+                          table
+                      ):
+                          continue
+                      rows = self._db.query_all(
+                          _SOURCE_QUERIES[source],
+                          (q,),
+                      )
+                      for row in rows:
+                          title = str(
+                              row["title"]
+                          )
+                          hits.append(
+                              SearchHit(
+                                  source=source,
+                                  ref_id=str(
+                                      row["ref_id"]
+                                  ),
+                                  title=title,
+                                  snippet=str(
+                                      row["snippet"]
+                                  ),
+                                  score=self._score(
+                                      title, q
+                                  ),
+                              )
+                          )
+                  hits.sort(
+                      key=lambda h: (
+                          -h.score,
+                          h.title,
+                          h.source,
+                          h.ref_id,
+                      )
+                  )
+                  total = len(hits)
+                  window = hits[
+                      offset : offset + limit
+                  ]
+                  with self._db.transaction() as cursor:
+                      cursor.execute(
+                          "INSERT INTO search_log"
+                          " (app_id, query, sources,"
+                          "  result_count,"
+                          "  performed_at)"
+                          " VALUES (?, ?, ?, ?, ?)",
+                          (
+                              app_id,
+                              q,
+                              ",".join(chosen),
+                              total,
+                              self._clock.now(),
+                          ),
+                      )
+                      self._emit(
+                          cursor,
+                          app_id=app_id,
+                          q=q,
+                          total=total,
+                      )
+                  self._audit.append(
+                      event_type=(
+                          EVENT_SEARCH_PERFORMED
+                      ),
+                      actor=app_id,
+                      subject=q,
+                      payload={"results": total},
+                  )
+                  return Page(
+                      items=tuple(window),
+                      offset=offset,
+                      limit=limit,
+                      total=total,
+                  )
 
               def _emit(
                   self,
                   cursor: sqlite3.Cursor,
                   *,
-                  event_type: str,
-                  aggregate: str,
-                  payload: dict[str, object],
+                  app_id: str,
+                  q: str,
+                  total: int,
               ) -> None:
                   event_id = hashlib.sha256(
                       canonical_json_dumps(
                           {
-                              "t": event_type,
-                              "a": aggregate,
-                              "p": payload,
+                              "a": app_id,
+                              "q": q,
                               "ts": self._clock.now(),
                           }
                       ).encode("utf-8")
@@ -509,7 +424,9 @@ jobs:
                       canonical_json_dumps(
                           {
                               "id": event_id,
-                              "ty": event_type,
+                              "ty": (
+                                  EVENT_SEARCH_PERFORMED
+                              ),
                           }
                       ).encode("utf-8")
                   ).hexdigest()
@@ -524,481 +441,40 @@ jobs:
                       " ?, NULL)",
                       (
                           event_id,
-                          event_type,
-                          aggregate,
+                          EVENT_SEARCH_PERFORMED,
+                          app_id,
                           self._clock.now(),
                           canonical_json_dumps(
-                              payload
+                              {
+                                  "query": q,
+                                  "results": total,
+                              }
                           ),
                           fp,
                       ),
                   )
 
-              def issue_certificate(
-                  self,
-                  *,
-                  subject_zid: str,
-                  issuer_id: str,
-                  scope: str,
-                  title: str,
-                  detail: str,
-                  evidence: tuple[str, ...] = (),
-                  valid_until: float | None = None,
-              ) -> CertificateRecord:
-                  """Accredited issuer certifies a
-                  subject. Refuses unregistered issuers,
-                  unauthorized scopes, unknown subjects.
-                  Always creates the underlying durable
-                  credential (integration, not
-                  duplication)."""
-                  require_non_empty_str(
-                      subject_zid, "subject_zid"
-                  )
-                  require_non_empty_str(
-                      issuer_id, "issuer_id"
-                  )
-                  require_non_empty_str(
-                      scope, "scope"
-                  )
-                  require_non_empty_str(
-                      title, "title"
-                  )
-                  issuer = (
-                      self._issuers.get_issuer(
-                          issuer_id
-                      )
-                  )
-                  if issuer is None:
-                      raise IssuerNotRegisteredError(
-                          "not an accredited"
-                          f" certifier: {issuer_id}"
-                      )
-                  if not issuer.active:
-                      raise IssuerNotRegisteredError(
-                          "certifier deactivated:"
-                          f" {issuer_id}"
-                      )
-                  if scope not in issuer.scopes:
-                      raise ScopeNotAuthorizedError(
-                          f"issuer {issuer_id} is"
-                          " not accredited for"
-                          f" scope '{scope}'"
-                      )
-                  self._identity.require_identity(
-                      subject_zid
-                  )
-                  self._identity.require_identity(
-                      issuer_id
-                  )
-                  now = self._clock.now()
-                  credential = (
-                      self._credentials.issue(
-                          subject_zid=subject_zid,
-                          issuer_zid=issuer_id,
-                          credential_type=(
-                              CredentialType
-                              .CERTIFICATION
-                          ),
-                          title=title,
-                          detail=detail,
-                          valid_from=now,
-                          valid_until=valid_until,
-                      )
-                  )
-                  certificate_id = (
-                      f"CRT-{new_id()}"
-                  )
-                  content_sha = _content_sha(
-                      title=title,
-                      detail=detail,
-                      evidence=evidence,
-                      issued_at=now,
-                      valid_until=valid_until,
-                  )
-                  signature = self._signer.sign(
-                      _sig_payload(
-                          certificate_id=(
-                              certificate_id
-                          ),
-                          subject_zid=subject_zid,
-                          issuer_id=issuer_id,
-                          scope=scope,
-                          content_sha=content_sha,
-                      )
-                  )
-                  with (
-                      self._db.transaction()
-                      as cursor
-                  ):
-                      cursor.execute(
-                          "INSERT INTO certificates"
-                          " (certificate_id,"
-                          " subject_zid, issuer_id,"
-                          " scope, title, detail,"
-                          " evidence_json,"
-                          " content_sha,"
-                          " credential_id,"
-                          " signature, public_pem,"
-                          " issued_at, valid_until)"
-                          " VALUES (?, ?, ?, ?, ?, ?,"
-                          " ?, ?, ?, ?, ?, ?, ?)",
-                          (
-                              certificate_id,
-                              subject_zid,
-                              issuer_id,
-                              scope,
-                              title,
-                              detail,
-                              canonical_json_dumps(
-                                  list(evidence)
-                              ),
-                              content_sha,
-                              credential.credential_id,
-                              signature,
-                              self._public_pem,
-                              now,
-                              valid_until,
-                          ),
-                      )
-                      self._emit(
-                          cursor,
-                          event_type=(
-                              EVENT_CERT_ISSUED
-                          ),
-                          aggregate=(
-                              certificate_id
-                          ),
-                          payload={
-                              "subject": (
-                                  subject_zid
-                              ),
-                              "issuer": issuer_id,
-                              "scope": scope,
-                          },
-                      )
-                  self._audit.append(
-                      event_type=EVENT_CERT_ISSUED,
-                      actor=issuer_id,
-                      subject=certificate_id,
-                      payload={
-                          "subject": subject_zid,
-                          "scope": scope,
-                      },
+              def search_log_count(self) -> int:
+                  row = self._db.query_one(
+                      "SELECT COUNT(*) AS n FROM"
+                      " search_log"
                   )
                   return (
-                      self.require_certificate(
-                          certificate_id=(
-                              certificate_id
-                          )
-                      )
-                  )
-
-              def _row_to_record(
-                  self, row: sqlite3.Row
-              ) -> CertificateRecord:
-                  raw_ev = row["evidence_json"]
-                  parsed = json.loads(str(raw_ev))
-                  ev_list = (
-                      [str(e) for e in parsed]
-                      if isinstance(parsed, list)
-                      else []
-                  )
-                  return CertificateRecord(
-                      certificate_id=str(
-                          row["certificate_id"]
-                      ),
-                      subject_zid=str(
-                          row["subject_zid"]
-                      ),
-                      issuer_id=str(
-                          row["issuer_id"]
-                      ),
-                      scope=str(row["scope"]),
-                      title=str(row["title"]),
-                      detail=str(
-                          row["detail"]
-                      ),
-                      evidence=tuple(ev_list),
-                      credential_id=str(
-                          row["credential_id"]
-                      ),
-                      signature=bytes(
-                          row["signature"]
-                      ),
-                      public_pem=bytes(
-                          row["public_pem"]
-                      ),
-                      issued_at=float(
-                          row["issued_at"]
-                      ),
-                      valid_until=(
-                          float(
-                              row["valid_until"]
-                          )
-                          if row["valid_until"]
-                          is not None
-                          else None
-                      ),
-                      revoked=bool(
-                          int(row["revoked"])
-                      ),
-                  )
-
-              def get_certificate(
-                  self,
-                  *,
-                  certificate_id: str,
-              ) -> CertificateRecord | None:
-                  row = self._db.query_one(
-                      "SELECT * FROM certificates"
-                      " WHERE certificate_id = ?",
-                      (certificate_id,),
-                  )
-                  if row is None:
-                      return None
-                  return self._row_to_record(
-                      row
-                  )
-
-              def require_certificate(
-                  self,
-                  *,
-                  certificate_id: str,
-              ) -> CertificateRecord:
-                  record = self.get_certificate(
-                      certificate_id=(
-                          certificate_id
-                      )
-                  )
-                  if record is None:
-                      raise (
-                          CertificateNotFoundError(
-                              "unknown certificate:"
-                              f" {certificate_id}"
-                          )
-                      )
-                  return record
-
-              def verify_certificate(
-                  self,
-                  *,
-                  certificate_id: str,
-              ) -> CertificationVerdict:
-                  """Full evidence-backed check:
-                  signature, validity window, issuer
-                  accreditation, revocation."""
-                  row = self._db.query_one(
-                      "SELECT * FROM certificates"
-                      " WHERE certificate_id = ?",
-                      (certificate_id,),
-                  )
-                  if row is None:
-                      raise NotFoundError(
-                          "unknown certificate:"
-                          f" {certificate_id}"
-                      )
-                  record = self._row_to_record(
-                      row
-                  )
-                  content_sha = _content_sha(
-                      title=record.title,
-                      detail=record.detail,
-                      evidence=record.evidence,
-                      issued_at=(
-                          record.issued_at
-                      ),
-                      valid_until=(
-                          record.valid_until
-                      ),
-                  )
-                  verifier = Ed25519Verifier(
-                      record.public_pem
-                  )
-                  signature_valid = (
-                      verifier.verify(
-                          _sig_payload(
-                              certificate_id=(
-                                  certificate_id
-                              ),
-                              subject_zid=(
-                                  record.subject_zid
-                              ),
-                              issuer_id=(
-                                  record.issuer_id
-                              ),
-                              scope=record.scope,
-                              content_sha=(
-                                  content_sha
-                              ),
-                          ),
-                          record.signature,
-                      )
-                  )
-                  now = self._clock.now()
-                  within = (
-                      record.valid_until is None
-                      or now <= record.valid_until
-                  )
-                  authorized = (
-                      self._issuers.has_scope(
-                          issuer_id=(
-                              record.issuer_id
-                          ),
-                          scope=record.scope,
-                      )
-                  )
-                  not_revoked = (
-                      not record.revoked
-                  )
-                  valid = (
-                      signature_valid
-                      and within
-                      and authorized
-                      and not_revoked
-                  )
-                  return CertificationVerdict(
-                      certificate_id=(
-                          certificate_id
-                      ),
-                      signature_valid=(
-                          signature_valid
-                      ),
-                      within_validity=within,
-                      issuer_authorized=(
-                          authorized
-                      ),
-                      not_revoked=not_revoked,
-                      valid=valid,
-                      credential_id=(
-                          record.credential_id
-                      ),
-                      evidence={
-                          "subject": (
-                              record.subject_zid
-                          ),
-                          "issuer": (
-                              record.issuer_id
-                          ),
-                          "scope": record.scope,
-                          "issued_at": (
-                              record.issued_at
-                          ),
-                          "valid_until": (
-                              record.valid_until
-                          ),
-                      },
-                  )
-
-              def revoke_certificate(
-                  self,
-                  *,
-                  certificate_id: str,
-                  revoked_by: str,
-                  reason: str,
-              ) -> CertificateRecord:
-                  """Revoke the certificate AND its
-                  underlying credential (cascade)."""
-                  record = (
-                      self.require_certificate(
-                          certificate_id=(
-                              certificate_id
-                          )
-                      )
-                  )
-                  if record.revoked:
-                      raise AlreadyRevokedError(
-                          "already revoked:"
-                          f" {certificate_id}"
-                      )
-                  now = self._clock.now()
-                  with (
-                      self._db.transaction()
-                      as cursor
-                  ):
-                      cursor.execute(
-                          "UPDATE certificates"
-                          " SET revoked = 1,"
-                          " revoked_at = ?,"
-                          " revoked_reason = ?"
-                          " WHERE certificate_id"
-                          " = ?",
-                          (
-                              now,
-                              reason,
-                              certificate_id,
-                          ),
-                      )
-                      self._emit(
-                          cursor,
-                          event_type=(
-                              EVENT_CERT_REVOKED
-                          ),
-                          aggregate=(
-                              certificate_id
-                          ),
-                          payload={
-                              "reason": reason
-                          },
-                      )
-                  self._credentials.revoke(
-                      record.credential_id,
-                      revoked_by=revoked_by,
-                      reason=reason,
-                  )
-                  self._audit.append(
-                      event_type=(
-                          EVENT_CERT_REVOKED
-                      ),
-                      actor=revoked_by,
-                      subject=certificate_id,
-                      payload={"reason": reason},
-                  )
-                  return (
-                      self.require_certificate(
-                          certificate_id=(
-                              certificate_id
-                          )
-                      )
-                  )
-
-              def list_by_subject(
-                  self, *, subject_zid: str
-              ) -> tuple[CertificateRecord, ...]:
-                  rows = self._db.query_all(
-                      "SELECT * FROM certificates"
-                      " WHERE subject_zid = ?"
-                      " ORDER BY issued_at",
-                      (subject_zid,),
-                  )
-                  return tuple(
-                      self._row_to_record(row)
-                      for row in rows
-                  )
-
-              def list_by_scope(
-                  self, *, scope: str
-              ) -> tuple[CertificateRecord, ...]:
-                  rows = self._db.query_all(
-                      "SELECT * FROM certificates"
-                      " WHERE scope = ?"
-                      " ORDER BY issued_at",
-                      (scope,),
-                  )
-                  return tuple(
-                      self._row_to_record(row)
-                      for row in rows
+                      int(row["n"])
+                      if row is not None
+                      else 0
                   )
           PYEOF
-          echo "=== CERTIFICATION ENGINE READY (integrated) ==="
+          echo "=== SEARCH ENGINE READY (transversal) ==="
 
-      - name: Certification proofs (4)
+      - name: Search proofs (4)
         run: |
           set -euo pipefail
-          mkdir -p shared_engines/certification/tests
-          cat > shared_engines/certification/tests/test_certification.py <<'PYEOF'
-          """Certification proofs: accredited issuance with
-          underlying credential, scope enforcement, expiry,
-          cascade revocation."""
+          mkdir -p shared_engines/search/tests
+          cat > shared_engines/search/tests/test_search.py <<'PYEOF'
+          """Search proofs: multi-source ranked results,
+          unauthorized apps refused, pagination via Page,
+          full auditability of every query."""
           from __future__ import annotations
 
           from pathlib import Path
@@ -1019,21 +495,32 @@ jobs:
           from shared_engines.identity.engine import (
               IdentityEngine,
           )
-          from shared_engines.certification.engine import (
-              CertificationEngine,
+          from shared_engines.integrity.engine import (
+              IntegrityEngine,
           )
-          from shared_engines.certification.errors import (
-              IssuerNotRegisteredError,
-              ScopeNotAuthorizedError,
+          from shared_engines.network.document_exchange import (
+              DocumentExchange,
           )
-          from shared_engines.certification.registry import (
-              IssuerRegistry,
+          from shared_engines.network.life_history import (
+              LifeHistory,
+          )
+          from shared_engines.network.portable_profile import (
+              ProfileRegistry,
+          )
+          from shared_engines.search.engine import SearchEngine
+          from shared_engines.search.errors import (
+              SearchNotAuthorizedError,
+              UnknownSourceError,
           )
           from shared_engines.storage.database import (
               SQLiteAdapter,
           )
+          from shared_engines.telemetry.collector import (
+              TelemetryCollector,
+          )
           from shared_engines.verification.credentials import (
               CredentialRegistry,
+              CredentialType,
           )
           from shared_engines.verification.signatures import (
               Ed25519Signer,
@@ -1061,12 +548,9 @@ jobs:
                       "identity.status_changed",
                       "verification.credential"
                       ".issued",
-                      "verification.credential"
-                      ".revoked",
-                      "certification.certificate"
-                      ".issued",
-                      "certification.certificate"
-                      ".revoked",
+                      "network.document.sealed",
+                      "network.history.appended",
+                      "network.search.performed",
                   ):
                       self.catalog.register(et)
                   self.identity = IdentityEngine(
@@ -1075,6 +559,12 @@ jobs:
                       audit=self.audit,
                       outbox=self.outbox,
                       catalog=self.catalog,
+                  )
+                  self.profiles = ProfileRegistry(
+                      self.db,
+                      self.clock,
+                      audit=self.audit,
+                      outbox=self.outbox,
                   )
                   self.credentials = (
                       CredentialRegistry(
@@ -1085,361 +575,248 @@ jobs:
                           self.catalog,
                       )
                   )
-                  self.issuers = IssuerRegistry(
+                  self.integrity = IntegrityEngine(
                       self.db, self.clock
                   )
                   signer, _ = (
                       Ed25519Signer.generate()
                   )
-                  self.certification = (
-                      CertificationEngine(
-                          self.db,
-                          self.clock,
-                          issuers=self.issuers,
-                          identity=self.identity,
-                          credentials=(
-                              self.credentials
-                          ),
-                          signer=signer,
-                          audit=self.audit,
-                          outbox=self.outbox,
-                      )
+                  self.exchange = DocumentExchange(
+                      self.db,
+                      self.clock,
+                      signer=signer,
+                      integrity=self.integrity,
+                      audit=self.audit,
+                      outbox=self.outbox,
+                  )
+                  self.history = LifeHistory(
+                      self.db,
+                      self.clock,
+                      audit=self.audit,
+                      outbox=self.outbox,
+                  )
+                  self.telemetry = TelemetryCollector(
+                      self.db, self.clock
+                  )
+                  self.search = SearchEngine(
+                      self.db,
+                      self.clock,
+                      audit=self.audit,
+                      outbox=self.outbox,
                   )
 
               def close(self) -> None:
                   self.db.close()
 
 
-          def test_accredited_issue_and_verify(
+          def test_multi_source_ranked_results(
               tmp_path: Path,
           ) -> None:
               net = _Net(tmp_path)
               try:
-                  uni = (
-                      net.identity.register_identity(
-                          kind=(
-                              IdentityKind
-                              .INSTITUTION
-                          ),
-                          display_name="Uni SV",
-                          actor="bootstrap",
-                      )
+                  net.profiles.register_app(
+                      app_id="portal",
+                      display_name="Portal",
+                      scopes=("display_name",),
                   )
-                  student = (
+                  person = (
                       net.identity.register_identity(
                           kind=(
                               IdentityKind.PERSON
                           ),
-                          display_name="maria",
-                          actor="bootstrap",
+                          display_name=(
+                              "Maria Lopez"
+                          ),
+                          actor="portal",
                       )
                   )
-                  net.issuers.register_issuer(
-                      issuer_id=uni.zid,
-                      display_name="Uni SV",
-                      scopes=(
-                          "education",
-                          "professional",
+                  net.credentials.issue(
+                      subject_zid=person.zid,
+                      issuer_zid=person.zid,
+                      credential_type=(
+                          CredentialType.REFERENCE
                       ),
+                      title=(
+                          "Referencia de"
+                          " Maria Lopez"
+                      ),
+                      detail="limpia",
                   )
-                  cert = (
-                      net.certification
-                      .issue_certificate(
-                          subject_zid=student.zid,
-                          issuer_id=uni.zid,
-                          scope="education",
+                  net.exchange.seal_document(
+                      owner_zid=person.zid,
+                      title=(
+                          "Contrato Maria Lopez"
+                      ),
+                      content=b"doc",
+                      actor_app="portal",
+                  )
+                  result = net.search.search(
+                      app_id="portal",
+                      query="maria lopez",
+                  )
+                  sources_found = {
+                      h.source
+                      for h in result.items
+                  }
+                  assert (
+                      "identity"
+                      in sources_found
+                  )
+                  assert (
+                      "credential"
+                      in sources_found
+                  )
+                  assert (
+                      "document"
+                      in sources_found
+                  )
+                  top = result.items[0]
+                  assert (
+                      top.source == "identity"
+                  )
+                  assert top.score == 3
+                  assert result.total >= 3
+              finally:
+                  net.close()
+
+
+          def test_unauthorized_and_unknown_source(
+              tmp_path: Path,
+          ) -> None:
+              net = _Net(tmp_path)
+              try:
+                  with pytest.raises(
+                      SearchNotAuthorizedError
+                  ):
+                      net.search.search(
+                          app_id="malware",
+                          query="x",
+                      )
+                  net.profiles.register_app(
+                      app_id="ok",
+                      display_name="OK",
+                      scopes=("display_name",),
+                  )
+                  with pytest.raises(
+                      UnknownSourceError
+                  ):
+                      net.search.search(
+                          app_id="ok",
+                          query="x",
+                          sources=("ghost",),
+                      )
+              finally:
+                  net.close()
+
+
+          def test_pagination_with_page(
+              tmp_path: Path,
+          ) -> None:
+              net = _Net(tmp_path)
+              try:
+                  net.profiles.register_app(
+                      app_id="portal",
+                      display_name="Portal",
+                      scopes=("display_name",),
+                  )
+                  owner = (
+                      net.identity.register_identity(
+                          kind=(
+                              IdentityKind.PERSON
+                          ),
+                          display_name="o",
+                          actor="portal",
+                      )
+                  )
+                  for i in range(5):
+                      net.exchange.seal_document(
+                          owner_zid=owner.zid,
                           title=(
-                              "Ingenieria en"
-                              " Informatica"
+                              f"Lote especial"
+                              f" {i}"
                           ),
-                          detail=(
-                              "Titulo registrado"
+                          content=(
+                              f"c{i}".encode()
                           ),
-                          evidence=(
-                              "doc-123",
-                              "record-456",
-                          ),
+                          actor_app="portal",
                       )
+                  page1 = net.search.search(
+                      app_id="portal",
+                      query="lote especial",
+                      offset=0,
+                      limit=2,
+                  )
+                  assert page1.total == 5
+                  assert len(page1.items) == 2
+                  assert (
+                      page1.has_more is True
                   )
                   assert (
-                      cert.credential_id != ""
+                      page1.next_offset == 2
                   )
-                  underlying = (
-                      net.credentials.get(
-                          cert.credential_id
-                      )
-                  )
-                  assert underlying is not None
-                  assert (
-                      underlying.revoked is False
-                  )
-                  verdict = (
-                      net.certification
-                      .verify_certificate(
-                          certificate_id=(
-                              cert.certificate_id
-                          )
-                      )
-                  )
-                  assert verdict.valid is True
-                  assert (
-                      verdict.signature_valid
-                      is True
+                  page3 = net.search.search(
+                      app_id="portal",
+                      query="lote especial",
+                      offset=4,
+                      limit=2,
                   )
                   assert (
-                      verdict.issuer_authorized
-                      is True
+                      len(page3.items) == 1
                   )
                   assert (
-                      verdict.credential_id
-                      == cert.credential_id
+                      page3.has_more is False
                   )
               finally:
                   net.close()
 
 
-          def test_unaccredited_or_scope_denied(
+          def test_every_query_audited(
               tmp_path: Path,
           ) -> None:
               net = _Net(tmp_path)
               try:
-                  stranger = (
-                      net.identity.register_identity(
-                          kind=(
-                              IdentityKind.PERSON
-                          ),
-                          display_name="x",
-                          actor="bootstrap",
-                      )
+                  net.profiles.register_app(
+                      app_id="portal",
+                      display_name="Portal",
+                      scopes=("display_name",),
                   )
-                  target = (
-                      net.identity.register_identity(
-                          kind=(
-                              IdentityKind.PERSON
-                          ),
-                          display_name="y",
-                          actor="bootstrap",
-                      )
+                  net.search.search(
+                      app_id="portal",
+                      query="algo",
                   )
-                  with pytest.raises(
-                      IssuerNotRegisteredError
-                  ):
-                      net.certification.issue_certificate(
-                          subject_zid=target.zid,
-                          issuer_id=stranger.zid,
-                          scope="education",
-                          title="fake",
-                          detail="fake",
-                      )
-                  uni = (
-                      net.identity.register_identity(
-                          kind=(
-                              IdentityKind
-                              .INSTITUTION
-                          ),
-                          display_name="Uni",
-                          actor="bootstrap",
-                      )
+                  net.search.search(
+                      app_id="portal",
+                      query="otro",
                   )
-                  net.issuers.register_issuer(
-                      issuer_id=uni.zid,
-                      display_name="Uni",
-                      scopes=("education",),
+                  assert (
+                      net.search
+                      .search_log_count()
+                      == 2
                   )
-                  with pytest.raises(
-                      ScopeNotAuthorizedError
-                  ):
-                      net.certification.issue_certificate(
-                          subject_zid=target.zid,
-                          issuer_id=uni.zid,
-                          scope="medical",
-                          title="fake",
-                          detail="fake",
-                      )
-              finally:
-                  net.close()
-
-
-          def test_expired_certificate_invalid(
-              tmp_path: Path,
-          ) -> None:
-              net = _Net(tmp_path)
-              try:
-                  uni = (
-                      net.identity.register_identity(
-                          kind=(
-                              IdentityKind
-                              .INSTITUTION
-                          ),
-                          display_name="Board",
-                          actor="bootstrap",
-                      )
+                  assert (
+                      net.audit.verify() >= 2
                   )
-                  pro = (
-                      net.identity.register_identity(
-                          kind=(
-                              IdentityKind.PERSON
-                          ),
-                          display_name="pro",
-                          actor="bootstrap",
-                      )
+                  net.telemetry.ingest_outbox(
+                      net.outbox
                   )
-                  net.issuers.register_issuer(
-                      issuer_id=uni.zid,
-                      display_name="Board",
-                      scopes=(
-                          "professional",
-                      ),
-                  )
-                  cert = (
-                      net.certification
-                      .issue_certificate(
-                          subject_zid=pro.zid,
-                          issuer_id=uni.zid,
-                          scope="professional",
-                          title="Licencia",
-                          detail="2026",
-                          valid_until=(
-                              net.clock.now()
-                              + 10.0
-                          ),
-                      )
-                  )
-                  early = (
-                      net.certification
-                      .verify_certificate(
-                          certificate_id=(
-                              cert.certificate_id
+                  events = (
+                      net.telemetry.query_events(
+                          event_type=(
+                              "network.search"
+                              ".performed"
                           )
                       )
                   )
-                  assert (
-                      early.within_validity
-                      is True
-                  )
-                  assert early.valid is True
-                  net.clock.advance(11)
-                  late = (
-                      net.certification
-                      .verify_certificate(
-                          certificate_id=(
-                              cert.certificate_id
-                          )
-                      )
-                  )
-                  assert (
-                      late.within_validity
-                      is False
-                  )
-                  assert (
-                      late.valid is False
-                  )
-              finally:
-                  net.close()
-
-
-          def test_revoke_cascades_to_credential(
-              tmp_path: Path,
-          ) -> None:
-              net = _Net(tmp_path)
-              try:
-                  uni = (
-                      net.identity.register_identity(
-                          kind=(
-                              IdentityKind
-                              .INSTITUTION
-                          ),
-                          display_name="Uni",
-                          actor="bootstrap",
-                      )
-                  )
-                  grad = (
-                      net.identity.register_identity(
-                          kind=(
-                              IdentityKind.PERSON
-                          ),
-                          display_name="g",
-                          actor="bootstrap",
-                      )
-                  )
-                  net.issuers.register_issuer(
-                      issuer_id=uni.zid,
-                      display_name="Uni",
-                      scopes=("education",),
-                  )
-                  cert = (
-                      net.certification
-                      .issue_certificate(
-                          subject_zid=grad.zid,
-                          issuer_id=uni.zid,
-                          scope="education",
-                          title="Diploma",
-                          detail="ok",
-                      )
-                  )
-                  before = (
-                      net.certification
-                      .verify_certificate(
-                          certificate_id=(
-                              cert.certificate_id
-                          )
-                      )
-                  )
-                  assert before.valid is True
-                  revoked = (
-                      net.certification
-                      .revoke_certificate(
-                          certificate_id=(
-                              cert.certificate_id
-                          ),
-                          revoked_by=uni.zid,
-                          reason="fraud detected",
-                      )
-                  )
-                  assert (
-                      revoked.revoked is True
-                  )
-                  after = (
-                      net.certification
-                      .verify_certificate(
-                          certificate_id=(
-                              cert.certificate_id
-                          )
-                      )
-                  )
-                  assert (
-                      after.valid is False
-                  )
-                  assert (
-                      after.not_revoked
-                      is False
-                  )
-                  underlying = (
-                      net.credentials.get(
-                          cert.credential_id
-                      )
-                  )
-                  assert underlying is not None
-                  assert (
-                      underlying.revoked is True
-                  )
-                  with pytest.raises(Exception):
-                      net.certification.revoke_certificate(
-                          certificate_id=(
-                              cert.certificate_id
-                          ),
-                          revoked_by=uni.zid,
-                          reason="again",
-                      )
+                  assert len(events) == 2
               finally:
                   net.close()
           PYEOF
-          echo "=== CERTIFICATION TESTS READY ==="
+          echo "=== SEARCH TESTS READY ==="
 
       - name: Quality gates (mypy first; full regression)
         run: |
           set -euo pipefail
-          M="shared_engines/common shared_engines/storage shared_engines/events shared_engines/observability shared_engines/audit shared_engines/security shared_engines/identity shared_engines/verification shared_engines/runtime shared_engines/tokenization shared_engines/currency shared_engines/verifier shared_engines/hardening shared_engines/authority shared_engines/network shared_engines/telemetry shared_engines/logs shared_engines/consensus shared_engines/integrity shared_engines/encryption shared_engines/certification"
+          M="shared_engines/common shared_engines/storage shared_engines/events shared_engines/observability shared_engines/audit shared_engines/security shared_engines/identity shared_engines/verification shared_engines/runtime shared_engines/tokenization shared_engines/currency shared_engines/verifier shared_engines/hardening shared_engines/authority shared_engines/network shared_engines/telemetry shared_engines/logs shared_engines/consensus shared_engines/integrity shared_engines/encryption shared_engines/certification shared_engines/search"
           python -m compileall -q $M main.py scripts shared_engines/tests
           echo "compile OK"
           find $M scripts -name '__pycache__' -type d -prune -exec rm -rf {} +
@@ -1462,7 +839,7 @@ jobs:
           if git diff --cached --quiet; then
             echo "No changes."
           else
-            git commit -m "zyra: engine 4/17 certification - integration layer over existing engines (IssuerRegistry accreditation+scopes; IdentityEngine+CredentialRegistry+Ed25519 reused); keyword-only call fix; 4 proofs"
+            git commit -m "zyra: engine 5/17 search - transversal query layer over EXISTING tables (identity/credential/document/certificate/history), authorized apps only, every query in durable search_log + audit chain + network.search.performed, ranked exact>prefix>substring, paginated via common Page, missing tables skipped; 4 proofs"
             git push origin "HEAD:${{ github.ref_name }}"
           fi
-          echo "=== ENGINE CERTIFICATION COMPLETE ==="
+          echo "=== ENGINE SEARCH COMPLETE ==="

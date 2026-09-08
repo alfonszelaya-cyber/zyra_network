@@ -1,23 +1,32 @@
 """Transactional outbox with at-least-once dispatch.
 
-``enqueue_in_transaction`` runs inside the SAME transaction as
-the state change; delivery happens afterwards. A crash between
-handler and mark causes redelivery; consumers suppress
-duplicates via the Inbox.
+Concurrency: PENDING -> CLAIMED -> DISPATCHED, with
+retry/backoff, dead-letter and lease reaping. A claim
+holds a lease (owner + expiration) and a fencing
+token; stale workers get ``LeaseLost``. The legacy
+single-worker path (``pending`` +
+``dispatch_pending``) is preserved.
 """
 from __future__ import annotations
 
 import sqlite3
 from collections.abc import Callable
+from dataclasses import dataclass
 
 from shared_engines.common.clocks import Clock
+from shared_engines.common.errors import LeaseLost
 from shared_engines.common.serialization import (
     canonical_json_dumps,
     canonical_json_loads,
 )
 from shared_engines.events.contracts import Event
-from shared_engines.storage.database import Database
-from shared_engines.storage.migrations import Migration, MigrationRunner
+from shared_engines.storage.database import (
+    Database,
+)
+from shared_engines.storage.migrations import (
+    Migration,
+    MigrationRunner,
+)
 
 MIGRATIONS = (
     Migration(
@@ -35,33 +44,78 @@ MIGRATIONS = (
             " fingerprint TEXT NOT NULL,"
             " published_at REAL)",
             "CREATE INDEX events_outbox_pending"
-            " ON events_outbox (published_at, created_at)",
+            " ON events_outbox (published_at,"
+            " created_at)",
+        ),
+    ),
+    Migration(
+        2,
+        "events_outbox_concurrency",
+        (
+            "ALTER TABLE events_outbox"
+            " ADD COLUMN state TEXT"
+            " NOT NULL DEFAULT 'PENDING'",
+            "ALTER TABLE events_outbox"
+            " ADD COLUMN lease_owner TEXT",
+            "ALTER TABLE events_outbox"
+            " ADD COLUMN lease_expires_at REAL",
+            "ALTER TABLE events_outbox"
+            " ADD COLUMN attempts INTEGER"
+            " NOT NULL DEFAULT 0",
+            "ALTER TABLE events_outbox"
+            " ADD COLUMN next_retry_at REAL",
+            "ALTER TABLE events_outbox"
+            " ADD COLUMN last_error TEXT",
+            "CREATE INDEX events_outbox_state"
+            " ON events_outbox (state,"
+            " next_retry_at)",
         ),
     ),
 )
 
+STATE_PENDING = "PENDING"
+STATE_CLAIMED = "CLAIMED"
+STATE_DISPATCHED = "DISPATCHED"
+STATE_DEAD = "DEAD"
+
+
+@dataclass(frozen=True)
+class OutboxClaim:
+    """A leased event plus its fencing token."""
+
+    event: Event
+    fencing_token: int
+
 
 class Outbox:
-    """Persists events atomically with the state producing them."""
+    """Persists events atomically with the state
+    producing them."""
 
-    def __init__(self, db: Database, clock: Clock) -> None:
+    def __init__(
+        self, db: Database, clock: Clock
+    ) -> None:
         self._db = db
         self._clock = clock
 
     def ensure_schema(self) -> None:
-        MigrationRunner(self._db, "events.outbox", MIGRATIONS).run(
-            self._clock
-        )
+        MigrationRunner(
+            self._db,
+            "events.outbox",
+            MIGRATIONS,
+        ).run(self._clock)
 
     def enqueue_in_transaction(
         self, cursor: sqlite3.Cursor, event: Event
     ) -> None:
         cursor.execute(
             "INSERT INTO events_outbox"
-            " (event_id, event_type, aggregate_id, schema_version,"
-            "  envelope_version, created_at, payload, fingerprint,"
-            "  published_at)"
-            " VALUES (?, ?, ?, ?, ?, ?, ?, ?, NULL)",
+            " (event_id, event_type,"
+            " aggregate_id, schema_version,"
+            " envelope_version, created_at,"
+            " payload, fingerprint,"
+            " published_at)"
+            " VALUES (?, ?, ?, ?, ?, ?, ?, ?,"
+            " NULL)",
             (
                 event.event_id,
                 event.event_type,
@@ -69,22 +123,40 @@ class Outbox:
                 event.schema_version,
                 event.envelope_version,
                 event.timestamp,
-                canonical_json_dumps(dict(event.payload)),
+                canonical_json_dumps(
+                    dict(event.payload)
+                ),
                 event.fingerprint,
             ),
         )
 
     def enqueue(self, event: Event) -> None:
         with self._db.transaction() as cursor:
-            self.enqueue_in_transaction(cursor, event)
+            self.enqueue_in_transaction(
+                cursor, event
+            )
 
-    def pending(self, limit: int = 100) -> tuple[Event, ...]:
+    def pending(
+        self, limit: int = 100
+    ) -> tuple[Event, ...]:
         rows = self._db.query_all(
-            "SELECT * FROM events_outbox WHERE published_at IS NULL"
-            " ORDER BY created_at, event_id LIMIT ?",
-            (limit,),
+            "SELECT * FROM events_outbox"
+            " WHERE published_at IS NULL"
+            " AND state = ?"
+            " AND (next_retry_at IS NULL"
+            "      OR next_retry_at <= ?)"
+            " ORDER BY created_at, event_id"
+            " LIMIT ?",
+            (
+                STATE_PENDING,
+                self._clock.now(),
+                limit,
+            ),
         )
-        return tuple(self._to_event(row) for row in rows)
+        return tuple(
+            self._to_event(row)
+            for row in rows
+        )
 
     def dispatch_pending(
         self,
@@ -96,22 +168,289 @@ class Outbox:
         for event in self.pending(batch_size):
             handler(event)
             self._db.execute(
-                "UPDATE events_outbox SET published_at = ?"
-                " WHERE event_id = ? AND published_at IS NULL",
-                (self._clock.now(), event.event_id),
+                "UPDATE events_outbox"
+                " SET published_at = ?,"
+                " state = ?"
+                " WHERE event_id = ?"
+                " AND published_at IS NULL",
+                (
+                    self._clock.now(),
+                    STATE_DISPATCHED,
+                    event.event_id,
+                ),
             )
             delivered += 1
         return delivered
+
+    def claim_batch(
+        self,
+        *,
+        owner: str,
+        lease_seconds: float,
+        limit: int = 10,
+    ) -> tuple[OutboxClaim, ...]:
+        """Atomically lease due pending events.
+
+        Two workers racing on the same event get at
+        most one claim: the UPDATE guards on
+        state = PENDING inside one transaction.
+        """
+        if lease_seconds <= 0:
+            raise ValueError(
+                "lease_seconds must be"
+                " positive"
+            )
+        now = self._clock.now()
+        claims: list[OutboxClaim] = []
+        with self._db.transaction() as cursor:
+            rows = cursor.execute(
+                "SELECT * FROM events_outbox"
+                " WHERE state = ?"
+                " AND (next_retry_at IS NULL"
+                "      OR next_retry_at <= ?)"
+                " ORDER BY created_at,"
+                " event_id LIMIT ?",
+                (
+                    STATE_PENDING,
+                    now,
+                    limit,
+                ),
+            ).fetchall()
+            for row in rows:
+                event_id = str(
+                    row["event_id"]
+                )
+                attempts = (
+                    int(row["attempts"]) + 1
+                )
+                cursor.execute(
+                    "UPDATE events_outbox"
+                    " SET state = ?,"
+                    " lease_owner = ?,"
+                    " lease_expires_at = ?,"
+                    " attempts = ?"
+                    " WHERE event_id = ?"
+                    " AND state = ?",
+                    (
+                        STATE_CLAIMED,
+                        owner,
+                        now + lease_seconds,
+                        attempts,
+                        event_id,
+                        STATE_PENDING,
+                    ),
+                )
+                if cursor.rowcount != 1:
+                    continue
+                claims.append(
+                    OutboxClaim(
+                        event=self._to_event(
+                            row
+                        ),
+                        fencing_token=(
+                            attempts
+                        ),
+                    )
+                )
+        return tuple(claims)
+
+    def complete(
+        self,
+        *,
+        event_id: str,
+        owner: str,
+        fencing_token: int,
+    ) -> None:
+        """Mark DISPATCHED; LeaseLost if the
+        lease or fencing token is stale."""
+        now = self._clock.now()
+        with self._db.transaction() as cursor:
+            cursor.execute(
+                "UPDATE events_outbox"
+                " SET state = ?,"
+                " published_at = ?,"
+                " lease_owner = NULL,"
+                " lease_expires_at = NULL"
+                " WHERE event_id = ?"
+                " AND state = ?"
+                " AND lease_owner = ?"
+                " AND attempts = ?"
+                " AND lease_expires_at > ?",
+                (
+                    STATE_DISPATCHED,
+                    now,
+                    event_id,
+                    STATE_CLAIMED,
+                    owner,
+                    fencing_token,
+                    now,
+                ),
+            )
+            if cursor.rowcount != 1:
+                raise LeaseLost(
+                    "lease lost for event"
+                    f" {event_id}: fencing"
+                    " rejected"
+                )
+
+    def fail(
+        self,
+        *,
+        event_id: str,
+        owner: str,
+        fencing_token: int,
+        error: str,
+        max_attempts: int = 5,
+        backoff_base_seconds: float = 1.0,
+    ) -> bool:
+        """Report a processing failure.
+
+        Schedules an exponential-backoff retry,
+        or moves the event to DEAD once
+        ``max_attempts`` is reached. True = retry
+        scheduled, False = dead-lettered.
+        """
+        now = self._clock.now()
+        with self._db.transaction() as cursor:
+            cursor.execute(
+                "SELECT state, lease_owner,"
+                " attempts FROM events_outbox"
+                " WHERE event_id = ?",
+                (event_id,),
+            )
+            row = cursor.fetchone()
+            if row is None:
+                raise LeaseLost(
+                    "lease lost for event"
+                    f" {event_id}: missing"
+                )
+            state = str(row["state"])
+            lease_owner = str(
+                row["lease_owner"] or ""
+            )
+            attempts = int(row["attempts"])
+            if (
+                state != STATE_CLAIMED
+                or lease_owner != owner
+                or attempts != fencing_token
+            ):
+                raise LeaseLost(
+                    "lease lost for event"
+                    f" {event_id}: fencing"
+                    " rejected"
+                )
+            if attempts >= max_attempts:
+                cursor.execute(
+                    "UPDATE events_outbox"
+                    " SET state = ?,"
+                    " last_error = ?,"
+                    " lease_owner = NULL,"
+                    " lease_expires_at = NULL"
+                    " WHERE event_id = ?",
+                    (
+                        STATE_DEAD,
+                        error,
+                        event_id,
+                    ),
+                )
+                return False
+            delay = backoff_base_seconds * (
+                2 ** (attempts - 1)
+            )
+            cursor.execute(
+                "UPDATE events_outbox"
+                " SET state = ?,"
+                " next_retry_at = ?,"
+                " last_error = ?,"
+                " lease_owner = NULL,"
+                " lease_expires_at = NULL"
+                " WHERE event_id = ?",
+                (
+                    STATE_PENDING,
+                    now + delay,
+                    error,
+                    event_id,
+                ),
+            )
+            return True
+
+    def reap_expired_leases(self) -> int:
+        """Return expired CLAIMED events to
+        PENDING (worker died mid-processing)."""
+        now = self._clock.now()
+        with self._db.transaction() as cursor:
+            cursor.execute(
+                "UPDATE events_outbox"
+                " SET state = ?,"
+                " lease_owner = NULL,"
+                " lease_expires_at = NULL"
+                " WHERE state = ?"
+                " AND lease_expires_at <= ?",
+                (
+                    STATE_PENDING,
+                    STATE_CLAIMED,
+                    now,
+                ),
+            )
+            return int(cursor.rowcount)
+
+    def dead_letter(
+        self, limit: int = 100
+    ) -> tuple[Event, ...]:
+        rows = self._db.query_all(
+            "SELECT * FROM events_outbox"
+            " WHERE state = ?"
+            " ORDER BY created_at, event_id"
+            " LIMIT ?",
+            (STATE_DEAD, limit),
+        )
+        return tuple(
+            self._to_event(row)
+            for row in rows
+        )
+
+    def requeue_dead(
+        self, *, event_id: str
+    ) -> None:
+        with self._db.transaction() as cursor:
+            cursor.execute(
+                "UPDATE events_outbox"
+                " SET state = ?,"
+                " attempts = 0,"
+                " next_retry_at = NULL,"
+                " last_error = NULL"
+                " WHERE event_id = ?"
+                " AND state = ?",
+                (
+                    STATE_PENDING,
+                    event_id,
+                    STATE_DEAD,
+                ),
+            )
 
     @staticmethod
     def _to_event(row: sqlite3.Row) -> Event:
         return Event(
             event_id=str(row["event_id"]),
-            event_type=str(row["event_type"]),
-            aggregate_id=str(row["aggregate_id"]),
-            schema_version=int(row["schema_version"]),
-            envelope_version=int(row["envelope_version"]),
-            timestamp=float(row["created_at"]),
-            payload=canonical_json_loads(str(row["payload"])),
-            fingerprint=str(row["fingerprint"]),
+            event_type=str(
+                row["event_type"]
+            ),
+            aggregate_id=str(
+                row["aggregate_id"]
+            ),
+            schema_version=int(
+                row["schema_version"]
+            ),
+            envelope_version=int(
+                row["envelope_version"]
+            ),
+            timestamp=float(
+                row["created_at"]
+            ),
+            payload=canonical_json_loads(
+                str(row["payload"])
+            ),
+            fingerprint=str(
+                row["fingerprint"]
+            ),
         )

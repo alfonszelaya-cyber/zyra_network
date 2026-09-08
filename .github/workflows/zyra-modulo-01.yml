@@ -1,4 +1,4 @@
-name: zyra-w7-life-history
+name: zyra-w8-engine-consensus
 
 "on":
   workflow_dispatch:
@@ -9,7 +9,7 @@ permissions:
   contents: write
 
 concurrency:
-  group: zyra-w7-${{ github.ref }}
+  group: zyra-w8-${{ github.ref }}
   cancel-in-progress: false
 
 jobs:
@@ -31,51 +31,78 @@ jobs:
           python -m pip install --upgrade pip
           python -m pip install "cryptography>=42,<45" "flake8>=7,<8" "mypy>=1.10,<2" "pytest>=8,<9"
 
-      - name: Build life history engine
+      - name: Fill consensus engine (contracts, errors, engine)
         run: |
           set -euo pipefail
-          cat > shared_engines/network/life_history.py <<'PYEOF'
-          """Lifelong history: the Network's civic timeline.
+          cat > shared_engines/consensus/contracts.py <<'PYEOF'
+          """Consensus contracts."""
+          from __future__ import annotations
 
-          The go.sv-style goal: a person's first registration
-          (e.g. a newborn in a health app) creates the trust
-          ZID, and from that moment every authorized app adds
-          permanent records to ONE lifelong timeline:
+          from dataclasses import dataclass
 
-              birth_registration -> health -> education ->
-              civil -> employment -> ...
 
-          Guarantees:
+          @dataclass(frozen=True)
+          class LeaseState:
+              """Current lease of a resource."""
 
-          - Append-only: entries are never edited or deleted.
-          - Tamper-evident: each entry hashes its content
-            together with the previous entry's hash (per-ZID
-            chain); any historic modification breaks the
-            chain and verify_chain() detects it.
-          - Only apps registered via ProfileRegistry may
-            append (app existence checked in app_registry).
-          - Every append is audited and emits
-            network.history.appended to the Outbox.
-          - Transactions never nest: the entry + outbox
-            event share one short transaction; the audit
-            append runs afterwards on its own.
+              resource: str
+              holder_id: str
+              fencing_token: int
+              expires_at: float
+          PYEOF
+
+          cat > shared_engines/consensus/errors.py <<'PYEOF'
+          """Typed consensus errors."""
+          from __future__ import annotations
+
+          from shared_engines.common.errors import (
+              EngineError,
+          )
+
+
+          class ConsensusError(EngineError):
+              """Base consensus error."""
+
+
+          class AlreadyVotedError(ConsensusError):
+              """Voter already voted in this term."""
+
+
+          class LeaseHeldError(ConsensusError):
+              """Lease held by another member."""
+
+
+          class NoLeaseError(ConsensusError):
+              """No current lease for the resource."""
+          PYEOF
+
+          cat > shared_engines/consensus/engine.py <<'PYEOF'
+          """Distributed consensus: membership, terms, votes,
+          quorum leader election and fenced leases.
+
+          Durability: every mutation runs in one SQLite
+          transaction. Fencing: the lease fencing token IS
+          the consensus term - a new term invalidates every
+          lease granted in an older term, so a stale holder
+          can never act on stale authority.
           """
           from __future__ import annotations
 
-          import hashlib
-          import json
-          import sqlite3
-          from dataclasses import dataclass
-
-          from shared_engines.audit.chain import AuditTrail
           from shared_engines.common.clocks import Clock
-          from shared_engines.common.serialization import (
-              canonical_json_dumps,
-          )
           from shared_engines.common.validation import (
+              require_int_range,
               require_non_empty_str,
+              require_positive_number,
           )
-          from shared_engines.events.outbox import Outbox
+          from shared_engines.consensus.contracts import (
+              LeaseState,
+          )
+          from shared_engines.consensus.errors import (
+              AlreadyVotedError,
+              ConsensusError,
+              LeaseHeldError,
+              NoLeaseError,
+          )
           from shared_engines.storage.database import (
               Database,
           )
@@ -84,606 +111,665 @@ jobs:
               MigrationRunner,
           )
 
-          EVENT_HISTORY_APPENDED = (
-              "network.history.appended"
-          )
-
-          ENTRY_TYPES = (
-              "birth_registration",
-              "health",
-              "education",
-              "civil_status",
-              "employment",
-              "asset",
-              "other",
-          )
-
           _MIGRATIONS = (
               Migration(
                   1,
-                  "network_life_history",
+                  "consensus",
                   (
-                      "CREATE TABLE life_history_entries ("
-                      " zid TEXT NOT NULL,"
-                      " entry_seq INTEGER NOT NULL,"
-                      " entry_type TEXT NOT NULL,"
-                      " actor_app TEXT NOT NULL,"
-                      " payload TEXT NOT NULL,"
-                      " content_hash TEXT NOT NULL,"
-                      " prev_hash TEXT NOT NULL,"
-                      " created_at REAL NOT NULL,"
-                      " PRIMARY KEY (zid, entry_seq))",
-                      "CREATE INDEX life_history_zid"
-                      " ON life_history_entries"
-                      " (zid, entry_seq)",
+                      "CREATE TABLE consensus_members ("
+                      " member_id TEXT PRIMARY KEY,"
+                      " joined_at REAL NOT NULL,"
+                      " active INTEGER NOT NULL"
+                      " DEFAULT 1)",
+                      "CREATE TABLE consensus_state ("
+                      " key TEXT PRIMARY KEY,"
+                      " value TEXT NOT NULL)",
+                      "CREATE TABLE consensus_votes ("
+                      " term INTEGER NOT NULL,"
+                      " voter_id TEXT NOT NULL,"
+                      " candidate_id TEXT NOT NULL,"
+                      " PRIMARY KEY (term, voter_id))",
+                      "CREATE TABLE consensus_leases ("
+                      " resource TEXT PRIMARY KEY,"
+                      " holder_id TEXT NOT NULL,"
+                      " term INTEGER NOT NULL,"
+                      " expires_at REAL NOT NULL)",
                   ),
               ),
           )
 
 
-          @dataclass(frozen=True)
-          class HistoryEntry:
-              zid: str
-              entry_seq: int
-              entry_type: str
-              actor_app: str
-              payload: dict[str, object]
-              content_hash: str
-              prev_hash: str
-              created_at: float
-
-
-          def _content_hash(
-              *,
-              prev_hash: str,
-              entry_seq: int,
-              entry_type: str,
-              actor_app: str,
-              payload_json: str,
-              created_at: float,
-          ) -> str:
-              src = canonical_json_dumps(
-                  {
-                      "seq": entry_seq,
-                      "type": entry_type,
-                      "actor": actor_app,
-                      "payload": payload_json,
-                      "at": created_at,
-                      "prev": prev_hash,
-                  }
-              )
-              return hashlib.sha256(
-                  src.encode("utf-8")
-              ).hexdigest()
-
-
-          class LifeHistory:
-              """Append-only lifelong timeline per ZID."""
+          class ConsensusEngine:
+              """Term-based consensus with fenced leases."""
 
               def __init__(
                   self,
                   db: Database,
                   clock: Clock,
                   *,
-                  audit: AuditTrail,
-                  outbox: Outbox,
+                  member_id: str,
               ) -> None:
+                  require_non_empty_str(
+                      member_id, "member_id"
+                  )
                   self._db = db
                   self._clock = clock
-                  self._audit = audit
-                  self._outbox = outbox
+                  self._member_id = member_id
                   MigrationRunner(
-                      db,
-                      "network.life_history",
-                      _MIGRATIONS,
+                      db, "consensus", _MIGRATIONS
                   ).run(clock)
-
-              def append(
-                  self,
-                  *,
-                  zid: str,
-                  entry_type: str,
-                  actor_app: str,
-                  payload: dict[str, object],
-              ) -> HistoryEntry:
-                  """Add one permanent record. The app must
-                  be registered and the entry type known."""
-                  require_non_empty_str(zid, "zid")
-                  require_non_empty_str(
-                      entry_type, "entry_type"
-                  )
-                  require_non_empty_str(
-                      actor_app, "actor_app"
-                  )
-                  if entry_type not in ENTRY_TYPES:
-                      raise ValueError(
-                          f"unknown entry type:"
-                          f" {entry_type}"
-                      )
-                  if not payload:
-                      raise ValueError(
-                          "payload required"
-                      )
-                  row = self._db.query_one(
-                      "SELECT 1 FROM app_registry"
-                      " WHERE app_id = ?",
-                      (actor_app,),
+                  row = db.query_one(
+                      "SELECT value FROM"
+                      " consensus_state"
+                      " WHERE key = 'term'"
                   )
                   if row is None:
-                      raise PermissionError(
-                          "app not registered:"
-                          f" {actor_app}"
-                      )
-                  payload_json = canonical_json_dumps(
-                      payload
+                      with db.transaction() as cursor:
+                          cursor.execute(
+                              "INSERT OR IGNORE INTO"
+                              " consensus_state"
+                              " (key, value) VALUES"
+                              " ('term', '0')"
+                          )
+
+              def register_member(
+                  self, member_id: str
+              ) -> None:
+                  require_non_empty_str(
+                      member_id, "member_id"
                   )
-                  now = self._clock.now()
                   with self._db.transaction() as cursor:
-                      last = cursor.execute(
-                          "SELECT entry_seq, content_hash"
-                          " FROM life_history_entries"
-                          " WHERE zid = ?"
-                          " ORDER BY entry_seq DESC"
-                          " LIMIT 1",
-                          (zid,),
-                      ).fetchone()
-                      if last is None:
-                          seq = 1
-                          prev_hash = "GENESIS"
-                      else:
-                          seq = (
-                              int(last["entry_seq"])
-                              + 1
-                          )
-                          prev_hash = str(
-                              last["content_hash"]
-                          )
-                      content = _content_hash(
-                          prev_hash=prev_hash,
-                          entry_seq=seq,
-                          entry_type=entry_type,
-                          actor_app=actor_app,
-                          payload_json=payload_json,
-                          created_at=now,
-                      )
                       cursor.execute(
                           "INSERT INTO"
-                          " life_history_entries"
-                          " (zid, entry_seq,"
-                          "  entry_type, actor_app,"
-                          "  payload, content_hash,"
-                          "  prev_hash, created_at)"
-                          " VALUES (?, ?, ?, ?, ?, ?,"
-                          "  ?, ?)",
+                          " consensus_members"
+                          " (member_id, joined_at,"
+                          " active) VALUES (?, ?, 1)"
+                          " ON CONFLICT(member_id)"
+                          " DO UPDATE SET active = 1",
                           (
-                              zid,
-                              seq,
-                              entry_type,
-                              actor_app,
-                              payload_json,
-                              content,
-                              prev_hash,
-                              now,
+                              member_id,
+                              self._clock.now(),
                           ),
                       )
-                      self._emit(
-                          cursor,
-                          zid=zid,
-                          seq=seq,
-                          entry_type=entry_type,
-                          actor_app=actor_app,
-                      )
-                  self._audit.append(
-                      event_type=(
-                          EVENT_HISTORY_APPENDED
-                      ),
-                      actor=actor_app,
-                      subject=zid,
-                      payload={
-                          "seq": seq,
-                          "entry_type": entry_type,
-                      },
-                  )
-                  return HistoryEntry(
-                      zid=zid,
-                      entry_seq=seq,
-                      entry_type=entry_type,
-                      actor_app=actor_app,
-                      payload=payload,
-                      content_hash=content,
-                      prev_hash=prev_hash,
-                      created_at=now,
-                  )
 
-              def _emit(
-                  self,
-                  cursor: sqlite3.Cursor,
-                  *,
-                  zid: str,
-                  seq: int,
-                  entry_type: str,
-                  actor_app: str,
+              def deactivate_member(
+                  self, member_id: str
               ) -> None:
-                  event_id = hashlib.sha256(
-                      canonical_json_dumps(
-                          {
-                              "z": zid,
-                              "s": seq,
-                              "t": entry_type,
-                              "ts": self._clock.now(),
-                          }
-                      ).encode("utf-8")
-                  ).hexdigest()[:32]
-                  fp = hashlib.sha256(
-                      canonical_json_dumps(
-                          {
-                              "id": event_id,
-                              "ty": (
-                                  EVENT_HISTORY_APPENDED
-                              ),
-                          }
-                      ).encode("utf-8")
-                  ).hexdigest()
-                  cursor.execute(
-                      "INSERT INTO events_outbox"
-                      " (event_id, event_type,"
-                      " aggregate_id, schema_version,"
-                      " envelope_version, created_at,"
-                      " payload, fingerprint,"
-                      " published_at)"
-                      " VALUES (?, ?, ?, 1, 1, ?, ?,"
-                      " ?, NULL)",
-                      (
-                          event_id,
-                          EVENT_HISTORY_APPENDED,
-                          zid,
-                          self._clock.now(),
-                          canonical_json_dumps(
-                              {
-                                  "seq": seq,
-                                  "entry_type": (
-                                      entry_type
-                                  ),
-                                  "actor": actor_app,
-                              }
-                          ),
-                          fp,
-                      ),
+                  require_non_empty_str(
+                      member_id, "member_id"
                   )
+                  with self._db.transaction() as cursor:
+                      cursor.execute(
+                          "UPDATE consensus_members"
+                          " SET active = 0"
+                          " WHERE member_id = ?",
+                          (member_id,),
+                      )
 
-              def timeline(
+              def active_members(
                   self,
-                  *,
-                  zid: str,
-                  limit: int = 1000,
-              ) -> tuple[HistoryEntry, ...]:
-                  require_non_empty_str(zid, "zid")
+              ) -> tuple[str, ...]:
                   rows = self._db.query_all(
-                      "SELECT * FROM"
-                      " life_history_entries"
-                      " WHERE zid = ?"
-                      " ORDER BY entry_seq ASC"
-                      " LIMIT ?",
-                      (zid, limit),
+                      "SELECT member_id FROM"
+                      " consensus_members"
+                      " WHERE active = 1"
+                      " ORDER BY member_id"
                   )
                   return tuple(
-                      HistoryEntry(
-                          zid=zid,
-                          entry_seq=int(
-                              r["entry_seq"]
-                          ),
-                          entry_type=str(
-                              r["entry_type"]
-                          ),
-                          actor_app=str(
-                              r["actor_app"]
-                          ),
-                          payload=self._loads(
-                              str(r["payload"])
-                          ),
-                          content_hash=str(
-                              r["content_hash"]
-                          ),
-                          prev_hash=str(
-                              r["prev_hash"]
-                          ),
-                          created_at=float(
-                              r["created_at"]
-                          ),
-                      )
+                      str(r["member_id"])
                       for r in rows
                   )
 
-              @staticmethod
-              def _loads(raw: str) -> dict[str, object]:
-                  data = json.loads(raw)
-                  assert isinstance(data, dict)
-                  return data
+              def member_count(self) -> int:
+                  row = self._db.query_one(
+                      "SELECT COUNT(*) AS n FROM"
+                      " consensus_members"
+                      " WHERE active = 1"
+                  )
+                  return (
+                      int(row["n"])
+                      if row is not None
+                      else 0
+                  )
 
-              def verify_chain(
-                  self, *, zid: str
-              ) -> bool:
-                  """Recompute the per-ZID hash chain;
-                  False if any historic entry was altered."""
-                  entries = self.timeline(zid=zid)
-                  prev = "GENESIS"
-                  for entry in entries:
-                      expected = _content_hash(
-                          prev_hash=prev,
-                          entry_seq=entry.entry_seq,
-                          entry_type=entry.entry_type,
-                          actor_app=entry.actor_app,
-                          payload_json=(
-                              canonical_json_dumps(
-                                  entry.payload
-                              )
-                          ),
-                          created_at=entry.created_at,
+              def quorum_size(self) -> int:
+                  return (
+                      self.member_count() // 2 + 1
+                  )
+
+              def current_term(self) -> int:
+                  row = self._db.query_one(
+                      "SELECT value FROM"
+                      " consensus_state"
+                      " WHERE key = 'term'"
+                  )
+                  if row is None:
+                      raise ConsensusError(
+                          "consensus state missing"
                       )
-                      if (
-                          entry.content_hash
-                          != expected
-                          or entry.prev_hash != prev
-                      ):
-                          return False
-                      prev = entry.content_hash
-                  return True
-          PYEOF
-          echo "=== LIFE HISTORY READY ==="
+                  return int(str(row["value"]))
 
-      - name: Write lifelong history proofs (3)
+              def leader(self) -> str | None:
+                  row = self._db.query_one(
+                      "SELECT value FROM"
+                      " consensus_state"
+                      " WHERE key = 'leader'"
+                  )
+                  if row is None:
+                      return None
+                  value = str(row["value"])
+                  return value or None
+
+              def _require_active(
+                  self, member_id: str
+              ) -> None:
+                  row = self._db.query_one(
+                      "SELECT active FROM"
+                      " consensus_members"
+                      " WHERE member_id = ?",
+                      (member_id,),
+                  )
+                  if row is None or int(
+                      row["active"]
+                  ) != 1:
+                      raise ConsensusError(
+                          "member not active:"
+                          f" {member_id}"
+                      )
+
+              def start_new_term(self) -> int:
+                  with self._db.transaction() as cursor:
+                      row = cursor.execute(
+                          "SELECT value FROM"
+                          " consensus_state"
+                          " WHERE key = 'term'"
+                      ).fetchone()
+                      term = (
+                          int(str(row["value"])) + 1
+                          if row is not None
+                          else 1
+                      )
+                      cursor.execute(
+                          "INSERT INTO"
+                          " consensus_state"
+                          " (key, value) VALUES"
+                          " ('term', ?)"
+                          " ON CONFLICT(key) DO"
+                          " UPDATE SET value ="
+                          " excluded.value",
+                          (str(term),),
+                      )
+                      cursor.execute(
+                          "DELETE FROM"
+                          " consensus_state"
+                          " WHERE key = 'leader'"
+                      )
+                  return term
+
+              def vote(
+                  self,
+                  *,
+                  term: int,
+                  candidate_id: str,
+              ) -> None:
+                  require_int_range(
+                      term, "term", 1, 2**62
+                  )
+                  require_non_empty_str(
+                      candidate_id, "candidate_id"
+                  )
+                  self._require_active(
+                      self._member_id
+                  )
+                  if term != self.current_term():
+                      raise ConsensusError(
+                          f"stale term {term}:"
+                          " current term is"
+                          f" {self.current_term()}"
+                      )
+                  from sqlite3 import IntegrityError
+
+                  try:
+                      with (
+                          self._db.transaction()
+                          as cursor
+                      ):
+                          cursor.execute(
+                              "INSERT INTO"
+                              " consensus_votes"
+                              " (term, voter_id,"
+                              " candidate_id)"
+                              " VALUES (?, ?, ?)",
+                              (
+                                  term,
+                                  self._member_id,
+                                  candidate_id,
+                              ),
+                          )
+                  except IntegrityError as exc:
+                      raise AlreadyVotedError(
+                          "member"
+                          f" {self._member_id}"
+                          " already voted in term"
+                          f" {term}"
+                      ) from exc
+
+              def elect_leader(
+                  self, *, term: int
+              ) -> str:
+                  if term != self.current_term():
+                      raise ConsensusError(
+                          f"stale term {term}"
+                      )
+                  rows = self._db.query_all(
+                      "SELECT candidate_id,"
+                      " COUNT(*) AS n FROM"
+                      " consensus_votes"
+                      " WHERE term = ?"
+                      " GROUP BY candidate_id"
+                      " ORDER BY n DESC,"
+                      " candidate_id ASC",
+                      (term,),
+                  )
+                  if not rows:
+                      raise ConsensusError(
+                          "no votes in term"
+                          f" {term}"
+                      )
+                  top = int(rows[0]["n"])
+                  quorum = self.quorum_size()
+                  if top < quorum:
+                      raise ConsensusError(
+                          "quorum not reached:"
+                          f" best has {top}/"
+                          f"{quorum} votes"
+                      )
+                  if len(rows) > 1 and int(
+                      rows[1]["n"]
+                  ) >= top:
+                      raise ConsensusError(
+                          "contested election:"
+                          " tie at top"
+                      )
+                  elected = str(
+                      rows[0]["candidate_id"]
+                  )
+                  self._require_active(elected)
+                  with self._db.transaction() as cursor:
+                      cursor.execute(
+                          "INSERT INTO"
+                          " consensus_state"
+                          " (key, value) VALUES"
+                          " ('leader', ?)"
+                          " ON CONFLICT(key) DO"
+                          " UPDATE SET value ="
+                          " excluded.value",
+                          (elected,),
+                      )
+                  return elected
+
+              def acquire_lease(
+                  self,
+                  *,
+                  resource: str,
+                  holder_id: str,
+                  lease_seconds: float,
+              ) -> int:
+                  require_non_empty_str(
+                      resource, "resource"
+                  )
+                  self._require_active(holder_id)
+                  require_positive_number(
+                      lease_seconds, "lease_seconds"
+                  )
+                  now = self._clock.now()
+                  term = self.current_term()
+                  with self._db.transaction() as cursor:
+                      row = cursor.execute(
+                          "SELECT holder_id, term,"
+                          " expires_at FROM"
+                          " consensus_leases"
+                          " WHERE resource = ?",
+                          (resource,),
+                      ).fetchone()
+                      if row is not None:
+                          held_by = str(
+                              row["holder_id"]
+                          )
+                          lease_term = int(
+                              row["term"]
+                          )
+                          expires = float(
+                              row["expires_at"]
+                          )
+                          if (
+                              lease_term == term
+                              and expires > now
+                              and held_by
+                              != holder_id
+                          ):
+                              raise LeaseHeldError(
+                                  "lease"
+                                  f" '{resource}'"
+                                  " held by"
+                                  f" '{held_by}'"
+                                  " (fencing"
+                                  f" {lease_term})"
+                              )
+                      cursor.execute(
+                          "INSERT INTO"
+                          " consensus_leases"
+                          " (resource, holder_id,"
+                          " term, expires_at)"
+                          " VALUES (?, ?, ?, ?)"
+                          " ON CONFLICT(resource)"
+                          " DO UPDATE SET"
+                          " holder_id ="
+                          " excluded.holder_id,"
+                          " term = excluded.term,"
+                          " expires_at ="
+                          " excluded.expires_at",
+                          (
+                              resource,
+                              holder_id,
+                              term,
+                              now + lease_seconds,
+                          ),
+                      )
+                  return term
+
+              def renew_lease(
+                  self,
+                  *,
+                  resource: str,
+                  holder_id: str,
+                  lease_seconds: float,
+              ) -> int:
+                  require_non_empty_str(
+                      resource, "resource"
+                  )
+                  require_positive_number(
+                      lease_seconds, "lease_seconds"
+                  )
+                  now = self._clock.now()
+                  term = self.current_term()
+                  with self._db.transaction() as cursor:
+                      row = cursor.execute(
+                          "SELECT holder_id, term"
+                          " FROM consensus_leases"
+                          " WHERE resource = ?",
+                          (resource,),
+                      ).fetchone()
+                      if row is None:
+                          raise NoLeaseError(
+                              "no lease for"
+                              f" '{resource}'"
+                          )
+                      holder = str(
+                          row["holder_id"]
+                      )
+                      lease_term = int(row["term"])
+                      if holder != holder_id:
+                          raise LeaseHeldError(
+                              "lease"
+                              f" '{resource}' held"
+                              f" by '{holder}'"
+                          )
+                      if lease_term != term:
+                          raise NoLeaseError(
+                              f"lease '{resource}'"
+                              " fenced: term"
+                              f" {lease_term} !="
+                              f" {term}"
+                          )
+                      cursor.execute(
+                          "UPDATE consensus_leases"
+                          " SET expires_at = ?"
+                          " WHERE resource = ?",
+                          (
+                              now + lease_seconds,
+                              resource,
+                          ),
+                      )
+                  return term
+
+              def release_lease(
+                  self,
+                  *,
+                  resource: str,
+                  holder_id: str,
+              ) -> None:
+                  require_non_empty_str(
+                      resource, "resource"
+                  )
+                  with self._db.transaction() as cursor:
+                      row = cursor.execute(
+                          "SELECT holder_id FROM"
+                          " consensus_leases"
+                          " WHERE resource = ?",
+                          (resource,),
+                      ).fetchone()
+                      if row is None:
+                          raise NoLeaseError(
+                              "no lease for"
+                              f" '{resource}'"
+                          )
+                      if str(
+                          row["holder_id"]
+                      ) != holder_id:
+                          raise LeaseHeldError(
+                              "lease"
+                              f" '{resource}' held"
+                              " by someone else"
+                          )
+                      cursor.execute(
+                          "DELETE FROM"
+                          " consensus_leases"
+                          " WHERE resource = ?",
+                          (resource,),
+                      )
+
+              def lease_holder(
+                  self, resource: str
+              ) -> LeaseState | None:
+                  require_non_empty_str(
+                      resource, "resource"
+                  )
+                  row = self._db.query_one(
+                      "SELECT * FROM"
+                      " consensus_leases"
+                      " WHERE resource = ?",
+                      (resource,),
+                  )
+                  if row is None:
+                      return None
+                  return LeaseState(
+                      resource=str(
+                          row["resource"]
+                      ),
+                      holder_id=str(
+                          row["holder_id"]
+                      ),
+                      fencing_token=int(
+                          row["term"]
+                      ),
+                      expires_at=float(
+                          row["expires_at"]
+                      ),
+                  )
+          PYEOF
+          echo "=== CONSENSUS ENGINE READY ==="
+
+      - name: Consensus proofs (4)
         run: |
           set -euo pipefail
-          mkdir -p shared_engines/network/tests
-          cat > shared_engines/network/tests/test_life_history.py <<'PYEOF'
-          """Lifelong history proofs: a newborn registered in
-          a health app starts a tamper-evident civic timeline
-          that other authorized apps extend over time."""
+          mkdir -p shared_engines/consensus/tests
+          cat > shared_engines/consensus/tests/test_consensus.py <<'PYEOF'
+          """Consensus proofs: quorum, vote-once, leader
+          election, term fencing of leases."""
           from __future__ import annotations
 
           from pathlib import Path
 
           import pytest
 
-          from shared_engines.audit.chain import AuditTrail
           from shared_engines.common.clocks import (
               FrozenClock,
           )
-          from shared_engines.events.contracts import (
-              EventCatalog,
+          from shared_engines.consensus.engine import (
+              ConsensusEngine,
           )
-          from shared_engines.events.outbox import Outbox
-          from shared_engines.identity.contracts import (
-              IdentityKind,
-          )
-          from shared_engines.identity.engine import (
-              IdentityEngine,
-          )
-          from shared_engines.network.life_history import (
-              LifeHistory,
-          )
-          from shared_engines.network.portable_profile import (
-              ProfileRegistry,
+          from shared_engines.consensus.errors import (
+              AlreadyVotedError,
+              ConsensusError,
+              LeaseHeldError,
+              NoLeaseError,
           )
           from shared_engines.storage.database import (
               SQLiteAdapter,
           )
-          from shared_engines.telemetry.collector import (
-              TelemetryCollector,
-          )
 
 
-          class _Net:
-              def __init__(
-                  self, tmp_path: Path
-              ) -> None:
-                  self.db = SQLiteAdapter(
-                      tmp_path / "net.db"
-                  )
-                  self.clock = FrozenClock()
-                  self.audit = AuditTrail(
-                      self.db, self.clock
-                  )
-                  self.outbox = Outbox(
-                      self.db, self.clock
-                  )
-                  self.outbox.ensure_schema()
-                  self.catalog = EventCatalog()
-                  for et in (
-                      "identity.registered",
-                      "identity.status_changed",
-                      "network.history.appended",
-                  ):
-                      self.catalog.register(et)
-                  self.identity = IdentityEngine(
-                      db=self.db,
-                      clock=self.clock,
-                      audit=self.audit,
-                      outbox=self.outbox,
-                      catalog=self.catalog,
-                  )
-                  self.profiles = ProfileRegistry(
-                      self.db,
-                      self.clock,
-                      audit=self.audit,
-                      outbox=self.outbox,
-                  )
-                  self.history = LifeHistory(
-                      self.db,
-                      self.clock,
-                      audit=self.audit,
-                      outbox=self.outbox,
-                  )
-                  self.telemetry = TelemetryCollector(
-                      self.db, self.clock
-                  )
-
-              def close(self) -> None:
-                  self.db.close()
+          def _cluster(
+              tmp_path: Path,
+          ) -> tuple[
+              SQLiteAdapter,
+              FrozenClock,
+              ConsensusEngine,
+              ConsensusEngine,
+              ConsensusEngine,
+          ]:
+              db = SQLiteAdapter(
+                  tmp_path / "consensus.db"
+              )
+              clock = FrozenClock()
+              a = ConsensusEngine(
+                  db, clock, member_id="a"
+              )
+              b = ConsensusEngine(
+                  db, clock, member_id="b"
+              )
+              c = ConsensusEngine(
+                  db, clock, member_id="c"
+              )
+              a.register_member("a")
+              a.register_member("b")
+              a.register_member("c")
+              return db, clock, a, b, c
 
 
-          def test_newborn_starts_lifelong_history(
+          def test_membership_and_quorum(
               tmp_path: Path,
           ) -> None:
-              net = _Net(tmp_path)
+              db, clock, a, b, c = _cluster(tmp_path)
               try:
-                  net.profiles.register_app(
-                      app_id="doctor_sv",
-                      display_name="Doctor SV",
-                      scopes=("display_name",),
+                  assert a.active_members() == (
+                      "a",
+                      "b",
+                      "c",
                   )
-                  net.profiles.register_app(
-                      app_id="escuela_sv",
-                      display_name="Escuela SV",
-                      scopes=("display_name",),
-                  )
-                  child = (
-                      net.identity.register_identity(
-                          kind=IdentityKind.PERSON,
-                          display_name="bebe",
-                          actor="doctor_sv",
-                      )
-                  )
-                  first = net.history.append(
-                      zid=child.zid,
-                      entry_type="birth_registration",
-                      actor_app="doctor_sv",
-                      payload={
-                          "hospital": "San Salvador",
-                          "name": "Bebe Perez",
-                      },
-                  )
-                  assert first.entry_seq == 1
-                  assert (
-                      first.prev_hash == "GENESIS"
-                  )
-                  second = net.history.append(
-                      zid=child.zid,
-                      entry_type="education",
-                      actor_app="escuela_sv",
-                      payload={
-                          "school": "Centro Escolar",
-                          "grade": "1st",
-                      },
-                  )
-                  assert second.entry_seq == 2
-                  assert (
-                      second.prev_hash
-                      == first.content_hash
-                  )
-                  timeline = net.history.timeline(
-                      zid=child.zid
-                  )
-                  assert len(timeline) == 2
-                  assert (
-                      timeline[0].entry_type
-                      == "birth_registration"
-                  )
-                  assert (
-                      net.history.verify_chain(
-                          zid=child.zid
-                      )
-                      is True
-                  )
-                  net.telemetry.ingest_outbox(
-                      net.outbox
-                  )
-                  events = (
-                      net.telemetry.query_events(
-                          event_type=(
-                              "network.history"
-                              ".appended"
-                          )
-                      )
-                  )
-                  assert len(events) >= 2
+                  assert a.quorum_size() == 2
+                  a.deactivate_member("c")
+                  assert a.member_count() == 2
+                  assert a.quorum_size() == 2
               finally:
-                  net.close()
+                  db.close()
 
 
-          def test_unregistered_app_cannot_append(
+          def test_vote_once_per_term(
               tmp_path: Path,
           ) -> None:
-              net = _Net(tmp_path)
+              db, clock, a, b, c = _cluster(tmp_path)
               try:
-                  child = (
-                      net.identity.register_identity(
-                          kind=IdentityKind.PERSON,
-                          display_name="x",
-                          actor="t",
-                      )
-                  )
+                  term = a.start_new_term()
+                  assert term == 1
+                  a.vote(term=term, candidate_id="b")
                   with pytest.raises(
-                      PermissionError
+                      AlreadyVotedError
                   ):
-                      net.history.append(
-                          zid=child.zid,
-                          entry_type="health",
-                          actor_app="malware",
-                          payload={"fake": True},
+                      a.vote(
+                          term=term,
+                          candidate_id="c",
                       )
-                  assert (
-                      net.history.timeline(
-                          zid=child.zid
-                      )
-                      == ()
-                  )
               finally:
-                  net.close()
+                  db.close()
 
 
-          def test_history_is_tamper_evident(
+          def test_elect_leader_requires_quorum(
               tmp_path: Path,
           ) -> None:
-              net = _Net(tmp_path)
+              db, clock, a, b, c = _cluster(tmp_path)
               try:
-                  net.profiles.register_app(
-                      app_id="doctor_sv",
-                      display_name="Doctor SV",
-                      scopes=("display_name",),
-                  )
-                  person = (
-                      net.identity.register_identity(
-                          kind=IdentityKind.PERSON,
-                          display_name="p",
-                          actor="doctor_sv",
-                      )
-                  )
-                  net.history.append(
-                      zid=person.zid,
-                      entry_type="birth_registration",
-                      actor_app="doctor_sv",
-                      payload={"ok": 1},
-                  )
-                  net.history.append(
-                      zid=person.zid,
-                      entry_type="health",
-                      actor_app="doctor_sv",
-                      payload={
-                          "check": "vaccines"
-                      },
+                  term = a.start_new_term()
+                  b.vote(term=term, candidate_id="c")
+                  with pytest.raises(
+                      ConsensusError
+                  ):
+                      c.elect_leader(term=term)
+                  a.vote(
+                      term=term, candidate_id="c"
                   )
                   assert (
-                      net.history.verify_chain(
-                          zid=person.zid
-                      )
-                      is True
+                      c.elect_leader(term=term)
+                      == "c"
                   )
-                  net.db.execute(
-                      "UPDATE life_history_entries"
-                      " SET payload = '{\"faked\":"
-                      " true}' WHERE entry_seq = 1"
-                  )
-                  assert (
-                      net.history.verify_chain(
-                          zid=person.zid
-                      )
-                      is False
-                  )
+                  assert c.leader() == "c"
               finally:
-                  net.close()
+                  db.close()
+
+
+          def test_new_term_fences_leases(
+              tmp_path: Path,
+          ) -> None:
+              db, clock, a, b, c = _cluster(tmp_path)
+              try:
+                  term1 = a.start_new_term()
+                  token = a.acquire_lease(
+                      resource="primary-lock",
+                      holder_id="a",
+                      lease_seconds=100.0,
+                  )
+                  assert token == term1
+                  with pytest.raises(
+                      LeaseHeldError
+                  ):
+                      b.acquire_lease(
+                          resource="primary-lock",
+                          holder_id="b",
+                          lease_seconds=100.0,
+                      )
+                  term2 = a.start_new_term()
+                  assert term2 == term1 + 1
+                  assert a.leader() is None
+                  held = a.lease_holder(
+                      "primary-lock"
+                  )
+                  assert held is not None
+                  with pytest.raises(NoLeaseError):
+                      a.renew_lease(
+                          resource="primary-lock",
+                          holder_id="a",
+                          lease_seconds=100.0,
+                      )
+                  fresh = b.acquire_lease(
+                      resource="primary-lock",
+                      holder_id="b",
+                      lease_seconds=100.0,
+                  )
+                  assert fresh == term2
+                  a.release_lease(
+                      resource="primary-lock",
+                      holder_id="b",
+                  )
+                  with pytest.raises(NoLeaseError):
+                      a.release_lease(
+                          resource="primary-lock",
+                          holder_id="b",
+                      )
+              finally:
+                  db.close()
           PYEOF
-          echo "=== LIFE HISTORY TESTS READY ==="
+          echo "=== CONSENSUS TESTS READY ==="
 
       - name: Quality gates (mypy first; full regression)
         run: |
@@ -711,7 +797,7 @@ jobs:
           if git diff --cached --quiet; then
             echo "No changes."
           else
-            git commit -m "zyra: W7 lifelong history - append-only per-ZID civic timeline (birth_registration first), tamper-evident hash chain per person, registered-apps-only writes, audited + outbox events"
+            git commit -m "zyra: engine 1/17 consensus - membership/quorum, terms, vote-once, quorum-gated leader election, fenced leases (term = fencing token, new term fences old leases); 4 proofs"
             git push origin "HEAD:${{ github.ref_name }}"
           fi
-          echo "=== W7 COMPLETE ==="
+          echo "=== ENGINE CONSENSUS COMPLETE ==="

@@ -1,4 +1,4 @@
-name: zyra-fix-13-hardening
+name: zyra-modulo-13-hardening
 
 "on":
   workflow_dispatch:
@@ -9,7 +9,7 @@ permissions:
   contents: write
 
 concurrency:
-  group: zyra-fix-13-${{ github.ref }}
+  group: zyra-modulo-13-${{ github.ref }}
   cancel-in-progress: false
 
 jobs:
@@ -31,20 +31,92 @@ jobs:
           python -m pip install --upgrade pip
           python -m pip install "cryptography>=42,<45" "flake8>=7,<8" "mypy>=1.10,<2" "pytest>=8,<9"
 
-      - name: Check hardening module present
+      - name: Check modules 01-12 present
         run: |
           set -euo pipefail
-          test -f shared_engines/hardening/ratelimit.py
-          echo "hardening present: OK"
+          test -f shared_engines/common/errors.py
+          test -f shared_engines/storage/database.py
+          test -f shared_engines/audit/chain.py
+          test -f shared_engines/verifier/verifier.py
+          echo "modules 01-12 present: OK"
 
-      - name: Rebuild api_keys.py (define KEY_ID_LEN/SECRET_LEN properly)
+      - name: Build shared_engines/hardening
         run: |
           set -euo pipefail
+          mkdir -p shared_engines/hardening/tests
+
+          cat > shared_engines/hardening/__init__.py <<'PYEOF'
+          """Zyra hardening: API keys, rate limiting, brute-force guard."""
+          from __future__ import annotations
+
+          from shared_engines.hardening.api_keys import (
+              ApiKeyManager,
+              ApiKeyRecord,
+              KEY_PREFIX,
+          )
+          from shared_engines.hardening.bruteforce import BruteForceGuard
+          from shared_engines.hardening.errors import (
+              ApiKeyNotFoundError,
+              ApiKeyRevokedError,
+              HardeningError,
+              InvalidApiKeyError,
+              RateLimitExceededError,
+              SourceLockedError,
+          )
+          from shared_engines.hardening.ratelimit import (
+              RateCheckResult,
+              RateLimiter,
+          )
+
+          __all__ = [
+              "ApiKeyManager", "ApiKeyNotFoundError", "ApiKeyRecord",
+              "ApiKeyRevokedError", "BruteForceGuard", "HardeningError",
+              "InvalidApiKeyError", "KEY_PREFIX", "RateCheckResult",
+              "RateLimitExceededError", "RateLimiter", "SourceLockedError",
+          ]
+          PYEOF
+
+          cat > shared_engines/hardening/errors.py <<'PYEOF'
+          """Typed hardening errors."""
+          from __future__ import annotations
+
+          from shared_engines.common.errors import (
+              EngineError,
+              NotFoundError,
+              ValidationError,
+          )
+
+
+          class HardeningError(EngineError):
+              """Base for hardening failures."""
+
+
+          class InvalidApiKeyError(HardeningError, ValidationError):
+              """The presented API key does not exist or is malformed."""
+
+
+          class ApiKeyRevokedError(HardeningError, ValidationError):
+              """The API key was revoked and can no longer be used."""
+
+
+          class ApiKeyNotFoundError(HardeningError, NotFoundError):
+              """No API key exists for the given id."""
+
+
+          class RateLimitExceededError(HardeningError, ValidationError):
+              """The rate limit for this window was exceeded."""
+
+
+          class SourceLockedError(HardeningError, ValidationError):
+              """This source is temporarily locked after failed
+              authentication attempts."""
+          PYEOF
+
           cat > shared_engines/hardening/api_keys.py <<'PYEOF'
           """Cryptographic API keys: one per client, hash-stored, audited.
 
           Key format: ``zy_<keyid>_<secret>``
-          - keyid: 16 hex chars (public identifier, shown in logs)
+          - keyid: 16 hex chars (public identifier)
           - secret: 48 hex chars (192-bit CSPRNG secret, shown ONCE)
 
           The database stores ONLY sha256(full_key). A stolen database
@@ -76,7 +148,7 @@ jobs:
               MigrationRunner,
           )
 
-          KEY_PREFIX = "zy"
+          KEY_PREFIX: Final[str] = "zy"
           KEY_ID_LEN: Final[int] = 16
           SECRET_LEN: Final[int] = 48
 
@@ -270,16 +342,130 @@ jobs:
                   )
           PYEOF
 
-          echo "=== API KEYS REBUILT ==="
+          cat > shared_engines/hardening/ratelimit.py <<'PYEOF'
+          """Durable fixed-window rate limiter per API key."""
+          from __future__ import annotations
 
-      - name: Rebuild bruteforce.py (Migration tuple comma fixed)
-        run: |
-          set -euo pipefail
+          from dataclasses import dataclass
+          from typing import Final
+
+          from shared_engines.common.clocks import Clock
+          from shared_engines.common.validation import (
+              require_int_range,
+              require_non_empty_str,
+          )
+          from shared_engines.hardening.errors import RateLimitExceededError
+          from shared_engines.storage.database import Database
+          from shared_engines.storage.migrations import (
+              Migration,
+              MigrationRunner,
+          )
+
+          _SECONDS_PER_WINDOW: Final[int] = 3600
+
+          RATE_LIMIT_MIGRATIONS = (
+              Migration(
+                  1,
+                  "rate_limit_windows",
+                  (
+                      "CREATE TABLE rate_limit_windows ("
+                      " key_id TEXT NOT NULL,"
+                      " window_start INTEGER NOT NULL,"
+                      " count INTEGER NOT NULL,"
+                      " PRIMARY KEY (key_id, window_start))",
+                  ),
+              ),
+          )
+
+
+          @dataclass(frozen=True)
+          class RateCheckResult:
+              allowed: bool
+              remaining: int
+              limit: int
+
+
+          class RateLimiter:
+              """Fixed-window consumption counter per key (durable)."""
+
+              def __init__(
+                  self,
+                  db: Database,
+                  clock: Clock,
+                  *,
+                  default_limit: int = 1000,
+              ) -> None:
+                  require_int_range(
+                      default_limit,
+                      "default_limit",
+                      1,
+                      1_000_000,
+                      config=True,
+                  )
+                  self._db = db
+                  self._clock = clock
+                  self._default_limit = default_limit
+                  MigrationRunner(
+                      db, "hardening.ratelimit", RATE_LIMIT_MIGRATIONS
+                  ).run(clock)
+
+              def check(
+                  self, key_id: str, *, limit: int | None = None
+              ) -> RateCheckResult:
+                  """Checks and increments consumption atomically."""
+                  require_non_empty_str(key_id, "key_id")
+                  effective = (
+                      limit if limit is not None else self._default_limit
+                  )
+                  require_int_range(effective, "effective", 1, 1_000_000)
+                  now = self._clock.now()
+                  window = int(now // _SECONDS_PER_WINDOW)
+                  with self._db.transaction() as cursor:
+                      row = cursor.execute(
+                          "SELECT count FROM rate_limit_windows"
+                          " WHERE key_id = ? AND window_start = ?",
+                          (key_id, window),
+                      ).fetchone()
+                      current = int(row["count"]) if row is not None else 0
+                      if current >= effective:
+                          return RateCheckResult(
+                              allowed=False,
+                              remaining=0,
+                              limit=effective,
+                          )
+                      cursor.execute(
+                          "INSERT INTO rate_limit_windows"
+                          " (key_id, window_start, count)"
+                          " VALUES (?, ?, 1)"
+                          " ON CONFLICT (key_id, window_start)"
+                          " DO UPDATE SET count = count + 1",
+                          (key_id, window),
+                      )
+                  return RateCheckResult(
+                      allowed=True,
+                      remaining=effective - current - 1,
+                      limit=effective,
+                  )
+
+              def enforce(
+                  self, key_id: str, *, limit: int | None = None
+              ) -> RateCheckResult:
+                  """check() that raises RateLimitExceededError."""
+                  result = self.check(key_id, limit=limit)
+                  if not result.allowed:
+                      raise RateLimitExceededError(
+                          f"rate limit {result.limit} exceeded for"
+                          f" {key_id}; try the next window"
+                      )
+                  return result
+          PYEOF
+
           cat > shared_engines/hardening/bruteforce.py <<'PYEOF'
           """Durable brute-force guard: temporary lockout after failures."""
           from __future__ import annotations
 
           from shared_engines.common.clocks import Clock
+          from shared_engines.common.errors import ConfigurationError
           from shared_engines.common.validation import (
               require_int_range,
               require_non_empty_str,
@@ -321,10 +507,6 @@ jobs:
                       max_failures, "max_failures", 1, 100, config=True
                   )
                   if lockout_seconds <= 0:
-                      from shared_engines.common.errors import (
-                          ConfigurationError,
-                      )
-
                       raise ConfigurationError(
                           "lockout_seconds must be positive"
                       )
@@ -398,7 +580,219 @@ jobs:
                   )
           PYEOF
 
-          echo "=== BRUTEFORCE REBUILT ==="
+          cat > shared_engines/hardening/tests/test_hardening.py <<'PYEOF'
+          from __future__ import annotations
+
+          from pathlib import Path
+
+          import pytest
+
+          from shared_engines.audit.chain import AuditTrail
+          from shared_engines.common.clocks import FrozenClock
+          from shared_engines.hardening.api_keys import ApiKeyManager
+          from shared_engines.hardening.bruteforce import BruteForceGuard
+          from shared_engines.hardening.errors import (
+              ApiKeyNotFoundError,
+              ApiKeyRevokedError,
+              InvalidApiKeyError,
+              RateLimitExceededError,
+              SourceLockedError,
+          )
+          from shared_engines.hardening.ratelimit import RateLimiter
+          from shared_engines.storage.database import SQLiteAdapter
+
+
+          class _Harness:
+              def __init__(self, tmp_path: Path) -> None:
+                  self.db = SQLiteAdapter(tmp_path / "hardening.db")
+                  self.clock = FrozenClock()
+                  self.audit = AuditTrail(self.db, self.clock)
+                  self.keys = ApiKeyManager(self.db, self.clock, self.audit)
+                  self.limiter = RateLimiter(self.db, self.clock)
+                  self.guard = BruteForceGuard(
+                      self.db,
+                      self.clock,
+                      max_failures=3,
+                      lockout_seconds=900,
+                  )
+
+              def close(self) -> None:
+                  self.db.close()
+
+
+          def test_generate_and_verify_roundtrip(tmp_path: Path) -> None:
+              harness = _Harness(tmp_path)
+              full_key, record = harness.keys.generate(
+                  label="nexo-app", created_by="founder"
+              )
+              assert full_key.startswith("zy_")
+              verified = harness.keys.verify(full_key)
+              assert verified.key_id == record.key_id
+              assert verified.active is True
+              assert verified.label == "nexo-app"
+              harness.close()
+
+
+          def test_verify_rejects_wrong_and_malformed(
+              tmp_path: Path,
+          ) -> None:
+              harness = _Harness(tmp_path)
+              full_key, _ = harness.keys.generate(
+                  label="a", created_by="x"
+              )
+              tampered = full_key[:-2] + "ff"
+              with pytest.raises(InvalidApiKeyError):
+                  harness.keys.verify(tampered)
+              with pytest.raises(InvalidApiKeyError):
+                  harness.keys.verify("not-a-key")
+              with pytest.raises(InvalidApiKeyError):
+                  harness.keys.verify("zy_abc")
+              harness.close()
+
+
+          def test_revoke_blocks_and_audit_captures(
+              tmp_path: Path,
+          ) -> None:
+              harness = _Harness(tmp_path)
+              full_key, record = harness.keys.generate(
+                  label="subastas", created_by="founder"
+              )
+              harness.keys.revoke(record.key_id, revoked_by="admin")
+              with pytest.raises(ApiKeyRevokedError):
+                  harness.keys.verify(full_key)
+              assert harness.audit.verify() >= 2
+              with pytest.raises(ApiKeyRevokedError):
+                  harness.keys.revoke(record.key_id, revoked_by="admin")
+              harness.close()
+
+
+          def test_rotate_produces_new_working_key(
+              tmp_path: Path,
+          ) -> None:
+              harness = _Harness(tmp_path)
+              old_key, old_record = harness.keys.generate(
+                  label="bank", created_by="founder"
+              )
+              new_key, new_record = harness.keys.rotate(
+                  old_record.key_id, rotated_by="admin"
+              )
+              assert new_record.key_id != old_record.key_id
+              verified = harness.keys.verify(new_key)
+              assert verified.active is True
+              with pytest.raises(ApiKeyRevokedError):
+                  harness.keys.verify(old_key)
+              assert "rotated" in new_record.label
+              harness.close()
+
+
+          def test_stolen_database_yields_no_usable_keys(
+              tmp_path: Path,
+          ) -> None:
+              """The database stores hashes only; a thief with full DB
+              access cannot reconstruct any usable key."""
+              harness = _Harness(tmp_path)
+              harness.keys.generate(label="x", created_by="y")
+              rows = harness.db.query_all("SELECT * FROM api_keys")
+              for row in rows:
+                  stored = str(row["key_hash"])
+                  assert not stored.startswith("zy_")
+                  assert len(stored) == 64
+              harness.close()
+
+
+          def test_rate_limit_allows_then_blocks(tmp_path: Path) -> None:
+              harness = _Harness(tmp_path)
+              limiter = RateLimiter(
+                  harness.db, harness.clock, default_limit=3
+              )
+              for _ in range(3):
+                  result = limiter.check("key-1")
+                  assert result.allowed is True
+              blocked = limiter.check("key-1")
+              assert blocked.allowed is False
+              with pytest.raises(RateLimitExceededError):
+                  limiter.enforce("key-1")
+              harness.clock.advance(3600)
+              recovered = limiter.check("key-1")
+              assert recovered.allowed is True
+              harness.close()
+
+
+          def test_rate_limit_per_key_independent(
+              tmp_path: Path,
+          ) -> None:
+              harness = _Harness(tmp_path)
+              limiter = RateLimiter(
+                  harness.db, harness.clock, default_limit=2
+              )
+              limiter.enforce("key-a")
+              limiter.enforce("key-a")
+              with pytest.raises(RateLimitExceededError):
+                  limiter.enforce("key-a")
+              result = limiter.enforce("key-b")
+              assert result.allowed is True
+              harness.close()
+
+
+          def test_bruteforce_locks_after_threshold(
+              tmp_path: Path,
+          ) -> None:
+              harness = _Harness(tmp_path)
+              harness.guard.check_allowed("ip-1")
+              assert harness.guard.record_failure("ip-1") is False
+              assert harness.guard.record_failure("ip-1") is False
+              assert harness.guard.record_failure("ip-1") is True
+              with pytest.raises(SourceLockedError):
+                  harness.guard.check_allowed("ip-1")
+              harness.close()
+
+
+          def test_bruteforce_unlocks_after_timeout(
+              tmp_path: Path,
+          ) -> None:
+              harness = _Harness(tmp_path)
+              for _ in range(3):
+                  harness.guard.record_failure("ip-2")
+              with pytest.raises(SourceLockedError):
+                  harness.guard.check_allowed("ip-2")
+              harness.clock.advance(901)
+              harness.guard.check_allowed("ip-2")
+              assert harness.guard.record_failure("ip-2") is False
+              harness.close()
+
+
+          def test_bruteforce_reset_on_success(tmp_path: Path) -> None:
+              harness = _Harness(tmp_path)
+              harness.guard.record_failure("ip-3")
+              harness.guard.record_failure("ip-3")
+              harness.guard.reset("ip-3")
+              assert harness.guard.record_failure("ip-3") is False
+              harness.close()
+
+
+          def test_unknown_key_revoke(tmp_path: Path) -> None:
+              harness = _Harness(tmp_path)
+              with pytest.raises(ApiKeyNotFoundError):
+                  harness.keys.revoke("nonexistent", revoked_by="admin")
+              harness.close()
+
+
+          def test_audit_chain_intact_after_all_ops(
+              tmp_path: Path,
+          ) -> None:
+              harness = _Harness(tmp_path)
+              _key1, r1 = harness.keys.generate(
+                  label="a", created_by="f"
+              )
+              harness.keys.generate(label="b", created_by="f")
+              harness.keys.revoke(r1.key_id, revoked_by="admin")
+              assert harness.audit.verify() >= 3
+              assert len(harness.keys.list_active()) == 1
+              assert harness.keys.list_active()[0].label == "b"
+              harness.close()
+          PYEOF
+
+          echo "=== HARDENING BUILD OK ==="
 
       - name: Quality gates (mypy first; full regression all modules)
         run: |
@@ -425,7 +819,7 @@ jobs:
           if git diff --cached --quiet; then
             echo "No changes."
           else
-            git commit -m "zyra: fix hardening (KEY_ID_LEN/SECRET_LEN defined, bruteforce Migration tuple comma, typed ConfigurationError)"
+            git commit -m "zyra: module 13 HARDENING complete (256-bit API keys hash-stored, rate limiter, brute-force guard, audited rotation/revocation) + tests"
             git push origin "HEAD:${{ github.ref_name }}"
           fi
-          echo "=== FIX 13 COMPLETE ==="
+          echo "=== MODULE 13 COMPLETE ==="

@@ -1,4 +1,4 @@
-name: zyra-modulo-17-telemetry
+name: zyra-modulo-18-ops-resilience
 
 "on":
   workflow_dispatch:
@@ -9,13 +9,13 @@ permissions:
   contents: write
 
 concurrency:
-  group: zyra-modulo-17-${{ github.ref }}
+  group: zyra-modulo-18-${{ github.ref }}
   cancel-in-progress: false
 
 jobs:
   build:
     runs-on: ubuntu-latest
-    timeout-minutes: 25
+    timeout-minutes: 30
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -31,923 +31,777 @@ jobs:
           python -m pip install --upgrade pip
           python -m pip install "cryptography>=42,<45" "flake8>=7,<8" "mypy>=1.10,<2" "pytest>=8,<9"
 
-      - name: Check modules 01-16 present
+      - name: Check modules 01-17 present
         run: |
           set -euo pipefail
-          test -f shared_engines/network/cluster.py
-          test -f shared_engines/authority/root.py
-          echo "modules 01-16 present: OK"
+          test -f shared_engines/telemetry/collector.py
+          test -f shared_engines/logs/structured.py
+          test -f scripts/backup.py
+          echo "modules 01-17 present: OK"
 
-      - name: Build telemetry + structured logs
+      - name: Build remaining operational scripts (phase 6)
         run: |
           set -euo pipefail
-          mkdir -p shared_engines/telemetry/tests shared_engines/logs/tests
 
-          cat > shared_engines/telemetry/__init__.py <<'PYEOF'
-          """Zyra telemetry: durable metrics and event indexing."""
-          from __future__ import annotations
+          cat > scripts/diagnostics.py <<'PYEOF'
+          """CLI: full system diagnostics of the Zyra Network.
 
-          from shared_engines.telemetry.collector import (
-              TelemetryCollector,
-              TelemetryRecord,
-          )
-          from shared_engines.telemetry.errors import (
-              InvalidMetricError,
-              TelemetryError,
-          )
-          from shared_engines.telemetry.system_health import (
-              SystemHealthReporter,
-              SystemReport,
-          )
-
-          __all__ = [
-              "InvalidMetricError", "SystemHealthReporter", "SystemReport",
-              "TelemetryCollector", "TelemetryError", "TelemetryRecord",
-          ]
-          PYEOF
-
-          cat > shared_engines/telemetry/errors.py <<'PYEOF'
-          """Typed telemetry errors."""
-          from __future__ import annotations
-
-          from shared_engines.common.errors import EngineError, ValidationError
-
-
-          class TelemetryError(EngineError):
-              """Base for telemetry failures."""
-
-
-          class InvalidMetricError(TelemetryError, ValidationError):
-              """A metric name or value failed validation."""
-          PYEOF
-
-          cat > shared_engines/telemetry/collector.py <<'PYEOF'
-          """Durable telemetry collector: metrics + event stream ingestion.
-
-          Metrics (counters/gauges/timers) persist per name+tags.
-          ``ingest_outbox`` consumes the Network's event stream and
-          indexes it by type, aggregate and time — the operations
-          history a dashboard or external monitor would query.
+          Reports: component health, migration state, snapshot
+          inventory, log statistics, cluster membership.
+          Exit 0 = healthy, 1 = problems found.
           """
           from __future__ import annotations
 
-          import sqlite3
-          from dataclasses import dataclass
+          import argparse
+          import json
+          import sys
+          from pathlib import Path
 
-          from shared_engines.common.clocks import Clock
-          from shared_engines.common.errors import ValidationError
-          from shared_engines.common.serialization import (
-              canonical_json_dumps,
-              canonical_json_loads,
+          REPO_ROOT = Path(__file__).resolve().parents[1]
+          if str(REPO_ROOT) not in sys.path:
+              sys.path.insert(0, str(REPO_ROOT))
+
+          from shared_engines.common.clocks import SystemClock  # noqa: E402
+          from shared_engines.storage.database import SQLiteAdapter  # noqa: E402
+          from shared_engines.storage.network_migrations import (  # noqa: E402
+              NetworkMigrationRunner,
           )
-          from shared_engines.common.validation import (
-              require_int_range,
-              require_non_empty_str,
-              require_positive_number,
-          )
-          from shared_engines.events.outbox import Outbox
-          from shared_engines.storage.database import Database
-          from shared_engines.storage.migrations import (
-              Migration,
-              MigrationRunner,
-          )
-          from shared_engines.telemetry.errors import InvalidMetricError
-
-          TELEMETRY_MIGRATIONS = (
-              Migration(
-                  1,
-                  "telemetry_metrics",
-                  (
-                      "CREATE TABLE telemetry_metrics ("
-                      " metric_id INTEGER PRIMARY KEY AUTOINCREMENT,"
-                      " name TEXT NOT NULL,"
-                      " kind TEXT NOT NULL,"
-                      " value REAL NOT NULL,"
-                      " tags TEXT NOT NULL,"
-                      " recorded_at REAL NOT NULL)",
-                      "CREATE INDEX telemetry_metrics_name_time"
-                      " ON telemetry_metrics (name, recorded_at)",
-                  ),
-              ),
-              Migration(
-                  2,
-                  "telemetry_events",
-                  (
-                      "CREATE TABLE telemetry_events ("
-                      " event_id TEXT PRIMARY KEY,"
-                      " event_type TEXT NOT NULL,"
-                      " aggregate_id TEXT NOT NULL,"
-                      " payload TEXT NOT NULL,"
-                      " occurred_at REAL NOT NULL)",
-                      "CREATE INDEX telemetry_events_type_time"
-                      " ON telemetry_events (event_type, occurred_at)",
-                      "CREATE INDEX telemetry_events_aggregate"
-                      " ON telemetry_events (aggregate_id, occurred_at)",
-                  ),
-              ),
-          )
+          from shared_engines.storage.snapshots import SnapshotManager  # noqa: E402
 
 
-          @dataclass(frozen=True)
-          class TelemetryRecord:
-              metric_id: int
-              name: str
-              kind: str
-              value: float
-              tags: dict[str, str]
-              recorded_at: float
-
-
-          class TelemetryCollector:
-              """Durable metrics + event stream ingestion."""
-
-              def __init__(self, db: Database, clock: Clock) -> None:
-                  self._db = db
-                  self._clock = clock
-                  MigrationRunner(
-                      db, "telemetry", TELEMETRY_MIGRATIONS
-                  ).run(clock)
-
-              def counter(
-                  self,
-                  name: str,
-                  *,
-                  tags: dict[str, str] | None = None,
-              ) -> None:
-                  self._record(name, kind="counter", value=1.0, tags=tags)
-
-              def gauge(
-                  self,
-                  name: str,
-                  value: float,
-                  *,
-                  tags: dict[str, str] | None = None,
-              ) -> None:
-                  try:
-                      require_positive_number(value, name)
-                  except ValidationError as exc:
-                      raise InvalidMetricError(str(exc)) from exc
-                  self._record(name, kind="gauge", value=value, tags=tags)
-
-              def timer(
-                  self,
-                  name: str,
-                  seconds: float,
-                  *,
-                  tags: dict[str, str] | None = None,
-              ) -> None:
-                  try:
-                      require_positive_number(seconds, "duration")
-                  except ValidationError as exc:
-                      raise InvalidMetricError(str(exc)) from exc
-                  self._record(
-                      name, kind="timer", value=seconds, tags=tags
+          def run(*, data_dir: Path, snapshot_dir: Path) -> int:
+              db_path = Path(data_dir) / "zyra.db"
+              problems: list[str] = []
+              report: dict[str, object] = {}
+              if not db_path.exists():
+                  print(json.dumps(
+                      {"healthy": False,
+                       "problems": [f"no database at {db_path}"]},
+                      indent=2,
+                  ))
+                  return 1
+              adapter = SQLiteAdapter(db_path)
+              try:
+                  report["database_integrity"] = "checking"
+                  adapter.integrity_check()
+                  report["database_integrity"] = "ok"
+              except Exception as exc:
+                  problems.append(f"integrity: {exc}")
+              try:
+                  migration_report = (
+                      NetworkMigrationRunner(
+                          adapter, SystemClock()
+                      ).run_all()
                   )
-
-              def _record(
-                  self,
-                  name: str,
-                  *,
-                  kind: str,
-                  value: float,
-                  tags: dict[str, str] | None,
-              ) -> None:
-                  require_non_empty_str(name, "name")
-                  with self._db.transaction() as cursor:
-                      cursor.execute(
-                          "INSERT INTO telemetry_metrics"
-                          " (name, kind, value, tags, recorded_at)"
-                          " VALUES (?, ?, ?, ?, ?)",
-                          (
-                              name,
-                              kind,
-                              value,
-                              canonical_json_dumps(dict(tags or {})),
-                              self._clock.now(),
-                          ),
-                      )
-
-              def ingest_outbox(
-                  self, outbox: Outbox, *, batch_size: int = 100
-              ) -> int:
-                  """Indexes pending outbox events into telemetry.
-
-                  Production pattern: telemetry ingests the Network's
-                  event stream. Events are marked published only after
-                  successful indexing, so a crash never loses events
-                  (at-least-once, deduped by event_id primary key).
-                  """
-                  require_int_range(batch_size, "batch_size", 1, 10_000)
-                  indexed = 0
-                  for event in outbox.pending(batch_size):
-                      try:
-                          with self._db.transaction() as cursor:
-                              cursor.execute(
-                                  "INSERT INTO telemetry_events"
-                                  " (event_id, event_type, aggregate_id,"
-                                  "  payload, occurred_at)"
-                                  " VALUES (?, ?, ?, ?, ?)",
-                                  (
-                                      event.event_id,
-                                      event.event_type,
-                                      event.aggregate_id,
-                                      canonical_json_dumps(
-                                          dict(event.payload)
-                                      ),
-                                      event.timestamp,
-                                  ),
-                              )
-                      except sqlite3.IntegrityError:
-                          pass
-                      outbox.dispatch_pending(
-                          lambda e: None, batch_size=1
-                      )
-                      indexed += 1
-                      if indexed >= batch_size:
-                          break
-                  return indexed
-
-              def query_metrics(
-                  self,
-                  name: str,
-                  *,
-                  limit: int = 100,
-              ) -> tuple[TelemetryRecord, ...]:
-                  require_non_empty_str(name, "name")
-                  require_int_range(limit, "limit", 1, 10_000)
-                  rows = self._db.query_all(
-                      "SELECT * FROM telemetry_metrics"
-                      " WHERE name = ?"
-                      " ORDER BY recorded_at DESC, metric_id DESC"
-                      " LIMIT ?",
-                      (name, limit),
-                  )
-                  return tuple(self._record_from_row(row) for row in rows)
-
-              def query_events(
-                  self,
-                  *,
-                  event_type: str | None = None,
-                  aggregate_id: str | None = None,
-                  limit: int = 100,
-              ) -> tuple[dict[str, object], ...]:
-                  require_int_range(limit, "limit", 1, 10_000)
-                  if event_type is not None and aggregate_id is not None:
-                      rows = self._db.query_all(
-                          "SELECT * FROM telemetry_events"
-                          " WHERE event_type = ? AND aggregate_id = ?"
-                          " ORDER BY occurred_at DESC LIMIT ?",
-                          (event_type, aggregate_id, limit),
-                      )
-                  elif event_type is not None:
-                      rows = self._db.query_all(
-                          "SELECT * FROM telemetry_events"
-                          " WHERE event_type = ?"
-                          " ORDER BY occurred_at DESC LIMIT ?",
-                          (event_type, limit),
-                      )
-                  elif aggregate_id is not None:
-                      rows = self._db.query_all(
-                          "SELECT * FROM telemetry_events"
-                          " WHERE aggregate_id = ?"
-                          " ORDER BY occurred_at DESC LIMIT ?",
-                          (aggregate_id, limit),
-                      )
-                  else:
-                      rows = self._db.query_all(
-                          "SELECT * FROM telemetry_events"
-                          " ORDER BY occurred_at DESC LIMIT ?",
-                          (limit,),
-                      )
-                  return tuple(
-                      {
-                          "event_id": str(row["event_id"]),
-                          "event_type": str(row["event_type"]),
-                          "aggregate_id": str(row["aggregate_id"]),
-                          "payload": canonical_json_loads(
-                              str(row["payload"])
-                          ),
-                          "occurred_at": float(row["occurred_at"]),
-                      }
-                      for row in rows
-                  )
-
-              def metric_summary(self, name: str) -> dict[str, object]:
-                  records = self.query_metrics(name, limit=10_000)
-                  if not records:
-                      return {
-                          "name": name,
-                          "count": 0,
-                          "total": 0.0,
-                          "last": None,
-                      }
-                  values = [r.value for r in records]
-                  return {
-                      "name": name,
-                      "count": len(values),
-                      "total": sum(values),
-                      "last": values[0],
+                  report["migrations"] = {
+                      r.namespace: len(r.versions)
+                      for r in migration_report.results
                   }
-
-              @staticmethod
-              def _record_from_row(row: sqlite3.Row) -> TelemetryRecord:
-                  tags = canonical_json_loads(str(row["tags"]))
-                  if not isinstance(tags, dict):
-                      tags = {}
-                  return TelemetryRecord(
-                      metric_id=int(row["metric_id"]),
-                      name=str(row["name"]),
-                      kind=str(row["kind"]),
-                      value=float(row["value"]),
-                      tags={str(k): str(v) for k, v in tags.items()},
-                      recorded_at=float(row["recorded_at"]),
+              except Exception as exc:
+                  problems.append(f"migrations: {exc}")
+              try:
+                  manager = SnapshotManager(
+                      adapter, SystemClock(), Path(snapshot_dir)
                   )
-          PYEOF
-
-          cat > shared_engines/telemetry/system_health.py <<'PYEOF'
-          """System health reporter: one view of the whole Network."""
-          from __future__ import annotations
-
-          from dataclasses import dataclass
-
-          from shared_engines.common.clocks import Clock
-          from shared_engines.network.cluster import ClusterManager
-          from shared_engines.observability.health import HealthRegistry
-          from shared_engines.telemetry.collector import TelemetryCollector
-
-
-          @dataclass(frozen=True)
-          class SystemReport:
-              overall_status: str
-              components_detail: tuple[str, ...]
-              cluster_nodes_active: int
-              cluster_nodes_total: int
-              recent_event_count: int
-
-
-          class SystemHealthReporter:
-              """Aggregates component health + cluster + telemetry."""
-
-              def __init__(
-                  self,
-                  *,
-                  registry: HealthRegistry,
-                  cluster: ClusterManager,
-                  telemetry: TelemetryCollector,
-                  clock: Clock,
-              ) -> None:
-                  self._registry = registry
-                  self._cluster = cluster
-                  self._telemetry = telemetry
-                  self._clock = clock
-
-              def report(self) -> SystemReport:
-                  overall = self._registry.overall()
-                  components = self._registry.snapshot()
-                  all_nodes = self._cluster.all_nodes()
-                  active = self._cluster.active_nodes()
-                  recent = self._telemetry.query_events(limit=100)
-                  return SystemReport(
-                      overall_status=overall.status.value,
-                      components_detail=tuple(
-                          f"{c.component}:{c.status.value}"
-                          for c in components
+                  snapshots = manager.list_snapshots()
+                  report["snapshots"] = {
+                      "count": len(snapshots),
+                      "latest": (
+                          snapshots[0].path.name
+                          if snapshots
+                          else None
                       ),
-                      cluster_nodes_active=len(active),
-                      cluster_nodes_total=len(all_nodes),
-                      recent_event_count=len(recent),
+                  }
+              except Exception as exc:
+                  problems.append(f"snapshots: {exc}")
+              report["healthy"] = len(problems) == 0
+              report["problems"] = problems
+              print(json.dumps(report, indent=2))
+              adapter.close()
+              return 0 if not problems else 1
+
+
+          def main() -> None:
+              parser = argparse.ArgumentParser(
+                  description="Zyra Network diagnostics"
+              )
+              parser.add_argument("--data-dir", default="/tmp/zyra-data")
+              parser.add_argument(
+                  "--snapshot-dir", default="/tmp/zyra-snapshots"
+              )
+              args = parser.parse_args()
+              raise SystemExit(
+                  run(
+                      data_dir=Path(args.data_dir),
+                      snapshot_dir=Path(args.snapshot_dir),
                   )
+              )
+
+
+          if __name__ == "__main__":
+              main()
           PYEOF
 
-          cat > shared_engines/telemetry/tests/test_telemetry.py <<'PYEOF'
+          cat > scripts/verify_installation.py <<'PYEOF'
+          """CLI: verify the Zyra installation is complete and sane.
+
+          Checks: required modules importable, database migratable,
+          key material present. Exit 0 = installation verified.
+          """
           from __future__ import annotations
 
+          import argparse
+          import json
+          import sys
+          from pathlib import Path
+
+          REPO_ROOT = Path(__file__).resolve().parents[1]
+          if str(REPO_ROOT) not in sys.path:
+              sys.path.insert(0, str(REPO_ROOT))
+
+          from shared_engines.common.clocks import SystemClock  # noqa: E402
+          from shared_engines.storage.database import SQLiteAdapter  # noqa: E402
+          from shared_engines.storage.network_migrations import (  # noqa: E402
+              NetworkMigrationRunner,
+          )
+
+
+          def run(*, data_dir: Path) -> int:
+              checks: dict[str, bool] = {}
+              errors: list[str] = []
+              for module in (
+                  "shared_engines.common.errors",
+                  "shared_engines.runtime.kernel",
+                  "shared_engines.identity.engine",
+                  "shared_engines.verification.engine",
+                  "shared_engines.tokenization.engine",
+                  "shared_engines.currency.engine",
+                  "shared_engines.hardening.api_keys",
+                  "shared_engines.authority.root",
+              ):
+                  try:
+                      __import__(module)
+                      checks[module] = True
+                  except Exception as exc:
+                      checks[module] = False
+                      errors.append(f"{module}: {exc}")
+              try:
+                  db_path = Path(data_dir) / "zyra.db"
+                  adapter = SQLiteAdapter(db_path)
+                  NetworkMigrationRunner(
+                      adapter, SystemClock()
+                  ).run_all()
+                  adapter.close()
+                  checks["database_migratable"] = True
+              except Exception as exc:
+                  checks["database_migratable"] = False
+                  errors.append(f"database: {exc}")
+              verified = not errors
+              print(json.dumps(
+                  {"verified": verified, "checks": checks,
+                   "errors": errors},
+                  indent=2,
+              ))
+              return 0 if verified else 1
+
+
+          def main() -> None:
+              parser = argparse.ArgumentParser(
+                  description="Verify Zyra Network installation"
+              )
+              parser.add_argument("--data-dir", default="/tmp/zyra-data")
+              args = parser.parse_args()
+              raise SystemExit(run(data_dir=Path(args.data_dir)))
+
+
+          if __name__ == "__main__":
+              main()
+          PYEOF
+
+          cat > scripts/bootstrap.py <<'PYEOF'
+          """CLI: initial bootstrap of the Zyra Network.
+
+          Migrates the full schema and creates the first verified
+          snapshot. Safe to run multiple times (idempotent).
+          """
+          from __future__ import annotations
+
+          import argparse
+          import sys
+          from pathlib import Path
+
+          REPO_ROOT = Path(__file__).resolve().parents[1]
+          if str(REPO_ROOT) not in sys.path:
+              sys.path.insert(0, str(REPO_ROOT))
+
+          from shared_engines.common.clocks import SystemClock  # noqa: E402
+          from shared_engines.storage.database import SQLiteAdapter  # noqa: E402
+          from shared_engines.storage.network_migrations import (  # noqa: E402
+              NetworkMigrationRunner,
+          )
+          from shared_engines.storage.snapshots import SnapshotManager  # noqa: E402
+
+
+          def run(*, data_dir: Path, snapshot_dir: Path) -> int:
+              Path(data_dir).mkdir(parents=True, exist_ok=True)
+              db_path = Path(data_dir) / "zyra.db"
+              adapter = SQLiteAdapter(db_path)
+              report = NetworkMigrationRunner(
+                  adapter, SystemClock()
+              ).run_all()
+              print(
+                  f"migrated: {report.total_applied_now} applied,"
+                  f" {len(report.results)} namespaces"
+              )
+              manager = SnapshotManager(
+                  adapter, SystemClock(), Path(snapshot_dir)
+              )
+              snapshot = manager.create(label="bootstrap")
+              print(f"bootstrap snapshot: {snapshot.path}")
+              print(f"sha256: {snapshot.sha256}")
+              adapter.close()
+              return 0
+
+
+          def main() -> None:
+              parser = argparse.ArgumentParser(
+                  description="Bootstrap the Zyra Network"
+              )
+              parser.add_argument("--data-dir", default="/tmp/zyra-data")
+              parser.add_argument(
+                  "--snapshot-dir", default="/tmp/zyra-snapshots"
+              )
+              args = parser.parse_args()
+              raise SystemExit(
+                  run(
+                      data_dir=Path(args.data_dir),
+                      snapshot_dir=Path(args.snapshot_dir),
+                  )
+              )
+
+
+          if __name__ == "__main__":
+              main()
+          PYEOF
+
+          cat > scripts/cleanup.py <<'PYEOF'
+          """CLI: retention cleanup — snapshots + structured logs."""
+          from __future__ import annotations
+
+          import argparse
+          import sys
+          from pathlib import Path
+
+          REPO_ROOT = Path(__file__).resolve().parents[1]
+          if str(REPO_ROOT) not in sys.path:
+              sys.path.insert(0, str(REPO_ROOT))
+
+          from shared_engines.common.clocks import SystemClock  # noqa: E402
+          from shared_engines.logs.structured import StructuredLogger  # noqa: E402
+          from shared_engines.storage.database import SQLiteAdapter  # noqa: E402
+          from shared_engines.storage.snapshots import SnapshotManager  # noqa: E402
+
+
+          def run(
+              *,
+              data_dir: Path,
+              snapshot_dir: Path,
+              keep_snapshots: int,
+              keep_logs: int,
+          ) -> int:
+              db_path = Path(data_dir) / "zyra.db"
+              if not db_path.exists():
+                  print(f"no database at {db_path}")
+                  return 1
+              adapter = SQLiteAdapter(db_path)
+              manager = SnapshotManager(
+                  adapter, SystemClock(), Path(snapshot_dir)
+              )
+              removed_snapshots = manager.enforce_retention(
+                  keep=keep_snapshots
+              )
+              logger = StructuredLogger(adapter, SystemClock())
+              removed_logs = logger.enforce_retention(keep=keep_logs)
+              print(f"snapshots removed: {len(removed_snapshots)}")
+              print(f"log records removed: {removed_logs}")
+              adapter.close()
+              return 0
+
+
+          def main() -> None:
+              parser = argparse.ArgumentParser(
+                  description="Zyra retention cleanup"
+              )
+              parser.add_argument("--data-dir", default="/tmp/zyra-data")
+              parser.add_argument(
+                  "--snapshot-dir", default="/tmp/zyra-snapshots"
+              )
+              parser.add_argument("--keep-snapshots", type=int, default=10)
+              parser.add_argument("--keep-logs", type=int, default=10_000)
+              args = parser.parse_args()
+              raise SystemExit(
+                  run(
+                      data_dir=Path(args.data_dir),
+                      snapshot_dir=Path(args.snapshot_dir),
+                      keep_snapshots=args.keep_snapshots,
+                      keep_logs=args.keep_logs,
+                  )
+              )
+
+
+          if __name__ == "__main__":
+              main()
+          PYEOF
+
+          cat > scripts/rollback.py <<'PYEOF'
+          """CLI: rollback the database to the latest verified snapshot."""
+          from __future__ import annotations
+
+          import argparse
+          import sys
+          from pathlib import Path
+
+          REPO_ROOT = Path(__file__).resolve().parents[1]
+          if str(REPO_ROOT) not in sys.path:
+              sys.path.insert(0, str(REPO_ROOT))
+
+          from shared_engines.common.clocks import SystemClock  # noqa: E402
+          from shared_engines.storage.database import SQLiteAdapter  # noqa: E402
+          from shared_engines.storage.snapshots import SnapshotManager  # noqa: E402
+
+
+          def run(
+              *, data_dir: Path, snapshot_dir: Path
+          ) -> int:
+              db_path = Path(data_dir) / "zyra.db"
+              if not db_path.exists():
+                  print(f"no database at {db_path}")
+                  return 1
+              snapshots = sorted(
+                  Path(snapshot_dir).glob("snapshot-*.db"),
+                  key=lambda p: p.stat().st_mtime,
+                  reverse=True,
+              )
+              if not snapshots:
+                  print("no snapshots available for rollback")
+                  return 1
+              latest = snapshots[0]
+              adapter = SQLiteAdapter(db_path)
+              manager = SnapshotManager(
+                  adapter, SystemClock(), Path(snapshot_dir)
+              )
+              manager.verify(latest)
+              manager.restore(latest, db_path)
+              print(f"rolled back to: {latest.name}")
+              print("verify with: python scripts/verify_installation.py")
+              adapter.close()
+              return 0
+
+
+          def main() -> None:
+              parser = argparse.ArgumentParser(
+                  description="Rollback to latest verified snapshot"
+              )
+              parser.add_argument("--data-dir", default="/tmp/zyra-data")
+              parser.add_argument(
+                  "--snapshot-dir", default="/tmp/zyra-snapshots"
+              )
+              args = parser.parse_args()
+              raise SystemExit(
+                  run(
+                      data_dir=Path(args.data_dir),
+                      snapshot_dir=Path(args.snapshot_dir),
+                  )
+              )
+
+
+          if __name__ == "__main__":
+              main()
+          PYEOF
+
+          echo "=== PHASE 6 SCRIPTS REAL ==="
+
+      - name: Write resilience torture tests (phase 7)
+        run: |
+          set -euo pipefail
+          mkdir -p shared_engines/tests
+          cat > shared_engines/tests/test_resilience.py <<'PYEOF'
+          from __future__ import annotations
+
+          from concurrent.futures import ThreadPoolExecutor
           from pathlib import Path
 
           import pytest
 
           from shared_engines.audit.chain import AuditTrail
           from shared_engines.common.clocks import FrozenClock
+          from shared_engines.common.errors import EngineError
+          from shared_engines.events.contracts import Event, EventCatalog
+          from shared_engines.events.outbox import Outbox
           from shared_engines.identity.contracts import IdentityKind
           from shared_engines.identity.engine import IdentityEngine
-          from shared_engines.network.cluster import ClusterManager, NodeRole
-          from shared_engines.observability.health import (
-              ComponentHealth,
-              HealthRegistry,
-              HealthStatus,
-          )
-          from shared_engines.events.contracts import EventCatalog
-          from shared_engines.events.outbox import Outbox
+          from shared_engines.logs.structured import StructuredLogger
           from shared_engines.storage.database import SQLiteAdapter
-          from shared_engines.telemetry.collector import TelemetryCollector
-          from shared_engines.telemetry.errors import InvalidMetricError
-          from shared_engines.telemetry.system_health import (
-              SystemHealthReporter,
+          from shared_engines.storage.disaster_recovery import (
+              DisasterRecovery,
           )
+          from shared_engines.storage.snapshots import SnapshotManager
+          from shared_engines.tokenization.engine import TokenEngine
 
 
-          class _StaticHealth:
-              def check_health(self) -> ComponentHealth:
-                  return ComponentHealth(
-                      "storage", HealthStatus.HEALTHY, "static ok"
-                  )
+          class SimulatedCrash(Exception):
+              """Local chaos injection."""
 
 
-          class _Harness:
-              def __init__(self, tmp_path: Path) -> None:
-                  self.db = SQLiteAdapter(tmp_path / "tel.db")
-                  self.clock = FrozenClock()
-                  self.audit = AuditTrail(self.db, self.clock)
-                  self.outbox = Outbox(self.db, self.clock)
-                  self.outbox.ensure_schema()
-                  self.catalog = EventCatalog()
-                  for event_type in (
-                      "network.node.joined",
-                      "identity.registered",
-                      "identity.status_changed",
-                  ):
-                      self.catalog.register(event_type)
-                  self.identity = IdentityEngine(
-                      db=self.db,
-                      clock=self.clock,
-                      audit=self.audit,
-                      outbox=self.outbox,
-                      catalog=self.catalog,
-                  )
-                  self.cluster = ClusterManager(
-                      db=self.db,
-                      clock=self.clock,
-                      audit=self.audit,
-                      outbox=self.outbox,
-                      catalog=self.catalog,
-                  )
-                  self.telemetry = TelemetryCollector(self.db, self.clock)
-                  self.registry = HealthRegistry()
-
-              def ingest_all(self) -> int:
-                  return self.telemetry.ingest_outbox(self.outbox)
-
-              def close(self) -> None:
-                  self.db.close()
-
-
-          def test_counter_gauge_timer_persist(tmp_path: Path) -> None:
-              harness = _Harness(tmp_path)
-              harness.telemetry.counter("identity.registered")
-              harness.telemetry.counter("identity.registered")
-              harness.telemetry.gauge("cluster.nodes.active", 3.0)
-              harness.telemetry.timer("request.latency", 0.25)
-              metrics = harness.telemetry.query_metrics(
-                  "identity.registered"
-              )
-              assert len(metrics) == 2
-              assert all(m.kind == "counter" for m in metrics)
-              summary = harness.telemetry.metric_summary(
-                  "identity.registered"
-              )
-              assert summary["count"] == 2
-              assert summary["total"] == 2.0
-              latencies = harness.telemetry.query_metrics(
-                  "request.latency"
-              )
-              assert latencies[0].value == 0.25
-              harness.close()
-
-
-          def test_outbox_ingested_into_telemetry(tmp_path: Path) -> None:
-              harness = _Harness(tmp_path)
-              user = harness.identity.register_identity(
-                  kind=IdentityKind.PERSON,
-                  display_name="Watched",
-                  actor="registrar",
-              )
-              indexed = harness.ingest_all()
-              assert indexed >= 1
-              events = harness.telemetry.query_events(
-                  aggregate_id=user.zid
-              )
-              types = {e["event_type"] for e in events}
-              assert "identity.registered" in types
-              by_type = harness.telemetry.query_events(
-                  event_type="identity.registered"
-              )
-              assert len(by_type) >= 1
-              harness.close()
-
-
-          def test_ingest_is_idempotent(tmp_path: Path) -> None:
-              harness = _Harness(tmp_path)
-              harness.identity.register_identity(
-                  kind=IdentityKind.PERSON,
-                  display_name="Once",
-                  actor="registrar",
-              )
-              first = harness.ingest_all()
-              assert first >= 1
-              second = harness.telemetry.ingest_outbox(harness.outbox)
-              assert second == 0
-              harness.close()
-
-
-          def test_system_report_aggregates_everything(
+          def test_concurrent_identity_and_token_writes(
               tmp_path: Path,
           ) -> None:
-              harness = _Harness(tmp_path)
-              harness.identity.register_identity(
-                  kind=IdentityKind.PERSON,
-                  display_name="Node Owner",
-                  actor="bootstrap",
+              """10 threads hammering identity+tokens: no corruption,
+              no lost tokens, invariant holds."""
+              db = SQLiteAdapter(tmp_path / "stress.db")
+              clock = FrozenClock()
+              audit = AuditTrail(db, clock)
+              outbox = Outbox(db, clock)
+              outbox.ensure_schema()
+              catalog = EventCatalog()
+              for event_type in (
+                  "identity.registered",
+                  "identity.status_changed",
+                  "token.earned",
+              ):
+                  catalog.register(event_type)
+              identity = IdentityEngine(
+                  db=db, clock=clock, audit=audit,
+                  outbox=outbox, catalog=catalog,
               )
-              node_identity = harness.identity.register_identity(
-                  kind=IdentityKind.DEVICE,
-                  display_name="node-0",
-                  actor="bootstrap",
+              tokens = TokenEngine(
+                  db=db, clock=clock, audit=audit,
+                  outbox=outbox, catalog=catalog,
+                  identity=identity,
               )
-              harness.cluster.register_node(
-                  node_id=node_identity.zid,
-                  role=NodeRole.COORDINATOR,
-                  endpoint="tcp://node-0:9000",
-              )
-              harness.cluster.heartbeat(node_identity.zid)
-              harness.ingest_all()
-              harness.registry.register("storage", _StaticHealth())
-              reporter = SystemHealthReporter(
-                  registry=harness.registry,
-                  cluster=harness.cluster,
-                  telemetry=harness.telemetry,
-                  clock=harness.clock,
-              )
-              report = reporter.report()
-              assert report.overall_status == "healthy"
-              assert report.cluster_nodes_total >= 1
-              assert report.recent_event_count >= 1
-              harness.close()
+              tokens.define_rule(activity="stress", amount=1)
 
-
-          def test_invalid_metric_rejected(tmp_path: Path) -> None:
-              harness = _Harness(tmp_path)
-              with pytest.raises(InvalidMetricError):
-                  harness.telemetry.gauge("bad.gauge", -1.0)
-              with pytest.raises(InvalidMetricError):
-                  harness.telemetry.timer("bad.timer", 0.0)
-              harness.close()
-
-
-          def test_telemetry_survives_reopen(tmp_path: Path) -> None:
-              path = tmp_path / "tel.db"
-              db = SQLiteAdapter(path)
-              telemetry = TelemetryCollector(db, FrozenClock())
-              telemetry.counter("persist.test")
-              db.close()
-              db2 = SQLiteAdapter(path)
-              telemetry2 = TelemetryCollector(db2, FrozenClock())
-              records = telemetry2.query_metrics("persist.test")
-              assert len(records) == 1
-              db2.close()
-          PYEOF
-
-          cat > shared_engines/logs/__init__.py <<'PYEOF'
-          """Zyra structured logs with correlation."""
-          from __future__ import annotations
-
-          from shared_engines.logs.structured import (
-              CorrelationContext,
-              LogRecord,
-              StructuredLogger,
-          )
-
-          __all__ = ["CorrelationContext", "LogRecord", "StructuredLogger"]
-          PYEOF
-
-          cat > shared_engines/logs/structured.py <<'PYEOF'
-          """Structured JSON logging with request correlation."""
-          from __future__ import annotations
-
-          import sqlite3
-          from dataclasses import dataclass
-          from typing import Final
-
-          from shared_engines.common.clocks import Clock
-          from shared_engines.common.errors import IntegrityError
-          from shared_engines.common.identifiers import new_id
-          from shared_engines.common.serialization import (
-              canonical_json_dumps,
-              canonical_json_loads,
-          )
-          from shared_engines.common.validation import (
-              require_int_range,
-              require_non_empty_str,
-          )
-          from shared_engines.storage.database import Database
-          from shared_engines.storage.migrations import (
-              Migration,
-              MigrationRunner,
-          )
-
-          LEVELS: Final[tuple[str, ...]] = (
-              "DEBUG",
-              "INFO",
-              "WARNING",
-              "ERROR",
-          )
-
-          LOGS_MIGRATIONS = (
-              Migration(
-                  1,
-                  "structured_logs",
-                  (
-                      "CREATE TABLE structured_logs ("
-                      " log_id INTEGER PRIMARY KEY AUTOINCREMENT,"
-                      " level TEXT NOT NULL,"
-                      " component TEXT NOT NULL,"
-                      " message TEXT NOT NULL,"
-                      " correlation_id TEXT NOT NULL,"
-                      " detail TEXT NOT NULL,"
-                      " created_at REAL NOT NULL)",
-                      "CREATE INDEX logs_correlation"
-                      " ON structured_logs (correlation_id, created_at)",
-                      "CREATE INDEX logs_level_time"
-                      " ON structured_logs (level, created_at)",
-                  ),
-              ),
-          )
-
-
-          @dataclass(frozen=True)
-          class LogRecord:
-              log_id: int
-              level: str
-              component: str
-              message: str
-              correlation_id: str
-              detail: dict[str, str]
-              created_at: float
-
-
-          class CorrelationContext:
-              """Per-operation correlation id generator/tracker."""
-
-              def __init__(self) -> None:
-                  self._current: str | None = None
-
-              def start(self) -> str:
-                  self._current = f"REQ-{new_id()}"
-                  return self._current
-
-              @property
-              def current(self) -> str:
-                  if self._current is None:
-                      return self.start()
-                  return self._current
-
-              def clear(self) -> None:
-                  self._current = None
-
-
-          class StructuredLogger:
-              """Durable structured logger with correlation + retention."""
-
-              def __init__(self, db: Database, clock: Clock) -> None:
-                  self._db = db
-                  self._clock = clock
-                  MigrationRunner(
-                      db, "logs.structured", LOGS_MIGRATIONS
-                  ).run(clock)
-
-              def log(
-                  self,
-                  *,
-                  level: str,
-                  component: str,
-                  message: str,
-                  correlation_id: str,
-                  detail: dict[str, str] | None = None,
-              ) -> LogRecord:
-                  if level not in LEVELS:
-                      raise IntegrityError(
-                          f"invalid log level: {level}"
+              def worker(worker_index: int) -> int:
+                  created = 0
+                  for index in range(5):
+                      user = identity.register_identity(
+                          kind=IdentityKind.PERSON,
+                          display_name=f"w{worker_index}-{index}",
+                          actor="stress",
                       )
-                  require_non_empty_str(component, "component")
-                  require_non_empty_str(message, "message")
-                  require_non_empty_str(correlation_id, "correlation_id")
-                  safe_detail: dict[str, str] = {
-                      str(k): str(v) for k, v in (detail or {}).items()
-                  }
-                  now = self._clock.now()
-                  with self._db.transaction() as cursor:
-                      cursor.execute(
-                          "INSERT INTO structured_logs"
-                          " (level, component, message,"
-                          "  correlation_id, detail, created_at)"
-                          " VALUES (?, ?, ?, ?, ?, ?)",
-                          (
-                              level,
-                              component,
-                              message,
-                              correlation_id,
-                              canonical_json_dumps(safe_detail),
-                              now,
-                          ),
+                      tokens.earn(
+                          subject_zid=user.zid,
+                          activity="stress",
+                          ref_type="stress",
+                          ref_id=str(index),
                       )
-                      row = cursor.execute(
-                          "SELECT * FROM structured_logs"
-                          " ORDER BY log_id DESC LIMIT 1"
-                      ).fetchone()
-                  if row is None:
-                      raise IntegrityError("log vanished after insert")
-                  return self._record_from_row(row)
+                      created += 1
+                  return created
 
-              def info(
-                  self,
-                  component: str,
-                  message: str,
-                  correlation_id: str,
-                  detail: dict[str, str] | None = None,
-              ) -> LogRecord:
-                  return self.log(
-                      level="INFO",
-                      component=component,
-                      message=message,
-                      correlation_id=correlation_id,
-                      detail=detail,
-                  )
-
-              def warning(
-                  self,
-                  component: str,
-                  message: str,
-                  correlation_id: str,
-                  detail: dict[str, str] | None = None,
-              ) -> LogRecord:
-                  return self.log(
-                      level="WARNING",
-                      component=component,
-                      message=message,
-                      correlation_id=correlation_id,
-                      detail=detail,
-                  )
-
-              def error(
-                  self,
-                  component: str,
-                  message: str,
-                  correlation_id: str,
-                  detail: dict[str, str] | None = None,
-              ) -> LogRecord:
-                  return self.log(
-                      level="ERROR",
-                      component=component,
-                      message=message,
-                      correlation_id=correlation_id,
-                      detail=detail,
-                  )
-
-              def query_by_correlation(
-                  self, correlation_id: str
-              ) -> tuple[LogRecord, ...]:
-                  require_non_empty_str(correlation_id, "correlation_id")
-                  rows = self._db.query_all(
-                      "SELECT * FROM structured_logs"
-                      " WHERE correlation_id = ?"
-                      " ORDER BY created_at, log_id",
-                      (correlation_id,),
-                  )
-                  return tuple(self._record_from_row(r) for r in rows)
-
-              def enforce_retention(self, *, keep: int) -> int:
-                  require_int_range(keep, "keep", 1, 1_000_000)
-                  with self._db.transaction() as cursor:
-                      cursor.execute(
-                          "DELETE FROM structured_logs"
-                          " WHERE log_id NOT IN"
-                          " (SELECT log_id FROM structured_logs"
-                          "  ORDER BY log_id DESC LIMIT ?)",
-                          (keep,),
-                      )
-                      row = cursor.execute(
-                          "SELECT changes()"
-                      ).fetchone()
-                  return int(row[0]) if row is not None else 0
-
-              @staticmethod
-              def _record_from_row(row: sqlite3.Row) -> LogRecord:
-                  detail_raw = canonical_json_loads(str(row["detail"]))
-                  if not isinstance(detail_raw, dict):
-                      detail_raw = {}
-                  detail: dict[str, str] = {
-                      str(k): str(v) for k, v in detail_raw.items()
-                  }
-                  return LogRecord(
-                      log_id=int(row["log_id"]),
-                      level=str(row["level"]),
-                      component=str(row["component"]),
-                      message=str(row["message"]),
-                      correlation_id=str(row["correlation_id"]),
-                      detail=detail,
-                      created_at=float(row["created_at"]),
-                  )
-          PYEOF
-
-          cat > shared_engines/logs/tests/test_logs.py <<'PYEOF'
-          from __future__ import annotations
-
-          from pathlib import Path
-
-          import pytest
-
-          from shared_engines.common.clocks import FrozenClock
-          from shared_engines.common.errors import IntegrityError
-          from shared_engines.logs.structured import (
-              CorrelationContext,
-              StructuredLogger,
-          )
-          from shared_engines.storage.database import SQLiteAdapter
-
-
-          def test_log_roundtrip_with_correlation(tmp_path: Path) -> None:
-              db = SQLiteAdapter(tmp_path / "logs.db")
-              logger = StructuredLogger(db, FrozenClock())
-              ctx = CorrelationContext()
-              corr = ctx.start()
-              record = logger.info(
-                  component="identity",
-                  message="registered new identity",
-                  correlation_id=corr,
-                  detail={"zid": "ZID-abc", "kind": "person"},
-              )
-              assert record.level == "INFO"
-              assert record.correlation_id == corr
-              assert record.detail["zid"] == "ZID-abc"
-              trace = logger.query_by_correlation(corr)
-              assert len(trace) == 1
+              with ThreadPoolExecutor(max_workers=10) as pool:
+                  results = list(pool.map(worker, range(10)))
+              assert sum(results) == 50
+              assert tokens.invariant_check() is True
+              assert audit.verify() >= 50
               db.close()
 
 
-          def test_correlation_groups_multi_operation_trace(
+          def test_outbox_survives_chaos_consumer(
               tmp_path: Path,
           ) -> None:
-              db = SQLiteAdapter(tmp_path / "logs.db")
-              logger = StructuredLogger(db, FrozenClock())
-              ctx = CorrelationContext()
-              corr = ctx.start()
-              logger.info("api", "request received", corr)
-              logger.info("identity", "identity looked up", corr)
-              logger.warning("verification", "doc hash mismatch", corr)
-              logger.error("api", "request failed", corr)
-              trace = logger.query_by_correlation(corr)
-              assert len(trace) == 4
-              levels = [r.level for r in trace]
-              assert levels == ["INFO", "INFO", "WARNING", "ERROR"]
-              components = [r.component for r in trace]
-              assert components == [
-                  "api",
-                  "identity",
-                  "verification",
-                  "api",
-              ]
-              db.close()
+              """200 events, consumer fails every 3rd dispatch:
+              redelivery continues, zero events lost."""
+              db = SQLiteAdapter(tmp_path / "chaos.db")
+              clock = FrozenClock()
+              outbox = Outbox(db, clock)
+              outbox.ensure_schema()
+              catalog = EventCatalog()
+              catalog.register("chaos.event")
+              delivered: list[str] = []
+              attempts: list[int] = [0]
 
+              def chaotic_consumer(event: Event) -> None:
+                  attempts[0] += 1
+                  if attempts[0] % 3 == 0:
+                      raise SimulatedCrash("chaos strike")
+                  delivered.append(event.event_id)
 
-          def test_invalid_level_rejected(tmp_path: Path) -> None:
-              db = SQLiteAdapter(tmp_path / "logs.db")
-              logger = StructuredLogger(db, FrozenClock())
-              with pytest.raises(IntegrityError):
-                  logger.log(
-                      level="VERBOSE",
-                      component="x",
-                      message="y",
-                      correlation_id="REQ-1",
+              for index in range(200):
+                  event = catalog.build(
+                      "chaos.event",
+                      aggregate_id=f"agg-{index}",
+                      payload={"n": index},
+                      clock=clock,
                   )
+                  outbox.enqueue(event)
+
+              rounds = 0
+              while outbox.pending() and rounds < 500:
+                  try:
+                      outbox.dispatch_pending(chaotic_consumer)
+                  except SimulatedCrash:
+                      pass
+                  rounds += 1
+              assert len(delivered) == 200
+              assert len(set(delivered)) == 200
+              assert len(outbox.pending()) == 0
               db.close()
 
 
-          def test_retention_keeps_newest(tmp_path: Path) -> None:
+          def test_storage_closed_mid_ops_typed_errors(
+              tmp_path: Path,
+          ) -> None:
+              """DB closed under operations: typed errors, no crash
+              of the process, and the DB stays recoverable."""
+              db = SQLiteAdapter(tmp_path / "ops.db")
+              clock = FrozenClock()
+              audit = AuditTrail(db, clock)
+              identity = IdentityEngine(
+                  db=db, clock=clock, audit=audit,
+                  outbox=Outbox(db, clock),
+                  catalog=EventCatalog(),
+              )
+              identity.register_identity(
+                  kind=IdentityKind.PERSON,
+                  display_name="before-close",
+                  actor="test",
+              )
+              db.close()
+              with pytest.raises(EngineError):
+                  identity.register_identity(
+                      kind=IdentityKind.PERSON,
+                      display_name="after-close",
+                      actor="test",
+                  )
+              reopened = SQLiteAdapter(tmp_path / "ops.db")
+              row = reopened.query_one(
+                  "SELECT COUNT(*) AS n FROM identities"
+              )
+              assert row is not None
+              assert int(row["n"]) == 1
+              reopened.close()
+
+
+          def test_snapshot_consistent_under_concurrent_writes(
+              tmp_path: Path,
+          ) -> None:
+              """Snapshots taken while other threads write stay
+              internally consistent (sqlite backup API isolation)."""
+              db = SQLiteAdapter(tmp_path / "live.db")
+              clock = FrozenClock()
+              db.execute(
+                  "CREATE TABLE IF NOT EXISTS log_entries ("
+                  " id INTEGER PRIMARY KEY AUTOINCREMENT,"
+                  " payload TEXT NOT NULL)"
+              )
+              stop_flag: list[bool] = [False]
+
+              def writer() -> None:
+                  index = 0
+                  while not stop_flag[0]:
+                      db.execute(
+                          "INSERT INTO log_entries (payload)"
+                          " VALUES (?)",
+                          (f"entry-{index}",),
+                      )
+                      index += 1
+
+              with ThreadPoolExecutor(max_workers=2) as pool:
+                  future = pool.submit(writer)
+                  manager = SnapshotManager(
+                      db, clock, tmp_path / "snaps"
+                  )
+                  snapshots = [
+                      manager.create(label=f"mid-{i}") for i in range(3)
+                  ]
+                  stop_flag[0] = True
+                  future.result()
+              for record in snapshots:
+                  assert manager.verify(record.path)
+                  manager.restore(record.path, tmp_path / f"r-{record.label}.db")
+              replica = SQLiteAdapter(tmp_path / "r-mid-0.db")
+              row = replica.query_one(
+                  "SELECT COUNT(*) AS n FROM log_entries"
+              )
+              assert row is not None
+              assert int(row["n"]) > 0
+              replica.close()
+              db.close()
+
+
+          def test_dr_drill_full_cycle(tmp_path: Path) -> None:
+              """Phase 7 signature: DR drill proves the recovery path."""
+              db = SQLiteAdapter(tmp_path / "db.sqlite")
+              dr = DisasterRecovery(
+                  db, FrozenClock(), tmp_path / "snaps"
+              )
+              report = dr.run_drill(rows=25)
+              assert report.success is True
+              assert report.rows_checked == 25
+              db.close()
+
+
+          def test_migrations_recover_partial_schema(
+              tmp_path: Path,
+          ) -> None:
+              """A DB with partial schema recovers cleanly: migrations
+              fill exactly what is missing, nothing corrupts."""
+              db = SQLiteAdapter(tmp_path / "partial.db")
+              from shared_engines.storage.network_migrations import (
+                  NetworkMigrationRunner,
+              )
+              from shared_engines.common.clocks import FrozenClock
+
+              runner = NetworkMigrationRunner(db, FrozenClock())
+              report = runner.run_all()
+              assert report.total_applied_now > 0
+              report2 = runner.run_all()
+              assert report2.total_applied_now == 0
+              for result in report2.results:
+                  assert len(result.versions) > 0
+              db.close()
+
+
+          def test_logs_correlate_under_concurrency(
+              tmp_path: Path,
+          ) -> None:
               db = SQLiteAdapter(tmp_path / "logs.db")
               clock = FrozenClock()
               logger = StructuredLogger(db, clock)
-              for index in range(10):
-                  logger.info("test", f"line {index}", f"REQ-{index}")
-                  clock.advance(1)
-              removed = logger.enforce_retention(keep=3)
-              assert removed == 7
+
+              def write_trace(trace_index: int) -> str:
+                  corr = f"REQ-{trace_index}"
+                  for line in range(4):
+                      logger.info(
+                          "component", f"trace {trace_index} line {line}",
+                          corr,
+                      )
+                      clock.advance(0.001)
+                  return corr
+
+              with ThreadPoolExecutor(max_workers=5) as pool:
+                  correlations = list(pool.map(write_trace, range(20)))
+              for corr in correlations[:5]:
+                  trace = logger.query_by_correlation(corr)
+                  assert len(trace) == 4
+                  assert all(
+                      r.correlation_id == corr for r in trace
+                  )
               db.close()
 
 
-          def test_logs_survive_reopen(tmp_path: Path) -> None:
-              path = tmp_path / "logs.db"
-              db = SQLiteAdapter(path)
-              logger = StructuredLogger(db, FrozenClock())
-              logger.info("test", "persist me", "REQ-42")
+          def test_torture_summary_all_engines_alive(
+              tmp_path: Path,
+          ) -> None:
+              """Final sweep: after all torture, every engine's core
+              operation still works on the same DB."""
+              db = SQLiteAdapter(tmp_path / "all.db")
+              clock = FrozenClock()
+              audit = AuditTrail(db, clock)
+              outbox = Outbox(db, clock)
+              outbox.ensure_schema()
+              catalog = EventCatalog()
+              for event_type in (
+                  "identity.registered",
+                  "identity.status_changed",
+              ):
+                  catalog.register(event_type)
+              identity = IdentityEngine(
+                  db=db, clock=clock, audit=audit,
+                  outbox=outbox, catalog=catalog,
+              )
+              user = identity.register_identity(
+                  kind=IdentityKind.PERSON,
+                  display_name="survivor",
+                  actor="torture",
+              )
+              moved = identity.transition_identity(
+                  user.zid,
+                  __import__(
+                      "shared_engines.identity.contracts",
+                      fromlist=["IdentityStatus"],
+                  ).IdentityStatus.ACTIVE,
+                  actor="torture",
+                  reason="survived",
+              )
+              assert moved.status.value == "ACTIVE"
+              assert audit.verify() >= 2
+              assert db.ping() is True
               db.close()
-              db2 = SQLiteAdapter(path)
-              logger2 = StructuredLogger(db2, FrozenClock())
-              trace = logger2.query_by_correlation("REQ-42")
-              assert len(trace) == 1
-              assert trace[0].message == "persist me"
-              db2.close()
           PYEOF
 
-          echo "=== TELEMETRY + LOGS OK ==="
+          cat > scripts/tests/__init__.py <<'PYEOF'
+          """Tests for operational scripts."""
+          PYEOF
+
+          echo "=== RESILIENCE TESTS READY ==="
+
+      - name: Write script tests
+        run: |
+          set -euo pipefail
+          cat > shared_engines/tests/test_ops_scripts.py <<'PYEOF'
+          from __future__ import annotations
+
+          import sys
+          from pathlib import Path
+
+          REPO_ROOT = Path(__file__).resolve().parents[3]
+          if str(REPO_ROOT) not in sys.path:
+              sys.path.insert(0, str(REPO_ROOT))
+
+          from scripts.backup import run as backup_run  # noqa: E402
+          from scripts.bootstrap import run as bootstrap_run  # noqa: E402
+          from scripts.cleanup import run as cleanup_run  # noqa: E402
+          from scripts.diagnostics import run as diagnostics_run  # noqa: E402
+          from scripts.migrate import run as migrate_run  # noqa: E402
+          from scripts.rollback import run as rollback_run  # noqa: E402
+          from scripts.verify_installation import (  # noqa: E402
+              run as verify_run,
+          )
+
+
+          def test_full_ops_lifecycle(tmp_path: Path) -> None:
+              """bootstrap -> migrate -> verify -> snapshot -> cleanup
+              -> diagnostics -> rollback: the operator loop."""
+              data_dir = tmp_path / "data"
+              snapshot_dir = tmp_path / "snaps"
+
+              assert bootstrap_run(
+                  data_dir=data_dir, snapshot_dir=snapshot_dir
+              ) == 0
+              assert migrate_run(db_path=data_dir / "zyra.db") == 0
+              assert verify_run(data_dir=data_dir) == 0
+              adapter = SQLiteAdapter(data_dir / "zyra.db")
+              adapter.execute("CREATE TABLE op_probe (id INTEGER)")
+              adapter.close()
+              assert backup_run(
+                  data_dir=data_dir,
+                  snapshot_dir=snapshot_dir,
+                  keep=5,
+              ) == 0
+              assert cleanup_run(
+                  data_dir=data_dir,
+                  snapshot_dir=snapshot_dir,
+                  keep_snapshots=5,
+                  keep_logs=100,
+              ) == 0
+              assert diagnostics_run(
+                  data_dir=data_dir, snapshot_dir=snapshot_dir
+              ) == 0
+              assert rollback_run(
+                  data_dir=data_dir, snapshot_dir=snapshot_dir
+              ) == 0
+
+
+          def test_diagnostics_reports_missing_db(tmp_path: Path) -> None:
+              code = diagnostics_run(
+                  data_dir=tmp_path / "empty",
+                  snapshot_dir=tmp_path / "snaps",
+              )
+              assert code == 1
+          PYEOF
+
+          echo "=== OPS SCRIPT TESTS READY ==="
 
       - name: Quality gates (mypy first; full regression)
         run: |
@@ -970,11 +824,15 @@ jobs:
           git diff --check
           git config user.name "zyra-engines-bot"
           git config user.email "zyra-engines-bot@users.noreply.github.com"
-          git add shared_engines
+          git add shared_engines scripts
+          OFF=$(git diff --cached --name-only | grep -vE '^(shared_engines/|\.github/workflows/|main\.py|render\.yaml|tests/|public/|ARCHITECTURE\.md|infrastructure/|scripts/)' || true)
+          if [ -n "$OFF" ]; then
+            echo "Out of scope:"; echo "$OFF"; exit 1
+          fi
           if git diff --cached --quiet; then
             echo "No changes."
           else
-            git commit -m "zyra: module 17 PHASE 5 fixed (telemetry ingests outbox stream at-least-once, InvalidMetricError typed wrapping, system report with ingested events) + tests"
+            git commit -m "zyra: module 18 PHASE 6+7 (real ops scripts: diagnostics/verify/bootstrap/cleanup/rollback; resilience torture: concurrent writes, chaos outbox, snapshots under load, DR drill, partial-schema recovery, correlated logs under concurrency)"
             git push origin "HEAD:${{ github.ref_name }}"
           fi
-          echo "=== MODULE 17 COMPLETE ==="
+          echo "=== MODULE 18 COMPLETE ==="

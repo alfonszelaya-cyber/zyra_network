@@ -1,4 +1,4 @@
-name: zyra-w4-replication-real
+name: zyra-w5-portable-identity
 
 "on":
   workflow_dispatch:
@@ -9,7 +9,7 @@ permissions:
   contents: write
 
 concurrency:
-  group: zyra-w4-${{ github.ref }}
+  group: zyra-w5-${{ github.ref }}
   cancel-in-progress: false
 
 jobs:
@@ -31,302 +31,425 @@ jobs:
           python -m pip install --upgrade pip
           python -m pip install "cryptography>=42,<45" "flake8>=7,<8" "mypy>=1.10,<2" "pytest>=8,<9"
 
-      - name: Write replication.py (physical transfer, legacy kept)
+      - name: Build portable profile engine
         run: |
           set -euo pipefail
-          cat > shared_engines/network/replication.py <<'PYEOF'
-          """Hash-verified state replication between nodes.
+          cat > shared_engines/network/portable_profile.py <<'PYEOF'
+          """Portable identity profile: one registration,
+          recognized across every authorized app.
 
-          Two layers:
+          This is the Network's federation layer:
 
-          1. Parity (legacy, preserved): ``compute_state_hash``
-             and ``replicate`` verify that a replica's state
-             hash matches the primary's.
-          2. Physical transfer (W4): ``export_state`` produces
-             a self-describing snapshot (schema DDL + rows of
-             the replicated tables), ``apply_state`` atomically
-             replaces the destination tables with it, and
-             ``replicate_to`` orchestrates transfer -> apply ->
-             verify -> ack. Real rows move between two SQLite
-             databases; deletes propagate; divergence is
-             detected and healable by re-replicating.
+              App registration (NEXO, Subastas, ...)
+                    |
+                    v
+              ZID (one identity for the whole Network)
+                    |
+                    v
+              ProfileRegistry (fields + verification level
+                               + source evidence)
+                    |
+                    v
+              CrossAppAccess (authorized app queries a ZID;
+              only permitted fields are returned; every access
+              is audited as network.profile.accessed)
+
+          Design guarantees:
+
+          - Profile state lives in its OWN tables (never
+            touches identity/ storage).
+          - Every field carries a verification level:
+            SELF_DECLARED or VERIFIED (evidence-backed).
+          - Apps register with scopes; queries return only
+            the intersection of scopes and filled fields.
+          - Every cross-app access emits an auditable event
+            to the Outbox: who consulted, whom, when, which
+            fields.
           """
           from __future__ import annotations
 
-          import json
+          import hashlib
           from dataclasses import dataclass
 
+          from shared_engines.audit.chain import AuditTrail
           from shared_engines.common.clocks import Clock
-          from shared_engines.common.identifiers import (
-              stable_hash,
+          from shared_engines.common.serialization import (
+              canonical_json_dumps,
           )
           from shared_engines.common.validation import (
               require_non_empty_str,
+              require_int_range,
           )
-          from shared_engines.network.errors import (
-              ReplicationMismatchError,
-          )
+          from shared_engines.events.contracts import Event
+          from shared_engines.events.outbox import Outbox
           from shared_engines.storage.database import (
               Database,
           )
+          from shared_engines.storage.migrations import (
+              Migration,
+              MigrationRunner,
+          )
 
-          REPLICATED_TABLES = (
-              "identities",
-              "cluster_nodes",
+          EVENT_PROFILE_ACCESSED = (
+              "network.profile.accessed"
+          )
+          EVENT_PROFILE_UPDATED = (
+              "network.profile.updated"
+          )
+
+          LEVEL_SELF = "SELF_DECLARED"
+          LEVEL_VERIFIED = "VERIFIED"
+
+          ALL_FIELDS = (
+              "display_name",
+              "contact",
+              "national_id",
+              "birth_date",
+              "address",
+          )
+
+          _MIGRATIONS = (
+              Migration(
+                  1,
+                  "network_portable_profile",
+                  (
+                      "CREATE TABLE app_registry ("
+                      " app_id TEXT PRIMARY KEY,"
+                      " display_name TEXT NOT NULL,"
+                      " scopes TEXT NOT NULL,"
+                      " registered_at REAL NOT NULL)",
+                      "CREATE TABLE profile_fields ("
+                      " zid TEXT NOT NULL,"
+                      " field TEXT NOT NULL,"
+                      " value TEXT NOT NULL,"
+                      " level TEXT NOT NULL,"
+                      " source_hash TEXT NOT NULL,"
+                      " updated_at REAL NOT NULL,"
+                      " PRIMARY KEY (zid, field))",
+                  ),
+              ),
           )
 
 
           @dataclass(frozen=True)
-          class ReplicationReport:
-              primary_node: str
-              replica_node: str
-              state_version: int
-              state_hash: str
-              consistent: bool
-              rows_replicated: int
+          class AppRegistration:
+              app_id: str
+              display_name: str
+              scopes: tuple[str, ...]
 
 
           @dataclass(frozen=True)
-          class StateSnapshot:
-              """Self-describing transferable state."""
+          class ProfileView:
+              """What an app may see for one ZID."""
 
-              version: int
-              state_hash: str
-              schemas: dict[str, str]
-              tables: dict[
-                  str, tuple[dict[str, object], ...]
-              ]
+              zid: str
+              fields: dict[str, str]
+              levels: dict[str, str]
 
 
-          class ReplicationManager:
-              """Computes hashes, verifies parity and now also
-              physically transfers state to replicas."""
+          def _source_hash(
+              zid: str, field: str, value: str
+          ) -> str:
+              src = canonical_json_dumps(
+                  {
+                      "zid": zid,
+                      "field": field,
+                      "value": value,
+                  }
+              )
+              return hashlib.sha256(
+                  src.encode("utf-8")
+              ).hexdigest()
+
+
+          class ProfileRegistry:
+              """Trust profile bound to a Network ZID."""
 
               def __init__(
-                  self, db: Database, clock: Clock
+                  self,
+                  db: Database,
+                  clock: Clock,
+                  *,
+                  audit: AuditTrail,
+                  outbox: Outbox,
               ) -> None:
                   self._db = db
                   self._clock = clock
+                  self._audit = audit
+                  self._outbox = outbox
+                  MigrationRunner(
+                      db,
+                      "network.portable_profile",
+                      _MIGRATIONS,
+                  ).run(clock)
 
-              def compute_state_hash(
+              def register_app(
                   self,
-              ) -> tuple[int, str]:
-                  parts: list[str] = []
-                  for table in REPLICATED_TABLES:
-                      rows = self._db.query_all(
-                          f"SELECT * FROM {table}"
-                          " ORDER BY rowid"
-                      )
-                      for row in rows:
-                          parts.append(
-                              json.dumps(
-                                  {
-                                      k: str(v)
-                                      for k, v in dict(
-                                          row
-                                      ).items()
-                                  },
-                                  sort_keys=True,
-                              )
-                          )
-                  version = int(self._clock.now())
-                  return version, stable_hash(*parts)
-
-              def export_state(self) -> StateSnapshot:
-                  """Capture schema DDL + rows + hash."""
-                  version, state_hash = (
-                      self.compute_state_hash()
+                  *,
+                  app_id: str,
+                  display_name: str,
+                  scopes: tuple[str, ...],
+              ) -> AppRegistration:
+                  require_non_empty_str(
+                      app_id, "app_id"
                   )
-                  tables: dict[
-                      str,
-                      tuple[dict[str, object], ...],
-                  ] = {}
-                  schemas: dict[str, str] = {}
-                  for table in REPLICATED_TABLES:
-                      rows = self._db.query_all(
-                          f"SELECT * FROM {table}"
-                          " ORDER BY rowid"
-                      )
-                      tables[table] = tuple(
-                          dict(row) for row in rows
-                      )
-                      schema_row = self._db.query_one(
-                          "SELECT sql FROM sqlite_master"
-                          " WHERE type = 'table'"
-                          " AND name = ?",
-                          (table,),
-                      )
-                      if schema_row is not None and (
-                          schema_row["sql"] is not None
-                      ):
-                          schemas[table] = str(
-                              schema_row["sql"]
-                          )
-                  return StateSnapshot(
-                      version=version,
-                      state_hash=state_hash,
-                      schemas=schemas,
-                      tables=tables,
+                  require_non_empty_str(
+                      display_name, "display_name"
                   )
-
-              def apply_state(
-                  self, snapshot: StateSnapshot
-              ) -> int:
-                  """Atomically replace local replicated
-                  tables with the snapshot. Returns the
-                  number of rows applied.
-
-                  FK-safe ordering: tables are created
-                  parent-first, emptied child-first and
-                  filled parent-first.
-                  """
-                  applied = 0
+                  clean: list[str] = []
+                  for scope in scopes:
+                      require_non_empty_str(
+                          scope, "scope"
+                      )
+                      if scope not in ALL_FIELDS:
+                          raise ValueError(
+                              f"unknown scope: {scope}"
+                          )
+                      if scope not in clean:
+                          clean.append(scope)
+                  if not clean:
+                      raise ValueError(
+                          "at least one scope required"
+                      )
                   with self._db.transaction() as cursor:
-                      for table in REPLICATED_TABLES:
-                          exists = cursor.execute(
-                              "SELECT name FROM"
-                              " sqlite_master"
-                              " WHERE type = 'table'"
-                              " AND name = ?",
-                              (table,),
-                          ).fetchone()
-                          if exists is None:
-                              ddl = (
-                                  snapshot.schemas.get(
-                                      table
-                                  )
-                              )
-                              if ddl:
-                                  cursor.execute(ddl)
-                      for table in reversed(
-                          REPLICATED_TABLES
-                      ):
-                          exists = cursor.execute(
-                              "SELECT name FROM"
-                              " sqlite_master"
-                              " WHERE type = 'table'"
-                              " AND name = ?",
-                              (table,),
-                          ).fetchone()
-                          if exists is not None:
-                              cursor.execute(
-                                  f"DELETE FROM {table}"
-                              )
-                      for table in REPLICATED_TABLES:
-                          for row in (
-                              snapshot.tables.get(
-                                  table, ()
-                              )
-                          ):
-                              cols = list(row.keys())
-                              col_sql = ", ".join(cols)
-                              marks = ", ".join(
-                                  "?" for _ in cols
-                              )
-                              cursor.execute(
-                                  f"INSERT INTO {table}"
-                                  f" ({col_sql}) VALUES"
-                                  f" ({marks})",
-                                  tuple(
-                                      row[c]
-                                      for c in cols
-                                  ),
-                              )
-                              applied += 1
-                  return applied
-
-              def replicate_to(
-                  self,
-                  *,
-                  replica_db: Database,
-                  primary_node: str,
-                  replica_node: str,
-              ) -> ReplicationReport:
-                  """Physical replication:
-                  transfer -> apply -> verify -> ack."""
-                  require_non_empty_str(
-                      primary_node, "primary_node"
-                  )
-                  require_non_empty_str(
-                      replica_node, "replica_node"
-                  )
-                  snapshot = self.export_state()
-                  replica_manager = ReplicationManager(
-                      replica_db, self._clock
-                  )
-                  applied = (
-                      replica_manager.apply_state(
-                          snapshot
+                      cursor.execute(
+                          "INSERT INTO app_registry"
+                          " (app_id, display_name,"
+                          " scopes, registered_at)"
+                          " VALUES (?, ?, ?, ?)"
+                          " ON CONFLICT(app_id) DO"
+                          " UPDATE SET display_name ="
+                          " excluded.display_name,"
+                          " scopes = excluded.scopes",
+                          (
+                              app_id,
+                              display_name,
+                              ",".join(clean),
+                              self._clock.now(),
+                          ),
                       )
-                  )
-                  _, replica_hash = (
-                      replica_manager.compute_state_hash()
-                  )
-                  if replica_hash != snapshot.state_hash:
-                      raise ReplicationMismatchError(
-                          f"replica {replica_node} hash"
-                          f" {replica_hash[:16]} !="
-                          f" primary"
-                          f" {snapshot.state_hash[:16]}"
-                          " after apply"
-                      )
-                  return ReplicationReport(
-                      primary_node=primary_node,
-                      replica_node=replica_node,
-                      state_version=snapshot.version,
-                      state_hash=snapshot.state_hash,
-                      consistent=True,
-                      rows_replicated=applied,
+                  return AppRegistration(
+                      app_id=app_id,
+                      display_name=display_name,
+                      scopes=tuple(clean),
                   )
 
-              def replicate(
+              def set_field(
                   self,
                   *,
-                  primary_node: str,
-                  replica_node: str,
-                  replica_hash: str | None = None,
-                  rows_replicated: int = 0,
-              ) -> ReplicationReport:
+                  zid: str,
+                  field: str,
+                  value: str,
+                  verified: bool = False,
+              ) -> None:
+                  require_non_empty_str(zid, "zid")
                   require_non_empty_str(
-                      primary_node, "primary_node"
+                      field, "field"
                   )
-                  require_non_empty_str(
-                      replica_node, "replica_node"
-                  )
-                  version, primary_hash = (
-                      self.compute_state_hash()
-                  )
-                  if replica_hash is None:
-                      replica_hash = primary_hash
-                  consistent = (
-                      replica_hash == primary_hash
-                  )
-                  if not consistent:
-                      raise ReplicationMismatchError(
-                          f"replica {replica_node} hash"
-                          f" {replica_hash[:16]}"
-                          f" != primary"
-                          f" {primary_hash[:16]}"
+                  if field not in ALL_FIELDS:
+                      raise ValueError(
+                          f"unknown field: {field}"
                       )
-                  return ReplicationReport(
-                      primary_node=primary_node,
-                      replica_node=replica_node,
-                      state_version=version,
-                      state_hash=primary_hash,
-                      consistent=True,
-                      rows_replicated=rows_replicated,
+                  require_non_empty_str(
+                      value, "value"
+                  )
+                  level = (
+                      LEVEL_VERIFIED
+                      if verified
+                      else LEVEL_SELF
+                  )
+                  now = self._clock.now()
+                  src = _source_hash(zid, field, value)
+                  with self._db.transaction() as cursor:
+                      cursor.execute(
+                          "INSERT INTO profile_fields"
+                          " (zid, field, value, level,"
+                          "  source_hash, updated_at)"
+                          " VALUES (?, ?, ?, ?, ?, ?)"
+                          " ON CONFLICT(zid, field) DO"
+                          " UPDATE SET value ="
+                          " excluded.value, level ="
+                          " excluded.level,"
+                          " source_hash ="
+                          " excluded.source_hash,"
+                          " updated_at ="
+                          " excluded.updated_at",
+                          (
+                              zid,
+                              field,
+                              value,
+                              level,
+                              src,
+                              now,
+                          ),
+                      )
+                      self._emit(
+                          cursor,
+                          event_type=(
+                              EVENT_PROFILE_UPDATED
+                          ),
+                          aggregate=zid,
+                          payload={
+                              "field": field,
+                              "level": level,
+                          },
+                      )
+
+              def _emit(
+                  self,
+                  cursor: object,
+                  *,
+                  event_type: str,
+                  aggregate: str,
+                  payload: dict[str, object],
+              ) -> None:
+                  import sqlite3
+
+                  assert isinstance(
+                      cursor, sqlite3.Cursor
+                  )
+                  event_id_src = (
+                      canonical_json_dumps(
+                          {
+                              "t": event_type,
+                              "a": aggregate,
+                              "p": payload,
+                              "ts": self._clock.now(),
+                          }
+                      )
+                  )
+                  event_id = hashlib.sha256(
+                      event_id_src.encode("utf-8")
+                  ).hexdigest()[:32]
+                  fp = hashlib.sha256(
+                      canonical_json_dumps(
+                          {
+                              "id": event_id,
+                              "ty": event_type,
+                          }
+                      ).encode("utf-8")
+                  ).hexdigest()
+                  cursor.execute(
+                      "INSERT INTO events_outbox"
+                      " (event_id, event_type,"
+                      " aggregate_id, schema_version,"
+                      " envelope_version, created_at,"
+                      " payload, fingerprint,"
+                      " published_at)"
+                      " VALUES (?, ?, ?, 1, 1, ?, ?,"
+                      " ?, NULL)",
+                      (
+                          event_id,
+                          event_type,
+                          aggregate,
+                          self._clock.now(),
+                          canonical_json_dumps(payload),
+                          fp,
+                      ),
+                  )
+
+              def app_scopes(
+                  self, app_id: str
+              ) -> tuple[str, ...] | None:
+                  row = self._db.query_one(
+                      "SELECT scopes FROM app_registry"
+                      " WHERE app_id = ?",
+                      (app_id,),
+                  )
+                  if row is None:
+                      return None
+                  return tuple(
+                      s
+                      for s in str(
+                          row["scopes"]
+                      ).split(",")
+                      if s
+                  )
+
+              def view_for_app(
+                  self,
+                  *,
+                  app_id: str,
+                  zid: str,
+              ) -> ProfileView:
+                  """Authorized cross-app read.
+
+                  Only fields in the app's scopes AND
+                  present in the profile are returned.
+                  Every call is audited and emits
+                  network.profile.accessed.
+                  """
+                  require_non_empty_str(
+                      app_id, "app_id"
+                  )
+                  require_non_empty_str(zid, "zid")
+                  scopes = self.app_scopes(app_id)
+                  if scopes is None:
+                      raise PermissionError(
+                          f"app not registered:"
+                          f" {app_id}"
+                      )
+                  fields: dict[str, str] = {}
+                  levels: dict[str, str] = {}
+                  rows = self._db.query_all(
+                      "SELECT field, value, level"
+                      " FROM profile_fields"
+                      " WHERE zid = ?",
+                      (zid,),
+                  )
+                  for row in rows:
+                      field = str(row["field"])
+                      if field not in scopes:
+                          continue
+                      fields[field] = str(
+                          row["value"]
+                      )
+                      levels[field] = str(
+                          row["level"]
+                      )
+                  now = self._clock.now()
+                  with self._db.transaction() as cursor:
+                      self._audit.append(
+                          event_type=(
+                              EVENT_PROFILE_ACCESSED
+                          ),
+                          actor=app_id,
+                          subject=zid,
+                          payload={
+                              "fields": sorted(
+                                  fields.keys()
+                              ),
+                          },
+                      )
+                      self._emit(
+                          cursor,
+                          event_type=(
+                              EVENT_PROFILE_ACCESSED
+                          ),
+                          aggregate=zid,
+                          payload={
+                              "app": app_id,
+                              "fields": sorted(
+                                  fields.keys()
+                              ),
+                          },
+                      )
+                  return ProfileView(
+                      zid=zid,
+                      fields=fields,
+                      levels=levels,
                   )
           PYEOF
-          echo "=== REPLICATION PHYSICAL READY ==="
+          echo "=== PORTABLE PROFILE ENGINE READY ==="
 
-      - name: Write physical replication proofs (3)
+      - name: Write portable identity proofs (4)
         run: |
           set -euo pipefail
           mkdir -p shared_engines/network/tests
-          cat > shared_engines/network/tests/test_replication_physical.py <<'PYEOF'
-          """Physical replication proofs: rows really move
-          between two databases, deletes propagate, and
-          divergence is detected and healed."""
+          cat > shared_engines/network/tests/test_portable_identity.py <<'PYEOF'
+          """Portable identity proofs: register in one app,
+          be recognized in another; scoped visibility; audited
+          access; verified levels."""
           from __future__ import annotations
 
           from pathlib import Path
@@ -345,25 +468,25 @@ jobs:
           from shared_engines.identity.engine import (
               IdentityEngine,
           )
-          from shared_engines.network.cluster import (
-              ClusterManager,
-          )
-          from shared_engines.network.replication import (
-              ReplicationManager,
+          from shared_engines.network.portable_profile import (
+              LEVEL_SELF,
+              LEVEL_VERIFIED,
+              ProfileRegistry,
           )
           from shared_engines.storage.database import (
               SQLiteAdapter,
           )
+          from shared_engines.telemetry.collector import (
+              TelemetryCollector,
+          )
 
 
-          class _Node:
-              """Real node: identity + cluster + replication."""
-
+          class _Net:
               def __init__(
-                  self, tmp_path: Path, name: str
+                  self, tmp_path: Path
               ) -> None:
                   self.db = SQLiteAdapter(
-                      tmp_path / f"{name}.db"
+                      tmp_path / "net.db"
                   )
                   self.clock = FrozenClock()
                   self.audit = AuditTrail(
@@ -377,8 +500,8 @@ jobs:
                   for et in (
                       "identity.registered",
                       "identity.status_changed",
-                      "network.node.joined",
-                      "network.node.state_changed",
+                      "network.profile.updated",
+                      "network.profile.accessed",
                   ):
                       self.catalog.register(et)
                   self.identity = IdentityEngine(
@@ -388,15 +511,13 @@ jobs:
                       outbox=self.outbox,
                       catalog=self.catalog,
                   )
-                  self.cluster = ClusterManager(
-                      db=self.db,
-                      clock=self.clock,
+                  self.profiles = ProfileRegistry(
+                      self.db,
+                      self.clock,
                       audit=self.audit,
                       outbox=self.outbox,
-                      catalog=self.catalog,
-                      heartbeat_ttl_seconds=30.0,
                   )
-                  self.replication = ReplicationManager(
+                  self.telemetry = TelemetryCollector(
                       self.db, self.clock
                   )
 
@@ -404,168 +525,181 @@ jobs:
                   self.db.close()
 
 
-          def _identity_count(
-              node: _Node,
-          ) -> int:
-              row = node.db.query_one(
-                  "SELECT COUNT(*) AS n FROM identities"
-              )
-              assert row is not None
-              return int(row["n"])
-
-
-          def test_transfer_resync_hashes_equal(
+          def test_register_once_recognized_everywhere(
               tmp_path: Path,
           ) -> None:
-              primary = _Node(tmp_path, "primary")
-              replica = _Node(tmp_path, "replica")
+              net = _Net(tmp_path)
               try:
-                  primary.identity.register_identity(
-                      kind=IdentityKind.PERSON,
-                      display_name="u1",
-                      actor="t",
+                  net.profiles.register_app(
+                      app_id="nexo",
+                      display_name="NEXO",
+                      scopes=(
+                          "display_name",
+                          "contact",
+                      ),
                   )
-                  report = (
-                      primary.replication.replicate_to(
-                          replica_db=replica.db,
-                          primary_node="A",
-                          replica_node="B",
+                  net.profiles.register_app(
+                      app_id="subastas",
+                      display_name="Subastas",
+                      scopes=("display_name",),
+                  )
+                  user = (
+                      net.identity.register_identity(
+                          kind=IdentityKind.PERSON,
+                          display_name="maria",
+                          actor="nexo",
                       )
                   )
-                  assert report.consistent is True
-                  assert report.rows_replicated >= 1
-                  assert (
-                      _identity_count(replica) == 1
+                  net.profiles.set_field(
+                      zid=user.zid,
+                      field="display_name",
+                      value="Maria Lopez",
                   )
-                  _, hp = (
-                      primary.replication.compute_state_hash()
+                  net.profiles.set_field(
+                      zid=user.zid,
+                      field="contact",
+                      value="maria@zyra.sv",
                   )
-                  _, hr = (
-                      replica.replication.compute_state_hash()
-                  )
-                  assert hp == hr
-                  # Re-sync after new writes
-                  primary.identity.register_identity(
-                      kind=IdentityKind.PERSON,
-                      display_name="u2",
-                      actor="t",
-                  )
-                  primary.replication.replicate_to(
-                      replica_db=replica.db,
-                      primary_node="A",
-                      replica_node="B",
+                  # NEXO sees both scoped fields
+                  view_nexo = (
+                      net.profiles.view_for_app(
+                          app_id="nexo",
+                          zid=user.zid,
+                      )
                   )
                   assert (
-                      _identity_count(replica) == 2
+                      view_nexo.fields["display_name"]
+                      == "Maria Lopez"
                   )
-                  _, hp2 = (
-                      primary.replication.compute_state_hash()
+                  assert (
+                      view_nexo.fields["contact"]
+                      == "maria@zyra.sv"
                   )
-                  _, hr2 = (
-                      replica.replication.compute_state_hash()
+                  # Subastas sees only its scope,
+                  # WITHOUT re-registering
+                  view_sub = (
+                      net.profiles.view_for_app(
+                          app_id="subastas",
+                          zid=user.zid,
+                      )
                   )
-                  assert hp2 == hr2
+                  assert (
+                      view_sub.fields["display_name"]
+                      == "Maria Lopez"
+                  )
+                  assert "contact" not in (
+                      view_sub.fields
+                  )
               finally:
-                  primary.close()
-                  replica.close()
+                  net.close()
 
 
-          def test_delete_propagates_to_replica(
+          def test_unregistered_app_denied(
               tmp_path: Path,
           ) -> None:
-              primary = _Node(tmp_path, "primary")
-              replica = _Node(tmp_path, "replica")
+              net = _Net(tmp_path)
               try:
-                  primary.identity.register_identity(
-                      kind=IdentityKind.PERSON,
-                      display_name="u1",
-                      actor="t",
+                  user = (
+                      net.identity.register_identity(
+                          kind=IdentityKind.PERSON,
+                          display_name="luis",
+                          actor="t",
+                      )
                   )
-                  primary.identity.register_identity(
-                      kind=IdentityKind.PERSON,
-                      display_name="u2",
-                      actor="t",
-                  )
-                  primary.replication.replicate_to(
-                      replica_db=replica.db,
-                      primary_node="A",
-                      replica_node="B",
-                  )
-                  assert (
-                      _identity_count(replica) == 2
-                  )
-                  primary.db.execute(
-                      "DELETE FROM identities WHERE"
-                      " rowid = (SELECT MIN(rowid)"
-                      " FROM identities)"
-                  )
-                  primary.replication.replicate_to(
-                      replica_db=replica.db,
-                      primary_node="A",
-                      replica_node="B",
-                  )
-                  assert (
-                      _identity_count(replica) == 1
-                  )
-                  _, hp = (
-                      primary.replication.compute_state_hash()
-                  )
-                  _, hr = (
-                      replica.replication.compute_state_hash()
-                  )
-                  assert hp == hr
+                  try:
+                      net.profiles.view_for_app(
+                          app_id="malware",
+                          zid=user.zid,
+                      )
+                      raise AssertionError(
+                          "expected PermissionError"
+                      )
+                  except PermissionError:
+                      pass
               finally:
-                  primary.close()
-                  replica.close()
+                  net.close()
 
 
-          def test_divergence_detected_and_healed(
+          def test_verified_level_and_telemetry(
               tmp_path: Path,
           ) -> None:
-              primary = _Node(tmp_path, "primary")
-              replica = _Node(tmp_path, "replica")
+              net = _Net(tmp_path)
               try:
-                  primary.identity.register_identity(
-                      kind=IdentityKind.PERSON,
-                      display_name="u1",
-                      actor="t",
+                  net.profiles.register_app(
+                      app_id="gov",
+                      display_name="Gov",
+                      scopes=("national_id",),
                   )
-                  primary.replication.replicate_to(
-                      replica_db=replica.db,
-                      primary_node="A",
-                      replica_node="B",
+                  user = (
+                      net.identity.register_identity(
+                          kind=IdentityKind.PERSON,
+                          display_name="ana",
+                          actor="t",
+                      )
                   )
-                  _, hp = (
-                      primary.replication.compute_state_hash()
+                  net.profiles.set_field(
+                      zid=user.zid,
+                      field="national_id",
+                      value="XXXXXXXXXX",
+                      verified=True,
                   )
-                  _, hr = (
-                      replica.replication.compute_state_hash()
+                  view = net.profiles.view_for_app(
+                      app_id="gov", zid=user.zid
                   )
-                  assert hp == hr
-                  # Tamper with the replica directly
-                  replica.db.execute(
-                      "UPDATE identities SET"
-                      " display_name = 'tampered'"
+                  assert (
+                      view.levels["national_id"]
+                      == LEVEL_VERIFIED
                   )
-                  _, hr_bad = (
-                      replica.replication.compute_state_hash()
+                  assert (
+                      view.levels["national_id"]
+                      != LEVEL_SELF
                   )
-                  assert hr_bad != hp
-                  # Re-replication heals the divergence
-                  primary.replication.replicate_to(
-                      replica_db=replica.db,
-                      primary_node="A",
-                      replica_node="B",
+                  net.telemetry.ingest_outbox(
+                      net.outbox
                   )
-                  _, hr_fixed = (
-                      replica.replication.compute_state_hash()
+                  accessed = (
+                      net.telemetry.query_events(
+                          event_type=(
+                              "network.profile.accessed"
+                          )
+                      )
                   )
-                  assert hr_fixed == hp
+                  assert len(accessed) >= 1
               finally:
-                  primary.close()
-                  replica.close()
+                  net.close()
+
+
+          def test_audit_trail_records_access(
+              tmp_path: Path,
+          ) -> None:
+              net = _Net(tmp_path)
+              try:
+                  net.profiles.register_app(
+                      app_id="a1",
+                      display_name="A1",
+                      scopes=("display_name",),
+                  )
+                  user = (
+                      net.identity.register_identity(
+                          kind=IdentityKind.PERSON,
+                          display_name="b",
+                          actor="t",
+                      )
+                  )
+                  net.profiles.set_field(
+                      zid=user.zid,
+                      field="display_name",
+                      value="B",
+                  )
+                  net.profiles.view_for_app(
+                      app_id="a1", zid=user.zid
+                  )
+                  count = net.audit.verify()
+                  assert count >= 1
+              finally:
+                  net.close()
           PYEOF
-          echo "=== PHYSICAL TESTS READY ==="
+          echo "=== PORTABLE TESTS READY ==="
 
       - name: Quality gates (mypy first; full regression)
         run: |
@@ -593,7 +727,7 @@ jobs:
           if git diff --cached --quiet; then
             echo "No changes."
           else
-            git commit -m "zyra: W4 physical replication - export_state/apply_state (self-describing snapshot, FK-safe apply), replicate_to transfer->apply->verify->ack, delete propagation, divergence heal; legacy parity API untouched"
+            git commit -m "zyra: W5 portable identity - ProfileRegistry (per-field verification levels + source evidence), CrossAppAccess scoped views with audited network.profile.accessed events; register-in-one-app recognized-everywhere"
             git push origin "HEAD:${{ github.ref_name }}"
           fi
-          echo "=== W4 COMPLETE ==="
+          echo "=== W5 COMPLETE ==="

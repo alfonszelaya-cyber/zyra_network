@@ -1,4 +1,4 @@
-name: zyra-modulo-14-root-authority
+name: zyra-fix-14-deployment-tests
 
 "on":
   workflow_dispatch:
@@ -9,7 +9,7 @@ permissions:
   contents: write
 
 concurrency:
-  group: zyra-modulo-14-${{ github.ref }}
+  group: zyra-fix-14-${{ github.ref }}
   cancel-in-progress: false
 
 jobs:
@@ -31,531 +31,208 @@ jobs:
           python -m pip install --upgrade pip
           python -m pip install "cryptography>=42,<45" "flake8>=7,<8" "mypy>=1.10,<2" "pytest>=8,<9"
 
-      - name: Check modules 01-13 present
+      - name: Check modules present
         run: |
           set -euo pipefail
-          test -f shared_engines/runtime/kernel.py
-          test -f shared_engines/hardening/api_keys.py
           test -f main.py
-          echo "modules 01-13 present: OK"
+          test -f tests/test_deployment.py
+          test -f shared_engines/authority/root.py
+          echo "targets present: OK"
 
-      - name: Repair broken _init_.py markers (audit finding)
+      - name: Rewrite deployment tests (pass ZYRA_ROOT_KEY)
         run: |
           set -euo pipefail
-          for f in infrastructure/external_services/_init_.py infrastructure/messaging/_init_.py; do
-            if [ -f "$f" ]; then
-              dir=$(dirname "$f")
-              if [ ! -f "$dir/__init__.py" ]; then
-                mv "$f" "$dir/__init__.py"
-                echo "repaired: $f"
-              else
-                rm "$f"
-                echo "removed duplicate broken marker: $f"
-              fi
-            fi
-          done
-
-      - name: Write architecture hierarchy document (audit finding)
-        run: |
-          set -euo pipefail
-          cat > ARCHITECTURE.md <<'MDEOF'
-          # Zyra Network — Jerarquía Arquitectónica Canónica
-
-          Documento de autoridad: define qué vive dónde y por qué.
-          Cualquier módulo nuevo DEBE colocarse según esta tabla.
-
-          ## Regla fundamental
-          La Red vive sola. Las Apps viven arriba y consumen.
-          Nadie duplica capacidades transversales.
-
-          ## Capas y responsabilidades
-
-          | Capa | Responsabilidad | NO hace |
-          |---|---|---|
-          | foundation/ | Contratos base, kernel conceptual, IDs, tipos, Result, serialización CANÓNICA de contratos | NO implementa motores |
-          | protocol/ | Reglas de comunicación entre nodos | NO toca dominio |
-          | infrastructure/ | Adapter operativos: DB, DNS, discovery, messaging | NO define contratos |
-          | network/ | Distribución: cluster, failover, quorum, routing | NO es dominio de negocio |
-          | shared_engines/ | MOTORES transversales ejecutables (identity, verification, tokens, currency...) | NO conoce apps |
-          | storage/ | Persistencia especializada (cold, shards, backups) | NO es el adapter común |
-          | observability/ telemetry/ logs/ | Ver la Red por dentro | NO afectan dominio |
-
-          ## Resolución de solapamientos (auditoría 2025)
-
-          | Tema | Autoridad canónica | El otro es |
-          |---|---|---|
-          | Result | foundation/contracts/result.py | shared_engines/common/result.py = alias interno para motores |
-          | Serialización | foundation/contracts/serialization.py | common/serialization.py = implementación ejecutable de motores |
-          | Tipos | foundation/types/ | common/types.py = alias de motores |
-          | Discovery | infrastructure/dns/ | infrastructure/discovery/ = fachada de alto nivel |
-          | Database | infrastructure/database/ = infra operativa | shared_engines/storage/ = contrato de motores |
-          | Verificación | verification/ = emisión y gestión | verifier/ = verificación OFFLINE de terceros |
-
-          ## Namespaces futuros (NO llenar artificialmente)
-          ai, certification, compliance, consensus, encryption, export,
-          integrations, integrity, interoperability, orchestration, radar
-          (pertenece a SUBASTAS), reputation, routing, scalability, search,
-          supervisor, system_loader, workflow — se implementan cuando su
-          fase llegue según roadmap, nunca por estética.
-
-          ## Deuda operativa aceptada (roadmap)
-          - Telemetry, Logs, Migrations, Scripts: fases 3-6 del plan
-          MDEOF
-
-          echo "=== ARCHITECTURE DOC OK ==="
-
-      - name: Build persistent root authority (critical audit fix)
-        run: |
-          set -euo pipefail
-          mkdir -p shared_engines/authority/tests
-
-          cat > shared_engines/authority/__init__.py <<'PYEOF'
-          """Zyra persistent Root Authority.
-
-          The Network's cryptographic identity must SURVIVE restarts:
-          same key across boots, rotation when needed, revocation
-          documented, historical verification intact. Key material is
-          stored AES-256-GCM encrypted with a master key from the
-          environment (KMS adapter point), never in plaintext.
-          """
+          cat > tests/test_deployment.py <<'PYEOF'
           from __future__ import annotations
 
-          from shared_engines.authority.root import (
-              PersistentRootAuthority,
-              RootAuthorityStatus,
-          )
-
-          __all__ = ["PersistentRootAuthority", "RootAuthorityStatus"]
-          PYEOF
-
-          cat > shared_engines/authority/root.py <<'PYEOF'
-          """Persistent Root Authority: the Network's lasting identity.
-
-          Boot logic:
-          - No key file + master key -> generate new key, store
-            encrypted (first boot ever).
-          - Key file present + master key -> load, verify, use.
-          - Key file present but master key wrong -> REFUSE to boot
-            (fail closed; a wrong master must not silently create a
-            second authority).
-
-          Rotation writes the new key encrypted and archives the old
-          public key so historical attestations remain attributable.
-          """
-          from __future__ import annotations
-
-          import base64
-          import hashlib
+          import json
           import os
-          from dataclasses import dataclass
-          from enum import Enum
-          from pathlib import Path
-
-          from cryptography.hazmat.primitives.ciphers.aead import AESGCM
-
-          from shared_engines.common.errors import (
-              ConfigurationError,
-              IntegrityError,
-          )
-          from shared_engines.common.validation import require_non_empty_str
-          from shared_engines.verification.signatures import Ed25519Signer
-
-          KEY_FILE_FORMAT = "zyra.rootkey.v1"
-          MASTER_ENV_VAR = "ZYRA_ROOT_KEY"
-
-          MASTER_MIGRATIONS_NOTE = "keys are file-based, not DB-based"
-
-
-          class RootAuthorityStatus(Enum):
-              CREATED_NEW = "created_new"
-              LOADED = "loaded"
-              ROTATED = "rotated"
-
-
-          @dataclass(frozen=True)
-          class RootAuthorityStatusRecord:
-              status: RootAuthorityStatus
-              public_pem_fingerprint: str
-
-
-          class PersistentRootAuthority:
-              """Loads or creates the Network's signing key, encrypted
-              at rest with the master key from the environment."""
-
-              def __init__(
-                  self,
-                  *,
-                  data_dir: Path,
-                  master_key_hex: str,
-              ) -> None:
-                  require_non_empty_str(master_key_hex, "master_key_hex")
-                  raw = bytes.fromhex(master_key_hex)
-                  if len(raw) != 32:
-                      raise ConfigurationError(
-                          f"{MASTER_ENV_VAR} must be 64 hex chars"
-                          " (32 bytes)"
-                      )
-                  self._master = raw
-                  self._dir = Path(data_dir)
-                  self._dir.mkdir(parents=True, exist_ok=True)
-                  self._key_path = self._dir / "root.key"
-                  self._history_path = self._dir / "root.history.json"
-
-              def _derive_file_key(self, nonce: bytes) -> bytes:
-                  return hashlib.sha256(
-                      b"zyra.rootkey.v1" + self._master + nonce
-                  ).digest()
-
-              def _encrypt_to_file(self, plaintext: bytes) -> None:
-                  nonce = os.urandom(12)
-                  file_key = self._derive_file_key(nonce)
-                  ciphertext = AESGCM(file_key).encrypt(
-                      nonce, plaintext, b"zyra-root"
-                  )
-                  token = {
-                      "format": KEY_FILE_FORMAT,
-                      "nonce": base64.b64encode(nonce).decode("ascii"),
-                      "ciphertext": base64.b64encode(
-                          ciphertext
-                      ).decode("ascii"),
-                  }
-                  import json
-
-                  self._key_path.write_text(
-                      json.dumps(token), encoding="utf-8"
-                  )
-
-              def _decrypt_from_file(self) -> bytes:
-                  import json
-
-                  if not self._key_path.exists():
-                      raise FileNotFoundError(str(self._key_path))
-                  doc = json.loads(
-                      self._key_path.read_text(encoding="utf-8")
-                  )
-                  if doc.get("format") != KEY_FILE_FORMAT:
-                      raise IntegrityError("unknown key file format")
-                  nonce = base64.b64decode(str(doc["nonce"]), validate=True)
-                  ciphertext = base64.b64decode(
-                      str(doc["ciphertext"]), validate=True
-                  )
-                  file_key = self._derive_file_key(nonce)
-                  try:
-                      return AESGCM(file_key).decrypt(
-                          nonce, ciphertext, b"zyra-root"
-                      )
-                  except Exception as exc:
-                      raise IntegrityError(
-                          "root key file cannot be decrypted:"
-                          " wrong master key or tampered file"
-                      ) from exc
-
-              @staticmethod
-              def _fingerprint(public_pem: bytes) -> str:
-                  return hashlib.sha256(public_pem).hexdigest()[:16]
-
-              def load_or_create(
-                  self,
-              ) -> tuple[Ed25519Signer, RootAuthorityStatusRecord]:
-                  """Returns (signer, status). Fails closed on a wrong
-                  master key when a key file already exists."""
-                  if self._key_path.exists():
-                      private_pem = self._decrypt_from_file()
-                      signer = Ed25519Signer(private_pem)
-                      return signer, RootAuthorityStatusRecord(
-                          status=RootAuthorityStatus.LOADED,
-                          public_pem_fingerprint=self._fingerprint(
-                              signer.public_pem
-                          ),
-                      )
-                  signer, private_pem = Ed25519Signer.generate()
-                  self._encrypt_to_file(private_pem)
-                  return signer, RootAuthorityStatusRecord(
-                      status=RootAuthorityStatus.CREATED_NEW,
-                      public_pem_fingerprint=self._fingerprint(
-                          signer.public_pem
-                      ),
-                  )
-
-              def rotate(
-                  self, *, rotated_by: str
-              ) -> tuple[Ed25519Signer, RootAuthorityStatusRecord]:
-                  """Creates a new key; archives the old fingerprint."""
-                  require_non_empty_str(rotated_by, "rotated_by")
-                  old_signer, _ = self.load_or_create()
-                  old_fp = self._fingerprint(old_signer.public_pem)
-                  import json
-
-                  history: list[str] = []
-                  if self._history_path.exists():
-                      loaded = json.loads(
-                          self._history_path.read_text(encoding="utf-8")
-                      )
-                      if isinstance(loaded, list):
-                          history = [str(x) for x in loaded]
-                  history.append(old_fp)
-                  self._history_path.write_text(
-                      json.dumps(history), encoding="utf-8"
-                  )
-                  signer, private_pem = Ed25519Signer.generate()
-                  self._encrypt_to_file(private_pem)
-                  return signer, RootAuthorityStatusRecord(
-                      status=RootAuthorityStatus.ROTATED,
-                      public_pem_fingerprint=self._fingerprint(
-                          signer.public_pem
-                      ),
-                  )
-
-              def historical_fingerprints(self) -> tuple[str, ...]:
-                  import json
-
-                  if not self._history_path.exists():
-                      return ()
-                  loaded = json.loads(
-                      self._history_path.read_text(encoding="utf-8")
-                  )
-                  if not isinstance(loaded, list):
-                      return ()
-                  return tuple(str(x) for x in loaded)
-
-              @staticmethod
-              def generate_master_key() -> str:
-                  """Helper for operators: returns a fresh 64-hex-char
-                  master key to store in the environment/KMS."""
-                  return os.urandom(32).hex()
-          PYEOF
-
-          cat > shared_engines/authority/tests/test_root_authority.py <<'PYEOF'
-          from __future__ import annotations
-
+          import socket
+          import subprocess
+          import sys
+          import time
+          import urllib.request
           from pathlib import Path
 
           import pytest
 
-          from shared_engines.authority.root import (
-              PersistentRootAuthority,
-              RootAuthorityStatus,
-          )
-          from shared_engines.common.errors import ConfigurationError, IntegrityError
-          from shared_engines.verification.signatures import Ed25519Signer
-
-          MASTER = "aa" * 32
-          OTHER_MASTER = "bb" * 32
+          REPO_ROOT = Path(__file__).resolve().parents[1]
+          TEST_MASTER_KEY = "aa" * 32
 
 
-          def test_first_boot_creates_and_persists(tmp_path: Path) -> None:
-              auth = PersistentRootAuthority(
-                  data_dir=tmp_path, master_key_hex=MASTER
+          def _free_port() -> int:
+              with socket.socket() as s:
+                  s.bind(("127.0.0.1", 0))
+                  return int(s.getsockname()[1])
+
+
+          def _boot(tmp_path: Path) -> tuple[
+              subprocess.Popen[bytes], str
+          ]:
+              """Boots main.py with a temp master key and data dir.
+
+              Returns (process, base_url) once /health is 200.
+              """
+              port = _free_port()
+              env = dict(os.environ)
+              env["ZYRA_PORT"] = str(port)
+              env["ZYRA_DATA_DIR"] = str(tmp_path / "data")
+              env["ZYRA_ROOT_KEY"] = TEST_MASTER_KEY
+              env.pop("ZYRA_API_TOKEN", None)
+              proc = subprocess.Popen(
+                  [sys.executable, str(REPO_ROOT / "main.py")],
+                  env=env,
+                  stdout=subprocess.PIPE,
+                  stderr=subprocess.STDOUT,
               )
-              signer, status = auth.load_or_create()
-              assert status.status is RootAuthorityStatus.CREATED_NEW
-              fp = status.public_pem_fingerprint
-              assert len(fp) == 16
-              signer2, status2 = auth.load_or_create()
-              assert status2.status is RootAuthorityStatus.LOADED
-              assert status2.public_pem_fingerprint == fp
-              probe = b"same-authority-across-boots"
-              sig = signer.sign(probe)
-              assert signer2.public_pem == signer.public_pem
-              assert Ed25519Signer(signer2.public_pem) is not None
-              _ = sig
+              base = f"http://127.0.0.1:{port}"
+              deadline = time.time() + 30.0
+              while time.time() < deadline:
+                  if proc.poll() is not None:
+                      out = (
+                          proc.stdout.read().decode("utf-8")
+                          if proc.stdout
+                          else ""
+                      )
+                      raise RuntimeError(f"server died early: {out}")
+                  try:
+                      with urllib.request.urlopen(
+                          f"{base}/health", timeout=2
+                      ) as resp:
+                          if resp.status == 200:
+                              return proc, base
+                  except Exception:
+                      time.sleep(0.3)
+              proc.kill()
+              raise RuntimeError("server never became healthy")
 
 
-          def test_wrong_master_fails_closed(tmp_path: Path) -> None:
-              auth = PersistentRootAuthority(
-                  data_dir=tmp_path, master_key_hex=MASTER
-              )
-              auth.load_or_create()
-              attacker = PersistentRootAuthority(
-                  data_dir=tmp_path, master_key_hex=OTHER_MASTER
-              )
-              with pytest.raises(IntegrityError):
-                  attacker.load_or_create()
-
-
-          def test_master_key_validation(tmp_path: Path) -> None:
-              with pytest.raises(ConfigurationError):
-                  PersistentRootAuthority(
-                      data_dir=tmp_path, master_key_hex="tooshort"
-                  )
-
-
-          def test_rotation_archives_old_fingerprint(
+          def test_production_server_serves_health(
               tmp_path: Path,
           ) -> None:
-              auth = PersistentRootAuthority(
-                  data_dir=tmp_path, master_key_hex=MASTER
-              )
-              signer1, s1 = auth.load_or_create()
-              assert s1.status is RootAuthorityStatus.LOADED
-              signer2, s2 = auth.rotate(rotated_by="founder")
-              assert s2.status is RootAuthorityStatus.ROTATED
-              assert s2.public_pem_fingerprint != s1.public_pem_fingerprint
-              history = auth.historical_fingerprints()
-              assert s1.public_pem_fingerprint in history
-              signer3, s3 = auth.load_or_create()
-              assert s3.status is RootAuthorityStatus.LOADED
-              assert s3.public_pem_fingerprint == s2.public_pem_fingerprint
-              probe = b"current-authority"
-              assert (
-                  signer3.sign(probe) is not None
-              )
-              assert signer2.public_pem != signer1.public_pem
-          PYEOF
-
-          echo "=== AUTHORITY MODULE OK ==="
-
-      - name: Wire main.py to use persistent authority (critical fix)
-        run: |
-          set -euo pipefail
-          cat > main.py <<'PYEOF'
-          """Zyra Network production entrypoint.
-
-          Environment:
-            ZYRA_ROOT_KEY   (REQUIRED) 64 hex chars = 32 bytes; the
-                            master key that encrypts the persistent
-                            root signing key. Same value across boots
-                            keeps the same cryptographic authority.
-            ZYRA_API_TOKEN  optional bearer token (>=16 chars)
-            ZYRA_PORT       defaults to $PORT then 8080
-            ZYRA_DATA_DIR   defaults to /tmp/zyra-data
-
-          The root signing key is created on first boot and loaded
-          (encrypted at rest) on every later boot: one authority,
-          forever, with rotation available to operators.
-          """
-          from __future__ import annotations
-
-          import logging
-          import os
-
-          from shared_engines.authority.root import PersistentRootAuthority
-          from shared_engines.common.clocks import SystemClock
-          from shared_engines.runtime.api import ZyraApiHandler
-          from shared_engines.runtime.config import RuntimeConfig
-          from shared_engines.runtime.kernel import ZyraKernel
-          from shared_engines.runtime.server import ZyraServer
-          from shared_engines.storage.database import SQLiteAdapter
-
-          DATA_DIR = os.environ.get("ZYRA_DATA_DIR", "/tmp/zyra-data")
-          DB_PATH = os.path.join(DATA_DIR, "zyra.db")
-
-
-          def main() -> None:
-              logging.basicConfig(
-                  level=logging.INFO,
-                  format="%(asctime)s %(name)s %(levelname)s %(message)s",
-              )
-              log = logging.getLogger("zyra.main")
-
-              master = os.environ.get("ZYRA_ROOT_KEY")
-              if not master:
-                  raise SystemExit(
-                      "ZYRA_ROOT_KEY is required (64 hex chars)."
-                      " Generate with:"
-                      " python -c 'import os;print(os.urandom(32).hex())'"
-                      " and store it in your secret manager/KMS."
-                  )
-              token = os.environ.get("ZYRA_API_TOKEN") or None
-              if token is not None and len(token) < 16:
-                  raise SystemExit(
-                      "ZYRA_API_TOKEN must be at least 16 characters"
-                  )
-              port = int(
-                  os.environ.get("ZYRA_PORT")
-                  or os.environ.get("PORT")
-                  or 8080
-              )
-
-              os.makedirs(DATA_DIR, exist_ok=True)
-              db = SQLiteAdapter(DB_PATH, busy_timeout_ms=10_000)
-              clock = SystemClock()
-
-              authority = PersistentRootAuthority(
-                  data_dir=Path(DATA_DIR), master_key_hex=master
-              )
-              signer, status = authority.load_or_create()
-              log.info(
-                  "root authority: %s fingerprint=%s",
-                  status.status.value,
-                  status.public_pem_fingerprint,
-              )
-              log.info("public verification key:")
-              log.info("%s", signer.public_pem.decode("utf-8"))
-
-              config = RuntimeConfig(
-                  host="0.0.0.0",
-                  port=port,
-                  max_body_bytes=5_000_000,
-                  api_token=token,
-              )
-              kernel = ZyraKernel(
-                  db=db, clock=clock, signer=signer, config=config
-              )
-              root = kernel.bootstrap_root()
-              ZyraApiHandler.kernel = kernel
-              server = ZyraServer((config.host, config.port))
-
-              log.info("Zyra Network is LIVE")
-              log.info("root authority zid=%s", root.zid)
-              log.info("listening on %s:%d", config.host, config.port)
-              log.info("health endpoint: GET /health")
-
+              proc, base = _boot(tmp_path)
               try:
-                  server.serve_forever()
-              except KeyboardInterrupt:
-                  log.info("shutdown requested")
+                  with urllib.request.urlopen(
+                      f"{base}/health", timeout=5
+                  ) as resp:
+                      assert resp.status == 200
+                  assert proc.poll() is None
               finally:
-                  server.server_close()
-                  db.close()
-                  log.info("Zyra Network stopped")
+                  proc.terminate()
+                  try:
+                      proc.wait(timeout=10)
+                  except subprocess.TimeoutExpired:
+                      proc.kill()
 
 
-          if __name__ == "__main__":
-              main()
+          def test_health_shape_via_env_port(tmp_path: Path) -> None:
+              proc, base = _boot(tmp_path)
+              try:
+                  with urllib.request.urlopen(
+                      f"{base}/health", timeout=5
+                  ) as resp:
+                      payload = json.loads(resp.read().decode("utf-8"))
+                  assert payload["ok"] is True
+                  data = payload["data"]
+                  components = {
+                      c["component"] for c in data["components"]
+                  }
+                  assert {
+                      "storage",
+                      "identity",
+                      "verification",
+                      "tokenization",
+                      "currency",
+                  } <= components
+                  assert data["overall"]["status"] == "healthy"
+              finally:
+                  proc.terminate()
+                  try:
+                      proc.wait(timeout=10)
+                  except subprocess.TimeoutExpired:
+                      proc.kill()
+
+
+          def test_server_fails_closed_without_master_key(
+              tmp_path: Path,
+          ) -> None:
+              """Without ZYRA_ROOT_KEY the server must REFUSE to boot:
+              the fail-closed behavior is the security feature."""
+              port = _free_port()
+              env = dict(os.environ)
+              env["ZYRA_PORT"] = str(port)
+              env["ZYRA_DATA_DIR"] = str(tmp_path / "data")
+              env.pop("ZYRA_ROOT_KEY", None)
+              proc = subprocess.Popen(
+                  [sys.executable, str(REPO_ROOT / "main.py")],
+                  env=env,
+                  stdout=subprocess.PIPE,
+                  stderr=subprocess.STDOUT,
+              )
+              try:
+                  out = (
+                      proc.communicate(timeout=15)[0].decode("utf-8")
+                      if proc.stdout
+                      else ""
+                  )
+                  assert proc.returncode != 0
+                  assert "ZYRA_ROOT_KEY is required" in out
+              finally:
+                  if proc.poll() is None:
+                      proc.kill()
+
+
+          def test_same_master_key_survives_restart(
+              tmp_path: Path,
+          ) -> None:
+              """Two boots with the same master key and data dir keep
+              the SAME authority fingerprint (persistence proof)."""
+              import hashlib
+
+              data_dir = tmp_path / "persistent"
+              fingerprints: list[str] = []
+              for _ in range(2):
+                  port = _free_port()
+                  env = dict(os.environ)
+                  env["ZYRA_PORT"] = str(port)
+                  env["ZYRA_DATA_DIR"] = str(data_dir)
+                  env["ZYRA_ROOT_KEY"] = TEST_MASTER_KEY
+                  proc = subprocess.Popen(
+                      [sys.executable, str(REPO_ROOT / "main.py")],
+                      env=env,
+                      stdout=subprocess.PIPE,
+                      stderr=subprocess.STDOUT,
+                  )
+                  base = f"http://127.0.0.1:{port}"
+                  deadline = time.time() + 30.0
+                  while time.time() < deadline:
+                      if proc.poll() is not None:
+                          break
+                      try:
+                          with urllib.request.urlopen(
+                              f"{base}/health", timeout=2
+                          ) as resp:
+                              if resp.status == 200:
+                                  break
+                      except Exception:
+                          time.sleep(0.3)
+                  proc.terminate()
+                  try:
+                      proc.wait(timeout=10)
+                  except subprocess.TimeoutExpired:
+                      proc.kill()
+                  key_file = data_dir / "root.key"
+                  assert key_file.exists()
+                  content = key_file.read_text(encoding="utf-8")
+                  fingerprints.append(
+                      hashlib.sha256(
+                          content.encode("utf-8")
+                      ).hexdigest()[:16]
+                  )
+              assert fingerprints[0] == fingerprints[1]
           PYEOF
 
-          python3 - <<'PYIMPORT'
-          from pathlib import Path
-          p = Path("main.py")
-          text = p.read_text(encoding="utf-8")
-          if "from pathlib import Path" not in text:
-              text = text.replace(
-                  "import os\n\nfrom shared_engines.authority.root",
-                  "import os\nfrom pathlib import Path\n\nfrom shared_engines.authority.root",
-              )
-              p.write_text(text, encoding="utf-8")
-              print("Path import added to main.py")
-          PYIMPORT
-
-          echo "=== MAIN WIRED TO PERSISTENT AUTHORITY ==="
-
-      - name: Update render.yaml (require ZYRA_ROOT_KEY)
-        run: |
-          set -euo pipefail
-          cat > render.yaml <<'YEOF'
-          services:
-            - type: web
-              name: zyra-network
-              runtime: python
-              plan: free
-              buildCommand: |
-                pip install --upgrade pip
-                pip install "cryptography>=42,<45"
-              startCommand: python main.py
-              healthCheckPath: /health
-              envVars:
-                - key: PYTHON_VERSION
-                  value: "3.12.4"
-                - key: ZYRA_PORT
-                  value: "10000"
-                - key: ZYRA_ROOT_KEY
-                  sync: false
-                - key: ZYRA_API_TOKEN
-                  sync: false
-          YEOF
-
-          echo "=== RENDER CONFIG OK ==="
+          echo "=== DEPLOYMENT TESTS REWRITTEN ==="
 
       - name: Quality gates (mypy first; full regression all modules)
         run: |
@@ -566,27 +243,23 @@ jobs:
           find $M -name '__pycache__' -type d -prune -exec rm -rf {} +
           mypy --strict --cache-dir="${RUNNER_TEMP}/mypy-cache" $M
           echo "mypy OK"
-          flake8 $M main.py --max-line-length=100
+          flake8 $M main.py tests --max-line-length=100
           echo "flake8 OK"
           PYTHONPATH="$PWD" python -m pytest -q -p no:cacheprovider $M tests
           echo "pytest OK"
           find $M -name '__pycache__' -type d -prune -exec rm -rf {} +
 
-      - name: Commit and push (scoped incl. repairs + docs)
+      - name: Commit and push
         run: |
           set -euo pipefail
           git diff --check
           git config user.name "zyra-engines-bot"
           git config user.email "zyra-engines-bot@users.noreply.github.com"
-          git add shared_engines main.py render.yaml ARCHITECTURE.md infrastructure
-          OFF=$(git diff --cached --name-only | grep -vE '^(shared_engines/|\.github/workflows/|main\.py|render\.yaml|tests/|public/|ARCHITECTURE\.md|infrastructure/)' || true)
-          if [ -n "$OFF" ]; then
-            echo "Out of scope:"; echo "$OFF"; exit 1
-          fi
+          git add tests
           if git diff --cached --quiet; then
             echo "No changes."
           else
-            git commit -m "zyra: module 14 ROOT AUTHORITY persistent (encrypted key at rest, fail-closed on wrong master, rotation with history) + ARCHITECTURE.md hierarchy + _init_ repairs + main.py wired"
+            git commit -m "zyra: fix deployment tests (pass ZYRA_ROOT_KEY, add fail-closed and persistence-across-restart proofs)"
             git push origin "HEAD:${{ github.ref_name }}"
           fi
-          echo "=== MODULE 14 COMPLETE ==="
+          echo "=== FIX 14 COMPLETE ==="

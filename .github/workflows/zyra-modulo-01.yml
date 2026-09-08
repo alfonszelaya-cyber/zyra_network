@@ -1,4 +1,4 @@
-name: zyra-fix-12-tests
+name: zyra-modulo-12-public-verifier
 
 "on":
   workflow_dispatch:
@@ -9,7 +9,7 @@ permissions:
   contents: write
 
 concurrency:
-  group: zyra-fix-12-${{ github.ref }}
+  group: zyra-modulo-12-${{ github.ref }}
   cancel-in-progress: false
 
 jobs:
@@ -31,44 +31,598 @@ jobs:
           python -m pip install --upgrade pip
           python -m pip install "cryptography>=42,<45" "flake8>=7,<8" "mypy>=1.10,<2" "pytest>=8,<9"
 
-      - name: Check verifier module present
+      - name: Check modules 01-11 present
         run: |
           set -euo pipefail
-          test -f shared_engines/verifier/verifier.py
-          echo "verifier present: OK"
+          test -f shared_engines/runtime/kernel.py
+          test -f shared_engines/runtime/api.py
+          test -f main.py
+          echo "modules 01-11 present: OK"
 
-      - name: Fix AttestationIssuer calls in both test files
+      - name: Build public verifier module
         run: |
           set -euo pipefail
-          python3 - <<'PYFIX'
+          mkdir -p shared_engines/verifier/tests
+
+          cat > shared_engines/verifier/__init__.py <<'PYEOF'
+          """Zyra public verifier: offline third-party authenticity."""
+          from __future__ import annotations
+
+          from shared_engines.verifier.verifier import (
+              VerificationReport,
+              verify_attestation_blob,
+          )
+
+          __all__ = ["VerificationReport", "verify_attestation_blob"]
+          PYEOF
+
+          cat > shared_engines/verifier/verifier.py <<'PYEOF'
+          """Offline attestation verification: paste, verify, trust.
+
+          Anyone holding an attestation JSON (signature + public key
+          embedded) verifies it WITHOUT database access. This is the
+          public face of the Network's trust: provable, not promised.
+          """
+          from __future__ import annotations
+
+          import base64
+          import hashlib
+          from dataclasses import dataclass
+
+          from shared_engines.common.serialization import (
+              canonical_json_dumps,
+              canonical_json_loads,
+          )
+          from shared_engines.verification.signatures import Ed25519Verifier
+
+          ATTESTATION_FORMAT = "zyra.attestation.v1"
+
+
+          @dataclass(frozen=True)
+          class VerificationReport:
+              valid: bool
+              reason: str
+              attestation_id: str | None
+              subject_zid: str | None
+              claim: str | None
+              issued_at: float | None
+              key_fingerprint: str | None
+
+
+          def _key_fingerprint(public_pem: bytes) -> str:
+              return hashlib.sha256(public_pem).hexdigest()[:16]
+
+
+          def _fail(reason: str) -> VerificationReport:
+              return VerificationReport(
+                  valid=False,
+                  reason=reason,
+                  attestation_id=None,
+                  subject_zid=None,
+                  claim=None,
+                  issued_at=None,
+                  key_fingerprint=None,
+              )
+
+
+          def verify_attestation_blob(blob: str) -> VerificationReport:
+              """Verifies a pasted attestation JSON, fully offline."""
+              try:
+                  doc = canonical_json_loads(blob)
+              except Exception:
+                  return _fail("the pasted text is not valid JSON")
+              if not isinstance(doc, dict):
+                  return _fail("attestation must be a JSON object")
+              if doc.get("format") != ATTESTATION_FORMAT:
+                  return _fail(
+                      f"unknown format (expected {ATTESTATION_FORMAT})"
+                  )
+              required = (
+                  "attestation_id",
+                  "subject_zid",
+                  "claim",
+                  "issued_at",
+                  "signature_b64",
+                  "signer_public_pem",
+              )
+              missing = [k for k in required if k not in doc]
+              if missing:
+                  return _fail(f"missing fields: {', '.join(missing)}")
+              try:
+                  signature = base64.b64decode(
+                      str(doc["signature_b64"]), validate=True
+                  )
+                  public_pem = str(doc["signer_public_pem"]).encode("utf-8")
+                  issued_at = float(doc["issued_at"])
+              except Exception:
+                  return _fail("signature, key or timestamp is malformed")
+              subject_sha256 = doc.get("subject_sha256")
+              payload = {
+                  "format": ATTESTATION_FORMAT,
+                  "attestation_id": str(doc["attestation_id"]),
+                  "subject_zid": str(doc["subject_zid"]),
+                  "claim": str(doc["claim"]),
+                  "subject_sha256": (
+                      None
+                      if subject_sha256 is None
+                      else str(subject_sha256)
+                  ),
+                  "issued_at": f"{issued_at:.6f}",
+              }
+              canonical = canonical_json_dumps(payload).encode("utf-8")
+              attestation_id = str(doc["attestation_id"])
+              subject_zid = str(doc["subject_zid"])
+              claim = str(doc["claim"])
+              try:
+                  verifier = Ed25519Verifier(public_pem)
+              except Exception:
+                  return VerificationReport(
+                      valid=False,
+                      reason="the embedded public key is not loadable",
+                      attestation_id=attestation_id,
+                      subject_zid=subject_zid,
+                      claim=claim,
+                      issued_at=issued_at,
+                      key_fingerprint=None,
+                  )
+              ok = verifier.verify(canonical, signature)
+              if not ok:
+                  return VerificationReport(
+                      valid=False,
+                      reason="INVALID signature: this attestation was"
+                      " tampered or was not issued by the key inside it",
+                      attestation_id=attestation_id,
+                      subject_zid=subject_zid,
+                      claim=claim,
+                      issued_at=issued_at,
+                      key_fingerprint=_key_fingerprint(public_pem),
+                  )
+              return VerificationReport(
+                  valid=True,
+                  reason="AUTHENTIC: signature verifies against the"
+                  " embedded public key",
+                  attestation_id=attestation_id,
+                  subject_zid=subject_zid,
+                  claim=claim,
+                  issued_at=issued_at,
+                  key_fingerprint=_key_fingerprint(public_pem),
+              )
+          PYEOF
+
+          cat > shared_engines/verifier/tests/test_verifier.py <<'PYEOF'
+          from __future__ import annotations
+
+          import base64
+          import json
           from pathlib import Path
 
-          old = """              issuer = AttestationIssuer(
-                  db=db, clock=clock, signer=signer, audit=audit
-              )"""
-          new = """              issuer = AttestationIssuer(
+          from shared_engines.audit.chain import AuditTrail
+          from shared_engines.common.clocks import FrozenClock
+          from shared_engines.events.contracts import EventCatalog
+          from shared_engines.events.outbox import Outbox
+          from shared_engines.identity.contracts import IdentityKind
+          from shared_engines.identity.engine import IdentityEngine
+          from shared_engines.storage.database import SQLiteAdapter
+          from shared_engines.verification.attestations import AttestationIssuer
+          from shared_engines.verification.signatures import Ed25519Signer
+          from shared_engines.verifier.verifier import verify_attestation_blob
+
+
+          def _issue_attestation_json(tmp_path: Path) -> str:
+              db = SQLiteAdapter(tmp_path / "v.db")
+              clock = FrozenClock()
+              audit = AuditTrail(db, clock)
+              outbox = Outbox(db, clock)
+              outbox.ensure_schema()
+              catalog = EventCatalog()
+              catalog.register("verification.attestation.issued")
+              identity = IdentityEngine(
+                  db=db,
+                  clock=clock,
+                  audit=audit,
+                  outbox=outbox,
+                  catalog=catalog,
+              )
+              subject = identity.register_identity(
+                  kind=IdentityKind.PERSON,
+                  display_name="Public Figure",
+                  actor="registrar",
+              )
+              signer, _ = Ed25519Signer.generate()
+              issuer = AttestationIssuer(
                   db=db,
                   clock=clock,
                   signer=signer,
                   audit=audit,
                   outbox=outbox,
                   catalog=catalog,
-              )"""
+              )
+              attestation = issuer.issue(
+                  subject_zid=subject.zid,
+                  claim="identity_active",
+              )
+              db.close()
+              return json.dumps(
+                  {
+                      "format": "zyra.attestation.v1",
+                      "attestation_id": attestation.attestation_id,
+                      "subject_zid": attestation.subject_zid,
+                      "claim": attestation.claim,
+                      "subject_sha256": attestation.subject_sha256,
+                      "issued_at": attestation.issued_at,
+                      "signature_b64": base64.b64encode(
+                          attestation.signature
+                      ).decode("ascii"),
+                      "signer_public_pem": attestation.signer_public_pem.decode(
+                          "utf-8"
+                      ),
+                  }
+              )
 
-          files = [
-              Path("shared_engines/verifier/tests/test_verifier.py"),
-              Path("shared_engines/runtime/tests/test_public_verify_api.py"),
-          ]
-          for f in files:
-              text = f.read_text(encoding="utf-8")
-              if "outbox=outbox," in text and "issuer = AttestationIssuer" in text:
-                  print(f"{f}: already fixed")
-                  continue
-              assert old in text, f"pattern not found in {f}"
-              text = text.replace(old, new)
-              f.write_text(text, encoding="utf-8")
-              print(f"{f}: fixed")
-          PYFIX
+
+          def test_authentic_attestation_verifies(tmp_path: Path) -> None:
+              blob = _issue_attestation_json(tmp_path)
+              report = verify_attestation_blob(blob)
+              assert report.valid is True
+              assert "AUTHENTIC" in report.reason
+              assert report.attestation_id is not None
+              assert report.key_fingerprint is not None
+              assert len(report.key_fingerprint) == 16
+
+
+          def test_tampered_claim_fails(tmp_path: Path) -> None:
+              blob = _issue_attestation_json(tmp_path)
+              doc = json.loads(blob)
+              doc["claim"] = "forged_claim"
+              report = verify_attestation_blob(json.dumps(doc))
+              assert report.valid is False
+              assert "INVALID" in report.reason
+
+
+          def test_wrong_key_fails(tmp_path: Path) -> None:
+              blob = _issue_attestation_json(tmp_path)
+              doc = json.loads(blob)
+              impostor, _ = Ed25519Signer.generate()
+              doc["signer_public_pem"] = impostor.public_pem.decode("utf-8")
+              report = verify_attestation_blob(json.dumps(doc))
+              assert report.valid is False
+              assert "INVALID" in report.reason
+
+
+          def test_garbage_input_fails_gracefully() -> None:
+              report = verify_attestation_blob("this is not json")
+              assert report.valid is False
+              assert "not valid JSON" in report.reason
+              report2 = verify_attestation_blob('{"format": "other"}')
+              assert report2.valid is False
+              assert "unknown format" in report2.reason
+          PYEOF
+
+          echo "=== VERIFIER MODULE OK ==="
+
+      - name: Add public /verify endpoint to api.py (robust line anchors)
+        run: |
+          set -euo pipefail
+          python3 - <<'PYENDPOINT'
+          from pathlib import Path
+
+          p = Path("shared_engines/runtime/api.py")
+          text = p.read_text(encoding="utf-8")
+
+          if "_handle_public_verify" in text:
+              print("api.py already has public verify endpoint")
+          else:
+              route_anchor = "        if not self._authorized():"
+              assert text.count(route_anchor) == 1, (
+                  "auth-check anchor not found exactly once"
+              )
+              route_insert = (
+                  '        if segments == ["verify"]'
+                  ' and method == "POST":\n'
+                  "            self._handle_public_verify()\n"
+                  "            return\n"
+              )
+              text = text.replace(route_anchor, route_insert + route_anchor, 1)
+
+              handler_anchor = "    def _handle_health(self) -> None:"
+              assert text.count(handler_anchor) == 1, (
+                  "health handler anchor not found exactly once"
+              )
+              handler = (
+                  "    def _handle_public_verify(self) -> None:\n"
+                  "        doc = self._read_json()\n"
+                  '        blob = self._require_str(doc, "attestation")\n'
+                  "        from shared_engines.verifier.verifier import (\n"
+                  "            verify_attestation_blob,\n"
+                  "        )\n"
+                  "\n"
+                  "        report = verify_attestation_blob(blob)\n"
+                  "        self._ok(\n"
+                  "            {\n"
+                  '                "valid": report.valid,\n'
+                  '                "reason": report.reason,\n'
+                  '                "attestation_id": report.attestation_id,\n'
+                  '                "subject_zid": report.subject_zid,\n'
+                  '                "claim": report.claim,\n'
+                  '                "issued_at": report.issued_at,\n'
+                  '                "key_fingerprint": report.key_fingerprint,\n'
+                  "            }\n"
+                  "        )\n\n"
+              )
+              text = text.replace(handler_anchor, handler + handler_anchor, 1)
+              p.write_text(text, encoding="utf-8")
+              print("api.py patched: public /verify endpoint added")
+          PYENDPOINT
+
+      - name: Build public web page (static, no dependencies)
+        run: |
+          set -euo pipefail
+          mkdir -p public
+          cat > public/index.html <<'HTMLEOF'
+          <!DOCTYPE html>
+          <html lang="es">
+          <head>
+          <meta charset="utf-8">
+          <meta name="viewport" content="width=device-width, initial-scale=1">
+          <title>Zyra Network — Verificador Público</title>
+          <style>
+            body{font-family:system-ui,sans-serif;background:#0d1117;color:#e6edf3;
+                 display:flex;justify-content:center;padding:24px}
+            .card{max-width:720px;width:100%}
+            h1{font-size:1.4rem}
+            textarea{width:100%;height:180px;background:#161b22;color:#e6edf3;
+                     border:1px solid #30363d;border-radius:8px;padding:12px;
+                     font-family:monospace;font-size:0.8rem}
+            button{margin-top:12px;background:#238636;color:#fff;border:none;
+                   padding:12px 24px;border-radius:8px;font-size:1rem;cursor:pointer}
+            #result{margin-top:16px;padding:16px;border-radius:8px;display:none}
+            .ok{background:#0f2417;border:1px solid #238636}
+            .bad{background:#2d1216;border:1px solid #da3633}
+            small{color:#8b949e}
+          </style>
+          </head>
+          <body>
+          <div class="card">
+            <h1>🛡️ Zyra Network — Verificador Público</h1>
+            <p>Pega aquí un certificado (attestation) emitido por la Red.
+               La verificación es <b>offline y criptográfica</b>.</p>
+            <textarea id="blob" placeholder='{"format":"zyra.attestation.v1",...}'></textarea>
+            <button onclick="verify()">Verificar autenticidad</button>
+            <div id="result"></div>
+            <p><small>Zyra Network — infraestructura de confianza digital
+               de JAZA Global Systems. La validez se demuestra con la
+               firma Ed25519 embebida en el propio certificado.</small></p>
+          </div>
+          <script src="app.js"></script>
+          </body>
+          </html>
+          HTMLEOF
+
+          cat > public/app.js <<'JSEOF'
+          async function verify() {
+            const blob = document.getElementById("blob").value.trim();
+            const box = document.getElementById("result");
+            if (!blob) { box.className="bad"; box.style.display="block";
+              box.textContent="Pega un certificado primero."; return; }
+            box.style.display="block";
+            box.textContent="Verificando...";
+            try {
+              const res = await fetch("/verify", {
+                method: "POST",
+                headers: {"Content-Type": "application/json"},
+                body: JSON.stringify({attestation: blob})
+              });
+              const payload = await res.json();
+              const d = payload.data || payload.error || {};
+              if (payload.ok && d.valid) {
+                box.className = "ok";
+                box.innerHTML = "<b>✓ AUTÉNTICO</b><br>" +
+                  "Motivo: " + d.reason + "<br>" +
+                  "ID: " + (d.attestation_id || "-") + "<br>" +
+                  "Sujeto: " + (d.subject_zid || "-") + "<br>" +
+                  "Declaración: " + (d.claim || "-") + "<br>" +
+                  "Huella de clave: " + (d.key_fingerprint || "-");
+              } else {
+                box.className = "bad";
+                box.innerHTML = "<b>✗ NO VÁLIDO</b><br>" +
+                  "Motivo: " + (d.reason || d.message || "desconocido");
+              }
+            } catch (e) {
+              box.className = "bad";
+              box.textContent = "Error contactando la Red: " + e;
+            }
+          }
+          JSEOF
+
+          echo "=== PUBLIC PAGE OK ==="
+
+      - name: Write public verify HTTP tests
+        run: |
+          set -euo pipefail
+          cat > shared_engines/runtime/tests/test_public_verify_api.py <<'PYEOF'
+          from __future__ import annotations
+
+          import base64
+          import json
+          import threading
+          import urllib.error
+          import urllib.request
+          from collections.abc import Iterator
+          from pathlib import Path
+          from typing import Any
+
+          import pytest
+
+          from shared_engines.audit.chain import AuditTrail
+          from shared_engines.common.clocks import FrozenClock
+          from shared_engines.events.contracts import EventCatalog
+          from shared_engines.events.outbox import Outbox
+          from shared_engines.identity.contracts import IdentityKind
+          from shared_engines.identity.engine import IdentityEngine
+          from shared_engines.runtime.api import ZyraApiHandler
+          from shared_engines.runtime.config import RuntimeConfig
+          from shared_engines.runtime.kernel import ZyraKernel
+          from shared_engines.runtime.server import ZyraServer
+          from shared_engines.storage.database import SQLiteAdapter
+          from shared_engines.verification.attestations import AttestationIssuer
+          from shared_engines.verification.signatures import Ed25519Signer
+
+
+          class _Cluster:
+              def __init__(self, tmp_path: Path) -> None:
+                  self.db = SQLiteAdapter(Path(tmp_path) / "runtime.db")
+                  self.kernel = ZyraKernel(
+                      db=self.db,
+                      clock=FrozenClock(),
+                      signer=Ed25519Signer.generate()[0],
+                      config=RuntimeConfig(host="127.0.0.1", port=0),
+                  )
+                  self.kernel.bootstrap_root()
+                  ZyraApiHandler.kernel = self.kernel
+                  self.server = ZyraServer(("127.0.0.1", 0))
+                  self.thread = threading.Thread(
+                      target=self.server.serve_forever, daemon=True
+                  )
+                  self.thread.start()
+                  self.base = f"http://127.0.0.1:{self.server.bound_port}"
+
+              def stop(self) -> None:
+                  self.server.shutdown()
+                  self.server.server_close()
+                  self.thread.join(timeout=5)
+                  self.db.close()
+
+              def call(
+                  self,
+                  method: str,
+                  path: str,
+                  body: dict[str, Any] | None = None,
+              ) -> tuple[int, dict[str, Any]]:
+                  headers: dict[str, str] = {
+                      "Content-Type": "application/json"
+                  }
+                  data = (
+                      json.dumps(body).encode("utf-8")
+                      if body is not None
+                      else None
+                  )
+                  request = urllib.request.Request(
+                      f"{self.base}{path}",
+                      data=data,
+                      headers=headers,
+                      method=method,
+                  )
+                  try:
+                      with urllib.request.urlopen(
+                          request, timeout=10
+                      ) as resp:
+                          payload: dict[str, Any] = json.loads(
+                              resp.read().decode("utf-8")
+                          )
+                          return int(resp.status), payload
+                  except urllib.error.HTTPError as exc:
+                      raw = exc.read().decode("utf-8") or "{}"
+                      error_payload: dict[str, Any] = json.loads(raw)
+                      return int(exc.code), error_payload
+
+
+          @pytest.fixture
+          def cluster(tmp_path: Path) -> Iterator[_Cluster]:
+              running = _Cluster(tmp_path)
+              yield running
+              running.stop()
+
+
+          def _mint_attestation(tmp_path: Path) -> str:
+              db = SQLiteAdapter(tmp_path / "mint.db")
+              clock = FrozenClock()
+              audit = AuditTrail(db, clock)
+              outbox = Outbox(db, clock)
+              outbox.ensure_schema()
+              catalog = EventCatalog()
+              catalog.register("verification.attestation.issued")
+              identity = IdentityEngine(
+                  db=db,
+                  clock=clock,
+                  audit=audit,
+                  outbox=outbox,
+                  catalog=catalog,
+              )
+              subject = identity.register_identity(
+                  kind=IdentityKind.PERSON,
+                  display_name="Public",
+                  actor="registrar",
+              )
+              signer, _ = Ed25519Signer.generate()
+              issuer = AttestationIssuer(
+                  db=db,
+                  clock=clock,
+                  signer=signer,
+                  audit=audit,
+                  outbox=outbox,
+                  catalog=catalog,
+              )
+              attestation = issuer.issue(
+                  subject_zid=subject.zid, claim="identity_active"
+              )
+              db.close()
+              return json.dumps(
+                  {
+                      "format": "zyra.attestation.v1",
+                      "attestation_id": attestation.attestation_id,
+                      "subject_zid": attestation.subject_zid,
+                      "claim": attestation.claim,
+                      "subject_sha256": attestation.subject_sha256,
+                      "issued_at": attestation.issued_at,
+                      "signature_b64": base64.b64encode(
+                          attestation.signature
+                      ).decode("ascii"),
+                      "signer_public_pem": attestation.signer_public_pem.decode(
+                          "utf-8"
+                      ),
+                  }
+              )
+
+
+          def test_public_verify_accepts_authentic(
+              cluster: _Cluster, tmp_path: Path,
+          ) -> None:
+              blob = _mint_attestation(tmp_path)
+              status, payload = cluster.call(
+                  "POST", "/verify", {"attestation": blob}
+              )
+              assert status == 200
+              assert payload["ok"] is True
+              assert payload["data"]["valid"] is True
+              assert "AUTHENTIC" in payload["data"]["reason"]
+
+
+          def test_public_verify_rejects_tampered(
+              cluster: _Cluster, tmp_path: Path,
+          ) -> None:
+              blob = _mint_attestation(tmp_path)
+              doc = json.loads(blob)
+              doc["claim"] = "forged"
+              status, payload = cluster.call(
+                  "POST", "/verify", {"attestation": json.dumps(doc)}
+              )
+              assert status == 200
+              assert payload["data"]["valid"] is False
+              assert "INVALID" in payload["data"]["reason"]
+
+
+          def test_public_verify_is_open_without_auth(
+              cluster: _Cluster, tmp_path: Path,
+          ) -> None:
+              blob = _mint_attestation(tmp_path)
+              status, payload = cluster.call(
+                  "POST", "/verify", {"attestation": blob}
+              )
+              assert status == 200
+              assert payload["ok"] is True
+          PYEOF
+
+          echo "=== VERIFY TESTS READY ==="
 
       - name: Quality gates (mypy first; full regression all modules)
         run: |
@@ -91,11 +645,15 @@ jobs:
           git diff --check
           git config user.name "zyra-engines-bot"
           git config user.email "zyra-engines-bot@users.noreply.github.com"
-          git add shared_engines
+          git add shared_engines public tests
+          OFF=$(git diff --cached --name-only | grep -vE '^(shared_engines/|\.github/workflows/|main\.py|render\.yaml|tests/|public/)' || true)
+          if [ -n "$OFF" ]; then
+            echo "Out of scope:"; echo "$OFF"; exit 1
+          fi
           if git diff --cached --quiet; then
             echo "No changes."
           else
-            git commit -m "zyra: fix verifier tests (pass outbox+catalog to AttestationIssuer)"
+            git commit -m "zyra: module 12 PUBLIC VERIFIER (offline verifier module, public /verify endpoint, static web page, tests with full AttestationIssuer args)"
             git push origin "HEAD:${{ github.ref_name }}"
           fi
-          echo "=== FIX COMPLETE ==="
+          echo "=== MODULE 12 COMPLETE ==="

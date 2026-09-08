@@ -1,4 +1,4 @@
-name: zyra-w1-fix-network-flow
+name: zyra-w3-outbox-concurrency
 
 "on":
   workflow_dispatch:
@@ -9,7 +9,7 @@ permissions:
   contents: write
 
 concurrency:
-  group: zyra-w1-${{ github.ref }}
+  group: zyra-w3-${{ github.ref }}
   cancel-in-progress: false
 
 jobs:
@@ -34,489 +34,749 @@ jobs:
       - name: Check modules present
         run: |
           set -euo pipefail
-          test -f shared_engines/network/cluster.py
-          test -f shared_engines/network/failover.py
-          test -f shared_engines/telemetry/collector.py
-          echo "modules present: OK"
+          test -f shared_engines/events/outbox.py
+          test -f shared_engines/common/errors.py
+          test -f shared_engines/storage/migrations.py
+          echo "outbox modules present: OK"
 
-      - name: Fix failover.py (publish elected event to Outbox)
+      - name: Upgrade outbox.py (claim/lease/fencing/retry/dead-letter)
         run: |
           set -euo pipefail
-          cat > shared_engines/network/failover.py <<'PYEOF'
-          """Quorum-gated failover: no split-brain, ever."""
+          cat > shared_engines/events/outbox.py <<'PYEOF'
+          """Transactional outbox with at-least-once dispatch.
+
+          ``enqueue_in_transaction`` runs inside the SAME
+          transaction as the state change; delivery happens
+          afterwards. A crash between handler and mark causes
+          redelivery; consumers suppress duplicates via the
+          Inbox.
+
+          Concurrency: besides the single-worker legacy path
+          (``pending`` + ``dispatch_pending``), the outbox
+          supports multi-worker consumption:
+
+              PENDING -> CLAIMED -> DISPATCHED
+                  ^          |
+                  |          v
+                  +-- PENDING (lease expired / retry)
+                             |
+                             v
+                           DEAD (dead-letter after max attempts)
+
+          A claim holds a lease (owner + expiration) and a
+          fencing token (the attempt counter). Only the current
+          lease owner with the current fencing token may
+          complete or fail the event; stale workers get
+          ``LeaseLost``.
+          """
+          from __future__ import annotations
+
+          import sqlite3
+          from collections.abc import Callable
+          from dataclasses import dataclass
+
+          from shared_engines.common.clocks import Clock
+          from shared_engines.common.errors import LeaseLost
+          from shared_engines.common.serialization import (
+              canonical_json_dumps,
+              canonical_json_loads,
+          )
+          from shared_engines.events.contracts import Event
+          from shared_engines.storage.database import Database
+          from shared_engines.storage.migrations import (
+              Migration,
+              MigrationRunner,
+          )
+
+          MIGRATIONS = (
+              Migration(
+                  1,
+                  "events_outbox",
+                  (
+                      "CREATE TABLE events_outbox ("
+                      " event_id TEXT PRIMARY KEY,"
+                      " event_type TEXT NOT NULL,"
+                      " aggregate_id TEXT NOT NULL,"
+                      " schema_version INTEGER NOT NULL,"
+                      " envelope_version INTEGER NOT NULL,"
+                      " created_at REAL NOT NULL,"
+                      " payload TEXT NOT NULL,"
+                      " fingerprint TEXT NOT NULL,"
+                      " published_at REAL)",
+                      "CREATE INDEX events_outbox_pending"
+                      " ON events_outbox (published_at,"
+                      " created_at)",
+                  ),
+              ),
+              Migration(
+                  2,
+                  "events_outbox_concurrency",
+                  (
+                      "ALTER TABLE events_outbox ADD COLUMN"
+                      " state TEXT NOT NULL DEFAULT"
+                      " 'PENDING'",
+                      "ALTER TABLE events_outbox ADD COLUMN"
+                      " lease_owner TEXT",
+                      "ALTER TABLE events_outbox ADD COLUMN"
+                      " lease_expires_at REAL",
+                      "ALTER TABLE events_outbox ADD COLUMN"
+                      " attempts INTEGER NOT NULL DEFAULT 0",
+                      "ALTER TABLE events_outbox ADD COLUMN"
+                      " next_retry_at REAL",
+                      "ALTER TABLE events_outbox ADD COLUMN"
+                      " last_error TEXT",
+                      "CREATE INDEX events_outbox_state"
+                      " ON events_outbox (state,"
+                      " next_retry_at)",
+                  ),
+              ),
+          )
+
+          STATE_PENDING = "PENDING"
+          STATE_CLAIMED = "CLAIMED"
+          STATE_DISPATCHED = "DISPATCHED"
+          STATE_DEAD = "DEAD"
+
+
+          @dataclass(frozen=True)
+          class OutboxClaim:
+              """A leased event plus its fencing token."""
+
+              event: Event
+              fencing_token: int
+
+
+          class Outbox:
+              """Persists events atomically with the state
+              producing them."""
+
+              def __init__(
+                  self, db: Database, clock: Clock
+              ) -> None:
+                  self._db = db
+                  self._clock = clock
+
+              def ensure_schema(self) -> None:
+                  MigrationRunner(
+                      self._db, "events.outbox", MIGRATIONS
+                  ).run(self._clock)
+
+              def enqueue_in_transaction(
+                  self, cursor: sqlite3.Cursor, event: Event
+              ) -> None:
+                  cursor.execute(
+                      "INSERT INTO events_outbox"
+                      " (event_id, event_type, aggregate_id,"
+                      "  schema_version, envelope_version,"
+                      "  created_at, payload, fingerprint,"
+                      "  published_at)"
+                      " VALUES (?, ?, ?, ?, ?, ?, ?, ?, NULL)",
+                      (
+                          event.event_id,
+                          event.event_type,
+                          event.aggregate_id,
+                          event.schema_version,
+                          event.envelope_version,
+                          event.timestamp,
+                          canonical_json_dumps(
+                              dict(event.payload)
+                          ),
+                          event.fingerprint,
+                      ),
+                  )
+
+              def enqueue(self, event: Event) -> None:
+                  with self._db.transaction() as cursor:
+                      self.enqueue_in_transaction(
+                          cursor, event
+                      )
+
+              def pending(
+                  self, limit: int = 100
+              ) -> tuple[Event, ...]:
+                  rows = self._db.query_all(
+                      "SELECT * FROM events_outbox"
+                      " WHERE published_at IS NULL"
+                      " AND state = ?"
+                      " AND (next_retry_at IS NULL"
+                      "      OR next_retry_at <= ?)"
+                      " ORDER BY created_at, event_id"
+                      " LIMIT ?",
+                      (
+                          STATE_PENDING,
+                          self._clock.now(),
+                          limit,
+                      ),
+                  )
+                  return tuple(
+                      self._to_event(row) for row in rows
+                  )
+
+              def dispatch_pending(
+                  self,
+                  handler: Callable[[Event], None],
+                  *,
+                  batch_size: int = 100,
+              ) -> int:
+                  delivered = 0
+                  for event in self.pending(batch_size):
+                      handler(event)
+                      self._db.execute(
+                          "UPDATE events_outbox"
+                          " SET published_at = ?,"
+                          " state = ?"
+                          " WHERE event_id = ?"
+                          " AND published_at IS NULL",
+                          (
+                              self._clock.now(),
+                              STATE_DISPATCHED,
+                              event.event_id,
+                          ),
+                      )
+                      delivered += 1
+                  return delivered
+
+              def claim_batch(
+                  self,
+                  *,
+                  owner: str,
+                  lease_seconds: float,
+                  limit: int = 10,
+              ) -> tuple[OutboxClaim, ...]:
+                  """Atomically lease due pending events.
+
+                  Two workers racing on the same event get at
+                  most one claim: the UPDATE guards on
+                  state = PENDING inside one transaction.
+                  """
+                  if lease_seconds <= 0:
+                      raise ValueError(
+                          "lease_seconds must be positive"
+                      )
+                  now = self._clock.now()
+                  claims: list[OutboxClaim] = []
+                  with self._db.transaction() as cursor:
+                      rows = cursor.execute(
+                          "SELECT * FROM events_outbox"
+                          " WHERE state = ?"
+                          " AND (next_retry_at IS NULL"
+                          "      OR next_retry_at <= ?)"
+                          " ORDER BY created_at, event_id"
+                          " LIMIT ?",
+                          (
+                              STATE_PENDING,
+                              now,
+                              limit,
+                          ),
+                      ).fetchall()
+                      for row in rows:
+                          event_id = str(row["event_id"])
+                          attempts = (
+                              int(row["attempts"]) + 1
+                          )
+                          cursor.execute(
+                              "UPDATE events_outbox"
+                              " SET state = ?,"
+                              " lease_owner = ?,"
+                              " lease_expires_at = ?,"
+                              " attempts = ?"
+                              " WHERE event_id = ?"
+                              " AND state = ?",
+                              (
+                                  STATE_CLAIMED,
+                                  owner,
+                                  now + lease_seconds,
+                                  attempts,
+                                  event_id,
+                                  STATE_PENDING,
+                              ),
+                          )
+                          if cursor.rowcount != 1:
+                              continue
+                          claims.append(
+                              OutboxClaim(
+                                  event=self._to_event(
+                                      row
+                                  ),
+                                  fencing_token=attempts,
+                              )
+                          )
+                  return tuple(claims)
+
+              def complete(
+                  self,
+                  *,
+                  event_id: str,
+                  owner: str,
+                  fencing_token: int,
+              ) -> None:
+                  """Mark DISPATCHED; refused if lease or
+                  fencing no longer current."""
+                  now = self._clock.now()
+                  with self._db.transaction() as cursor:
+                      cursor.execute(
+                          "UPDATE events_outbox"
+                          " SET state = ?,"
+                          " published_at = ?,"
+                          " lease_owner = NULL,"
+                          " lease_expires_at = NULL"
+                          " WHERE event_id = ?"
+                          " AND state = ?"
+                          " AND lease_owner = ?"
+                          " AND attempts = ?"
+                          " AND lease_expires_at > ?",
+                          (
+                              STATE_DISPATCHED,
+                              now,
+                              event_id,
+                              STATE_CLAIMED,
+                              owner,
+                              fencing_token,
+                              now,
+                          ),
+                      )
+                      if cursor.rowcount != 1:
+                          raise LeaseLost(
+                              "lease lost for event"
+                              f" {event_id}: fencing"
+                              " rejected"
+                          )
+
+              def fail(
+                  self,
+                  *,
+                  event_id: str,
+                  owner: str,
+                  fencing_token: int,
+                  error: str,
+                  max_attempts: int = 5,
+                  backoff_base_seconds: float = 1.0,
+              ) -> bool:
+                  """Report a processing failure.
+
+                  Schedules an exponential-backoff retry, or
+                  moves the event to DEAD once ``max_attempts``
+                  is reached. True = retry scheduled,
+                  False = dead-lettered. LeaseLost for stale
+                  workers.
+                  """
+                  now = self._clock.now()
+                  with self._db.transaction() as cursor:
+                      cursor.execute(
+                          "SELECT state, lease_owner,"
+                          " attempts FROM events_outbox"
+                          " WHERE event_id = ?",
+                          (event_id,),
+                      )
+                      row = cursor.fetchone()
+                      if row is None:
+                          raise LeaseLost(
+                              "lease lost for event"
+                              f" {event_id}: missing"
+                          )
+                      state = str(row["state"])
+                      lease_owner = str(
+                          row["lease_owner"] or ""
+                      )
+                      attempts = int(row["attempts"])
+                      if (
+                          state != STATE_CLAIMED
+                          or lease_owner != owner
+                          or attempts != fencing_token
+                      ):
+                          raise LeaseLost(
+                              "lease lost for event"
+                              f" {event_id}: fencing"
+                              " rejected"
+                          )
+                      if attempts >= max_attempts:
+                          cursor.execute(
+                              "UPDATE events_outbox"
+                              " SET state = ?,"
+                              " last_error = ?,"
+                              " lease_owner = NULL,"
+                              " lease_expires_at = NULL"
+                              " WHERE event_id = ?",
+                              (
+                                  STATE_DEAD,
+                                  error,
+                                  event_id,
+                              ),
+                          )
+                          return False
+                      delay = backoff_base_seconds * (
+                          2 ** (attempts - 1)
+                      )
+                      cursor.execute(
+                          "UPDATE events_outbox"
+                          " SET state = ?,"
+                          " next_retry_at = ?,"
+                          " last_error = ?,"
+                          " lease_owner = NULL,"
+                          " lease_expires_at = NULL"
+                          " WHERE event_id = ?",
+                          (
+                              STATE_PENDING,
+                              now + delay,
+                              error,
+                              event_id,
+                          ),
+                      )
+                      return True
+
+              def reap_expired_leases(self) -> int:
+                  """Return expired CLAIMED events to
+                  PENDING (worker died mid-processing)."""
+                  now = self._clock.now()
+                  with self._db.transaction() as cursor:
+                      cursor.execute(
+                          "UPDATE events_outbox"
+                          " SET state = ?,"
+                          " lease_owner = NULL,"
+                          " lease_expires_at = NULL"
+                          " WHERE state = ?"
+                          " AND lease_expires_at <= ?",
+                          (
+                              STATE_PENDING,
+                              STATE_CLAIMED,
+                              now,
+                          ),
+                      )
+                      return int(cursor.rowcount)
+
+              def dead_letter(
+                  self, limit: int = 100
+              ) -> tuple[Event, ...]:
+                  rows = self._db.query_all(
+                      "SELECT * FROM events_outbox"
+                      " WHERE state = ?"
+                      " ORDER BY created_at, event_id"
+                      " LIMIT ?",
+                      (STATE_DEAD, limit),
+                  )
+                  return tuple(
+                      self._to_event(row) for row in rows
+                  )
+
+              def requeue_dead(
+                  self, *, event_id: str
+              ) -> None:
+                  with self._db.transaction() as cursor:
+                      cursor.execute(
+                          "UPDATE events_outbox"
+                          " SET state = ?,"
+                          " attempts = 0,"
+                          " next_retry_at = NULL,"
+                          " last_error = NULL"
+                          " WHERE event_id = ?"
+                          " AND state = ?",
+                          (
+                              STATE_PENDING,
+                              event_id,
+                              STATE_DEAD,
+                          ),
+                      )
+
+              @staticmethod
+              def _to_event(row: sqlite3.Row) -> Event:
+                  return Event(
+                      event_id=str(row["event_id"]),
+                      event_type=str(row["event_type"]),
+                      aggregate_id=str(
+                          row["aggregate_id"]
+                      ),
+                      schema_version=int(
+                          row["schema_version"]
+                      ),
+                      envelope_version=int(
+                          row["envelope_version"]
+                      ),
+                      timestamp=float(row["created_at"]),
+                      payload=canonical_json_loads(
+                          str(row["payload"])
+                      ),
+                      fingerprint=str(row["fingerprint"]),
+                  )
+          PYEOF
+          echo "=== OUTBOX CONCURRENCY READY ==="
+
+      - name: Write concurrency proof tests (5)
+        run: |
+          set -euo pipefail
+          mkdir -p shared_engines/events/tests
+          cat > shared_engines/events/tests/test_outbox_concurrency.py <<'PYEOF'
+          """Concurrency-grade proofs for the Outbox:
+          claim/lease exclusivity, fencing, backoff retry,
+          dead-letter, lease reaping and legacy dispatch."""
           from __future__ import annotations
 
           import hashlib
+          from pathlib import Path
 
-          from shared_engines.audit.chain import AuditTrail
-          from shared_engines.common.clocks import Clock
-          from shared_engines.common.identifiers import new_id
+          from shared_engines.common.clocks import FrozenClock
+          from shared_engines.common.errors import LeaseLost
           from shared_engines.common.serialization import (
               canonical_json_dumps,
           )
-          from shared_engines.common.validation import (
-              require_non_empty_str,
-          )
           from shared_engines.events.contracts import Event
-          from shared_engines.events.outbox import Outbox
-          from shared_engines.network.cluster import (
-              ClusterManager,
-              NodeRole,
+          from shared_engines.events.outbox import (
+              Outbox,
+              OutboxClaim,
           )
-          from shared_engines.network.errors import NoQuorumError
+          from shared_engines.storage.database import (
+              SQLiteAdapter,
+          )
 
-          EVENT_FAILOVER = "network.failover.elected"
 
-
-          class FailoverCoordinator:
-              """Elects a new primary under quorum.
-
-              The election is audited always, and when an Outbox
-              is provided the elected event is enqueued durably,
-              closing the flow: Failover -> Audit -> Outbox ->
-              Telemetry.
-              """
-
-              def __init__(
-                  self,
-                  *,
-                  cluster: ClusterManager,
-                  audit: AuditTrail,
-                  outbox: Outbox | None = None,
-                  clock: Clock | None = None,
-              ) -> None:
-                  self._cluster = cluster
-                  self._audit = audit
-                  self._outbox = outbox
-                  self._clock = clock
-
-              def elect_new_primary(
-                  self, *, failed_primary: str
-              ) -> str:
-                  require_non_empty_str(
-                      failed_primary, "failed_primary"
-                  )
-                  registered = self._cluster.all_nodes()
-                  if len(registered) == 0:
-                      raise NoQuorumError("cluster is empty")
-                  active = self._cluster.active_nodes()
-                  majority = len(registered) // 2 + 1
-                  if len(active) < majority:
-                      raise NoQuorumError(
-                          f"{len(active)}/{len(registered)}"
-                          f" active: majority ({majority})"
-                          " not reached - failover refused"
-                          " to avoid split-brain"
-                      )
-                  candidates = [
-                      n
-                      for n in active
-                      if n.node_id != failed_primary
-                      and n.role
-                      in (NodeRole.COORDINATOR, NodeRole.WORKER)
-                  ]
-                  if not candidates:
-                      raise NoQuorumError(
-                          "no eligible candidate node available"
-                      )
-                  candidates.sort(key=lambda n: n.node_id)
-                  elected = candidates[0]
-                  self._audit.append(
-                      event_type=EVENT_FAILOVER,
-                      actor="failover-coordinator",
-                      subject=elected.node_id,
-                      payload={
-                          "failed_primary": failed_primary,
-                          "active": len(active),
-                          "registered": len(registered),
-                      },
-                  )
-                  self._publish(
-                      elected=elected.node_id,
-                      failed_primary=failed_primary,
-                      active=len(active),
-                      registered=len(registered),
-                  )
-                  return elected.node_id
-
-              def _publish(
-                  self,
-                  *,
-                  elected: str,
-                  failed_primary: str,
-                  active: int,
-                  registered: int,
-              ) -> None:
-                  """Durably enqueue the elected event (if wired)."""
-                  if self._outbox is None:
-                      return
-                  timestamp = (
-                      self._clock.now()
-                      if self._clock is not None
-                      else 0.0
-                  )
-                  payload = {
-                      "failed_primary": failed_primary,
-                      "elected": elected,
-                      "active": active,
-                      "registered": registered,
+          def _make_event(suffix: str, ts: float) -> Event:
+              event_id = f"evt-{suffix}"
+              event_type = "network.node.joined"
+              aggregate_id = f"agg-{suffix}"
+              payload: dict[str, object] = {"seq": suffix}
+              fingerprint_src = canonical_json_dumps(
+                  {
+                      "event_id": event_id,
+                      "event_type": event_type,
+                      "aggregate_id": aggregate_id,
+                      "timestamp": ts,
+                      "payload": payload,
                   }
-                  event_id = new_id()
-                  fingerprint_src = canonical_json_dumps(
-                      {
-                          "event_id": event_id,
-                          "event_type": EVENT_FAILOVER,
-                          "aggregate_id": elected,
-                          "timestamp": timestamp,
-                          "payload": payload,
-                      }
-                  )
-                  fingerprint = hashlib.sha256(
-                      fingerprint_src.encode("utf-8")
-                  ).hexdigest()
-                  self._outbox.enqueue(
-                      Event(
-                          event_id=event_id,
-                          event_type=EVENT_FAILOVER,
-                          aggregate_id=elected,
-                          schema_version=1,
-                          envelope_version=1,
-                          timestamp=timestamp,
-                          payload=payload,
-                          fingerprint=fingerprint,
+              )
+              fingerprint = hashlib.sha256(
+                  fingerprint_src.encode("utf-8")
+              ).hexdigest()
+              return Event(
+                  event_id=event_id,
+                  event_type=event_type,
+                  aggregate_id=aggregate_id,
+                  schema_version=1,
+                  envelope_version=1,
+                  timestamp=ts,
+                  payload=payload,
+                  fingerprint=fingerprint,
+              )
+
+
+          def _boot(
+              tmp_path: Path,
+          ) -> tuple[SQLiteAdapter, Outbox, FrozenClock]:
+              db = SQLiteAdapter(tmp_path / "outbox.db")
+              clock = FrozenClock()
+              outbox = Outbox(db, clock)
+              outbox.ensure_schema()
+              return db, outbox, clock
+
+
+          def test_two_workers_never_claim_same_event(
+              tmp_path: Path,
+          ) -> None:
+              db, outbox, clock = _boot(tmp_path)
+              try:
+                  for i in range(4):
+                      outbox.enqueue(
+                          _make_event(str(i), clock.now())
+                      )
+                  claims_a: tuple[OutboxClaim, ...] = (
+                      outbox.claim_batch(
+                          owner="worker-a",
+                          lease_seconds=30.0,
+                          limit=10,
                       )
                   )
-
-              def has_quorum(self) -> bool:
-                  registered = self._cluster.all_nodes()
-                  if not registered:
-                      return False
-                  active = self._cluster.active_nodes()
-                  return len(active) >= len(registered) // 2 + 1
-          PYEOF
-          echo "=== FAILOVER FIXED ==="
-
-      - name: Fix distributed tests (events-based metric check)
-        run: |
-          set -euo pipefail
-          mkdir -p shared_engines/network/tests
-          cat > shared_engines/network/tests/test_distributed.py <<'PYEOF'
-          """Full distributed-network demonstrations over one shared
-          authority DB: 3 nodes with real ZIDs, replication checks,
-          coordinator failure with quorum failover, node recovery,
-          partition refusal (anti-split-brain), all audited and
-          visible in telemetry."""
-          from __future__ import annotations
-
-          from pathlib import Path
-
-          import pytest
-
-          from shared_engines.audit.chain import AuditTrail
-          from shared_engines.common.clocks import FrozenClock
-          from shared_engines.events.contracts import EventCatalog
-          from shared_engines.events.outbox import Outbox
-          from shared_engines.identity.contracts import IdentityKind
-          from shared_engines.identity.engine import IdentityEngine
-          from shared_engines.network.cluster import (
-              ClusterManager,
-              NodeRole,
-              NodeState,
-          )
-          from shared_engines.network.errors import NoQuorumError
-          from shared_engines.network.failover import FailoverCoordinator
-          from shared_engines.network.replication import ReplicationManager
-          from shared_engines.storage.database import SQLiteAdapter
-          from shared_engines.telemetry.collector import TelemetryCollector
-
-
-          class DistributedNetwork:
-              """3-node network over one durable authority store."""
-
-              def __init__(self, tmp_path: Path) -> None:
-                  self.db = SQLiteAdapter(tmp_path / "cluster.db")
-                  self.clock = FrozenClock()
-                  self.audit = AuditTrail(self.db, self.clock)
-                  self.outbox = Outbox(self.db, self.clock)
-                  self.outbox.ensure_schema()
-                  self.catalog = EventCatalog()
-                  for event_type in (
-                      "network.node.joined",
-                      "network.node.state_changed",
-                      "network.failover.elected",
-                      "identity.registered",
-                      "identity.status_changed",
-                  ):
-                      self.catalog.register(event_type)
-                  self.identity = IdentityEngine(
-                      db=self.db,
-                      clock=self.clock,
-                      audit=self.audit,
-                      outbox=self.outbox,
-                      catalog=self.catalog,
-                  )
-                  self.cluster = ClusterManager(
-                      db=self.db,
-                      clock=self.clock,
-                      audit=self.audit,
-                      outbox=self.outbox,
-                      catalog=self.catalog,
-                      heartbeat_ttl_seconds=30.0,
-                  )
-                  self.replication = ReplicationManager(
-                      self.db, self.clock
-                  )
-                  self.failover = FailoverCoordinator(
-                      cluster=self.cluster,
-                      audit=self.audit,
-                      outbox=self.outbox,
-                      clock=self.clock,
-                  )
-                  self.telemetry = TelemetryCollector(
-                      self.db, self.clock
-                  )
-                  self.node_ids: list[str] = []
-                  for index in range(3):
-                      node_identity = self.identity.register_identity(
-                          kind=IdentityKind.DEVICE,
-                          display_name=f"zyra-node-{index}",
-                          actor="bootstrap",
+                  claims_b: tuple[OutboxClaim, ...] = (
+                      outbox.claim_batch(
+                          owner="worker-b",
+                          lease_seconds=30.0,
+                          limit=10,
                       )
-                      role = (
-                          NodeRole.COORDINATOR
-                          if index == 0
-                          else NodeRole.WORKER
-                      )
-                      self.cluster.register_node(
-                          node_id=node_identity.zid,
-                          role=role,
-                          endpoint=(
-                              f"tcp://zyra-node-{index}:9000"
+                  )
+                  ids_a = {
+                      c.event.event_id for c in claims_a
+                  }
+                  ids_b = {
+                      c.event.event_id for c in claims_b
+                  }
+                  assert (
+                      len(claims_a) + len(claims_b) == 4
+                  )
+                  assert not (
+                      ids_a & ids_b
+                  ), "double claim detected"
+              finally:
+                  db.close()
+
+
+          def test_complete_requires_owner_and_fencing(
+              tmp_path: Path,
+          ) -> None:
+              db, outbox, clock = _boot(tmp_path)
+              try:
+                  outbox.enqueue(
+                      _make_event("f1", clock.now())
+                  )
+                  (claim,) = outbox.claim_batch(
+                      owner="worker-a",
+                      lease_seconds=30.0,
+                  )
+                  try:
+                      outbox.complete(
+                          event_id=claim.event.event_id,
+                          owner="worker-b",
+                          fencing_token=(
+                              claim.fencing_token
                           ),
                       )
-                      self.node_ids.append(node_identity.zid)
-
-              def beat(self, node_id: str) -> None:
-                  self.cluster.heartbeat(node_id)
-
-              def beat_all(self) -> None:
-                  for node_id in self.node_ids:
-                      self.cluster.heartbeat(node_id)
-
-              def beat_except(self, dead: str) -> None:
-                  for node_id in self.node_ids:
-                      if node_id != dead:
-                          self.cluster.heartbeat(node_id)
-
-              def sync_replicas(self) -> None:
-                  _, state_hash = (
-                      self.replication.compute_state_hash()
-                  )
-                  self.replication.replicate(
-                      primary_node=self.node_ids[0],
-                      replica_node=self.node_ids[1],
-                      replica_hash=state_hash,
-                  )
-                  self.replication.replicate(
-                      primary_node=self.node_ids[0],
-                      replica_node=self.node_ids[2],
-                      replica_hash=state_hash,
-                  )
-
-              def ingest_telemetry(self) -> int:
-                  return self.telemetry.ingest_outbox(self.outbox)
-
-              def close(self) -> None:
-                  self.db.close()
-
-
-          def test_demo_1_three_nodes_join_and_synchronize(
-              tmp_path: Path,
-          ) -> None:
-              net = DistributedNetwork(tmp_path)
-              try:
-                  net.beat_all()
-                  active = net.cluster.active_nodes()
-                  assert len(active) == 3
-                  assert active[0].state is NodeState.ACTIVE
-                  net.sync_replicas()
-                  report = net.replication.replicate(
-                      primary_node=net.node_ids[0],
-                      replica_node=net.node_ids[1],
-                      replica_hash=(
-                          net.replication.compute_state_hash()[1]
-                      ),
-                  )
-                  assert report.consistent is True
-                  assert net.audit.verify() >= 6
-              finally:
-                  net.close()
-
-
-          def test_demo_2_coordinator_fails_quorum_failover(
-              tmp_path: Path,
-          ) -> None:
-              net = DistributedNetwork(tmp_path)
-              try:
-                  net.beat_all()
-                  coordinator = net.node_ids[0]
-                  net.clock.advance(31)
-                  net.beat_except(coordinator)
-                  detected = net.cluster.detect_failures()
-                  assert coordinator in detected
-                  assert net.cluster.require(
-                      coordinator
-                  ).state is NodeState.SUSPECT
-                  net.clock.advance(31)
-                  net.beat_except(coordinator)
-                  net.cluster.detect_failures()
-                  assert net.cluster.require(
-                      coordinator
-                  ).state is NodeState.DOWN
-                  assert net.failover.has_quorum() is True
-                  new_primary = net.failover.elect_new_primary(
-                      failed_primary=coordinator
-                  )
-                  assert new_primary in net.node_ids[1:]
-                  net.beat_all()
-                  net.clock.advance(1)
-                  net.ingest_telemetry()
-                  events = net.telemetry.query_events(
-                      event_type="network.failover.elected"
-                  )
-                  assert len(events) >= 1
-                  events_state = net.telemetry.query_events(
-                      event_type="network.node.state_changed"
-                  )
-                  assert len(events_state) >= 1
-              finally:
-                  net.close()
-
-
-          def test_demo_3_failed_node_returns_and_resyncs(
-              tmp_path: Path,
-          ) -> None:
-              net = DistributedNetwork(tmp_path)
-              try:
-                  net.beat_all()
-                  worker = net.node_ids[2]
-                  net.clock.advance(31)
-                  net.beat_except(worker)
-                  net.cluster.detect_failures()
-                  net.clock.advance(31)
-                  net.beat_except(worker)
-                  net.cluster.detect_failures()
-                  assert net.cluster.require(worker).state is (
-                      NodeState.DOWN
-                  )
-                  net.cluster.heartbeat(worker)
-                  assert net.cluster.require(worker).state is (
-                      NodeState.REJOINED
-                  )
-                  net.clock.advance(1)
-                  net.cluster.heartbeat(worker)
-                  assert net.cluster.require(worker).state is (
-                      NodeState.ACTIVE
-                  )
-                  _, state_hash = (
-                      net.replication.compute_state_hash()
-                  )
-                  report = net.replication.replicate(
-                      primary_node=net.node_ids[0],
-                      replica_node=worker,
-                      replica_hash=state_hash,
-                  )
-                  assert report.consistent is True
-                  net.ingest_telemetry()
-                  rejoin_events = net.telemetry.query_events(
-                      event_type="network.node.state_changed"
-                  )
-                  assert len(rejoin_events) >= 1
-              finally:
-                  net.close()
-
-
-          def test_demo_4_partition_refuses_split_brain(
-              tmp_path: Path,
-          ) -> None:
-              net = DistributedNetwork(tmp_path)
-              try:
-                  net.beat_all()
-                  coordinator = net.node_ids[0]
-                  net.clock.advance(31)
-                  net.cluster.detect_failures()
-                  net.clock.advance(31)
-                  net.cluster.detect_failures()
-                  for node_id in net.node_ids[1:]:
-                      net.clock.advance(31)
-                      net.cluster.detect_failures()
-                      net.clock.advance(31)
-                      net.cluster.detect_failures()
-                  assert net.failover.has_quorum() is False
-                  with pytest.raises(NoQuorumError):
-                      net.failover.elect_new_primary(
-                          failed_primary=coordinator
+                      raise AssertionError(
+                          "expected LeaseLost"
                       )
-                  assert net.audit.verify() >= 1
-                  net.ingest_telemetry()
+                  except LeaseLost:
+                      pass
+                  outbox.complete(
+                      event_id=claim.event.event_id,
+                      owner="worker-a",
+                      fencing_token=claim.fencing_token,
+                  )
+                  assert outbox.pending() == ()
+                  assert outbox.dead_letter() == ()
               finally:
-                  net.close()
+                  db.close()
 
 
-          def test_demo_5_full_lifecycle_audit_and_telemetry(
+          def test_fail_backoff_then_dead_letter(
               tmp_path: Path,
           ) -> None:
-              net = DistributedNetwork(tmp_path)
+              db, outbox, clock = _boot(tmp_path)
               try:
-                  net.beat_all()
-                  coordinator = net.node_ids[0]
-                  net.clock.advance(31)
-                  net.beat_except(coordinator)
-                  net.cluster.detect_failures()
-                  net.clock.advance(31)
-                  net.beat_except(coordinator)
-                  net.cluster.detect_failures()
-                  new_primary = net.failover.elect_new_primary(
-                      failed_primary=coordinator
+                  outbox.enqueue(
+                      _make_event("r1", clock.now())
                   )
-                  net.clock.advance(1)
-                  net.cluster.heartbeat(coordinator)
-                  net.cluster.heartbeat(new_primary)
-                  net.ingest_telemetry()
-                  assert net.audit.verify() >= 8
-                  joined = net.telemetry.query_events(
-                      event_type="network.node.joined"
+                  (c1,) = outbox.claim_batch(
+                      owner="w", lease_seconds=30.0
                   )
-                  assert len(joined) == 3
-                  failover_events = net.telemetry.query_events(
-                      event_type="network.failover.elected"
+                  scheduled = outbox.fail(
+                      event_id=c1.event.event_id,
+                      owner="w",
+                      fencing_token=c1.fencing_token,
+                      error="boom-1",
+                      max_attempts=2,
+                      backoff_base_seconds=1.0,
                   )
-                  assert len(failover_events) >= 1
-                  # Identity registrations are EVENTS in
-                  # telemetry_events (not metrics), so the
-                  # registered count is queried from the event
-                  # stream.
-                  registered_events = net.telemetry.query_events(
-                      event_type="identity.registered"
+                  assert scheduled is True
+                  assert (
+                      outbox.claim_batch(
+                          owner="w", lease_seconds=30.0
+                      )
+                      == ()
                   )
-                  assert len(registered_events) >= 3
+                  clock.advance(2)
+                  (c2,) = outbox.claim_batch(
+                      owner="w", lease_seconds=30.0
+                  )
+                  assert c2.fencing_token == 2
+                  dead = outbox.fail(
+                      event_id=c2.event.event_id,
+                      owner="w",
+                      fencing_token=c2.fencing_token,
+                      error="boom-2",
+                      max_attempts=2,
+                      backoff_base_seconds=1.0,
+                  )
+                  assert dead is False
+                  assert len(outbox.dead_letter()) == 1
+                  outbox.requeue_dead(
+                      event_id=c2.event.event_id
+                  )
+                  (c3,) = outbox.claim_batch(
+                      owner="w", lease_seconds=30.0
+                  )
+                  assert c3.fencing_token == 1
               finally:
-                  net.close()
+                  db.close()
+
+
+          def test_expired_lease_reaped_and_fenced(
+              tmp_path: Path,
+          ) -> None:
+              db, outbox, clock = _boot(tmp_path)
+              try:
+                  outbox.enqueue(
+                      _make_event("l1", clock.now())
+                  )
+                  (old,) = outbox.claim_batch(
+                      owner="worker-dead",
+                      lease_seconds=10.0,
+                  )
+                  clock.advance(11)
+                  reaped = outbox.reap_expired_leases()
+                  assert reaped == 1
+                  (fresh,) = outbox.claim_batch(
+                      owner="worker-new",
+                      lease_seconds=30.0,
+                  )
+                  assert fresh.fencing_token == 2
+                  try:
+                      outbox.complete(
+                          event_id=fresh.event.event_id,
+                          owner="worker-dead",
+                          fencing_token=(
+                              old.fencing_token
+                          ),
+                      )
+                      raise AssertionError(
+                          "expected LeaseLost"
+                      )
+                  except LeaseLost:
+                      pass
+                  outbox.complete(
+                      event_id=fresh.event.event_id,
+                      owner="worker-new",
+                      fencing_token=fresh.fencing_token,
+                  )
+                  assert outbox.pending() == ()
+              finally:
+                  db.close()
+
+
+          def test_legacy_dispatch_still_works(
+              tmp_path: Path,
+          ) -> None:
+              db, outbox, clock = _boot(tmp_path)
+              try:
+                  outbox.enqueue(
+                      _make_event("a", clock.now())
+                  )
+                  outbox.enqueue(
+                      _make_event("b", clock.now())
+                  )
+                  seen: list[str] = []
+
+                  def collect(event: Event) -> None:
+                      seen.append(event.event_id)
+
+                  delivered = outbox.dispatch_pending(
+                      collect
+                  )
+                  assert delivered == 2
+                  assert len(seen) == 2
+                  assert outbox.pending() == ()
+                  assert outbox.dead_letter() == ()
+              finally:
+                  db.close()
           PYEOF
-          echo "=== DISTRIBUTED TESTS READY ==="
+          echo "=== CONCURRENCY TESTS READY ==="
 
       - name: Quality gates (mypy first; full regression)
         run: |
           set -euo pipefail
           M="shared_engines/common shared_engines/storage shared_engines/events shared_engines/observability shared_engines/audit shared_engines/security shared_engines/identity shared_engines/verification shared_engines/runtime shared_engines/tokenization shared_engines/currency shared_engines/verifier shared_engines/hardening shared_engines/authority shared_engines/network shared_engines/telemetry shared_engines/logs"
-          python -m compileall -q $M main.py scripts
+          python -m compileall -q $M main.py scripts shared_engines/tests
           echo "compile OK"
           find $M scripts -name '__pycache__' -type d -prune -exec rm -rf {} +
           mypy --strict --cache-dir="${RUNNER_TEMP}/mypy-cache" $M
           echo "mypy OK"
           flake8 $M main.py scripts tests/test_deployment.py --max-line-length=100
           echo "flake8 OK"
-          PYTHONPATH="$PWD" python -m pytest -q -p no:cacheprovider --import-mode=importlib $M tests/test_deployment.py observability/tests
+          PYTHONPATH="$PWD" python -m pytest -q -p no:cacheprovider --import-mode=importlib $M shared_engines/tests tests/test_deployment.py observability/tests
           echo "pytest OK"
           find $M scripts -name '__pycache__' -type d -prune -exec rm -rf {} +
 
@@ -530,7 +790,7 @@ jobs:
           if git diff --cached --quiet; then
             echo "No changes."
           else
-            git commit -m "zyra: W1 fix - failover publishes elected event to outbox; demo5 registration count queried from telemetry event stream; demos 5/5"
+            git commit -m "zyra: W3 outbox concurrency - atomic claim/lease, fencing (LeaseLost), backoff retry, dead-letter + requeue, expired-lease reaper; 5 proofs; legacy dispatch preserved"
             git push origin "HEAD:${{ github.ref_name }}"
           fi
-          echo "=== W1 COMPLETE ==="
+          echo "=== W3 COMPLETE ==="

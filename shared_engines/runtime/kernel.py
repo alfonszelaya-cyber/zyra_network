@@ -1,15 +1,16 @@
 """ZyraKernel: the living composition root of the Network.
 
 Builds and owns every engine over one durable database,
-registers a central event catalog, bootstraps the Root
-Authority identity (the Network's own ACTIVE institution),
-and aggregates component health. This is the object the
-HTTP layer serves; nothing else needs to know the wiring.
+registers the central event catalog, bootstraps the Root
+Authority identity, wires the token ledger and the FX
+engine, and aggregates component health.
 """
 from __future__ import annotations
 
 from shared_engines.audit.chain import AuditTrail
 from shared_engines.common.clocks import Clock
+from shared_engines.currency.engine import CurrencyEngine
+from shared_engines.currency.rates import StaticTableRateProvider
 from shared_engines.events.contracts import EventCatalog
 from shared_engines.events.outbox import Outbox
 from shared_engines.identity.contracts import (
@@ -30,6 +31,7 @@ from shared_engines.observability.health import (
 )
 from shared_engines.runtime.config import RuntimeConfig
 from shared_engines.storage.database import Database
+from shared_engines.tokenization.engine import TokenEngine
 from shared_engines.verification.engine import VerificationEngine
 from shared_engines.verification.signatures import Ed25519Signer
 
@@ -42,6 +44,13 @@ NETWORK_EVENT_TYPES = (
     "verification.credential.revoked",
     "verification.attestation.issued",
 )
+
+DEFAULT_FX_RATES: dict[str, str] = {
+    "USD/EUR": "0.92",
+    "USD/CNY": "7.25",
+    "GTQ/USD": "0.128",
+    "USD/MXN": "17.0",
+}
 
 
 class _StorageHealth:
@@ -70,6 +79,7 @@ class ZyraKernel:
         clock: Clock,
         signer: Ed25519Signer,
         config: RuntimeConfig,
+        fx_rates: dict[str, str] | None = None,
         metrics: MetricsBackend | None = None,
     ) -> None:
         self._config = config
@@ -101,10 +111,39 @@ class ZyraKernel:
             identity=self._identity,
             metrics=self._metrics,
         )
+        self._tokens = TokenEngine(
+            db=db,
+            clock=clock,
+            audit=self._audit,
+            outbox=self._outbox,
+            catalog=self._catalog,
+            identity=self._identity,
+            metrics=self._metrics,
+        )
+        self._currency = CurrencyEngine(
+            db=db,
+            clock=clock,
+            providers=[
+                StaticTableRateProvider(
+                    fx_rates
+                    if fx_rates is not None
+                    else DEFAULT_FX_RATES,
+                    clock,
+                )
+            ],
+            signer=signer,
+            audit=self._audit,
+            outbox=self._outbox,
+            catalog=self._catalog,
+            identity=self._identity,
+            metrics=self._metrics,
+        )
         self._health = HealthRegistry()
         self._health.register("storage", _StorageHealth(db))
         self._health.register("identity", self._identity)
         self._health.register("verification", self._verification)
+        self._health.register("tokens", self._tokens)
+        self._health.register("currency", self._currency)
         self._root_zid: str | None = None
 
     @property
@@ -118,6 +157,14 @@ class ZyraKernel:
     @property
     def verification(self) -> VerificationEngine:
         return self._verification
+
+    @property
+    def tokens(self) -> TokenEngine:
+        return self._tokens
+
+    @property
+    def currency(self) -> CurrencyEngine:
+        return self._currency
 
     @property
     def audit(self) -> AuditTrail:
@@ -134,11 +181,7 @@ class ZyraKernel:
     def bootstrap_root(
         self, *, display_name: str = "Zyra Root Authority"
     ) -> Identity:
-        """Creates/returns the Network's own ACTIVE authority.
-
-        Idempotent: the first call registers + activates it;
-        later calls return the same identity.
-        """
+        """Creates/returns the Network's own ACTIVE authority."""
         if self._root_zid is not None:
             return self._identity.require_identity(self._root_zid)
         root = self._identity.register_identity(

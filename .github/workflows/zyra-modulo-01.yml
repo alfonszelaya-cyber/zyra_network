@@ -1,4 +1,4 @@
-name: zyra-modulo-14-complete
+name: zyra-modulo-15-storage-dr
 
 "on":
   workflow_dispatch:
@@ -9,13 +9,13 @@ permissions:
   contents: write
 
 concurrency:
-  group: zyra-modulo-14-${{ github.ref }}
+  group: zyra-modulo-15-${{ github.ref }}
   cancel-in-progress: false
 
 jobs:
   build:
     runs-on: ubuntu-latest
-    timeout-minutes: 30
+    timeout-minutes: 25
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -31,643 +31,725 @@ jobs:
           python -m pip install --upgrade pip
           python -m pip install "cryptography>=42,<45" "flake8>=7,<8" "mypy>=1.10,<2" "pytest>=8,<9"
 
-      - name: Check modules 01-13 present
+      - name: Check modules 01-14 present
         run: |
           set -euo pipefail
-          test -f shared_engines/runtime/kernel.py
-          test -f shared_engines/hardening/api_keys.py
+          test -f shared_engines/authority/root.py
           test -f main.py
-          echo "modules 01-13 present: OK"
+          echo "modules 01-14 present: OK"
 
-      - name: Repair broken _init_.py markers
+      - name: Build network migration registry + snapshots + DR
         run: |
           set -euo pipefail
-          for f in infrastructure/external_services/_init_.py infrastructure/messaging/_init_.py; do
-            if [ -f "$f" ]; then
-              dir=$(dirname "$f")
-              if [ ! -f "$dir/__init__.py" ]; then
-                mv "$f" "$dir/__init__.py"
-                echo "repaired: $f"
-              else
-                rm "$f"
-                echo "removed duplicate: $f"
-              fi
-            fi
-          done
+          mkdir -p shared_engines/storage/tests
 
-      - name: Zero tests scaffold init files (W391 fix)
-        run: |
-          set -euo pipefail
-          python3 - <<'PYCLEAN'
-          from pathlib import Path
-          cleaned = 0
-          for f in Path("tests").rglob("__init__.py"):
-              text = f.read_text(encoding="utf-8")
-              if text.strip() == "":
-                  if text != "":
-                      f.write_text("", encoding="utf-8")
-                      cleaned += 1
-              else:
-                  stripped = text.rstrip("\n") + "\n"
-                  if stripped != text:
-                      f.write_text(stripped, encoding="utf-8")
-                      cleaned += 1
-          print(f"cleaned {cleaned}")
-          PYCLEAN
+          cat > shared_engines/storage/network_migrations.py <<'PYEOF'
+          """Central migration registry: one entry migrates ALL engines.
 
-      - name: Write ARCHITECTURE.md
-        run: |
-          set -euo pipefail
-          cat > ARCHITECTURE.md <<'MDEOF'
-          # Zyra Network — Jerarquía Canónica (auditoría 2025)
-
-          foundation/ = contratos canónicos; shared_engines/common/ = ejecución
-          infrastructure/dns/ = autoridad discovery; discovery/ = fachada
-          infrastructure/database/ = infra; shared_engines/storage/ = contrato
-          verification/ = emisión; verifier/ = verificación offline terceros
-          Namespaces futuros NO se llenan artificialmente (ai, certification,
-          compliance, consensus, encryption, export, integrations, integrity,
-          interoperability, orchestration, radar->SUBASTAS, reputation,
-          routing, scalability, search, supervisor, system_loader, workflow).
-          Deuda aceptada: telemetry, logs, migrations, scripts (fases 3-6).
-          MDEOF
-
-      - name: Build authority module (hex validation fixed)
-        run: |
-          set -euo pipefail
-          mkdir -p shared_engines/authority/tests
-
-          cat > shared_engines/authority/__init__.py <<'PYEOF'
-          """Zyra persistent Root Authority."""
+          Deterministic namespace order, checksummed migrations,
+          idempotent: running twice applies nothing new. This is the
+          engine behind ``scripts/migrate.py`` and what makes the
+          root ``migrations/`` folder operationally real.
+          """
           from __future__ import annotations
 
-          from shared_engines.authority.root import (
-              PersistentRootAuthority,
-              RootAuthorityStatus,
-          )
-
-          __all__ = ["PersistentRootAuthority", "RootAuthorityStatus"]
-          PYEOF
-
-          cat > shared_engines/authority/root.py <<'PYEOF'
-          """Persistent Root Authority: encrypted key at rest, fail-closed."""
-          from __future__ import annotations
-
-          import base64
-          import hashlib
-          import json
-          import os
           from dataclasses import dataclass
-          from enum import Enum
-          from pathlib import Path
 
-          from cryptography.hazmat.primitives.ciphers.aead import AESGCM
-
-          from shared_engines.common.errors import (
-              ConfigurationError,
-              IntegrityError,
+          from shared_engines.common.clocks import Clock
+          from shared_engines.storage.database import Database
+          from shared_engines.storage.migrations import (
+              Migration,
+              MigrationRunner,
           )
-          from shared_engines.common.validation import require_non_empty_str
-          from shared_engines.verification.signatures import Ed25519Signer
-
-          KEY_FILE_FORMAT = "zyra.rootkey.v1"
-          MASTER_ENV_VAR = "ZYRA_ROOT_KEY"
-
-
-          class RootAuthorityStatus(Enum):
-              CREATED_NEW = "created_new"
-              LOADED = "loaded"
-              ROTATED = "rotated"
 
 
           @dataclass(frozen=True)
-          class RootAuthorityStatusRecord:
-              status: RootAuthorityStatus
-              public_pem_fingerprint: str
+          class NamespaceResult:
+              namespace: str
+              applied_now: tuple[int, ...]
+              versions: tuple[int, ...]
 
 
-          class PersistentRootAuthority:
-              def __init__(
-                  self, *, data_dir: Path, master_key_hex: str
-              ) -> None:
-                  require_non_empty_str(master_key_hex, "master_key_hex")
-                  try:
-                      raw = bytes.fromhex(master_key_hex)
-                  except ValueError as exc:
-                      raise ConfigurationError(
-                          f"{MASTER_ENV_VAR} must be valid hex"
-                      ) from exc
-                  if len(raw) != 32:
-                      raise ConfigurationError(
-                          f"{MASTER_ENV_VAR} must be 64 hex chars"
-                          " (32 bytes)"
-                      )
-                  self._master = raw
-                  self._dir = Path(data_dir)
-                  self._dir.mkdir(parents=True, exist_ok=True)
-                  self._key_path = self._dir / "root.key"
-                  self._history_path = self._dir / "root.history.json"
+          @dataclass(frozen=True)
+          class NetworkMigrationReport:
+              results: tuple[NamespaceResult, ...]
 
-              def _derive_file_key(self, nonce: bytes) -> bytes:
-                  return hashlib.sha256(
-                      b"zyra.rootkey.v1" + self._master + nonce
-                  ).digest()
+              @property
+              def total_applied_now(self) -> int:
+                  return sum(len(r.applied_now) for r in self.results)
 
-              def _encrypt_to_file(self, plaintext: bytes) -> None:
-                  nonce = os.urandom(12)
-                  file_key = self._derive_file_key(nonce)
-                  ciphertext = AESGCM(file_key).encrypt(
-                      nonce, plaintext, b"zyra-root"
-                  )
-                  token = {
-                      "format": KEY_FILE_FORMAT,
-                      "nonce": base64.b64encode(nonce).decode("ascii"),
-                      "ciphertext": base64.b64encode(
-                          ciphertext
-                      ).decode("ascii"),
-                  }
-                  self._key_path.write_text(
-                      json.dumps(token), encoding="utf-8"
-                  )
 
-              def _decrypt_from_file(self) -> bytes:
-                  if not self._key_path.exists():
-                      raise FileNotFoundError(str(self._key_path))
-                  doc = json.loads(
-                      self._key_path.read_text(encoding="utf-8")
-                  )
-                  if doc.get("format") != KEY_FILE_FORMAT:
-                      raise IntegrityError("unknown key file format")
-                  nonce = base64.b64decode(str(doc["nonce"]), validate=True)
-                  ciphertext = base64.b64decode(
-                      str(doc["ciphertext"]), validate=True
-                  )
-                  file_key = self._derive_file_key(nonce)
-                  try:
-                      return AESGCM(file_key).decrypt(
-                          nonce, ciphertext, b"zyra-root"
-                      )
-                  except Exception as exc:
-                      raise IntegrityError(
-                          "root key file cannot be decrypted:"
-                          " wrong master key or tampered file"
-                      ) from exc
+          class NetworkMigrationRunner:
+              """Runs every engine's migrations in deterministic order."""
 
-              @staticmethod
-              def _fingerprint(public_pem: bytes) -> str:
-                  return hashlib.sha256(public_pem).hexdigest()[:16]
+              def __init__(self, db: Database, clock: Clock) -> None:
+                  self._db = db
+                  self._clock = clock
 
-              def load_or_create(
+              def _registry(
                   self,
-              ) -> tuple[Ed25519Signer, RootAuthorityStatusRecord]:
-                  if self._key_path.exists():
-                      private_pem = self._decrypt_from_file()
-                      signer = Ed25519Signer(private_pem)
-                      return signer, RootAuthorityStatusRecord(
-                          status=RootAuthorityStatus.LOADED,
-                          public_pem_fingerprint=self._fingerprint(
-                              signer.public_pem
-                          ),
+              ) -> tuple[tuple[str, tuple[Migration, ...]], ...]:
+                  from shared_engines.audit.chain import (
+                      MIGRATIONS as AUDIT,
+                  )
+                  from shared_engines.currency.engine import (
+                      CONVERSIONS_MIGRATIONS,
+                  )
+                  from shared_engines.currency.store import (
+                      RATES_MIGRATIONS,
+                  )
+                  from shared_engines.events.inbox import (
+                      MIGRATIONS as INBOX,
+                  )
+                  from shared_engines.events.outbox import (
+                      MIGRATIONS as OUTBOX,
+                  )
+                  from shared_engines.hardening.api_keys import (
+                      API_KEYS_MIGRATIONS,
+                  )
+                  from shared_engines.hardening.bruteforce import (
+                      BRUTE_FORCE_MIGRATIONS,
+                  )
+                  from shared_engines.hardening.ratelimit import (
+                      RATE_LIMIT_MIGRATIONS,
+                  )
+                  from shared_engines.identity.registry import (
+                      IDENTITY_MIGRATIONS,
+                  )
+                  from shared_engines.tokenization.ledger import (
+                      TOKEN_MIGRATIONS,
+                  )
+                  from shared_engines.verification.attestations import (
+                      ATTESTATION_MIGRATIONS,
+                  )
+                  from shared_engines.verification.credentials import (
+                      CREDENTIALS_MIGRATIONS,
+                  )
+                  from shared_engines.verification.media import (
+                      MEDIA_MIGRATIONS,
+                  )
+                  from shared_engines.verification.provenance import (
+                      PROVENANCE_MIGRATIONS,
+                  )
+
+                  return (
+                      ("audit", AUDIT),
+                      ("events.outbox", OUTBOX),
+                      ("events.inbox", INBOX),
+                      ("identity", IDENTITY_MIGRATIONS),
+                      ("verification.media", MEDIA_MIGRATIONS),
+                      ("verification.provenance", PROVENANCE_MIGRATIONS),
+                      ("verification.credentials", CREDENTIALS_MIGRATIONS),
+                      ("verification.attestations", ATTESTATION_MIGRATIONS),
+                      ("currency.rates", RATES_MIGRATIONS),
+                      ("currency.conversions", CONVERSIONS_MIGRATIONS),
+                      ("tokenization", TOKEN_MIGRATIONS),
+                      ("hardening.keys", API_KEYS_MIGRATIONS),
+                      ("hardening.ratelimit", RATE_LIMIT_MIGRATIONS),
+                      ("hardening.bruteforce", BRUTE_FORCE_MIGRATIONS),
+                  )
+
+              def run_all(self) -> NetworkMigrationReport:
+                  self._db.execute(
+                      "CREATE TABLE IF NOT EXISTS schema_migrations ("
+                      " namespace TEXT NOT NULL,"
+                      " version INTEGER NOT NULL,"
+                      " name TEXT NOT NULL,"
+                      " checksum TEXT NOT NULL,"
+                      " applied_at REAL NOT NULL,"
+                      " PRIMARY KEY (namespace, version))"
+                  )
+                  results: list[NamespaceResult] = []
+                  for namespace, migrations in self._registry():
+                      before = self._known_versions(namespace)
+                      runner = MigrationRunner(
+                          self._db, namespace, migrations
                       )
-                  signer, private_pem = Ed25519Signer.generate()
-                  self._encrypt_to_file(private_pem)
-                  return signer, RootAuthorityStatusRecord(
-                      status=RootAuthorityStatus.CREATED_NEW,
-                      public_pem_fingerprint=self._fingerprint(
-                          signer.public_pem
-                      ),
-                  )
-
-              def rotate(
-                  self, *, rotated_by: str
-              ) -> tuple[Ed25519Signer, RootAuthorityStatusRecord]:
-                  require_non_empty_str(rotated_by, "rotated_by")
-                  old_signer, _ = self.load_or_create()
-                  old_fp = self._fingerprint(old_signer.public_pem)
-                  history: list[str] = []
-                  if self._history_path.exists():
-                      loaded = json.loads(
-                          self._history_path.read_text(encoding="utf-8")
+                      runner.run(self._clock)
+                      after = self._known_versions(namespace)
+                      applied_now = tuple(
+                          v for v in after if v not in before
                       )
-                      if isinstance(loaded, list):
-                          history = [str(x) for x in loaded]
-                  history.append(old_fp)
-                  self._history_path.write_text(
-                      json.dumps(history), encoding="utf-8"
-                  )
-                  signer, private_pem = Ed25519Signer.generate()
-                  self._encrypt_to_file(private_pem)
-                  return signer, RootAuthorityStatusRecord(
-                      status=RootAuthorityStatus.ROTATED,
-                      public_pem_fingerprint=self._fingerprint(
-                          signer.public_pem
-                      ),
-                  )
+                      results.append(
+                          NamespaceResult(
+                              namespace=namespace,
+                              applied_now=applied_now,
+                              versions=after,
+                          )
+                      )
+                  return NetworkMigrationReport(results=tuple(results))
 
-              def historical_fingerprints(self) -> tuple[str, ...]:
-                  if not self._history_path.exists():
-                      return ()
-                  loaded = json.loads(
-                      self._history_path.read_text(encoding="utf-8")
+              def _known_versions(self, namespace: str) -> tuple[int, ...]:
+                  rows = self._db.query_all(
+                      "SELECT version FROM schema_migrations"
+                      " WHERE namespace = ? ORDER BY version",
+                      (namespace,),
                   )
-                  if not isinstance(loaded, list):
-                      return ()
-                  return tuple(str(x) for x in loaded)
-
-              @staticmethod
-              def generate_master_key() -> str:
-                  return os.urandom(32).hex()
+                  return tuple(int(row["version"]) for row in rows)
           PYEOF
 
-          cat > shared_engines/authority/tests/test_root_authority.py <<'PYEOF'
+          cat > shared_engines/storage/snapshots.py <<'PYEOF'
+          """Snapshot manager: labeled, verified, retention-managed.
+
+          Builds on the sqlite backup API + manifest hashes. Retention
+          keeps the newest N snapshots and removes the rest, so
+          snapshot storage stays bounded in production.
+          """
+          from __future__ import annotations
+
+          import hashlib
+          import json
+          import os
+          import re
+          import sqlite3
+          from dataclasses import dataclass
+          from pathlib import Path
+
+          from shared_engines.common.clocks import Clock
+          from shared_engines.common.errors import IntegrityError
+          from shared_engines.common.identifiers import new_id
+          from shared_engines.storage.database import SQLiteAdapter
+
+
+          def _sha256_file(path: Path) -> str:
+              digest = hashlib.sha256()
+              with path.open("rb") as handle:
+                  for chunk in iter(
+                      lambda: handle.read(512 * 1024), b""
+                  ):
+                      digest.update(chunk)
+              return digest.hexdigest()
+
+
+          @dataclass(frozen=True)
+          class SnapshotRecord:
+              path: Path
+              label: str
+              created_at: float
+              sha256: str
+              size_bytes: int
+
+
+          class SnapshotManager:
+              def __init__(
+                  self,
+                  adapter: SQLiteAdapter,
+                  clock: Clock,
+                  snapshot_dir: Path,
+              ) -> None:
+                  self._adapter = adapter
+                  self._clock = clock
+                  self._dir = Path(snapshot_dir)
+                  self._dir.mkdir(parents=True, exist_ok=True)
+
+              def _manifest(self, path: Path) -> Path:
+                  return path.with_suffix(".manifest.json")
+
+              def create(self, *, label: str) -> SnapshotRecord:
+                  safe = re.sub(r"[^a-z0-9_-]+", "-", label.lower())
+                  safe = safe.strip("-") or "snap"
+                  stamp = f"{int(self._clock.now())}-{new_id()[:8]}"
+                  path = self._dir / f"snapshot-{stamp}-{safe}.db"
+                  self._adapter.backup_to(path)
+                  digest = _sha256_file(path)
+                  manifest = {
+                      "label": safe,
+                      "created_at": self._clock.now(),
+                      "sha256": digest,
+                  }
+                  self._manifest(path).write_text(
+                      json.dumps(manifest), encoding="utf-8"
+                  )
+                  self.verify(path)
+                  return SnapshotRecord(
+                      path=path,
+                      label=safe,
+                      created_at=float(manifest["created_at"]),
+                      sha256=digest,
+                      size_bytes=path.stat().st_size,
+                  )
+
+              def verify(self, path: Path) -> str:
+                  if not path.exists():
+                      raise IntegrityError(f"snapshot missing: {path}")
+                  manifest_path = self._manifest(path)
+                  if not manifest_path.exists():
+                      raise IntegrityError(
+                          f"snapshot manifest missing: {manifest_path}"
+                      )
+                  manifest = json.loads(
+                      manifest_path.read_text(encoding="utf-8")
+                  )
+                  digest = _sha256_file(path)
+                  if not isinstance(manifest, dict) or digest != (
+                      manifest.get("sha256")
+                  ):
+                      raise IntegrityError(
+                          "snapshot hash does not match manifest"
+                      )
+                  connection = sqlite3.connect(
+                      f"file:{path}?mode=ro", uri=True
+                  )
+                  try:
+                      row = connection.execute(
+                          "PRAGMA integrity_check"
+                      ).fetchone()
+                  finally:
+                      connection.close()
+                  if row is None or str(row[0]) != "ok":
+                      raise IntegrityError(
+                          "snapshot failed integrity_check"
+                      )
+                  return digest
+
+              def list_snapshots(self) -> tuple[SnapshotRecord, ...]:
+                  records: list[SnapshotRecord] = []
+                  for path in sorted(self._dir.glob("snapshot-*.db")):
+                      manifest_path = self._manifest(path)
+                      if not manifest_path.exists():
+                          continue
+                      manifest = json.loads(
+                          manifest_path.read_text(encoding="utf-8")
+                      )
+                      records.append(
+                          SnapshotRecord(
+                              path=path,
+                              label=str(manifest.get("label", "")),
+                              created_at=float(
+                                  manifest.get("created_at", 0.0)
+                              ),
+                              sha256=str(manifest.get("sha256", "")),
+                              size_bytes=path.stat().st_size,
+                          )
+                      )
+                  records.sort(key=lambda r: r.created_at, reverse=True)
+                  return tuple(records)
+
+              def enforce_retention(self, *, keep: int) -> tuple[Path, ...]:
+                  if keep < 1:
+                      raise IntegrityError("keep must be >= 1")
+                  records = self.list_snapshots()
+                  to_remove = records[keep:]
+                  removed: list[Path] = []
+                  for record in to_remove:
+                      record.path.unlink(missing_ok=True)
+                      self._manifest(record.path).unlink(missing_ok=True)
+                      removed.append(record.path)
+                  return tuple(removed)
+
+              def restore(self, path: Path, target: Path) -> None:
+                  self.verify(path)
+                  target.parent.mkdir(parents=True, exist_ok=True)
+                  for suffix in ("-wal", "-shm"):
+                      Path(str(target) + suffix).unlink(missing_ok=True)
+                  tmp = target.with_name(
+                      f"{target.name}.restore-{new_id()[:8]}"
+                  )
+                  tmp.write_bytes(path.read_bytes())
+                  os.replace(tmp, target)
+          PYEOF
+
+          cat > shared_engines/storage/disaster_recovery.py <<'PYEOF'
+          """Disaster recovery drill: prove backup->restore->verify.
+
+          Seeds known rows, snapshots, simulates data loss, restores
+          into a fresh file and verifies the data came back. A drill
+          that passes means the recovery path WORKS, not that it
+          should work.
+          """
+          from __future__ import annotations
+
+          import sqlite3
+          from dataclasses import dataclass
+          from pathlib import Path
+
+          from shared_engines.common.clocks import Clock
+          from shared_engines.storage.database import SQLiteAdapter
+          from shared_engines.storage.snapshots import SnapshotManager
+
+
+          @dataclass(frozen=True)
+          class DrillReport:
+              success: bool
+              backup_path: Path
+              restored_path: Path
+              rows_checked: int
+              detail: str
+
+
+          class DisasterRecovery:
+              def __init__(
+                  self,
+                  adapter: SQLiteAdapter,
+                  clock: Clock,
+                  snapshot_dir: Path,
+              ) -> None:
+                  self._adapter = adapter
+                  self._clock = clock
+                  self._snapshots = SnapshotManager(
+                      adapter, clock, snapshot_dir
+                  )
+
+              def run_drill(
+                  self, *, rows: int = 5
+              ) -> DrillReport:
+                  self._adapter.execute(
+                      "DROP TABLE IF EXISTS dr_probe"
+                  )
+                  self._adapter.execute(
+                      "CREATE TABLE dr_probe (id INTEGER NOT NULL)"
+                  )
+                  for index in range(rows):
+                      self._adapter.execute(
+                          "INSERT INTO dr_probe (id) VALUES (?)",
+                          (index,),
+                      )
+                  snapshot = self._snapshots.create(label="dr-drill")
+                  self._adapter.execute("DELETE FROM dr_probe")
+                  restored = (
+                      self._snapshots._dir
+                      / f"restored-{snapshot.path.stem}.db"
+                  )
+                  self._snapshots.restore(snapshot.path, restored)
+                  connection = sqlite3.connect(
+                      f"file:{restored}?mode=ro", uri=True
+                  )
+                  try:
+                      row = connection.execute(
+                          "SELECT COUNT(*) FROM dr_probe"
+                      ).fetchone()
+                  finally:
+                      connection.close()
+                  count = int(row[0]) if row is not None else -1
+                  success = count == rows
+                  self._adapter.execute(
+                      "DROP TABLE IF EXISTS dr_probe"
+                  )
+                  return DrillReport(
+                      success=success,
+                      backup_path=snapshot.path,
+                      restored_path=restored,
+                      rows_checked=count,
+                      detail=(
+                          f"restored {count}/{rows} rows"
+                          + ("" if success else " MISMATCH")
+                      ),
+                  )
+          PYEOF
+
+          cat > shared_engines/storage/tests/test_phase3.py <<'PYEOF'
           from __future__ import annotations
 
           from pathlib import Path
 
           import pytest
 
-          from shared_engines.authority.root import (
-              PersistentRootAuthority,
-              RootAuthorityStatus,
+          from shared_engines.common.clocks import FrozenClock
+          from shared_engines.common.errors import IntegrityError
+          from shared_engines.storage.database import SQLiteAdapter
+          from shared_engines.storage.disaster_recovery import DisasterRecovery
+          from shared_engines.storage.network_migrations import (
+              NetworkMigrationRunner,
           )
-          from shared_engines.common.errors import (
-              ConfigurationError,
-              IntegrityError,
-          )
-
-          MASTER = "aa" * 32
-          OTHER_MASTER = "bb" * 32
+          from shared_engines.storage.snapshots import SnapshotManager
 
 
-          def test_first_boot_creates_then_loads_same_key(
+          def test_network_migrations_apply_all_and_idempotent(
               tmp_path: Path,
           ) -> None:
-              auth = PersistentRootAuthority(
-                  data_dir=tmp_path, master_key_hex=MASTER
-              )
-              signer, status = auth.load_or_create()
-              assert status.status is RootAuthorityStatus.CREATED_NEW
-              fp = status.public_pem_fingerprint
-              signer2, status2 = auth.load_or_create()
-              assert status2.status is RootAuthorityStatus.LOADED
-              assert status2.public_pem_fingerprint == fp
-              assert signer2.public_pem == signer.public_pem
+              adapter = SQLiteAdapter(tmp_path / "net.db")
+              runner = NetworkMigrationRunner(adapter, FrozenClock())
+              report1 = runner.run_all()
+              assert report1.total_applied_now > 0
+              namespaces = {r.namespace for r in report1.results}
+              assert {
+                  "audit",
+                  "identity",
+                  "tokenization",
+                  "hardening.keys",
+              } <= namespaces
+              report2 = runner.run_all()
+              assert report2.total_applied_now == 0
+              adapter.close()
 
 
-          def test_wrong_master_fails_closed(tmp_path: Path) -> None:
-              auth = PersistentRootAuthority(
-                  data_dir=tmp_path, master_key_hex=MASTER
+          def test_snapshot_create_list_verify(tmp_path: Path) -> None:
+              adapter = SQLiteAdapter(tmp_path / "db.sqlite")
+              adapter.execute("CREATE TABLE t (id INTEGER)")
+              adapter.execute("INSERT INTO t (id) VALUES (1)")
+              manager = SnapshotManager(
+                  adapter, FrozenClock(), tmp_path / "snaps"
               )
-              auth.load_or_create()
-              attacker = PersistentRootAuthority(
-                  data_dir=tmp_path, master_key_hex=OTHER_MASTER
-              )
+              record = manager.create(label="Nightly")
+              assert record.label == "nightly"
+              assert len(record.sha256) == 64
+              assert len(manager.list_snapshots()) == 1
+              adapter.execute("INSERT INTO t (id) VALUES (2)")
+              adapter.close()
+              assert manager.verify(record.path)
+              adapter = SQLiteAdapter(tmp_path / "db.sqlite")
+              adapter.close()
               with pytest.raises(IntegrityError):
-                  attacker.load_or_create()
+                  corrupt = record.path
+                  corrupt.write_bytes(corrupt.read_bytes() + b"x")
+                  manager.verify(corrupt)
 
 
-          def test_master_key_validation(tmp_path: Path) -> None:
-              with pytest.raises(ConfigurationError):
-                  PersistentRootAuthority(
-                      data_dir=tmp_path, master_key_hex="tooshort"
-                  )
-              with pytest.raises(ConfigurationError):
-                  PersistentRootAuthority(
-                      data_dir=tmp_path, master_key_hex="zz" * 32
-                  )
+          def test_snapshot_retention_keeps_newest(tmp_path: Path) -> None:
+              adapter = SQLiteAdapter(tmp_path / "db.sqlite")
+              adapter.execute("CREATE TABLE t (id INTEGER)")
+              manager = SnapshotManager(
+                  adapter, FrozenClock(), tmp_path / "snaps"
+              )
+              clock = FrozenClock()
+              for _ in range(5):
+                  manager.create(label="cycle")
+                  clock.advance(10)
+              removed = manager.enforce_retention(keep=2)
+              assert len(removed) == 3
+              assert len(manager.list_snapshots()) == 2
+              adapter.close()
 
 
-          def test_rotation_archives_old_fingerprint(
+          def test_snapshot_restore_recovers_data(tmp_path: Path) -> None:
+              adapter = SQLiteAdapter(tmp_path / "db.sqlite")
+              adapter.execute("CREATE TABLE t (id INTEGER)")
+              adapter.execute("INSERT INTO t (id) VALUES (42)")
+              manager = SnapshotManager(
+                  adapter, FrozenClock(), tmp_path / "snaps"
+              )
+              record = manager.create(label="pre-disaster")
+              adapter.execute("DELETE FROM t")
+              target = tmp_path / "restored.db"
+              manager.restore(record.path, target)
+              replica = SQLiteAdapter(target)
+              row = replica.query_one("SELECT id FROM t")
+              assert row is not None
+              assert int(row["id"]) == 42
+              replica.close()
+              adapter.close()
+
+
+          def test_disaster_recovery_drill(tmp_path: Path) -> None:
+              adapter = SQLiteAdapter(tmp_path / "db.sqlite")
+              dr = DisasterRecovery(
+                  adapter, FrozenClock(), tmp_path / "snaps"
+              )
+              report = dr.run_drill(rows=5)
+              assert report.success is True
+              assert report.rows_checked == 5
+              adapter.close()
+
+
+          def test_snapshot_without_manifest_rejected(
               tmp_path: Path,
           ) -> None:
-              auth = PersistentRootAuthority(
-                  data_dir=tmp_path, master_key_hex=MASTER
+              adapter = SQLiteAdapter(tmp_path / "db.sqlite")
+              manager = SnapshotManager(
+                  adapter, FrozenClock(), tmp_path / "snaps"
               )
-              signer1, s1 = auth.load_or_create()
-              signer2, s2 = auth.rotate(rotated_by="founder")
-              assert s2.status is RootAuthorityStatus.ROTATED
-              assert s2.public_pem_fingerprint != s1.public_pem_fingerprint
-              assert (
-                  s1.public_pem_fingerprint
-                  in auth.historical_fingerprints()
-              )
-              signer3, s3 = auth.load_or_create()
-              assert s3.status is RootAuthorityStatus.LOADED
-              assert s3.public_pem_fingerprint == s2.public_pem_fingerprint
-              assert signer2.public_pem != signer1.public_pem
+              record = manager.create(label="x")
+              manager._manifest(record.path).unlink()
+              with pytest.raises(IntegrityError):
+                  manager.verify(record.path)
+              adapter.close()
           PYEOF
 
-          echo "=== AUTHORITY MODULE OK ==="
+          echo "=== PHASE 3 STORAGE OK ==="
 
-      - name: Rewrite main.py (persistent authority)
+      - name: Build real operational scripts (bootstrap of phase 6)
         run: |
           set -euo pipefail
-          cat > main.py <<'PYEOF'
-          """Zyra Network production entrypoint (persistent authority)."""
+          if [ ! -f scripts/__init__.py ]; then
+            printf '' > scripts/__init__.py
+          fi
+
+          cat > scripts/backup.py <<'PYEOF'
+          """CLI: create a verified snapshot of the Zyra database.
+
+          Usage:
+            python scripts/backup.py [--data-dir DIR] [--snapshot-dir DIR] [--keep N]
+          """
           from __future__ import annotations
 
-          import logging
-          import os
+          import argparse
+          import sys
           from pathlib import Path
 
-          from shared_engines.authority.root import PersistentRootAuthority
-          from shared_engines.common.clocks import SystemClock
-          from shared_engines.runtime.api import ZyraApiHandler
-          from shared_engines.runtime.config import RuntimeConfig
-          from shared_engines.runtime.kernel import ZyraKernel
-          from shared_engines.runtime.server import ZyraServer
-          from shared_engines.storage.database import SQLiteAdapter
+          REPO_ROOT = Path(__file__).resolve().parents[1]
+          if str(REPO_ROOT) not in sys.path:
+              sys.path.insert(0, str(REPO_ROOT))
 
-          DATA_DIR = os.environ.get("ZYRA_DATA_DIR", "/tmp/zyra-data")
-          DB_PATH = os.path.join(DATA_DIR, "zyra.db")
+          from shared_engines.common.clocks import SystemClock  # noqa: E402
+          from shared_engines.storage.database import SQLiteAdapter  # noqa: E402
+          from shared_engines.storage.snapshots import SnapshotManager  # noqa: E402
+
+
+          def run(*, data_dir: Path, snapshot_dir: Path, keep: int) -> int:
+              db_path = Path(data_dir) / "zyra.db"
+              if not db_path.exists():
+                  print(f"no database at {db_path}")
+                  return 1
+              adapter = SQLiteAdapter(db_path)
+              manager = SnapshotManager(
+                  adapter, SystemClock(), Path(snapshot_dir)
+              )
+              record = manager.create(label="scheduled")
+              removed = manager.enforce_retention(keep=keep)
+              print(f"snapshot: {record.path}")
+              print(f"sha256: {record.sha256}")
+              print(f"retention removed: {len(removed)}")
+              adapter.close()
+              return 0
 
 
           def main() -> None:
-              logging.basicConfig(
-                  level=logging.INFO,
-                  format="%(asctime)s %(name)s %(levelname)s %(message)s",
+              parser = argparse.ArgumentParser(
+                  description="Zyra DB snapshot with retention"
               )
-              log = logging.getLogger("zyra.main")
-
-              master = os.environ.get("ZYRA_ROOT_KEY")
-              if not master:
-                  raise SystemExit(
-                      "ZYRA_ROOT_KEY is required (64 hex chars)."
+              parser.add_argument("--data-dir", default="/tmp/zyra-data")
+              parser.add_argument(
+                  "--snapshot-dir", default="/tmp/zyra-snapshots"
+              )
+              parser.add_argument("--keep", type=int, default=10)
+              args = parser.parse_args()
+              raise SystemExit(
+                  run(
+                      data_dir=Path(args.data_dir),
+                      snapshot_dir=Path(args.snapshot_dir),
+                      keep=args.keep,
                   )
-              token = os.environ.get("ZYRA_API_TOKEN") or None
-              if token is not None and len(token) < 16:
-                  raise SystemExit(
-                      "ZYRA_API_TOKEN must be at least 16 characters"
-                  )
-              port = int(
-                  os.environ.get("ZYRA_PORT")
-                  or os.environ.get("PORT")
-                  or 8080
               )
-
-              os.makedirs(DATA_DIR, exist_ok=True)
-              db = SQLiteAdapter(DB_PATH, busy_timeout_ms=10_000)
-              clock = SystemClock()
-
-              authority = PersistentRootAuthority(
-                  data_dir=Path(DATA_DIR), master_key_hex=master
-              )
-              signer, status = authority.load_or_create()
-              log.info(
-                  "root authority: %s fingerprint=%s",
-                  status.status.value,
-                  status.public_pem_fingerprint,
-              )
-
-              config = RuntimeConfig(
-                  host="0.0.0.0",
-                  port=port,
-                  max_body_bytes=5_000_000,
-                  api_token=token,
-              )
-              kernel = ZyraKernel(
-                  db=db, clock=clock, signer=signer, config=config
-              )
-              root = kernel.bootstrap_root()
-              ZyraApiHandler.kernel = kernel
-              server = ZyraServer((config.host, config.port))
-
-              log.info("Zyra Network is LIVE")
-              log.info("root zid=%s", root.zid)
-
-              try:
-                  server.serve_forever()
-              except KeyboardInterrupt:
-                  pass
-              finally:
-                  server.server_close()
-                  db.close()
 
 
           if __name__ == "__main__":
               main()
           PYEOF
 
-      - name: Update render.yaml
-        run: |
-          set -euo pipefail
-          cat > render.yaml <<'YEOF'
-          services:
-            - type: web
-              name: zyra-network
-              runtime: python
-              plan: free
-              buildCommand: |
-                pip install --upgrade pip
-                pip install "cryptography>=42,<45"
-              startCommand: python main.py
-              healthCheckPath: /health
-              envVars:
-                - key: PYTHON_VERSION
-                  value: "3.12.4"
-                - key: ZYRA_PORT
-                  value: "10000"
-                - key: ZYRA_ROOT_KEY
-                  sync: false
-                - key: ZYRA_API_TOKEN
-                  sync: false
-          YEOF
+          cat > scripts/migrate.py <<'PYEOF'
+          """CLI: migrate the whole Network schema to the latest version.
 
-      - name: Rewrite deployment tests
-        run: |
-          set -euo pipefail
-          mkdir -p tests
-          cat > tests/test_deployment.py <<'PYEOF'
+          Usage:
+            python scripts/migrate.py [--db PATH]
+          """
           from __future__ import annotations
 
-          import json
-          import os
-          import socket
-          import subprocess
+          import argparse
           import sys
-          import time
-          import urllib.request
           from pathlib import Path
 
           REPO_ROOT = Path(__file__).resolve().parents[1]
-          TEST_MASTER_KEY = "aa" * 32
+          if str(REPO_ROOT) not in sys.path:
+              sys.path.insert(0, str(REPO_ROOT))
+
+          from shared_engines.common.clocks import SystemClock  # noqa: E402
+          from shared_engines.storage.database import SQLiteAdapter  # noqa: E402
+          from shared_engines.storage.network_migrations import (  # noqa: E402
+              NetworkMigrationRunner,
+          )
 
 
-          def _free_port() -> int:
-              with socket.socket() as s:
-                  s.bind(("127.0.0.1", 0))
-                  return int(s.getsockname()[1])
+          def run(*, db_path: Path) -> int:
+              adapter = SQLiteAdapter(Path(db_path))
+              report = NetworkMigrationRunner(adapter, SystemClock()).run_all()
+              for result in report.results:
+                  print(
+                      f"{result.namespace}: {len(result.versions)} versions"
+                      f" ({len(result.applied_now)} applied now)"
+                  )
+              print(f"total applied now: {report.total_applied_now}")
+              adapter.close()
+              return 0
 
 
-          def _boot(tmp_path: Path) -> tuple[subprocess.Popen[bytes], str]:
-              port = _free_port()
-              env = dict(os.environ)
-              env["ZYRA_PORT"] = str(port)
-              env["ZYRA_DATA_DIR"] = str(tmp_path / "data")
-              env["ZYRA_ROOT_KEY"] = TEST_MASTER_KEY
-              env.pop("ZYRA_API_TOKEN", None)
-              proc = subprocess.Popen(
-                  [sys.executable, str(REPO_ROOT / "main.py")],
-                  env=env,
-                  stdout=subprocess.PIPE,
-                  stderr=subprocess.STDOUT,
+          def main() -> None:
+              parser = argparse.ArgumentParser(
+                  description="Migrate the whole Zyra Network schema"
               )
-              base = f"http://127.0.0.1:{port}"
-              deadline = time.time() + 30.0
-              while time.time() < deadline:
-                  if proc.poll() is not None:
-                      out = (
-                          proc.stdout.read().decode("utf-8")
-                          if proc.stdout
-                          else ""
-                      )
-                      raise RuntimeError(f"server died early: {out}")
-                  try:
-                      with urllib.request.urlopen(
-                          f"{base}/health", timeout=2
-                      ) as resp:
-                          if resp.status == 200:
-                              return proc, base
-                  except Exception:
-                      time.sleep(0.3)
-              proc.kill()
-              raise RuntimeError("server never became healthy")
-
-
-          def test_production_server_serves_health(tmp_path: Path) -> None:
-              proc, base = _boot(tmp_path)
-              try:
-                  with urllib.request.urlopen(
-                      f"{base}/health", timeout=5
-                  ) as resp:
-                      assert resp.status == 200
-                  assert proc.poll() is None
-              finally:
-                  proc.terminate()
-                  try:
-                      proc.wait(timeout=10)
-                  except subprocess.TimeoutExpired:
-                      proc.kill()
-
-
-          def test_health_shape(tmp_path: Path) -> None:
-              proc, base = _boot(tmp_path)
-              try:
-                  with urllib.request.urlopen(
-                      f"{base}/health", timeout=5
-                  ) as resp:
-                      payload = json.loads(resp.read().decode("utf-8"))
-                  assert payload["ok"] is True
-                  names = {
-                      c["component"]
-                      for c in payload["data"]["components"]
-                  }
-                  assert {
-                      "storage",
-                      "identity",
-                      "verification",
-                      "tokenization",
-                      "currency",
-                  } <= names
-                  assert payload["data"]["overall"]["status"] == "healthy"
-              finally:
-                  proc.terminate()
-                  try:
-                      proc.wait(timeout=10)
-                  except subprocess.TimeoutExpired:
-                      proc.kill()
-
-
-          def test_fails_closed_without_master_key(
-              tmp_path: Path,
-          ) -> None:
-              port = _free_port()
-              env = dict(os.environ)
-              env["ZYRA_PORT"] = str(port)
-              env["ZYRA_DATA_DIR"] = str(tmp_path / "data")
-              env.pop("ZYRA_ROOT_KEY", None)
-              proc = subprocess.Popen(
-                  [sys.executable, str(REPO_ROOT / "main.py")],
-                  env=env,
-                  stdout=subprocess.PIPE,
-                  stderr=subprocess.STDOUT,
+              parser.add_argument(
+                  "--db", default="/tmp/zyra-data/zyra.db"
               )
-              try:
-                  out = (
-                      proc.communicate(timeout=15)[0].decode("utf-8")
-                      if proc.stdout
-                      else ""
-                  )
-                  assert proc.returncode != 0
-                  assert "ZYRA_ROOT_KEY is required" in out
-              finally:
-                  if proc.poll() is None:
-                      proc.kill()
+              args = parser.parse_args()
+              raise SystemExit(run(db_path=Path(args.db)))
 
 
-          def test_key_file_persists_across_boots(
-              tmp_path: Path,
-          ) -> None:
-              import hashlib
-
-              data_dir = tmp_path / "persistent"
-              fingerprints: list[str] = []
-              for _ in range(2):
-                  port = _free_port()
-                  env = dict(os.environ)
-                  env["ZYRA_PORT"] = str(port)
-                  env["ZYRA_DATA_DIR"] = str(data_dir)
-                  env["ZYRA_ROOT_KEY"] = TEST_MASTER_KEY
-                  proc = subprocess.Popen(
-                      [sys.executable, str(REPO_ROOT / "main.py")],
-                      env=env,
-                      stdout=subprocess.PIPE,
-                      stderr=subprocess.STDOUT,
-                  )
-                  base = f"http://127.0.0.1:{port}"
-                  deadline = time.time() + 30.0
-                  while time.time() < deadline:
-                      if proc.poll() is not None:
-                          break
-                      try:
-                          with urllib.request.urlopen(
-                              f"{base}/health", timeout=2
-                          ) as resp:
-                              if resp.status == 200:
-                                  break
-                      except Exception:
-                          time.sleep(0.3)
-                  proc.terminate()
-                  try:
-                      proc.wait(timeout=10)
-                  except subprocess.TimeoutExpired:
-                      proc.kill()
-                  key_file = data_dir / "root.key"
-                  assert key_file.exists()
-                  fingerprints.append(
-                      hashlib.sha256(
-                          key_file.read_text(encoding="utf-8").encode(
-                              "utf-8"
-                          )
-                      ).hexdigest()[:16]
-                  )
-              assert fingerprints[0] == fingerprints[1]
+          if __name__ == "__main__":
+              main()
           PYEOF
+
+          echo "=== SCRIPTS REAL ==="
+
+      - name: Write phase 3 tests
+        run: |
+          set -euo pipefail
+          cat > shared_engines/storage/tests/test_scripts.py <<'PYEOF'
+          from __future__ import annotations
+
+          import sys
+          from pathlib import Path
+
+          REPO_ROOT = Path(__file__).resolve().parents[3]
+          if str(REPO_ROOT) not in sys.path:
+              sys.path.insert(0, str(REPO_ROOT))
+
+          from scripts.backup import run as backup_run  # noqa: E402
+          from scripts.migrate import run as migrate_run  # noqa: E402
+
+          from shared_engines.storage.database import SQLiteAdapter  # noqa: E402
+
+
+          def test_backup_script_creates_snapshot(tmp_path: Path) -> None:
+              data_dir = tmp_path / "data"
+              data_dir.mkdir()
+              adapter = SQLiteAdapter(data_dir / "zyra.db")
+              adapter.execute("CREATE TABLE t (id INTEGER)")
+              adapter.close()
+              code = backup_run(
+                  data_dir=data_dir,
+                  snapshot_dir=tmp_path / "snaps",
+                  keep=3,
+              )
+              assert code == 0
+              snaps = list((tmp_path / "snaps").glob("snapshot-*.db"))
+              assert len(snaps) == 1
+
+
+          def test_backup_script_fails_without_db(
+              tmp_path: Path,
+          ) -> None:
+              code = backup_run(
+                  data_dir=tmp_path / "empty",
+                  snapshot_dir=tmp_path / "snaps",
+                  keep=3,
+              )
+              assert code == 1
+
+
+          def test_migrate_script_migrates_full_network(
+              tmp_path: Path,
+          ) -> None:
+              code = migrate_run(db_path=tmp_path / "net.db")
+              assert code == 0
+              code2 = migrate_run(db_path=tmp_path / "net.db")
+              assert code2 == 0
+          PYEOF
+
+          echo "=== SCRIPT TESTS READY ==="
 
       - name: Quality gates (mypy first; full regression)
         run: |
           set -euo pipefail
           M="shared_engines/common shared_engines/storage shared_engines/events shared_engines/observability shared_engines/audit shared_engines/security shared_engines/identity shared_engines/verification shared_engines/runtime shared_engines/tokenization shared_engines/currency shared_engines/verifier shared_engines/hardening shared_engines/authority"
-          python -m compileall -q $M main.py tests/test_deployment.py
+          python -m compileall -q $M main.py scripts
           echo "compile OK"
-          find $M tests -name '__pycache__' -type d -prune -exec rm -rf {} +
+          find $M scripts -name '__pycache__' -type d -prune -exec rm -rf {} +
           mypy --strict --cache-dir="${RUNNER_TEMP}/mypy-cache" $M
           echo "mypy OK"
-          flake8 $M main.py tests/test_deployment.py --max-line-length=100
+          flake8 $M main.py scripts tests/test_deployment.py --max-line-length=100
           echo "flake8 OK"
           PYTHONPATH="$PWD" python -m pytest -q -p no:cacheprovider $M tests/test_deployment.py
           echo "pytest OK"
-          find $M tests -name '__pycache__' -type d -prune -exec rm -rf {} +
+          find $M scripts -name '__pycache__' -type d -prune -exec rm -rf {} +
 
       - name: Commit and push
         run: |
@@ -675,15 +757,15 @@ jobs:
           git diff --check
           git config user.name "zyra-engines-bot"
           git config user.email "zyra-engines-bot@users.noreply.github.com"
-          git add shared_engines main.py render.yaml ARCHITECTURE.md tests infrastructure
-          OFF=$(git diff --cached --name-only | grep -vE '^(shared_engines/|\.github/workflows/|main\.py|render\.yaml|tests/|public/|ARCHITECTURE\.md|infrastructure/)' || true)
+          git add shared_engines scripts
+          OFF=$(git diff --cached --name-only | grep -vE '^(shared_engines/|\.github/workflows/|main\.py|render\.yaml|tests/|public/|ARCHITECTURE\.md|infrastructure/|scripts/)' || true)
           if [ -n "$OFF" ]; then
             echo "Out of scope:"; echo "$OFF"; exit 1
           fi
           if git diff --cached --quiet; then
             echo "No changes."
           else
-            git commit -m "zyra: module 14 complete (persistent Root Authority with hex validation, ARCHITECTURE.md, _init_ repairs, zeroed scaffolds, deployment tests)"
+            git commit -m "zyra: module 15 PHASE 3 (NetworkMigrationRunner all-engines, SnapshotManager with retention, DR drill, real scripts backup+migrate) + tests"
             git push origin "HEAD:${{ github.ref_name }}"
           fi
-          echo "=== MODULE 14 COMPLETE ==="
+          echo "=== MODULE 15 COMPLETE ==="

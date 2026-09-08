@@ -1,0 +1,290 @@
+from __future__ import annotations
+
+import json
+import threading
+import urllib.error
+import urllib.request
+from collections.abc import Iterator
+from decimal import Decimal
+from pathlib import Path
+from typing import Any
+
+import pytest
+
+from shared_engines.common.clocks import FrozenClock
+from shared_engines.runtime.api import ZyraApiHandler
+from shared_engines.runtime.config import RuntimeConfig
+from shared_engines.runtime.kernel import ZyraKernel
+from shared_engines.runtime.server import ZyraServer
+from shared_engines.storage.database import SQLiteAdapter
+from shared_engines.verification.signatures import Ed25519Signer
+
+
+class _Cluster:
+    def __init__(self, tmp_path: Path) -> None:
+        self.db = SQLiteAdapter(Path(tmp_path) / "runtime.db")
+        self.kernel = ZyraKernel(
+            db=self.db,
+            clock=FrozenClock(),
+            signer=Ed25519Signer.generate()[0],
+            config=RuntimeConfig(host="127.0.0.1", port=0),
+        )
+        self.kernel.bootstrap_root()
+        ZyraApiHandler.kernel = self.kernel
+        self.server = ZyraServer(("127.0.0.1", 0))
+        self.thread = threading.Thread(
+            target=self.server.serve_forever, daemon=True
+        )
+        self.thread.start()
+        self.base = f"http://127.0.0.1:{self.server.bound_port}"
+
+    def stop(self) -> None:
+        self.server.shutdown()
+        self.server.server_close()
+        self.thread.join(timeout=5)
+        self.db.close()
+
+    def call(
+        self,
+        method: str,
+        path: str,
+        body: dict[str, Any] | None = None,
+    ) -> tuple[int, dict[str, Any]]:
+        headers: dict[str, str] = {
+            "Content-Type": "application/json"
+        }
+        data = (
+            json.dumps(body).encode("utf-8")
+            if body is not None
+            else None
+        )
+        request = urllib.request.Request(
+            f"{self.base}{path}",
+            data=data,
+            headers=headers,
+            method=method,
+        )
+        try:
+            with urllib.request.urlopen(
+                request, timeout=10
+            ) as resp:
+                payload: dict[str, Any] = json.loads(
+                    resp.read().decode("utf-8")
+                )
+                return int(resp.status), payload
+        except urllib.error.HTTPError as exc:
+            raw = exc.read().decode("utf-8") or "{}"
+            error_payload: dict[str, Any] = json.loads(raw)
+            return int(exc.code), error_payload
+
+
+@pytest.fixture
+def cluster(tmp_path: Path) -> Iterator[_Cluster]:
+    running = _Cluster(tmp_path)
+    yield running
+    running.stop()
+
+
+def _user(cluster: _Cluster, name: str) -> dict[str, Any]:
+    status, payload = cluster.call(
+        "POST",
+        "/identity/register",
+        {
+            "kind": "person",
+            "display_name": name,
+            "actor": "api-clerk",
+        },
+    )
+    assert status == 201
+    data: dict[str, Any] = payload["data"]
+    return data
+
+
+def test_health_includes_tokenization_and_currency(
+    cluster: _Cluster,
+) -> None:
+    """TokenEngine reports under its real name 'tokenization'."""
+    status, payload = cluster.call("GET", "/health")
+    assert status == 200
+    names = {
+        c["component"] for c in payload["data"]["components"]
+    }
+    assert {
+        "tokenization",
+        "currency",
+        "storage",
+        "identity",
+        "verification",
+    } <= names
+    assert payload["data"]["overall"]["status"] == "healthy"
+
+
+def test_token_full_lifecycle_via_http(
+    cluster: _Cluster,
+) -> None:
+    user = _user(cluster, "Recycler")
+    rule_status, rule = cluster.call(
+        "POST",
+        "/tokens/rules",
+        {
+            "activity": "recycle.photo",
+            "amount": 5,
+            "daily_cap": 20,
+        },
+    )
+    assert rule_status == 201
+    assert rule["data"]["active"] is True
+    earn_status, earned = cluster.call(
+        "POST",
+        "/tokens/earn",
+        {
+            "subject_zid": user["zid"],
+            "activity": "recycle.photo",
+            "ref_type": "media",
+            "ref_id": "MED-1",
+        },
+    )
+    assert earn_status == 201
+    assert earned["data"]["amount"] == 5
+    balance_status, balance = cluster.call(
+        "GET", f"/tokens/{user['zid']}/balance"
+    )
+    assert balance_status == 200
+    assert balance["data"]["balance"] == 5
+    item_status, _ = cluster.call(
+        "POST",
+        "/tokens/items",
+        {
+            "item_id": "premium_space_1gb",
+            "title": "1 GB premium space",
+            "cost": 3,
+        },
+    )
+    assert item_status == 201
+    redeem_status, redeemed = cluster.call(
+        "POST",
+        "/tokens/redeem",
+        {
+            "subject_zid": user["zid"],
+            "item_id": "premium_space_1gb",
+        },
+    )
+    assert redeem_status == 200
+    assert redeemed["data"]["cost"] == 3
+    final_status, final_balance = cluster.call(
+        "GET", f"/tokens/{user['zid']}/balance"
+    )
+    assert final_status == 200
+    assert final_balance["data"]["balance"] == 2
+    history_status, history = cluster.call(
+        "GET", f"/tokens/{user['zid']}/history"
+    )
+    assert history_status == 200
+    kinds = sorted(t["kind"] for t in history["data"])
+    assert kinds == ["mint", "redeem"]
+
+
+def test_token_earn_without_rule_not_found(
+    cluster: _Cluster,
+) -> None:
+    user = _user(cluster, "NoRule")
+    status, payload = cluster.call(
+        "POST",
+        "/tokens/earn",
+        {
+            "subject_zid": user["zid"],
+            "activity": "never.defined",
+            "ref_type": "x",
+            "ref_id": "1",
+        },
+    )
+    assert status == 404
+    assert payload["error"]["type"] == "not_found"
+
+
+def test_token_balance_unknown_identity(
+    cluster: _Cluster,
+) -> None:
+    status, payload = cluster.call(
+        "GET", "/tokens/ZID-ghost/balance"
+    )
+    assert status == 404
+    assert payload["error"]["type"] == "not_found"
+
+
+def test_currency_quote_bridge_and_convert(
+    cluster: _Cluster,
+) -> None:
+    user = _user(cluster, "Importer")
+    quote_status, quote = cluster.call(
+        "POST",
+        "/currency/quote",
+        {
+            "base": "GTQ",
+            "quote_ccy": "CNY",
+            "requester_zid": user["zid"],
+        },
+    )
+    assert quote_status == 201
+    # Numeric comparison: 0.92800 == 0.928 in exact Decimal
+    # (trailing zeros are legitimate multiplication artifacts).
+    assert Decimal(quote["data"]["rate"]) == Decimal("0.928")
+    assert quote["data"]["source"].startswith("bridge:USD")
+    assert quote["data"]["signature_b64"]
+    convert_status, converted = cluster.call(
+        "POST",
+        "/currency/convert",
+        {
+            "subject_zid": user["zid"],
+            "base": "GTQ",
+            "quote_ccy": "CNY",
+            "amount": "1000.00",
+        },
+    )
+    assert convert_status == 201
+    conversion_id = converted["data"]["conversion_id"]
+    assert Decimal(
+        converted["data"]["exact_amount"]
+    ) == Decimal("928")
+    settle_status, _ = cluster.call(
+        "POST",
+        "/currency/settle",
+        {
+            "conversion_id": conversion_id,
+            "settlement_ref": "WIRE-ZY-001",
+        },
+    )
+    assert settle_status == 200
+    get_status, record = cluster.call(
+        "GET", f"/currency/conversions/{conversion_id}"
+    )
+    assert get_status == 200
+    assert record["data"]["fx_settlement_ref"] == "WIRE-ZY-001"
+
+
+def test_currency_bad_amount_and_unknown_currency(
+    cluster: _Cluster,
+) -> None:
+    user = _user(cluster, "Fx")
+    bad_status, _ = cluster.call(
+        "POST",
+        "/currency/convert",
+        {
+            "subject_zid": user["zid"],
+            "base": "USD",
+            "quote_ccy": "EUR",
+            "amount": "not-a-number",
+        },
+    )
+    assert bad_status == 400
+    unknown_status, unknown = cluster.call(
+        "POST",
+        "/currency/quote",
+        {
+            "base": "USD",
+            "quote_ccy": "ZZZ",
+            "requester_zid": user["zid"],
+        },
+    )
+    assert unknown_status == 404
+    assert unknown["error"]["type"] == "not_found"

@@ -1,4 +1,4 @@
-name: zyra-w9-engine-integrity
+name: zyra-w10-verification-package
 
 "on":
   workflow_dispatch:
@@ -9,7 +9,7 @@ permissions:
   contents: write
 
 concurrency:
-  group: zyra-w9-${{ github.ref }}
+  group: zyra-w10-${{ github.ref }}
   cancel-in-progress: false
 
 jobs:
@@ -31,90 +31,63 @@ jobs:
           python -m pip install --upgrade pip
           python -m pip install "cryptography>=42,<45" "flake8>=7,<8" "mypy>=1.10,<2" "pytest>=8,<9"
 
-      - name: Clean engine __init__ files (W391 fix)
+      - name: Build document exchange (seal, sign, third-party verify)
         run: |
           set -euo pipefail
-          for f in shared_engines/consensus/__init__.py shared_engines/integrity/__init__.py; do
-            if [ -f "$f" ]; then
-              printf '"""ZYRA Network engine package."""\n' > "$f"
-            fi
-          done
-          echo "init files cleaned"
+          cat > shared_engines/network/document_exchange.py <<'PYEOF'
+          """Document exchange: the Network's digital notary.
 
-      - name: Fill integrity engine (contracts, errors, engine)
-        run: |
-          set -euo pipefail
-          cat > shared_engines/integrity/contracts.py <<'PYEOF'
-          """Integrity contracts."""
-          from __future__ import annotations
+          The commercial heart of the verification package:
 
-          from dataclasses import dataclass
+              owner seals a document (any bytes: contract,
+              image, video, PDF)
+                    |
+                    v
+              Network notarizes: sha256 + Ed25519 signature
+              + durable integrity proof
+                    |
+                    v
+              ANY third party (buyer, bank, government)
+              verifies authenticity OFFLINE with only:
+              document_id + content + signature +
+              network public key. No database, no trust
+              in the sender - just cryptography.
 
+              plus signature requests:
 
-          @dataclass(frozen=True)
-          class IntegrityProof:
-              """A durable, verifiable content proof."""
+              requester asks a ZID to sign a sealed doc
+                    |
+                    v
+              PENDING -> SIGNED (network-notarized on
+              behalf of the signer ZID) or REJECTED
 
-              proof_id: str
-              subject: str
-              algorithm: str
-              digest: str
-              size_bytes: int
-              created_at: float
-          PYEOF
-
-          cat > shared_engines/integrity/errors.py <<'PYEOF'
-          """Typed integrity errors."""
-          from __future__ import annotations
-
-          from shared_engines.common.errors import (
-              EngineError,
-          )
-
-
-          class UnsupportedAlgorithmError(
-              EngineError
-          ):
-              """Requested digest algorithm is not
-              available."""
-
-
-          class ProofNotFoundError(EngineError):
-              """No proof stored for the subject."""
-          PYEOF
-
-          cat > shared_engines/integrity/engine.py <<'PYEOF'
-          """Integrity engine: hashing, durable proofs and
-          tamper detection for content and files.
-
-          Complements (never duplicates) the audit chain:
-          the audit chain proves the ORDER of network
-          events; this engine proves the CONTENT of data.
-          An app stores a proof once, then can re-verify
-          at any time that the bytes are still exactly the
-          originals.
+          Signature payloads are domain-separated:
+          "DOC:<id>:<sha256>" for seals and
+          "SIG:<req>:<doc>:<sha>:<zid>" for signatures,
+          so one kind can never be replayed as the other.
           """
           from __future__ import annotations
 
           import hashlib
           import sqlite3
-          from pathlib import Path
+          from dataclasses import dataclass
 
-          from shared_engines.common.clocks import Clock
-          from shared_engines.common.errors import (
-              NotFoundError,
+          from shared_engines.audit.chain import (
+              AuditTrail,
           )
+          from shared_engines.common.clocks import Clock
           from shared_engines.common.identifiers import (
               new_id,
+          )
+          from shared_engines.common.serialization import (
+              canonical_json_dumps,
           )
           from shared_engines.common.validation import (
               require_non_empty_str,
           )
-          from shared_engines.integrity.contracts import (
-              IntegrityProof,
-          )
-          from shared_engines.integrity.errors import (
-              UnsupportedAlgorithmError,
+          from shared_engines.events.outbox import Outbox
+          from shared_engines.integrity.engine import (
+              IntegrityEngine,
           )
           from shared_engines.storage.database import (
               Database,
@@ -123,415 +96,1209 @@ jobs:
               Migration,
               MigrationRunner,
           )
+          from shared_engines.verification.signatures import (
+              Ed25519Signer,
+              Ed25519Verifier,
+          )
 
-          ALGORITHMS = {
-              "sha256": hashlib.sha256,
-              "sha512": hashlib.sha512,
-          }
+          EVENT_SEALED = "network.document.sealed"
+          EVENT_SIGN_REQUESTED = (
+              "network.signature.requested"
+          )
+          EVENT_SIGNED = "network.document.signed"
+          EVENT_REJECTED = "network.document.rejected"
+
+          STATUS_PENDING = "PENDING"
+          STATUS_SIGNED = "SIGNED"
+          STATUS_REJECTED = "REJECTED"
 
           _MIGRATIONS = (
               Migration(
                   1,
-                  "integrity",
+                  "network_document_exchange",
                   (
-                      "CREATE TABLE integrity_proofs ("
-                      " proof_id TEXT PRIMARY KEY,"
-                      " subject TEXT NOT NULL,"
-                      " algorithm TEXT NOT NULL,"
-                      " digest TEXT NOT NULL,"
+                      "CREATE TABLE sealed_documents ("
+                      " document_id TEXT PRIMARY KEY,"
+                      " owner_zid TEXT NOT NULL,"
+                      " title TEXT NOT NULL,"
+                      " sha256 TEXT NOT NULL,"
                       " size_bytes INTEGER NOT NULL,"
-                      " created_at REAL NOT NULL)",
-                      "CREATE INDEX integrity_subject"
-                      " ON integrity_proofs"
-                      " (subject, created_at)",
+                      " network_signature BLOB"
+                      " NOT NULL,"
+                      " public_pem BLOB NOT NULL,"
+                      " proof_id TEXT NOT NULL,"
+                      " sealed_at REAL NOT NULL)",
+                      "CREATE TABLE"
+                      " signature_requests ("
+                      " request_id TEXT PRIMARY KEY,"
+                      " document_id TEXT NOT NULL,"
+                      " sha256 TEXT NOT NULL,"
+                      " signer_zid TEXT NOT NULL,"
+                      " requester_zid TEXT NOT NULL,"
+                      " status TEXT NOT NULL,"
+                      " created_at REAL NOT NULL,"
+                      " resolved_at REAL,"
+                      " signature BLOB)",
+                      "CREATE INDEX sigreq_signer"
+                      " ON signature_requests"
+                      " (signer_zid, status)",
                   ),
               ),
           )
 
 
-          class IntegrityEngine:
-              """Content proofs with tamper detection."""
+          @dataclass(frozen=True)
+          class SealedDocument:
+              """The owner's verifiable receipt."""
+
+              document_id: str
+              owner_zid: str
+              title: str
+              sha256: str
+              size_bytes: int
+              network_signature: bytes
+              public_pem: bytes
+              proof_id: str
+              sealed_at: float
+
+
+          @dataclass(frozen=True)
+          class SignatureRequest:
+              request_id: str
+              document_id: str
+              sha256: str
+              signer_zid: str
+              requester_zid: str
+              status: str
+              created_at: float
+              resolved_at: float | None
+              signature: bytes | None
+
+
+          @dataclass(frozen=True)
+          class DocumentVerdict:
+              """Evidence-backed authenticity answer."""
+
+              document_id: str
+              hash_matches: bool
+              signature_valid: bool
+              authentic: bool
+              evidence: dict[str, object]
+
+
+          def _doc_payload(
+              document_id: str, sha256: str
+          ) -> bytes:
+              return (
+                  f"DOC:{document_id}:{sha256}"
+                .encode("utf-8")
+              )
+
+
+          def _sig_payload(
+              *,
+              request_id: str,
+              document_id: str,
+              sha256: str,
+              signer_zid: str,
+          ) -> bytes:
+              return (
+                  f"SIG:{request_id}:{document_id}:"
+                  f"{sha256}:{signer_zid}"
+              ).encode("utf-8")
+
+
+          class DocumentExchange:
+              """Seal, sign and third-party verify."""
 
               def __init__(
                   self,
                   db: Database,
                   clock: Clock,
                   *,
-                  algorithm: str = "sha256",
+                  signer: Ed25519Signer,
+                  integrity: IntegrityEngine,
+                  audit: AuditTrail,
+                  outbox: Outbox,
               ) -> None:
-                  if algorithm not in ALGORITHMS:
-                      raise UnsupportedAlgorithmError(
-                          "unsupported algorithm:"
-                          f" {algorithm}"
-                      )
                   self._db = db
                   self._clock = clock
-                  self._algorithm = algorithm
-                  self._hasher = ALGORITHMS[
-                      algorithm
-                  ]
+                  self._signer = signer
+                  self._integrity = integrity
+                  self._audit = audit
+                  self._outbox = outbox
+                  self._public_pem = (
+                      signer.public_pem
+                  )
                   MigrationRunner(
-                      db, "integrity", _MIGRATIONS
+                      db,
+                      "network.document_exchange",
+                      _MIGRATIONS,
                   ).run(clock)
 
-              def digest_bytes(
-                  self, data: bytes
-              ) -> str:
-                  return self._hasher(
-                      data
+              def _require_app(
+                  self, app_id: str
+              ) -> None:
+                  row = self._db.query_one(
+                      "SELECT 1 FROM app_registry"
+                      " WHERE app_id = ?",
+                      (app_id,),
+                  )
+                  if row is None:
+                      raise PermissionError(
+                          "app not registered:"
+                          f" {app_id}"
+                      )
+
+              def _emit(
+                  self,
+                  cursor: sqlite3.Cursor,
+                  *,
+                  event_type: str,
+                  aggregate: str,
+                  payload: dict[str, object],
+              ) -> None:
+                  event_id = hashlib.sha256(
+                      canonical_json_dumps(
+                          {
+                              "t": event_type,
+                              "a": aggregate,
+                              "p": payload,
+                              "ts": self._clock.now(),
+                          }
+                      ).encode("utf-8")
+                  ).hexdigest()[:32]
+                  fp = hashlib.sha256(
+                      canonical_json_dumps(
+                          {
+                              "id": event_id,
+                              "ty": event_type,
+                          }
+                      ).encode("utf-8")
                   ).hexdigest()
-
-              def digest_file(
-                  self, path: Path
-              ) -> str:
-                  """Streaming digest: constant memory
-                  regardless of file size."""
-                  digest = self._hasher()
-                  with Path(path).open("rb") as fh:
-                      for chunk in iter(
-                          lambda: fh.read(
-                              512 * 1024
+                  cursor.execute(
+                      "INSERT INTO events_outbox"
+                      " (event_id, event_type,"
+                      " aggregate_id, schema_version,"
+                      " envelope_version, created_at,"
+                      " payload, fingerprint,"
+                      " published_at)"
+                      " VALUES (?, ?, ?, 1, 1, ?, ?,"
+                      " ?, NULL)",
+                      (
+                          event_id,
+                          event_type,
+                          aggregate,
+                          self._clock.now(),
+                          canonical_json_dumps(
+                              payload
                           ),
-                          b"",
-                      ):
-                          digest.update(chunk)
-                  return digest.hexdigest()
+                          fp,
+                      ),
+                  )
 
-              def issue_proof(
+              def seal_document(
                   self,
                   *,
-                  subject: str,
-                  data: bytes,
-              ) -> IntegrityProof:
-                  """Store a durable proof for content."""
+                  owner_zid: str,
+                  title: str,
+                  content: bytes,
+                  actor_app: str,
+              ) -> SealedDocument:
+                  """Notarize a document: hash, network
+                  signature, integrity proof."""
                   require_non_empty_str(
-                      subject, "subject"
+                      owner_zid, "owner_zid"
                   )
-                  digest = self.digest_bytes(data)
-                  proof_id = f"PRF-{new_id()}"
-                  created_at = self._clock.now()
+                  require_non_empty_str(
+                      title, "title"
+                  )
+                  self._require_app(actor_app)
+                  if not content:
+                      raise ValueError(
+                          "content required"
+                      )
+                  sha = hashlib.sha256(
+                      content
+                  ).hexdigest()
+                  document_id = f"DOC-{new_id()}"
+                  proof = (
+                      self._integrity.issue_proof(
+                          subject=document_id,
+                          data=content,
+                      )
+                  )
+                  signature = self._signer.sign(
+                      _doc_payload(
+                          document_id, sha
+                      )
+                  )
+                  now = self._clock.now()
                   with (
                       self._db.transaction()
                       as cursor
                   ):
                       cursor.execute(
                           "INSERT INTO"
-                          " integrity_proofs"
-                          " (proof_id, subject,"
-                          " algorithm, digest,"
-                          " size_bytes, created_at)"
-                          " VALUES (?, ?, ?, ?, ?, ?)",
+                          " sealed_documents"
+                          " (document_id, owner_zid,"
+                          " title, sha256,"
+                          " size_bytes,"
+                          " network_signature,"
+                          " public_pem, proof_id,"
+                          " sealed_at)"
+                          " VALUES (?, ?, ?, ?, ?,"
+                          " ?, ?, ?, ?)",
                           (
-                              proof_id,
-                              subject,
-                              self._algorithm,
-                              digest,
-                              len(data),
-                              created_at,
+                              document_id,
+                              owner_zid,
+                              title,
+                              sha,
+                              len(content),
+                              signature,
+                              self._public_pem,
+                              proof.proof_id,
+                              now,
                           ),
                       )
-                  return IntegrityProof(
-                      proof_id=proof_id,
-                      subject=subject,
-                      algorithm=self._algorithm,
-                      digest=digest,
-                      size_bytes=len(data),
-                      created_at=created_at,
+                      self._emit(
+                          cursor,
+                          event_type=EVENT_SEALED,
+                          aggregate=document_id,
+                          payload={
+                              "owner": owner_zid,
+                              "sha256": sha,
+                              "app": actor_app,
+                          },
+                      )
+                  self._audit.append(
+                      event_type=EVENT_SEALED,
+                      actor=actor_app,
+                      subject=document_id,
+                      payload={
+                          "owner": owner_zid,
+                          "sha256": sha,
+                      },
+                  )
+                  return SealedDocument(
+                      document_id=document_id,
+                      owner_zid=owner_zid,
+                      title=title,
+                      sha256=sha,
+                      size_bytes=len(content),
+                      network_signature=(
+                          signature
+                      ),
+                      public_pem=self._public_pem,
+                      proof_id=proof.proof_id,
+                      sealed_at=now,
                   )
 
-              def get_proof(
-                  self, *, proof_id: str
-              ) -> IntegrityProof:
-                  require_non_empty_str(
-                      proof_id, "proof_id"
-                  )
+              def get_sealed(
+                  self, *, document_id: str
+              ) -> SealedDocument | None:
                   row = self._db.query_one(
                       "SELECT * FROM"
-                      " integrity_proofs"
-                      " WHERE proof_id = ?",
-                      (proof_id,),
+                      " sealed_documents"
+                      " WHERE document_id = ?",
+                      (document_id,),
                   )
                   if row is None:
-                      raise NotFoundError(
-                          "proof not found:"
-                          f" {proof_id}"
-                      )
-                  return self._proof_from_row(row)
-
-              def proofs_for(
-                  self, *, subject: str
-              ) -> tuple[IntegrityProof, ...]:
-                  require_non_empty_str(
-                      subject, "subject"
-                  )
-                  rows = self._db.query_all(
-                      "SELECT * FROM"
-                      " integrity_proofs"
-                      " WHERE subject = ?"
-                      " ORDER BY created_at DESC",
-                      (subject,),
-                  )
-                  return tuple(
-                      self._proof_from_row(row)
-                      for row in rows
-                  )
-
-              def verify_proof(
-                  self,
-                  *,
-                  proof_id: str,
-                  data: bytes,
-              ) -> bool:
-                  """Re-hash the current bytes and
-                  compare with the stored digest."""
-                  proof = self.get_proof(
-                      proof_id=proof_id
-                  )
-                  if (
-                      proof.algorithm
-                      not in ALGORITHMS
-                  ):
-                      raise UnsupportedAlgorithmError(
-                          "proof algorithm"
-                          " unknown:"
-                          f" {proof.algorithm}"
-                      )
-                  current = ALGORITHMS[
-                      proof.algorithm
-                  ](data).hexdigest()
-                  return current == proof.digest
-
-              def verify_latest(
-                  self,
-                  *,
-                  subject: str,
-                  data: bytes,
-              ) -> bool:
-                  """Verify against the most recent
-                  proof of a subject."""
-                  proofs = self.proofs_for(
-                      subject=subject
-                  )
-                  if not proofs:
-                      raise NotFoundError(
-                          "no proof for subject:"
-                          f" {subject}"
-                      )
-                  return self.verify_proof(
-                      proof_id=proofs[
-                          0
-                      ].proof_id,
-                      data=data,
-                  )
-
-              @staticmethod
-              def _proof_from_row(
-                  row: sqlite3.Row,
-              ) -> IntegrityProof:
-                  return IntegrityProof(
-                      proof_id=str(
-                          row["proof_id"]
+                      return None
+                  return SealedDocument(
+                      document_id=str(
+                          row["document_id"]
                       ),
-                      subject=str(
-                          row["subject"]
+                      owner_zid=str(
+                          row["owner_zid"]
                       ),
-                      algorithm=str(
-                          row["algorithm"]
-                      ),
-                      digest=str(row["digest"]),
+                      title=str(row["title"]),
+                      sha256=str(row["sha256"]),
                       size_bytes=int(
                           row["size_bytes"]
                       ),
+                      network_signature=bytes(
+                          row["network_signature"]
+                      ),
+                      public_pem=bytes(
+                          row["public_pem"]
+                      ),
+                      proof_id=str(
+                          row["proof_id"]
+                      ),
+                      sealed_at=float(
+                          row["sealed_at"]
+                      ),
+                  )
+
+              def verify_document(
+                  self,
+                  *,
+                  document_id: str,
+                  content: bytes,
+              ) -> DocumentVerdict:
+                  """Full verification against the
+                  sealed record."""
+                  sealed = self.get_sealed(
+                      document_id=document_id
+                  )
+                  if sealed is None:
+                      raise ValueError(
+                          "unknown document:"
+                          f" {document_id}"
+                      )
+                  current = hashlib.sha256(
+                      content
+                  ).hexdigest()
+                  hash_matches = (
+                      current == sealed.sha256
+                  )
+                  verifier = Ed25519Verifier(
+                      sealed.public_pem
+                  )
+                  signature_valid = (
+                      verifier.verify(
+                          _doc_payload(
+                              document_id,
+                              sealed.sha256,
+                          ),
+                          sealed.network_signature,
+                      )
+                  )
+                  return DocumentVerdict(
+                      document_id=document_id,
+                      hash_matches=hash_matches,
+                      signature_valid=(
+                          signature_valid
+                      ),
+                      authentic=(
+                          hash_matches
+                          and signature_valid
+                      ),
+                      evidence={
+                          "sealed_sha256": (
+                              sealed.sha256
+                          ),
+                          "presented_sha256": (
+                              current
+                          ),
+                          "proof_id": (
+                              sealed.proof_id
+                          ),
+                          "owner": (
+                              sealed.owner_zid
+                          ),
+                          "sealed_at": (
+                              sealed.sealed_at
+                          ),
+                      },
+                  )
+
+              @staticmethod
+              def offline_verify(
+                  *,
+                  document_id: str,
+                  content: bytes,
+                  signature: bytes,
+                  public_pem: bytes,
+              ) -> bool:
+                  """Third-party verification with NO
+                  database: only the receipt data."""
+                  sha = hashlib.sha256(
+                      content
+                  ).hexdigest()
+                  verifier = Ed25519Verifier(
+                      public_pem
+                  )
+                  return verifier.verify(
+                      _doc_payload(
+                          document_id, sha
+                      ),
+                      signature,
+                  )
+
+              def request_signature(
+                  self,
+                  *,
+                  document_id: str,
+                  signer_zid: str,
+                  requester_zid: str,
+              ) -> SignatureRequest:
+                  require_non_empty_str(
+                      signer_zid, "signer_zid"
+                  )
+                  require_non_empty_str(
+                      requester_zid,
+                      "requester_zid",
+                  )
+                  sealed = self.get_sealed(
+                      document_id=document_id
+                  )
+                  if sealed is None:
+                      raise ValueError(
+                          "cannot sign unknown"
+                          f" document:"
+                          f" {document_id}"
+                      )
+                  request_id = f"REQ-{new_id()}"
+                  now = self._clock.now()
+                  with (
+                      self._db.transaction()
+                      as cursor
+                  ):
+                      cursor.execute(
+                          "INSERT INTO"
+                          " signature_requests"
+                          " (request_id,"
+                          " document_id, sha256,"
+                          " signer_zid,"
+                          " requester_zid, status,"
+                          " created_at)"
+                          " VALUES (?, ?, ?, ?, ?,"
+                          " ?, ?)",
+                          (
+                              request_id,
+                              document_id,
+                              sealed.sha256,
+                              signer_zid,
+                              requester_zid,
+                              STATUS_PENDING,
+                              now,
+                          ),
+                      )
+                      self._emit(
+                          cursor,
+                          event_type=(
+                              EVENT_SIGN_REQUESTED
+                          ),
+                          aggregate=request_id,
+                          payload={
+                              "document": (
+                                  document_id
+                              ),
+                              "signer": signer_zid,
+                          },
+                      )
+                  self._audit.append(
+                      event_type=(
+                          EVENT_SIGN_REQUESTED
+                      ),
+                      actor=requester_zid,
+                      subject=request_id,
+                      payload={
+                          "document": document_id,
+                          "signer": signer_zid,
+                      },
+                  )
+                  return SignatureRequest(
+                      request_id=request_id,
+                      document_id=document_id,
+                      sha256=sealed.sha256,
+                      signer_zid=signer_zid,
+                      requester_zid=(
+                          requester_zid
+                      ),
+                      status=STATUS_PENDING,
+                      created_at=now,
+                      resolved_at=None,
+                      signature=None,
+                  )
+
+              def _load_request(
+                  self,
+                  cursor: sqlite3.Cursor,
+                  request_id: str,
+              ) -> sqlite3.Row:
+                  row = cursor.execute(
+                      "SELECT * FROM"
+                      " signature_requests"
+                      " WHERE request_id = ?",
+                      (request_id,),
+                  ).fetchone()
+                  if row is None:
+                      raise ValueError(
+                          "unknown request:"
+                          f" {request_id}"
+                      )
+                  return row
+
+              def sign_request(
+                  self,
+                  *,
+                  request_id: str,
+                  signer_zid: str,
+              ) -> SignatureRequest:
+                  """The ZID signs; the Network
+                  notarizes on its behalf."""
+                  require_non_empty_str(
+                      signer_zid, "signer_zid"
+                  )
+                  now = self._clock.now()
+                  with (
+                      self._db.transaction()
+                      as cursor
+                  ):
+                      row = self._load_request(
+                          cursor, request_id
+                      )
+                      if str(row["status"]) != (
+                          STATUS_PENDING
+                      ):
+                          raise ValueError(
+                              "request not"
+                              " pending:"
+                              f" {request_id}"
+                          )
+                      if str(
+                          row["signer_zid"]
+                      ) != signer_zid:
+                          raise PermissionError(
+                              "only the requested"
+                              " signer may sign"
+                          )
+                      signature = (
+                          self._signer.sign(
+                              _sig_payload(
+                                  request_id=(
+                                      request_id
+                                  ),
+                                  document_id=str(
+                                      row[
+                                          "document_id"
+                                      ]
+                                  ),
+                                  sha256=str(
+                                      row["sha256"]
+                                  ),
+                                  signer_zid=(
+                                      signer_zid
+                                  ),
+                              )
+                          )
+                      )
+                      cursor.execute(
+                          "UPDATE"
+                          " signature_requests"
+                          " SET status = ?,"
+                          " resolved_at = ?,"
+                          " signature = ?"
+                          " WHERE request_id = ?",
+                          (
+                              STATUS_SIGNED,
+                              now,
+                              signature,
+                              request_id,
+                          ),
+                      )
+                      self._emit(
+                          cursor,
+                          event_type=EVENT_SIGNED,
+                          aggregate=request_id,
+                          payload={
+                              "signer": signer_zid,
+                              "document": str(
+                                  row["document_id"]
+                              ),
+                          },
+                      )
+                  self._audit.append(
+                      event_type=EVENT_SIGNED,
+                      actor=signer_zid,
+                      subject=request_id,
+                      payload={},
+                  )
+                  return self.get_request(
+                      request_id=request_id
+                  )
+
+              def reject_request(
+                  self,
+                  *,
+                  request_id: str,
+                  signer_zid: str,
+              ) -> SignatureRequest:
+                  require_non_empty_str(
+                      signer_zid, "signer_zid"
+                  )
+                  now = self._clock.now()
+                  with (
+                      self._db.transaction()
+                      as cursor
+                  ):
+                      row = self._load_request(
+                          cursor, request_id
+                      )
+                      if str(row["status"]) != (
+                          STATUS_PENDING
+                      ):
+                          raise ValueError(
+                              "request not"
+                              " pending:"
+                              f" {request_id}"
+                          )
+                      if str(
+                          row["signer_zid"]
+                      ) != signer_zid:
+                          raise PermissionError(
+                              "only the requested"
+                              " signer may reject"
+                          )
+                      cursor.execute(
+                          "UPDATE"
+                          " signature_requests"
+                          " SET status = ?,"
+                          " resolved_at = ?"
+                          " WHERE request_id = ?",
+                          (
+                              STATUS_REJECTED,
+                              now,
+                              request_id,
+                          ),
+                      )
+                      self._emit(
+                          cursor,
+                          event_type=(
+                              EVENT_REJECTED
+                          ),
+                          aggregate=request_id,
+                          payload={
+                              "signer": signer_zid
+                          },
+                      )
+                  self._audit.append(
+                      event_type=EVENT_REJECTED,
+                      actor=signer_zid,
+                      subject=request_id,
+                      payload={},
+                  )
+                  return self.get_request(
+                      request_id=request_id
+                  )
+
+              def get_request(
+                  self, *, request_id: str
+              ) -> SignatureRequest:
+                  row = self._db.query_one(
+                      "SELECT * FROM"
+                      " signature_requests"
+                      " WHERE request_id = ?",
+                      (request_id,),
+                  )
+                  if row is None:
+                      raise ValueError(
+                          "unknown request:"
+                          f" {request_id}"
+                      )
+                  raw_sig = row["signature"]
+                  resolved = row["resolved_at"]
+                  return SignatureRequest(
+                      request_id=str(
+                          row["request_id"]
+                      ),
+                      document_id=str(
+                          row["document_id"]
+                      ),
+                      sha256=str(row["sha256"]),
+                      signer_zid=str(
+                          row["signer_zid"]
+                      ),
+                      requester_zid=str(
+                          row["requester_zid"]
+                      ),
+                      status=str(row["status"]),
                       created_at=float(
                           row["created_at"]
                       ),
+                      resolved_at=(
+                          float(resolved)
+                          if resolved is not None
+                          else None
+                      ),
+                      signature=(
+                          bytes(raw_sig)
+                          if raw_sig is not None
+                          else None
+                      ),
+                  )
+
+              def pending_for(
+                  self, *, signer_zid: str
+              ) -> tuple[SignatureRequest, ...]:
+                  rows = self._db.query_all(
+                      "SELECT request_id FROM"
+                      " signature_requests"
+                      " WHERE signer_zid = ?"
+                      " AND status = ?"
+                      " ORDER BY created_at",
+                      (
+                          signer_zid,
+                          STATUS_PENDING,
+                      ),
+                  )
+                  return tuple(
+                      self.get_request(
+                          request_id=str(
+                              r["request_id"]
+                          )
+                      )
+                      for r in rows
+                  )
+
+              @staticmethod
+              def verify_signature_receipt(
+                  *,
+                  request_id: str,
+                  document_id: str,
+                  sha256: str,
+                  signer_zid: str,
+                  signature: bytes,
+                  public_pem: bytes,
+              ) -> bool:
+                  """Offline check of a completed
+                  signature, for third parties."""
+                  verifier = Ed25519Verifier(
+                      public_pem
+                  )
+                  return verifier.verify(
+                      _sig_payload(
+                          request_id=request_id,
+                          document_id=(
+                              document_id
+                          ),
+                          sha256=sha256,
+                          signer_zid=signer_zid,
+                      ),
+                      signature,
                   )
           PYEOF
-          echo "=== INTEGRITY ENGINE READY ==="
+          echo "=== DOCUMENT EXCHANGE READY ==="
 
-      - name: Integrity proofs tests (4)
+      - name: Verification package proofs (4)
         run: |
           set -euo pipefail
-          mkdir -p shared_engines/integrity/tests
-          cat > shared_engines/integrity/tests/test_integrity.py <<'PYEOF'
-          """Integrity proofs: deterministic digests,
-          streaming file hashing, tamper detection and
-          unknown-proof errors."""
+          mkdir -p shared_engines/network/tests
+          cat > shared_engines/network/tests/test_document_exchange.py <<'PYEOF'
+          """Verification package proofs: a seller seals a
+          document, a buyer verifies it offline; tampering is
+          detected; signature requests complete or get
+          rejected; unregistered apps are refused."""
           from __future__ import annotations
 
-          import hashlib
           from pathlib import Path
 
           import pytest
 
+          from shared_engines.audit.chain import AuditTrail
           from shared_engines.common.clocks import (
               FrozenClock,
           )
-          from shared_engines.common.errors import (
-              NotFoundError,
+          from shared_engines.events.contracts import (
+              EventCatalog,
+          )
+          from shared_engines.events.outbox import Outbox
+          from shared_engines.identity.contracts import (
+              IdentityKind,
+          )
+          from shared_engines.identity.engine import (
+              IdentityEngine,
           )
           from shared_engines.integrity.engine import (
               IntegrityEngine,
           )
-          from shared_engines.integrity.errors import (
-              UnsupportedAlgorithmError,
+          from shared_engines.network.document_exchange import (
+              DocumentExchange,
+          )
+          from shared_engines.network.portable_profile import (
+              ProfileRegistry,
           )
           from shared_engines.storage.database import (
               SQLiteAdapter,
           )
+          from shared_engines.verification.signatures import (
+              Ed25519Signer,
+          )
 
 
-          def _engine(
-              tmp_path: Path,
-          ) -> tuple[
-              SQLiteAdapter,
-              IntegrityEngine,
-              FrozenClock,
-          ]:
-              db = SQLiteAdapter(
-                  tmp_path / "integrity.db"
-              )
-              clock = FrozenClock()
-              engine = IntegrityEngine(db, clock)
-              return db, engine, clock
+          class _Net:
+              def __init__(
+                  self, tmp_path: Path
+              ) -> None:
+                  self.db = SQLiteAdapter(
+                      tmp_path / "net.db"
+                  )
+                  self.clock = FrozenClock()
+                  self.audit = AuditTrail(
+                      self.db, self.clock
+                  )
+                  self.outbox = Outbox(
+                      self.db, self.clock
+                  )
+                  self.outbox.ensure_schema()
+                  self.catalog = EventCatalog()
+                  for et in (
+                      "identity.registered",
+                      "identity.status_changed",
+                      "network.document.sealed",
+                      (
+                          "network.signature"
+                          ".requested"
+                      ),
+                      "network.document.signed",
+                      "network.document.rejected",
+                  ):
+                      self.catalog.register(et)
+                  self.identity = IdentityEngine(
+                      db=self.db,
+                      clock=self.clock,
+                      audit=self.audit,
+                      outbox=self.outbox,
+                      catalog=self.catalog,
+                  )
+                  self.profiles = ProfileRegistry(
+                      self.db,
+                      self.clock,
+                      audit=self.audit,
+                      outbox=self.outbox,
+                  )
+                  self.integrity = IntegrityEngine(
+                      self.db, self.clock
+                  )
+                  signer, _ = (
+                      Ed25519Signer.generate()
+                  )
+                  self.signer = signer
+                  self.exchange = DocumentExchange(
+                      self.db,
+                      self.clock,
+                      signer=signer,
+                      integrity=self.integrity,
+                      audit=self.audit,
+                      outbox=self.outbox,
+                  )
+
+              def close(self) -> None:
+                  self.db.close()
 
 
-          def test_deterministic_digest(
+          def test_seal_and_buyer_verifies_offline(
               tmp_path: Path,
           ) -> None:
-              db, engine, clock = _engine(tmp_path)
+              net = _Net(tmp_path)
               try:
-                  d1 = engine.digest_bytes(
-                      b"zyra network"
+                  net.profiles.register_app(
+                      app_id="marketplace",
+                      display_name="Market",
+                      scopes=("display_name",),
                   )
-                  d2 = engine.digest_bytes(
-                      b"zyra network"
+                  seller = (
+                      net.identity.register_identity(
+                          kind=(
+                              IdentityKind.PERSON
+                          ),
+                          display_name="seller",
+                          actor="marketplace",
+                      )
                   )
-                  assert d1 == d2
-                  assert (
-                      d1
-                      == hashlib.sha256(
-                          b"zyra network"
-                      ).hexdigest()
+                  contract = (
+                      b"CONTRATO DE VENTA ... v1"
                   )
-                  d3 = engine.digest_bytes(
-                      b"zyra network "
+                  sealed = (
+                      net.exchange.seal_document(
+                          owner_zid=seller.zid,
+                          title="Contrato",
+                          content=contract,
+                          actor_app=(
+                              "marketplace"
+                          ),
+                      )
                   )
-                  assert d3 != d1
-              finally:
-                  db.close()
-
-
-          def test_file_digest_streams(
-              tmp_path: Path,
-          ) -> None:
-              db, engine, clock = _engine(tmp_path)
-              try:
-                  blob = tmp_path / "doc.bin"
-                  payload = (
-                      b"patient record" * 10_000
-                  )
-                  blob.write_bytes(payload)
-                  assert (
-                      engine.digest_file(blob)
-                      == hashlib.sha256(
-                          payload
-                      ).hexdigest()
-                  )
-              finally:
-                  db.close()
-
-
-          def test_issue_and_verify_detects_tampering(
-              tmp_path: Path,
-          ) -> None:
-              db, engine, clock = _engine(tmp_path)
-              try:
-                  original = (
-                      b"birth record: Bebe Perez"
-                  )
-                  proof = engine.issue_proof(
-                      subject="doc-1",
-                      data=original,
+                  verdict = (
+                      net.exchange.verify_document(
+                          document_id=(
+                              sealed.document_id
+                          ),
+                          content=contract,
+                      )
                   )
                   assert (
-                      engine.verify_proof(
-                          proof_id=proof.proof_id,
-                          data=original,
+                      verdict.authentic is True
+                  )
+                  assert (
+                      verdict.hash_matches
+                      is True
+                  )
+                  assert (
+                      verdict.signature_valid
+                      is True
+                  )
+                  # Buyer verifies OFFLINE: no DB
+                  assert (
+                      DocumentExchange
+                      .offline_verify(
+                          document_id=(
+                              sealed.document_id
+                          ),
+                          content=contract,
+                          signature=(
+                              sealed
+                              .network_signature
+                          ),
+                          public_pem=(
+                              sealed.public_pem
+                          ),
                       )
                       is True
                   )
-                  altered = (
-                      b"birth record: Faked Name"
+              finally:
+                  net.close()
+
+
+          def test_tampered_document_detected(
+              tmp_path: Path,
+          ) -> None:
+              net = _Net(tmp_path)
+              try:
+                  net.profiles.register_app(
+                      app_id="marketplace",
+                      display_name="Market",
+                      scopes=("display_name",),
+                  )
+                  seller = (
+                      net.identity.register_identity(
+                          kind=(
+                              IdentityKind.PERSON
+                          ),
+                          display_name="s",
+                          actor="marketplace",
+                      )
+                  )
+                  sealed = (
+                      net.exchange.seal_document(
+                          owner_zid=seller.zid,
+                          title="T",
+                          content=b"original",
+                          actor_app=(
+                              "marketplace"
+                          ),
+                      )
+                  )
+                  verdict = (
+                      net.exchange.verify_document(
+                          document_id=(
+                              sealed.document_id
+                          ),
+                          content=b"altered!",
+                      )
                   )
                   assert (
-                      engine.verify_proof(
-                          proof_id=proof.proof_id,
-                          data=altered,
-                      )
+                      verdict.hash_matches
                       is False
                   )
                   assert (
-                      engine.verify_latest(
-                          subject="doc-1",
-                          data=original,
+                      verdict.authentic is False
+                  )
+                  assert (
+                      DocumentExchange
+                      .offline_verify(
+                          document_id=(
+                              sealed.document_id
+                          ),
+                          content=b"altered!",
+                          signature=(
+                              sealed
+                              .network_signature
+                          ),
+                          public_pem=(
+                              sealed.public_pem
+                          ),
+                      )
+                      is False
+                  )
+              finally:
+                  net.close()
+
+
+          def test_signature_request_flow(
+              tmp_path: Path,
+          ) -> None:
+              net = _Net(tmp_path)
+              try:
+                  net.profiles.register_app(
+                      app_id="marketplace",
+                      display_name="Market",
+                      scopes=("display_name",),
+                  )
+                  seller = (
+                      net.identity.register_identity(
+                          kind=(
+                              IdentityKind.PERSON
+                          ),
+                          display_name="s",
+                          actor="marketplace",
+                      )
+                  )
+                  buyer = (
+                      net.identity.register_identity(
+                          kind=(
+                              IdentityKind.PERSON
+                          ),
+                          display_name="b",
+                          actor="marketplace",
+                      )
+                  )
+                  sealed = (
+                      net.exchange.seal_document(
+                          owner_zid=seller.zid,
+                          title="Acuerdo",
+                          content=b"acuerdo v1",
+                          actor_app=(
+                              "marketplace"
+                          ),
+                      )
+                  )
+                  req = (
+                      net.exchange
+                      .request_signature(
+                          document_id=(
+                              sealed.document_id
+                          ),
+                          signer_zid=buyer.zid,
+                          requester_zid=(
+                              seller.zid
+                          ),
+                      )
+                  )
+                  assert req.status == "PENDING"
+                  assert len(
+                      net.exchange.pending_for(
+                          signer_zid=buyer.zid
+                      )
+                  ) == 1
+                  signed = (
+                      net.exchange.sign_request(
+                          request_id=req.request_id,
+                          signer_zid=buyer.zid,
+                      )
+                  )
+                  assert signed.status == "SIGNED"
+                  assert (
+                      signed.signature is not None
+                  )
+                  assert len(
+                      net.exchange.pending_for(
+                          signer_zid=buyer.zid
+                      )
+                  ) == 0
+                  assert (
+                      DocumentExchange
+                      .verify_signature_receipt(
+                          request_id=req.request_id,
+                          document_id=(
+                              sealed.document_id
+                          ),
+                          sha256=sealed.sha256,
+                          signer_zid=buyer.zid,
+                          signature=(
+                              signed.signature
+                          ),
+                          public_pem=(
+                              sealed.public_pem
+                          ),
                       )
                       is True
                   )
-                  assert (
-                      engine.verify_latest(
-                          subject="doc-1",
-                          data=altered,
+                  with pytest.raises(ValueError):
+                      net.exchange.sign_request(
+                          request_id=(
+                              req.request_id
+                          ),
+                          signer_zid=buyer.zid,
                       )
-                      is False
-                  )
               finally:
-                  db.close()
+                  net.close()
 
 
-          def test_unknown_proof_and_algorithm(
+          def test_reject_and_unauthorized_app(
               tmp_path: Path,
           ) -> None:
-              db, engine, clock = _engine(tmp_path)
+              net = _Net(tmp_path)
               try:
-                  with pytest.raises(
-                      NotFoundError
-                  ):
-                      engine.verify_proof(
-                          proof_id="PRF-nope",
-                          data=b"x",
-                      )
-                  with pytest.raises(
-                      NotFoundError
-                  ):
-                      engine.verify_latest(
-                          subject="ghost",
-                          data=b"x",
-                      )
-                  with pytest.raises(
-                      UnsupportedAlgorithmError
-                  ):
-                      IntegrityEngine(
-                          db,
-                          clock,
-                          algorithm="md5",
-                      )
-                  sha512_engine = IntegrityEngine(
-                      db, clock, algorithm="sha512"
+                  net.profiles.register_app(
+                      app_id="marketplace",
+                      display_name="Market",
+                      scopes=("display_name",),
                   )
-                  d = sha512_engine.digest_bytes(
-                      b"x"
+                  a = (
+                      net.identity.register_identity(
+                          kind=(
+                              IdentityKind.PERSON
+                          ),
+                          display_name="a",
+                          actor="marketplace",
+                      )
+                  )
+                  b = (
+                      net.identity.register_identity(
+                          kind=(
+                              IdentityKind.PERSON
+                          ),
+                          display_name="b",
+                          actor="marketplace",
+                      )
+                  )
+                  sealed = (
+                      net.exchange.seal_document(
+                          owner_zid=a.zid,
+                          title="T",
+                          content=b"x",
+                          actor_app=(
+                              "marketplace"
+                          ),
+                      )
+                  )
+                  req = (
+                      net.exchange
+                      .request_signature(
+                          document_id=(
+                              sealed.document_id
+                          ),
+                          signer_zid=b.zid,
+                          requester_zid=a.zid,
+                      )
+                  )
+                  rejected = (
+                      net.exchange
+                      .reject_request(
+                          request_id=req.request_id,
+                          signer_zid=b.zid,
+                      )
                   )
                   assert (
-                      d
-                      == hashlib.sha512(
-                          b"x"
-                      ).hexdigest()
+                      rejected.status
+                      == "REJECTED"
                   )
+                  with pytest.raises(
+                      ValueError
+                  ):
+                      net.exchange.sign_request(
+                          request_id=(
+                              req.request_id
+                          ),
+                          signer_zid=b.zid,
+                      )
+                  with pytest.raises(
+                      PermissionError
+                  ):
+                      net.exchange.seal_document(
+                          owner_zid=a.zid,
+                          title="T",
+                          content=b"y",
+                          actor_app="malware",
+                      )
               finally:
-                  db.close()
+                  net.close()
           PYEOF
-          echo "=== INTEGRITY TESTS READY ==="
+          echo "=== VERIFICATION TESTS READY ==="
 
       - name: Quality gates (mypy first; full regression)
         run: |
@@ -559,7 +1326,7 @@ jobs:
           if git diff --cached --quiet; then
             echo "No changes."
           else
-            git commit -m "zyra: engine 2/17 integrity - sha256/sha512 digests (bytes + streaming file), durable content proofs, tamper detection, typed errors; engine init files cleaned (W391)"
+            git commit -m "zyra: W10 verification package - DocumentExchange notary: seal documents (sha256+Ed25519+integrity proof), OFFLINE third-party verification (no DB), signature requests PENDING->SIGNED/REJECTED network-notarized per ZID, domain-separated payloads; 4 proofs"
             git push origin "HEAD:${{ github.ref_name }}"
           fi
-          echo "=== ENGINE INTEGRITY COMPLETE ==="
+          echo "=== W10 COMPLETE ==="

@@ -1,4 +1,4 @@
-name: zyra-w13-engine-search
+name: zyra-w14-engine-reputation
 
 "on":
   workflow_dispatch:
@@ -9,7 +9,7 @@ permissions:
   contents: write
 
 concurrency:
-  group: zyra-w13-${{ github.ref }}
+  group: zyra-w14-${{ github.ref }}
   cancel-in-progress: false
 
 jobs:
@@ -34,15 +34,15 @@ jobs:
       - name: Clean engine init (W391)
         run: |
           set -euo pipefail
-          f="shared_engines/search/__init__.py"
+          f="shared_engines/reputation/__init__.py"
           [ -f "$f" ] && printf '"""ZYRA Network engine package."""\n' > "$f"
           echo "init cleaned"
 
-      - name: Fill search engine (transversal authorized queries)
+      - name: Fill reputation engine (evidence-backed scoring)
         run: |
           set -euo pipefail
-          cat > shared_engines/search/errors.py <<'PYEOF'
-          """Typed search errors."""
+          cat > shared_engines/reputation/errors.py <<'PYEOF'
+          """Typed reputation errors."""
           from __future__ import annotations
 
           from shared_engines.common.errors import (
@@ -50,64 +50,152 @@ jobs:
           )
 
 
-          class SearchNotAuthorizedError(EngineError):
-              """Querying app is not registered."""
+          class SelfReputationError(EngineError):
+              """An entity cannot rate itself."""
 
 
-          class UnknownSourceError(EngineError):
-              """Requested search source does not exist."""
+          class UnknownEntityError(EngineError):
+              """Subject or actor identity unknown."""
+
+
+          class EmptyEvidenceError(EngineError):
+              """Evidence bytes are required."""
           PYEOF
 
-          cat > shared_engines/search/contracts.py <<'PYEOF'
-          """Search contracts."""
+          cat > shared_engines/reputation/contracts.py <<'PYEOF'
+          """Reputation contracts."""
           from __future__ import annotations
 
           from dataclasses import dataclass
 
+          KIND_POSITIVE = "positive"
+          KIND_NEGATIVE = "negative"
+
+          EVENT_KINDS = (
+              KIND_POSITIVE,
+              KIND_NEGATIVE,
+          )
+
 
           @dataclass(frozen=True)
-          class SearchHit:
-              """One ranked result from one source."""
+          class ReputationEvent:
+              """One evidence-backed reputation event."""
 
-              source: str
-              ref_id: str
-              title: str
-              snippet: str
+              event_id: str
+              seq: int
+              subject_zid: str
+              actor_zid: str
+              kind: str
+              weight: float
+              evidence_sha: str
+              proof_id: str
+              created_at: float
+
+
+          @dataclass(frozen=True)
+          class ReputationSummary:
+              """Computed, evidence-backed state."""
+
+              subject_zid: str
               score: int
+              positive_events: int
+              negative_events: int
+              last_event_at: float | None
           PYEOF
 
-          cat > shared_engines/search/engine.py <<'PYEOF'
-          """Search engine: the transversal query layer.
+          cat > shared_engines/reputation/policy.py <<'PYEOF'
+          """Reputation policy: explicit, inspectable rules.
 
-          Composes EXISTING tables as sources - never
-          duplicating engines or creating parallel indexes:
+          Score is NEVER a magic increment: every event
+          contributes weight * sign, decayed by a half-life.
+          The policy is a frozen value injected at
+          construction, so different deployments can use
+          different rules while the arithmetic stays
+          transparent and auditable.
+          """
+          from __future__ import annotations
 
-              identity    -> identities (display_name)
-              credential  -> credentials (title, not revoked)
-              document    -> sealed_documents (title)
-              certificate -> certificates (title, not revoked)
-              history     -> life_history_entries (payload)
+          from dataclasses import dataclass
+
+          from shared_engines.common.validation import (
+              require_positive_number,
+          )
+
+
+          @dataclass(frozen=True)
+          class ReputationPolicy:
+              """Scoring rules (all positive numbers)."""
+
+              weight_per_event: float = 10.0
+              half_life_seconds: float = 100.0
+
+              def __post_init__(self) -> None:
+                  require_positive_number(
+                      self.weight_per_event,
+                      "weight_per_event",
+                  )
+                  require_positive_number(
+                      self.half_life_seconds,
+                      "half_life_seconds",
+                  )
+
+              def decay_factor(
+                  self,
+                  *,
+                  age_seconds: float,
+              ) -> float:
+                  """0.5 ** (age / half_life): fresh
+                  evidence counts fully; old evidence
+                  fades, never below zero contribution
+                  magnitude."""
+                  if age_seconds <= 0.0:
+                      return 1.0
+                  return 2.0 ** (
+                      -age_seconds
+                      / self.half_life_seconds
+                  )
+          PYEOF
+
+          cat > shared_engines/reputation/engine.py <<'PYEOF'
+          """Reputation engine: evidence -> score, nothing
+          else.
+
+          Flow per event:
+
+              actor (another ZID, never self)
+                    |
+                    v
+              evidence bytes (real content)
+                    |
+                    v
+              IntegrityEngine.issue_proof
+              (durable, verifiable SHA-256)
+                    |
+                    v
+              reputation_events append-only row
+              (seq per subject, evidence_sha, proof_id)
+                    |
+                    v
+              score = sum(sign * weight
+                          * decay(age))
+              (policy-driven, transparent)
 
           Guarantees:
 
-          - Authorized: only apps registered via
-            ProfileRegistry (app_registry) may search.
-          - Auditable: every query is written to the
-            durable search log, appended to the audit
-            chain and emitted as network.search.performed
-            with a unique event id (repeated queries are
-            separate events, never deduplicated away).
-          - Ranked: exact title match (3) > prefix (2) >
-            substring (1); stable tiebreak by title.
-          - Paginated with the existing common Page.
-          - Case-insensitive matching via lower() +
-            instr(); no LIKE escaping issues.
-          - Missing source tables are skipped, so the
-            engine works on partial deployments.
+          - No self-rating: actor != subject, both must
+            be known identities.
+          - Evidence inmutable: every event carries a
+            verifiable integrity proof id; the evidence
+            hash is stored, so tampering with history
+            is detectable by recomputing.
+          - Deterministic score: pure function of the
+            event list, the policy and the clock.
+          - Every event is audited and emitted as
+            reputation.event.recorded.
 
-          Transactions never nest: the log entry and
-          outbox event share one short transaction; the
-          audit append runs afterwards on its own.
+          Deliberately separate from TokenLedger: tokens
+          are spendable currency; reputation is earned
+          trust with evidence and time decay.
           """
           from __future__ import annotations
 
@@ -116,24 +204,39 @@ jobs:
 
           from shared_engines.audit.chain import AuditTrail
           from shared_engines.common.clocks import Clock
+          from shared_engines.common.errors import (
+              NotFoundError,
+          )
           from shared_engines.common.identifiers import (
               new_id,
           )
-          from shared_engines.common.pagination import Page
           from shared_engines.common.serialization import (
               canonical_json_dumps,
           )
           from shared_engines.common.validation import (
-              require_int_range,
               require_non_empty_str,
           )
           from shared_engines.events.outbox import Outbox
-          from shared_engines.search.contracts import (
-              SearchHit,
+          from shared_engines.identity.engine import (
+              IdentityEngine,
           )
-          from shared_engines.search.errors import (
-              SearchNotAuthorizedError,
-              UnknownSourceError,
+          from shared_engines.integrity.engine import (
+              IntegrityEngine,
+          )
+          from shared_engines.reputation.contracts import (
+              EVENT_KINDS,
+              KIND_NEGATIVE,
+              KIND_POSITIVE,
+              ReputationEvent,
+              ReputationSummary,
+          )
+          from shared_engines.reputation.errors import (
+              EmptyEvidenceError,
+              SelfReputationError,
+              UnknownEntityError,
+          )
+          from shared_engines.reputation.policy import (
+              ReputationPolicy,
           )
           from shared_engines.storage.database import (
               Database,
@@ -143,288 +246,76 @@ jobs:
               MigrationRunner,
           )
 
-          EVENT_SEARCH_PERFORMED = (
-              "network.search.performed"
-          )
-
-          SOURCE_IDENTITY = "identity"
-          SOURCE_CREDENTIAL = "credential"
-          SOURCE_DOCUMENT = "document"
-          SOURCE_CERTIFICATE = "certificate"
-          SOURCE_HISTORY = "history"
-
-          ALL_SOURCES: tuple[str, ...] = (
-              SOURCE_IDENTITY,
-              SOURCE_CREDENTIAL,
-              SOURCE_DOCUMENT,
-              SOURCE_CERTIFICATE,
-              SOURCE_HISTORY,
+          EVENT_RECORDED = (
+              "reputation.event.recorded"
           )
 
           _MIGRATIONS = (
               Migration(
                   1,
-                  "search_log",
+                  "reputation_events",
                   (
-                      "CREATE TABLE search_log ("
-                      " search_id INTEGER PRIMARY KEY"
-                      " AUTOINCREMENT,"
-                      " app_id TEXT NOT NULL,"
-                      " query TEXT NOT NULL,"
-                      " sources TEXT NOT NULL,"
-                      " result_count INTEGER NOT NULL,"
-                      " performed_at REAL NOT NULL)",
+                      "CREATE TABLE"
+                      " reputation_events ("
+                      " event_id TEXT PRIMARY KEY,"
+                      " seq INTEGER NOT NULL,"
+                      " subject_zid TEXT NOT NULL,"
+                      " actor_zid TEXT NOT NULL,"
+                      " kind TEXT NOT NULL,"
+                      " weight REAL NOT NULL,"
+                      " evidence_sha TEXT NOT NULL,"
+                      " proof_id TEXT NOT NULL,"
+                      " created_at REAL NOT NULL)",
+                      "CREATE INDEX rep_subject"
+                      " ON reputation_events"
+                      " (subject_zid, seq)",
                   ),
               ),
           )
 
-          _SOURCE_QUERIES: dict[str, str] = {
-              SOURCE_IDENTITY: (
-                  "SELECT zid AS ref_id,"
-                  " display_name AS title,"
-                  " display_name AS snippet"
-                  " FROM identities"
-                  " WHERE instr(lower(display_name),"
-                  " ?) > 0 LIMIT 500"
-              ),
-              SOURCE_CREDENTIAL: (
-                  "SELECT credential_id AS ref_id,"
-                  " title AS title,"
-                  " detail AS snippet"
-                  " FROM credentials"
-                  " WHERE revoked = 0"
-                  " AND instr(lower(title), ?) > 0"
-                  " LIMIT 500"
-              ),
-              SOURCE_DOCUMENT: (
-                  "SELECT document_id AS ref_id,"
-                  " title AS title,"
-                  " title AS snippet"
-                  " FROM sealed_documents"
-                  " WHERE instr(lower(title), ?)"
-                  " > 0 LIMIT 500"
-              ),
-              SOURCE_CERTIFICATE: (
-                  "SELECT certificate_id AS ref_id,"
-                  " title AS title,"
-                  " scope AS snippet"
-                  " FROM certificates"
-                  " WHERE revoked = 0"
-                  " AND instr(lower(title), ?) > 0"
-                  " LIMIT 500"
-              ),
-              SOURCE_HISTORY: (
-                  "SELECT zid || '#' || entry_seq"
-                  " AS ref_id,"
-                  " entry_type AS title,"
-                  " substr(payload, 1, 120)"
-                  " AS snippet"
-                  " FROM life_history_entries"
-                  " WHERE instr("
-                  " lower(payload), ?) > 0"
-                  " LIMIT 500"
-              ),
-          }
 
-          _SOURCE_TABLES: dict[str, str] = {
-              SOURCE_IDENTITY: "identities",
-              SOURCE_CREDENTIAL: "credentials",
-              SOURCE_DOCUMENT: "sealed_documents",
-              SOURCE_CERTIFICATE: "certificates",
-              SOURCE_HISTORY: (
-                  "life_history_entries"
-              ),
-          }
-
-
-          class SearchEngine:
-              """Authorized, audited, ranked global
-              search over existing tables."""
+          class ReputationEngine:
+              """Evidence-backed trust scoring."""
 
               def __init__(
                   self,
                   db: Database,
                   clock: Clock,
                   *,
+                  identity: IdentityEngine,
+                  integrity: IntegrityEngine,
                   audit: AuditTrail,
                   outbox: Outbox,
+                  policy: ReputationPolicy
+                  | None = None,
               ) -> None:
                   self._db = db
                   self._clock = clock
+                  self._identity = identity
+                  self._integrity = integrity
                   self._audit = audit
                   self._outbox = outbox
+                  self._policy = (
+                      policy or ReputationPolicy()
+                  )
                   MigrationRunner(
-                      db, "search", _MIGRATIONS
+                      db,
+                      "reputation",
+                      _MIGRATIONS,
                   ).run(clock)
-
-              def _require_app(
-                  self, app_id: str
-              ) -> None:
-                  row = self._db.query_one(
-                      "SELECT 1 FROM app_registry"
-                      " WHERE app_id = ?",
-                      (app_id,),
-                  )
-                  if row is None:
-                      raise (
-                          SearchNotAuthorizedError(
-                              "app not registered:"
-                              f" {app_id}"
-                          )
-                      )
-
-              def _table_exists(
-                  self, table: str
-              ) -> bool:
-                  row = self._db.query_one(
-                      "SELECT 1 FROM sqlite_master"
-                      " WHERE type = 'table'"
-                      " AND name = ?",
-                      (table,),
-                  )
-                  return row is not None
-
-              def _score(
-                  self, title: str, q: str
-              ) -> int:
-                  t = title.lower()
-                  if t == q:
-                      return 3
-                  if t.startswith(q):
-                      return 2
-                  return 1
-
-              def search(
-                  self,
-                  *,
-                  app_id: str,
-                  query: str,
-                  sources: tuple[str, ...] | None = None,
-                  offset: int = 0,
-                  limit: int = 20,
-              ) -> Page[SearchHit]:
-                  """Global authorized search."""
-                  require_int_range(
-                      offset, "offset", 0, 10**12
-                  )
-                  require_int_range(
-                      limit, "limit", 1, 100
-                  )
-                  self._require_app(app_id)
-                  require_non_empty_str(
-                      query, "query"
-                  )
-                  q = query.strip().lower()
-                  chosen: tuple[str, ...]
-                  if sources is None:
-                      chosen = ALL_SOURCES
-                  else:
-                      for s in sources:
-                          if s not in ALL_SOURCES:
-                              raise (
-                                  UnknownSourceError(
-                                      "unknown"
-                                      " source:"
-                                      f" {s}"
-                                  )
-                              )
-                      chosen = sources
-                  hits: list[SearchHit] = []
-                  for source in chosen:
-                      table = _SOURCE_TABLES[
-                          source
-                      ]
-                      if not self._table_exists(
-                          table
-                      ):
-                          continue
-                      rows = self._db.query_all(
-                          _SOURCE_QUERIES[source],
-                          (q,),
-                      )
-                      for row in rows:
-                          title = str(
-                              row["title"]
-                          )
-                          hits.append(
-                              SearchHit(
-                                  source=source,
-                                  ref_id=str(
-                                      row["ref_id"]
-                                  ),
-                                  title=title,
-                                  snippet=str(
-                                      row["snippet"]
-                                  ),
-                                  score=self._score(
-                                      title, q
-                                  ),
-                              )
-                          )
-                  hits.sort(
-                      key=lambda h: (
-                          -h.score,
-                          h.title,
-                          h.source,
-                          h.ref_id,
-                      )
-                  )
-                  total = len(hits)
-                  end = offset + limit
-                  window = hits[offset:end]
-                  with self._db.transaction() as cursor:
-                      cursor.execute(
-                          "INSERT INTO search_log"
-                          " (app_id, query, sources,"
-                          "  result_count,"
-                          "  performed_at)"
-                          " VALUES (?, ?, ?, ?, ?)",
-                          (
-                              app_id,
-                              q,
-                              ",".join(chosen),
-                              total,
-                              self._clock.now(),
-                          ),
-                      )
-                      self._emit(
-                          cursor,
-                          app_id=app_id,
-                          q=q,
-                          total=total,
-                      )
-                  self._audit.append(
-                      event_type=(
-                          EVENT_SEARCH_PERFORMED
-                      ),
-                      actor=app_id,
-                      subject=q,
-                      payload={"results": total},
-                  )
-                  return Page(
-                      items=tuple(window),
-                      offset=offset,
-                      limit=limit,
-                      total=total,
-                  )
 
               def _emit(
                   self,
                   cursor: sqlite3.Cursor,
                   *,
-                  app_id: str,
-                  q: str,
-                  total: int,
+                  subject_zid: str,
+                  event_id: str,
+                  kind: str,
               ) -> None:
-                  """Unique event per execution:
-                  new_id() makes repeated identical
-                  queries distinct events."""
-                  event_id = hashlib.sha256(
+                  uid = hashlib.sha256(
                       canonical_json_dumps(
                           {
-                              "a": app_id,
-                              "q": q,
-                              "ts": self._clock.now(),
+                              "e": event_id,
                               "u": new_id(),
                           }
                       ).encode("utf-8")
@@ -432,10 +323,8 @@ jobs:
                   fp = hashlib.sha256(
                       canonical_json_dumps(
                           {
-                              "id": event_id,
-                              "ty": (
-                                  EVENT_SEARCH_PERFORMED
-                              ),
+                              "id": uid,
+                              "ty": EVENT_RECORDED,
                           }
                       ).encode("utf-8")
                   ).hexdigest()
@@ -449,41 +338,297 @@ jobs:
                       " VALUES (?, ?, ?, 1, 1, ?, ?,"
                       " ?, NULL)",
                       (
-                          event_id,
-                          EVENT_SEARCH_PERFORMED,
-                          app_id,
+                          uid,
+                          EVENT_RECORDED,
+                          subject_zid,
                           self._clock.now(),
                           canonical_json_dumps(
                               {
-                                  "query": q,
-                                  "results": total,
+                                  "event_id": event_id,
+                                  "kind": kind,
                               }
                           ),
                           fp,
                       ),
                   )
 
-              def search_log_count(self) -> int:
-                  row = self._db.query_one(
-                      "SELECT COUNT(*) AS n FROM"
-                      " search_log"
+              def record_event(
+                  self,
+                  *,
+                  subject_zid: str,
+                  actor_zid: str,
+                  kind: str,
+                  evidence: bytes,
+              ) -> ReputationEvent:
+                  """One evidence-backed reputation
+                  event. Refuses self-rating, unknown
+                  entities, empty evidence and unknown
+                  kinds."""
+                  require_non_empty_str(
+                      subject_zid, "subject_zid"
                   )
+                  require_non_empty_str(
+                      actor_zid, "actor_zid"
+                  )
+                  if kind not in EVENT_KINDS:
+                      raise ValueError(
+                          f"unknown kind: {kind}"
+                      )
+                  if actor_zid == subject_zid:
+                      raise SelfReputationError(
+                          "an entity cannot rate"
+                          " itself"
+                      )
+                  if not evidence:
+                      raise EmptyEvidenceError(
+                          "evidence bytes required"
+                      )
+                  try:
+                      self._identity.require_identity(
+                          subject_zid
+                      )
+                  except Exception as exc:
+                      raise UnknownEntityError(
+                          "unknown subject:"
+                          f" {subject_zid}"
+                      ) from exc
+                  try:
+                      self._identity.require_identity(
+                          actor_zid
+                      )
+                  except Exception as exc:
+                      raise UnknownEntityError(
+                          "unknown actor:"
+                          f" {actor_zid}"
+                      ) from exc
+                  event_id = f"REP-{new_id()}"
+                  proof = self._integrity.issue_proof(
+                      subject=event_id,
+                      data=evidence,
+                  )
+                  evidence_sha = (
+                      self._integrity.digest_bytes(
+                          evidence
+                      )
+                  )
+                  now = self._clock.now()
+                  with (
+                      self._db.transaction()
+                      as cursor
+                  ):
+                      row = cursor.execute(
+                          "SELECT COALESCE(MAX(seq),"
+                          " 0) AS last FROM"
+                          " reputation_events"
+                          " WHERE subject_zid = ?",
+                          (subject_zid,),
+                      ).fetchone()
+                      seq = (
+                          int(row["last"]) + 1
+                          if row is not None
+                          else 1
+                      )
+                      cursor.execute(
+                          "INSERT INTO"
+                          " reputation_events"
+                          " (event_id, seq,"
+                          "  subject_zid, actor_zid,"
+                          "  kind, weight,"
+                          "  evidence_sha, proof_id,"
+                          "  created_at)"
+                          " VALUES (?, ?, ?, ?, ?, ?,"
+                          "  ?, ?, ?)",
+                          (
+                              event_id,
+                              seq,
+                              subject_zid,
+                              actor_zid,
+                              kind,
+                              self._policy
+                              .weight_per_event,
+                              evidence_sha,
+                              proof.proof_id,
+                              now,
+                          ),
+                      )
+                      self._emit(
+                          cursor,
+                          subject_zid=subject_zid,
+                          event_id=event_id,
+                          kind=kind,
+                      )
+                  self._audit.append(
+                      event_type=EVENT_RECORDED,
+                      actor=actor_zid,
+                      subject=subject_zid,
+                      payload={
+                          "event_id": event_id,
+                          "kind": kind,
+                          "proof_id": (
+                              proof.proof_id
+                          ),
+                      },
+                  )
+                  return ReputationEvent(
+                      event_id=event_id,
+                      seq=seq,
+                      subject_zid=subject_zid,
+                      actor_zid=actor_zid,
+                      kind=kind,
+                      weight=self._policy
+                      .weight_per_event,
+                      evidence_sha=evidence_sha,
+                      proof_id=proof.proof_id,
+                      created_at=now,
+                  )
+
+              def _events(
+                  self, *, subject_zid: str
+              ) -> tuple[ReputationEvent, ...]:
+                  rows = self._db.query_all(
+                      "SELECT * FROM"
+                      " reputation_events"
+                      " WHERE subject_zid = ?"
+                      " ORDER BY seq",
+                      (subject_zid,),
+                  )
+                  return tuple(
+                      ReputationEvent(
+                          event_id=str(
+                              r["event_id"]
+                          ),
+                          seq=int(r["seq"]),
+                          subject_zid=str(
+                              r["subject_zid"]
+                          ),
+                          actor_zid=str(
+                              r["actor_zid"]
+                          ),
+                          kind=str(r["kind"]),
+                          weight=float(
+                              r["weight"]
+                          ),
+                          evidence_sha=str(
+                              r["evidence_sha"]
+                          ),
+                          proof_id=str(
+                              r["proof_id"]
+                          ),
+                          created_at=float(
+                              r["created_at"]
+                          ),
+                      )
+                      for r in rows
+                  )
+
+              def score(
+                  self, *, subject_zid: str
+              ) -> int:
+                  """Deterministic decayed score:
+                  sum(sign * weight * decay(age)),
+                  floored at zero."""
+                  require_non_empty_str(
+                      subject_zid, "subject_zid"
+                  )
+                  now = self._clock.now()
+                  total = 0.0
+                  for ev in self._events(
+                      subject_zid=subject_zid
+                  ):
+                      age = max(
+                          0.0,
+                          now - ev.created_at,
+                      )
+                      factor = (
+                          self._policy.decay_factor(
+                              age_seconds=age
+                          )
+                      )
+                      sign = (
+                          1.0
+                          if ev.kind == KIND_POSITIVE
+                          else -1.0
+                      )
+                      total += (
+                          sign
+                          * self._policy
+                          .weight_per_event
+                          * factor
+                      )
+                  return max(0, int(round(total)))
+
+              def summary(
+                  self, *, subject_zid: str
+              ) -> ReputationSummary:
+                  events = self._events(
+                      subject_zid=subject_zid
+                  )
+                  positives = sum(
+                      1
+                      for e in events
+                      if e.kind == KIND_POSITIVE
+                  )
+                  negatives = sum(
+                      1
+                      for e in events
+                      if e.kind == KIND_NEGATIVE
+                  )
+                  last = (
+                      max(
+                          e.created_at
+                          for e in events
+                      )
+                      if events
+                      else None
+                  )
+                  return ReputationSummary(
+                      subject_zid=subject_zid,
+                      score=self.score(
+                          subject_zid=subject_zid
+                      ),
+                      positive_events=positives,
+                      negative_events=negatives,
+                      last_event_at=last,
+                  )
+
+              def verify_evidence(
+                  self,
+                  *,
+                  event_id: str,
+                  evidence: bytes,
+              ) -> bool:
+                  """Re-verify historic evidence against
+                  its stored integrity proof."""
+                  row = self._db.query_one(
+                      "SELECT proof_id FROM"
+                      " reputation_events"
+                      " WHERE event_id = ?",
+                      (event_id,),
+                  )
+                  if row is None:
+                      raise NotFoundError(
+                          "unknown reputation"
+                          f" event: {event_id}"
+                      )
                   return (
-                      int(row["n"])
-                      if row is not None
-                      else 0
+                      self._integrity.verify_proof(
+                          proof_id=str(
+                              row["proof_id"]
+                          ),
+                          data=evidence,
+                      )
                   )
           PYEOF
-          echo "=== SEARCH ENGINE READY (transversal) ==="
+          echo "=== REPUTATION ENGINE READY ==="
 
-      - name: Search proofs (4)
+      - name: Reputation proofs (4)
         run: |
           set -euo pipefail
-          mkdir -p shared_engines/search/tests
-          cat > shared_engines/search/tests/test_search.py <<'PYEOF'
-          """Search proofs: multi-source ranked results,
-          unauthorized apps refused, pagination via Page,
-          full auditability of every query."""
+          mkdir -p shared_engines/reputation/tests
+          cat > shared_engines/reputation/tests/test_reputation.py <<'PYEOF'
+          """Reputation proofs: evidence-backed scoring,
+          self-rating refused, mixed signs, temporal decay,
+          evidence re-verification."""
           from __future__ import annotations
 
           from pathlib import Path
@@ -507,32 +652,22 @@ jobs:
           from shared_engines.integrity.engine import (
               IntegrityEngine,
           )
-          from shared_engines.network.document_exchange import (
-              DocumentExchange,
+          from shared_engines.reputation.engine import (
+              ReputationEngine,
           )
-          from shared_engines.network.life_history import (
-              LifeHistory,
+          from shared_engines.reputation.errors import (
+              EmptyEvidenceError,
+              SelfReputationError,
+              UnknownEntityError,
           )
-          from shared_engines.network.portable_profile import (
-              ProfileRegistry,
-          )
-          from shared_engines.search.engine import SearchEngine
-          from shared_engines.search.errors import (
-              SearchNotAuthorizedError,
-              UnknownSourceError,
+          from shared_engines.reputation.policy import (
+              ReputationPolicy,
           )
           from shared_engines.storage.database import (
               SQLiteAdapter,
           )
           from shared_engines.telemetry.collector import (
               TelemetryCollector,
-          )
-          from shared_engines.verification.credentials import (
-              CredentialRegistry,
-              CredentialType,
-          )
-          from shared_engines.verification.signatures import (
-              Ed25519Signer,
           )
 
 
@@ -555,11 +690,7 @@ jobs:
                   for et in (
                       "identity.registered",
                       "identity.status_changed",
-                      "verification.credential"
-                      ".issued",
-                      "network.document.sealed",
-                      "network.history.appended",
-                      "network.search.performed",
+                      "reputation.event.recorded",
                   ):
                       self.catalog.register(et)
                   self.identity = IdentityEngine(
@@ -569,241 +700,86 @@ jobs:
                       outbox=self.outbox,
                       catalog=self.catalog,
                   )
-                  self.profiles = ProfileRegistry(
-                      self.db,
-                      self.clock,
-                      audit=self.audit,
-                      outbox=self.outbox,
-                  )
-                  self.credentials = (
-                      CredentialRegistry(
-                          self.db,
-                          self.clock,
-                          self.audit,
-                          self.outbox,
-                          self.catalog,
-                      )
-                  )
                   self.integrity = IntegrityEngine(
                       self.db, self.clock
-                  )
-                  signer, _ = (
-                      Ed25519Signer.generate()
-                  )
-                  self.exchange = DocumentExchange(
-                      self.db,
-                      self.clock,
-                      signer=signer,
-                      integrity=self.integrity,
-                      audit=self.audit,
-                      outbox=self.outbox,
-                  )
-                  self.history = LifeHistory(
-                      self.db,
-                      self.clock,
-                      audit=self.audit,
-                      outbox=self.outbox,
                   )
                   self.telemetry = TelemetryCollector(
                       self.db, self.clock
                   )
-                  self.search = SearchEngine(
+                  self.policy = ReputationPolicy(
+                      weight_per_event=10.0,
+                      half_life_seconds=100.0,
+                  )
+                  self.reputation = ReputationEngine(
                       self.db,
                       self.clock,
+                      identity=self.identity,
+                      integrity=self.integrity,
                       audit=self.audit,
                       outbox=self.outbox,
+                      policy=self.policy,
                   )
+
+              def person(
+                  self, name: str
+              ) -> str:
+                  identity = (
+                      self.identity.register_identity(
+                          kind=(
+                              IdentityKind.PERSON
+                          ),
+                          display_name=name,
+                          actor="bootstrap",
+                      )
+                  )
+                  return identity.zid
 
               def close(self) -> None:
                   self.db.close()
 
 
-          def test_multi_source_ranked_results(
+          def test_evidence_backed_score(
               tmp_path: Path,
           ) -> None:
               net = _Net(tmp_path)
               try:
-                  net.profiles.register_app(
-                      app_id="portal",
-                      display_name="Portal",
-                      scopes=("display_name",),
+                  employer = net.person("employer")
+                  worker = net.person("worker")
+                  evidence = (
+                      b"contract 2026 signed"
                   )
-                  person = (
-                      net.identity.register_identity(
-                          kind=(
-                              IdentityKind.PERSON
-                          ),
-                          display_name=(
-                              "Maria Lopez"
-                          ),
-                          actor="portal",
+                  event = net.reputation.record_event(
+                      subject_zid=worker,
+                      actor_zid=employer,
+                      kind="positive",
+                      evidence=evidence,
+                  )
+                  assert event.seq == 1
+                  summary = (
+                      net.reputation.summary(
+                          subject_zid=worker
                       )
                   )
-                  net.credentials.issue(
-                      subject_zid=person.zid,
-                      issuer_zid=person.zid,
-                      credential_type=(
-                          CredentialType.REFERENCE
-                      ),
-                      title=(
-                          "Referencia de"
-                          " Maria Lopez"
-                      ),
-                      detail="limpia",
-                  )
-                  net.exchange.seal_document(
-                      owner_zid=person.zid,
-                      title=(
-                          "Contrato Maria Lopez"
-                      ),
-                      content=b"doc",
-                      actor_app="portal",
-                  )
-                  result = net.search.search(
-                      app_id="portal",
-                      query="maria lopez",
-                  )
-                  sources_found = {
-                      h.source
-                      for h in result.items
-                  }
+                  assert summary.score == 10
                   assert (
-                      "identity"
-                      in sources_found
+                      summary.positive_events == 1
                   )
                   assert (
-                      "credential"
-                      in sources_found
+                      summary.negative_events == 0
                   )
                   assert (
-                      "document"
-                      in sources_found
-                  )
-                  top = result.items[0]
-                  assert (
-                      top.source == "identity"
-                  )
-                  assert top.score == 3
-                  assert result.total >= 3
-              finally:
-                  net.close()
-
-
-          def test_unauthorized_and_unknown_source(
-              tmp_path: Path,
-          ) -> None:
-              net = _Net(tmp_path)
-              try:
-                  with pytest.raises(
-                      SearchNotAuthorizedError
-                  ):
-                      net.search.search(
-                          app_id="malware",
-                          query="x",
+                      net.reputation.verify_evidence(
+                          event_id=event.event_id,
+                          evidence=evidence,
                       )
-                  net.profiles.register_app(
-                      app_id="ok",
-                      display_name="OK",
-                      scopes=("display_name",),
+                      is True
                   )
-                  with pytest.raises(
-                      UnknownSourceError
-                  ):
-                      net.search.search(
-                          app_id="ok",
-                          query="x",
-                          sources=("ghost",),
+                  assert (
+                      net.reputation.verify_evidence(
+                          event_id=event.event_id,
+                          evidence=b"faked",
                       )
-              finally:
-                  net.close()
-
-
-          def test_pagination_with_page(
-              tmp_path: Path,
-          ) -> None:
-              net = _Net(tmp_path)
-              try:
-                  net.profiles.register_app(
-                      app_id="portal",
-                      display_name="Portal",
-                      scopes=("display_name",),
-                  )
-                  owner = (
-                      net.identity.register_identity(
-                          kind=(
-                              IdentityKind.PERSON
-                          ),
-                          display_name="o",
-                          actor="portal",
-                      )
-                  )
-                  for i in range(5):
-                      net.exchange.seal_document(
-                          owner_zid=owner.zid,
-                          title=(
-                              f"Lote especial"
-                              f" {i}"
-                          ),
-                          content=(
-                              f"c{i}".encode()
-                          ),
-                          actor_app="portal",
-                      )
-                  page1 = net.search.search(
-                      app_id="portal",
-                      query="lote especial",
-                      offset=0,
-                      limit=2,
-                  )
-                  assert page1.total == 5
-                  assert len(page1.items) == 2
-                  assert (
-                      page1.has_more is True
-                  )
-                  assert (
-                      page1.next_offset == 2
-                  )
-                  page3 = net.search.search(
-                      app_id="portal",
-                      query="lote especial",
-                      offset=4,
-                      limit=2,
-                  )
-                  assert (
-                      len(page3.items) == 1
-                  )
-                  assert (
-                      page3.has_more is False
-                  )
-              finally:
-                  net.close()
-
-
-          def test_every_query_audited(
-              tmp_path: Path,
-          ) -> None:
-              net = _Net(tmp_path)
-              try:
-                  net.profiles.register_app(
-                      app_id="portal",
-                      display_name="Portal",
-                      scopes=("display_name",),
-                  )
-                  net.search.search(
-                      app_id="portal",
-                      query="algo",
-                  )
-                  net.search.search(
-                      app_id="portal",
-                      query="otro",
-                  )
-                  assert (
-                      net.search
-                      .search_log_count()
-                      == 2
-                  )
-                  assert (
-                      net.audit.verify() >= 2
+                      is False
                   )
                   net.telemetry.ingest_outbox(
                       net.outbox
@@ -811,21 +787,155 @@ jobs:
                   events = (
                       net.telemetry.query_events(
                           event_type=(
-                              "network.search"
-                              ".performed"
+                              "reputation.event"
+                              ".recorded"
                           )
                       )
                   )
-                  assert len(events) == 2
+                  assert len(events) >= 1
+              finally:
+                  net.close()
+
+
+          def test_self_rating_and_unknown_refused(
+              tmp_path: Path,
+          ) -> None:
+              net = _Net(tmp_path)
+              try:
+                  worker = net.person("worker")
+                  with pytest.raises(
+                      SelfReputationError
+                  ):
+                      net.reputation.record_event(
+                          subject_zid=worker,
+                          actor_zid=worker,
+                          kind="positive",
+                          evidence=b"self",
+                      )
+                  with pytest.raises(
+                      UnknownEntityError
+                  ):
+                      net.reputation.record_event(
+                          subject_zid=worker,
+                          actor_zid="ZID-ghost",
+                          kind="positive",
+                          evidence=b"e",
+                      )
+                  employer = net.person("employer")
+                  with pytest.raises(
+                      EmptyEvidenceError
+                  ):
+                      net.reputation.record_event(
+                          subject_zid=worker,
+                          actor_zid=employer,
+                          kind="positive",
+                          evidence=b"",
+                      )
+                  with pytest.raises(ValueError):
+                      net.reputation.record_event(
+                          subject_zid=worker,
+                          actor_zid=employer,
+                          kind="magical",
+                          evidence=b"e",
+                      )
+                  assert (
+                      net.reputation.summary(
+                          subject_zid=worker
+                      ).score
+                      == 0
+                  )
+              finally:
+                  net.close()
+
+
+          def test_mixed_signs_cancel(
+              tmp_path: Path,
+          ) -> None:
+              net = _Net(tmp_path)
+              try:
+                  a = net.person("a")
+                  b = net.person("b")
+                  c = net.person("c")
+                  worker = net.person("worker")
+                  net.reputation.record_event(
+                      subject_zid=worker,
+                      actor_zid=a,
+                      kind="positive",
+                      evidence=b"good-1",
+                  )
+                  net.reputation.record_event(
+                      subject_zid=worker,
+                      actor_zid=b,
+                      kind="positive",
+                      evidence=b"good-2",
+                  )
+                  net.reputation.record_event(
+                      subject_zid=worker,
+                      actor_zid=c,
+                      kind="negative",
+                      evidence=b"breach",
+                  )
+                  summary = (
+                      net.reputation.summary(
+                          subject_zid=worker
+                      )
+                  )
+                  assert summary.score == 10
+                  assert (
+                      summary.positive_events == 2
+                  )
+                  assert (
+                      summary.negative_events == 1
+                  )
+                  assert (
+                      summary.last_event_at
+                      is not None
+                  )
+              finally:
+                  net.close()
+
+
+          def test_decay_over_time(
+              tmp_path: Path,
+          ) -> None:
+              net = _Net(tmp_path)
+              try:
+                  employer = net.person("employer")
+                  worker = net.person("worker")
+                  net.reputation.record_event(
+                      subject_zid=worker,
+                      actor_zid=employer,
+                      kind="positive",
+                      evidence=b"fresh",
+                  )
+                  assert (
+                      net.reputation.score(
+                          subject_zid=worker
+                      )
+                      == 10
+                  )
+                  net.clock.advance(100)
+                  assert (
+                      net.reputation.score(
+                          subject_zid=worker
+                      )
+                      == 5
+                  )
+                  net.clock.advance(100)
+                  faded = net.reputation.score(
+                      subject_zid=worker
+                  )
+                  assert faded < 6
+                  assert faded >= 2
               finally:
                   net.close()
           PYEOF
-          echo "=== SEARCH TESTS READY ==="
+          echo "=== REPUTATION TESTS READY ==="
 
       - name: Quality gates (mypy first; full regression)
         run: |
           set -euo pipefail
-          M="shared_engines/common shared_engines/storage shared_engines/events shared_engines/observability shared_engines/audit shared_engines/security shared_engines/identity shared_engines/verification shared_engines/runtime shared_engines/tokenization shared_engines/currency shared_engines/verifier shared_engines/hardening shared_engines/authority shared_engines/network shared_engines/telemetry shared_engines/logs shared_engines/consensus shared_engines/integrity shared_engines/encryption shared_engines/certification shared_engines/search"
+          M="shared_engines/common shared_engines/storage shared_engines/events shared_engines/observability shared_engines/audit shared_engines/security shared_engines/identity shared_engines/verification shared_engines/runtime shared_engines/tokenization shared_engines/currency shared_engines/verifier shared_engines/hardening shared_engines/authority shared_engines/network shared_engines/telemetry shared_engines/logs shared_engines/consensus shared_engines/integrity shared_engines/encryption shared_engines/certification shared_engines/search shared_engines/reputation"
           python -m compileall -q $M main.py scripts shared_engines/tests
           echo "compile OK"
           find $M scripts -name '__pycache__' -type d -prune -exec rm -rf {} +
@@ -848,7 +958,7 @@ jobs:
           if git diff --cached --quiet; then
             echo "No changes."
           else
-            git commit -m "zyra: engine 5/17 search - transversal query layer over EXISTING tables, authorized apps only, audited+outbox per query with unique event id (repeated queries are distinct events), ranked, paginated via common Page; 4 proofs"
+            git commit -m "zyra: engine 6/17 reputation - evidence-backed scoring over IntegrityEngine (durable proof per event, verify_evidence), no self-rating, unknown entities refused, append-only per-subject ledger, deterministic decayed score (policy: weight * half-life), audited + outbox; separate from TokenLedger; 4 proofs"
             git push origin "HEAD:${{ github.ref_name }}"
           fi
-          echo "=== ENGINE SEARCH COMPLETE ==="
+          echo "=== ENGINE REPUTATION COMPLETE ==="

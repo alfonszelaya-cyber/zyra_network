@@ -1,4 +1,4 @@
-name: zyra-w11-engine-encryption
+name: zyra-w12-engine-certification
 
 "on":
   workflow_dispatch:
@@ -9,7 +9,7 @@ permissions:
   contents: write
 
 concurrency:
-  group: zyra-w11-${{ github.ref }}
+  group: zyra-w12-${{ github.ref }}
   cancel-in-progress: false
 
 jobs:
@@ -34,39 +34,15 @@ jobs:
       - name: Clean engine init (W391)
         run: |
           set -euo pipefail
-          f="shared_engines/encryption/__init__.py"
+          f="shared_engines/certification/__init__.py"
           [ -f "$f" ] && printf '"""ZYRA Network engine package."""\n' > "$f"
           echo "init cleaned"
 
-      - name: Fill encryption engine (integrates security/crypto)
+      - name: Fill certification engine (integration layer)
         run: |
           set -euo pipefail
-          cat > shared_engines/encryption/contracts.py <<'PYEOF'
-          """Encryption engine contracts."""
-          from __future__ import annotations
-
-          from dataclasses import dataclass
-
-
-          @dataclass(frozen=True)
-          class KeyRecord:
-              """One durable key-encryption-key."""
-
-              key_id: str
-              version: int
-              state: str
-              created_at: float
-              retired_at: float | None
-          PYEOF
-
-          cat > shared_engines/encryption/errors.py <<'PYEOF'
-          """Typed encryption-engine errors.
-
-          Cryptographic failures themselves surface as the
-          existing typed errors of security.crypto
-          (IntegrityError, ConfigurationError); this module
-          adds engine-level lifecycle errors only.
-          """
+          cat > shared_engines/certification/errors.py <<'PYEOF'
+          """Typed certification errors."""
           from __future__ import annotations
 
           from shared_engines.common.errors import (
@@ -74,38 +50,89 @@ jobs:
           )
 
 
-          class EncryptionError(EngineError):
-              """Base encryption-engine error."""
+          class IssuerNotRegisteredError(EngineError):
+              """Entity is not an accredited certifier."""
 
 
-          class KeyStateError(EncryptionError):
-              """Illegal key lifecycle operation."""
+          class ScopeNotAuthorizedError(EngineError):
+              """Issuer lacks authority for this scope."""
+
+
+          class CertificateNotFoundError(EngineError):
+              """Unknown certificate id."""
+
+
+          class CertificateExpiredError(EngineError):
+              """Certificate validity window has ended."""
+
+
+          class AlreadyRevokedError(EngineError):
+              """Certificate was already revoked."""
           PYEOF
 
-          cat > shared_engines/encryption/keyring.py <<'PYEOF'
-          """Durable keyring feeding EnvelopeCrypto.
+          cat > shared_engines/certification/contracts.py <<'PYEOF'
+          """Certification contracts."""
+          from __future__ import annotations
 
-          Closes the security persistence gap: keys survive
-          restarts in SQLite. Rotation retires the current
-          version and persists the next one atomically;
-          retired versions are KEPT, so data sealed under
-          them stays openable forever (history, never
-          rewritten).
+          from dataclasses import dataclass
+
+
+          @dataclass(frozen=True)
+          class IssuerRecord:
+              issuer_id: str
+              display_name: str
+              scopes: tuple[str, ...]
+              registered_at: float
+              active: bool
+
+
+          @dataclass(frozen=True)
+          class CertificateRecord:
+              certificate_id: str
+              subject_zid: str
+              issuer_id: str
+              scope: str
+              title: str
+              detail: str
+              evidence: tuple[str, ...]
+              credential_id: str
+              signature: bytes
+              public_pem: bytes
+              issued_at: float
+              valid_until: float | None
+              revoked: bool
+
+
+          @dataclass(frozen=True)
+          class CertificationVerdict:
+              """Evidence-backed certification answer."""
+
+              certificate_id: str
+              signature_valid: bool
+              within_validity: bool
+              issuer_authorized: bool
+              not_revoked: bool
+              valid: bool
+              credential_id: str
+              evidence: dict[str, object]
+          PYEOF
+
+          cat > shared_engines/certification/registry.py <<'PYEOF'
+          """Accredited certifier registry.
+
+          The missing layer: WHO may certify WHAT. An issuer
+          is a Network identity (ZID) formally accredited for
+          explicit certification scopes; issuing outside the
+          accredited scopes is impossible by construction.
           """
           from __future__ import annotations
 
-          import os
-          import sqlite3
-
           from shared_engines.common.clocks import Clock
-          from shared_engines.common.errors import (
-              NotFoundError,
+          from shared_engines.common.validation import (
+              require_non_empty_str,
           )
-          from shared_engines.encryption.contracts import (
-              KeyRecord,
-          )
-          from shared_engines.encryption.errors import (
-              KeyStateError,
+          from shared_engines.certification.contracts import (
+              IssuerRecord,
           )
           from shared_engines.storage.database import (
               Database,
@@ -115,489 +142,1337 @@ jobs:
               MigrationRunner,
           )
 
-          STATE_ACTIVE = "ACTIVE"
-          STATE_RETIRED = "RETIRED"
-          KEY_SIZE = 32
-
           _MIGRATIONS = (
               Migration(
                   1,
-                  "encryption_keys",
+                  "certification_issuers",
                   (
-                      "CREATE TABLE encryption_keys ("
-                      " key_id TEXT PRIMARY KEY,"
-                      " version INTEGER NOT NULL"
-                      " UNIQUE,"
-                      " key_bytes BLOB NOT NULL,"
-                      " state TEXT NOT NULL,"
-                      " created_at REAL NOT NULL,"
-                      " retired_at REAL)",
+                      "CREATE TABLE"
+                      " certification_issuers ("
+                      " issuer_id TEXT PRIMARY KEY,"
+                      " display_name TEXT NOT NULL,"
+                      " scopes TEXT NOT NULL,"
+                      " registered_at REAL NOT NULL,"
+                      " active INTEGER NOT NULL"
+                      " DEFAULT 1)",
                   ),
               ),
           )
 
 
-          class DurableKeyring:
-              """Persistent versioned KEK store."""
+          class IssuerRegistry:
+              """Durable accreditation of certifiers."""
 
               def __init__(
                   self,
                   db: Database,
                   clock: Clock,
-                  *,
-                  namespace: str = "default",
               ) -> None:
                   self._db = db
                   self._clock = clock
-                  self._ns = namespace
                   MigrationRunner(
                       db,
-                      f"encryption.{namespace}",
+                      "certification.issuers",
                       _MIGRATIONS,
                   ).run(clock)
-                  row = db.query_one(
-                      "SELECT 1 FROM"
-                      " encryption_keys LIMIT 1"
-                  )
-                  if row is None:
-                      self._create_version(1)
 
-              def _create_version(
-                  self, version: int
-              ) -> None:
-                  key_id = (
-                      f"kek-{self._ns}-v{version}"
+              def register_issuer(
+                  self,
+                  *,
+                  issuer_id: str,
+                  display_name: str,
+                  scopes: tuple[str, ...],
+              ) -> IssuerRecord:
+                  require_non_empty_str(
+                      issuer_id, "issuer_id"
                   )
+                  require_non_empty_str(
+                      display_name,
+                      "display_name",
+                  )
+                  clean: list[str] = []
+                  for scope in scopes:
+                      require_non_empty_str(
+                          scope, "scope"
+                      )
+                      if scope not in clean:
+                          clean.append(scope)
+                  if not clean:
+                      raise ValueError(
+                          "at least one scope"
+                          " required"
+                      )
+                  now = self._clock.now()
                   with (
                       self._db.transaction()
                       as cursor
                   ):
                       cursor.execute(
                           "INSERT INTO"
-                          " encryption_keys"
-                          " (key_id, version,"
-                          "  key_bytes, state,"
-                          "  created_at)"
-                          " VALUES (?, ?, ?, ?, ?)",
+                          " certification_issuers"
+                          " (issuer_id,"
+                          " display_name, scopes,"
+                          " registered_at, active)"
+                          " VALUES (?, ?, ?, ?, 1)"
+                          " ON CONFLICT(issuer_id)"
+                          " DO UPDATE SET"
+                          " display_name ="
+                          " excluded.display_name,"
+                          " scopes ="
+                          " excluded.scopes,"
+                          " active = 1",
                           (
-                              key_id,
-                              version,
-                              os.urandom(KEY_SIZE),
-                              STATE_ACTIVE,
-                              self._clock.now(),
+                              issuer_id,
+                              display_name,
+                              ",".join(clean),
+                              now,
                           ),
                       )
+                  return IssuerRecord(
+                      issuer_id=issuer_id,
+                      display_name=(
+                          display_name
+                      ),
+                      scopes=tuple(clean),
+                      registered_at=now,
+                      active=True,
+                  )
 
-              def load_keys(
-                  self,
-              ) -> dict[int, bytes]:
-                  """All versions (active + retired)
-                  for EnvelopeCrypto: old envelopes
-                  stay openable."""
-                  rows = self._db.query_all(
-                      "SELECT version, key_bytes"
-                      " FROM encryption_keys"
-                      " ORDER BY version"
+              def deactivate_issuer(
+                  self, issuer_id: str
+              ) -> None:
+                  require_non_empty_str(
+                      issuer_id, "issuer_id"
                   )
-                  return {
-                      int(r["version"]): bytes(
-                          r["key_bytes"]
-                      )
-                      for r in rows
-                  }
-
-              def current_version(self) -> int:
-                  row = self._db.query_one(
-                      "SELECT version FROM"
-                      " encryption_keys"
-                      " WHERE state = ?"
-                      " ORDER BY version DESC"
-                      " LIMIT 1",
-                      (STATE_ACTIVE,),
-                  )
-                  if row is None:
-                      raise NotFoundError(
-                          "no active key version"
-                      )
-                  return int(row["version"])
-
-              def rotate(self) -> int:
-                  """Persist next version; retire the
-                  current one. Returns new version."""
-                  current = (
-                      self.current_version()
-                  )
-                  nxt = current + 1
-                  existing = self._db.query_one(
-                      "SELECT 1 FROM"
-                      " encryption_keys"
-                      " WHERE version = ?",
-                      (nxt,),
-                  )
-                  if existing is not None:
-                      raise KeyStateError(
-                          f"version {nxt}"
-                          " already exists"
-                      )
                   with (
                       self._db.transaction()
                       as cursor
                   ):
                       cursor.execute(
-                          "UPDATE encryption_keys"
-                          " SET state = ?,"
-                          " retired_at = ?"
-                          " WHERE version = ?",
-                          (
-                              STATE_RETIRED,
-                              self._clock.now(),
-                              current,
-                          ),
+                          "UPDATE"
+                          " certification_issuers"
+                          " SET active = 0"
+                          " WHERE issuer_id = ?",
+                          (issuer_id,),
                       )
-                  self._create_version(nxt)
-                  return nxt
 
-              def history(
-                  self,
-              ) -> tuple[KeyRecord, ...]:
-                  rows = self._db.query_all(
+              def get_issuer(
+                  self, issuer_id: str
+              ) -> IssuerRecord | None:
+                  row = self._db.query_one(
                       "SELECT * FROM"
-                      " encryption_keys"
-                      " ORDER BY version"
+                      " certification_issuers"
+                      " WHERE issuer_id = ?",
+                      (issuer_id,),
                   )
-                  return tuple(
-                      KeyRecord(
-                          key_id=str(
-                              r["key_id"]
-                          ),
-                          version=int(
-                              r["version"]
-                          ),
-                          state=str(
-                              r["state"]
-                          ),
-                          created_at=float(
-                              r["created_at"]
-                          ),
-                          retired_at=(
-                              float(
-                                  r["retired_at"]
-                              )
-                              if r["retired_at"]
-                              is not None
-                              else None
-                          ),
-                      )
-                      for r in rows
+                  if row is None:
+                      return None
+                  return IssuerRecord(
+                      issuer_id=str(
+                          row["issuer_id"]
+                      ),
+                      display_name=str(
+                          row["display_name"]
+                      ),
+                      scopes=tuple(
+                          s
+                          for s in str(
+                              row["scopes"]
+                          ).split(",")
+                          if s
+                      ),
+                      registered_at=float(
+                          row["registered_at"]
+                      ),
+                      active=bool(
+                          int(row["active"])
+                      ),
                   )
 
-
-          def _unused_row_guard(
-              row: sqlite3.Row,
-          ) -> int:
-              return int(row["version"])
+              def has_scope(
+                  self,
+                  *,
+                  issuer_id: str,
+                  scope: str,
+              ) -> bool:
+                  issuer = self.get_issuer(
+                      issuer_id
+                  )
+                  if issuer is None:
+                      return False
+                  return (
+                      issuer.active
+                      and scope
+                      in issuer.scopes
+                  )
           PYEOF
 
-          cat > shared_engines/encryption/engine.py <<'PYEOF'
-          """Encryption engine: high-level facade over the
-          existing EnvelopeCrypto (security/crypto.py).
+          cat > shared_engines/certification/engine.py <<'PYEOF'
+          """Certification engine: the integration layer.
 
-          Adds what crypto.py intentionally lacks: durable
-          key persistence. The sealed format, AES-GCM
-          primitives, AAD binding and zyra.enc.v1 envelope
-          are REUSED, never duplicated. Rotation here is
-          durable: after a restart, every historical
-          version is still available and old envelopes
-          stay openable.
+          Composes EXISTING network capabilities into formal
+          certifications - never duplicating them:
+
+              IssuerRegistry   who may certify what (new)
+              IdentityEngine   subject + issuer exist (reuse)
+              CredentialRegistry  durable credential per
+                                 certificate, revocable
+                                 (reuse, type CERTIFICATION)
+              Ed25519Signer    network-notarized signature
+                               (reuse)
+
+          A certificate is a signed, durable, verifiable
+          statement bound to its underlying credential:
+
+              revoke certificate -> credential revoked too
+              verify -> signature + validity window +
+                        issuer accreditation, all checked
+
+          Complements protocol/certification (in-memory
+          contract) with durable, audited, network-level
+          certification.
           """
           from __future__ import annotations
 
+          import hashlib
+          import sqlite3
+          from dataclasses import dataclass
+
+          from shared_engines.audit.chain import AuditTrail
           from shared_engines.common.clocks import Clock
-          from shared_engines.encryption.contracts import (
-              KeyRecord,
+          from shared_engines.common.errors import (
+              NotFoundError,
           )
-          from shared_engines.encryption.keyring import (
-              DurableKeyring,
+          from shared_engines.common.identifiers import (
+              new_id,
           )
-          from shared_engines.security.crypto import (
-              EnvelopeCrypto,
+          from shared_engines.common.serialization import (
+              canonical_json_dumps,
+          )
+          from shared_engines.common.validation import (
+              require_non_empty_str,
+          )
+          from shared_engines.events.outbox import Outbox
+          from shared_engines.identity.engine import (
+              IdentityEngine,
+          )
+          from shared_engines.certification.contracts import (
+              CertificateRecord,
+              CertificationVerdict,
+          )
+          from shared_engines.certification.errors import (
+              AlreadyRevokedError,
+              CertificateNotFoundError,
+              IssuerNotRegisteredError,
+              ScopeNotAuthorizedError,
+          )
+          from shared_engines.certification.registry import (
+              IssuerRegistry,
           )
           from shared_engines.storage.database import (
               Database,
           )
+          from shared_engines.storage.migrations import (
+              Migration,
+              MigrationRunner,
+          )
+          from shared_engines.verification.credentials import (
+              CredentialRegistry,
+              CredentialType,
+          )
+          from shared_engines.verification.signatures import (
+              Ed25519Signer,
+              Ed25519Verifier,
+          )
+
+          EVENT_CERT_ISSUED = (
+              "certification.certificate.issued"
+          )
+          EVENT_CERT_REVOKED = (
+              "certification.certificate.revoked"
+          )
+
+          _MIGRATIONS = (
+              Migration(
+                  1,
+                  "certificates",
+                  (
+                      "CREATE TABLE certificates ("
+                      " certificate_id TEXT"
+                      " PRIMARY KEY,"
+                      " subject_zid TEXT NOT NULL,"
+                      " issuer_id TEXT NOT NULL,"
+                      " scope TEXT NOT NULL,"
+                      " title TEXT NOT NULL,"
+                      " detail TEXT NOT NULL,"
+                      " evidence_json TEXT"
+                      " NOT NULL,"
+                      " content_sha TEXT NOT NULL,"
+                      " credential_id TEXT"
+                      " NOT NULL,"
+                      " signature BLOB NOT NULL,"
+                      " public_pem BLOB NOT NULL,"
+                      " issued_at REAL NOT NULL,"
+                      " valid_until REAL,"
+                      " revoked INTEGER NOT NULL"
+                      " DEFAULT 0,"
+                      " revoked_at REAL,"
+                      " revoked_reason TEXT)",
+                      "CREATE INDEX certs_subject"
+                      " ON certificates"
+                      " (subject_zid)",
+                      "CREATE INDEX certs_scope"
+                      " ON certificates (scope)",
+                  ),
+              ),
+          )
 
 
-          class EncryptionEngine:
-              """Durable sealed storage via EnvelopeCrypto."""
+          @dataclass(frozen=True)
+          class _CertRow:
+              certificate_id: str
+              subject_zid: str
+              issuer_id: str
+              scope: str
+              title: str
+              detail: str
+              evidence: tuple[str, ...]
+              content_sha: str
+              credential_id: str
+              signature: bytes
+              public_pem: bytes
+              issued_at: float
+              valid_until: float | None
+              revoked: bool
+
+
+          def _content_sha(
+              *,
+              title: str,
+              detail: str,
+              evidence: tuple[str, ...],
+              issued_at: float,
+              valid_until: float | None,
+          ) -> str:
+              src = canonical_json_dumps(
+                  {
+                      "title": title,
+                      "detail": detail,
+                      "evidence": list(evidence),
+                      "issued_at": issued_at,
+                      "valid_until": valid_until,
+                  }
+              )
+              return hashlib.sha256(
+                  src.encode("utf-8")
+              ).hexdigest()
+
+
+          def _sig_payload(
+              *,
+              certificate_id: str,
+              subject_zid: str,
+              issuer_id: str,
+              scope: str,
+              content_sha: str,
+          ) -> bytes:
+              return (
+                  f"CERT:{certificate_id}:"
+                  f"{subject_zid}:{issuer_id}:"
+                  f"{scope}:{content_sha}"
+              ).encode("utf-8")
+
+
+          class CertificationEngine:
+              """Formal certifications over existing
+              engines."""
 
               def __init__(
                   self,
                   db: Database,
                   clock: Clock,
                   *,
-                  namespace: str = "default",
+                  issuers: IssuerRegistry,
+                  identity: IdentityEngine,
+                  credentials: CredentialRegistry,
+                  signer: Ed25519Signer,
+                  audit: AuditTrail,
+                  outbox: Outbox,
               ) -> None:
-                  self._keyring = DurableKeyring(
+                  self._db = db
+                  self._clock = clock
+                  self._issuers = issuers
+                  self._identity = identity
+                  self._credentials = (
+                      credentials
+                  )
+                  self._signer = signer
+                  self._audit = audit
+                  self._outbox = outbox
+                  self._public_pem = (
+                      signer.public_pem
+                  )
+                  MigrationRunner(
                       db,
-                      clock,
-                      namespace=namespace,
-                  )
-                  self._crypto = self._reload()
+                      "certification.certs",
+                      _MIGRATIONS,
+                  ).run(clock)
 
-              def _reload(self) -> EnvelopeCrypto:
-                  keys = (
-                      self._keyring.load_keys()
-                  )
-                  current = (
-                      self._keyring.current_version()
-                  )
-                  return EnvelopeCrypto(
-                      keys, current
-                  )
-
-              def seal(
+              def _emit(
                   self,
-                  data: bytes,
+                  cursor: sqlite3.Cursor,
                   *,
-                  aad: bytes = b"",
-              ) -> bytes:
-                  return self._crypto.seal(
-                      data, aad=aad
+                  event_type: str,
+                  aggregate: str,
+                  payload: dict[str, object],
+              ) -> None:
+                  event_id = hashlib.sha256(
+                      canonical_json_dumps(
+                          {
+                              "t": event_type,
+                              "a": aggregate,
+                              "p": payload,
+                              "ts": self._clock.now(),
+                          }
+                      ).encode("utf-8")
+                  ).hexdigest()[:32]
+                  fp = hashlib.sha256(
+                      canonical_json_dumps(
+                          {
+                              "id": event_id,
+                              "ty": event_type,
+                          }
+                      ).encode("utf-8")
+                  ).hexdigest()
+                  cursor.execute(
+                      "INSERT INTO events_outbox"
+                      " (event_id, event_type,"
+                      " aggregate_id, schema_version,"
+                      " envelope_version, created_at,"
+                      " payload, fingerprint,"
+                      " published_at)"
+                      " VALUES (?, ?, ?, 1, 1, ?, ?,"
+                      " ?, NULL)",
+                      (
+                          event_id,
+                          event_type,
+                          aggregate,
+                          self._clock.now(),
+                          canonical_json_dumps(
+                              payload
+                          ),
+                          fp,
+                      ),
                   )
 
-              def open(
+              def issue_certificate(
                   self,
-                  sealed: bytes,
                   *,
-                  aad: bytes = b"",
-              ) -> bytes:
-                  return self._crypto.open(
-                      sealed, aad=aad
+                  subject_zid: str,
+                  issuer_id: str,
+                  scope: str,
+                  title: str,
+                  detail: str,
+                  evidence: tuple[str, ...] = (),
+                  valid_until: float | None = None,
+              ) -> CertificateRecord:
+                  """Accredited issuer certifies a subject.
+
+                  Refuses unregistered issuers, unauthorized
+                  scopes, unknown subjects. Always creates the
+                  underlying durable credential (integration,
+                  not duplication).
+                  """
+                  require_non_empty_str(
+                      subject_zid, "subject_zid"
+                  )
+                  require_non_empty_str(
+                      issuer_id, "issuer_id"
+                  )
+                  require_non_empty_str(
+                      scope, "scope"
+                  )
+                  require_non_empty_str(
+                      title, "title"
+                  )
+                  issuer = (
+                      self._issuers.get_issuer(
+                          issuer_id
+                      )
+                  )
+                  if issuer is None:
+                      raise IssuerNotRegisteredError(
+                          "not an accredited"
+                          f" certifier: {issuer_id}"
+                      )
+                  if not issuer.active:
+                      raise IssuerNotRegisteredError(
+                          "certifier deactivated:"
+                          f" {issuer_id}"
+                      )
+                  if scope not in issuer.scopes:
+                      raise ScopeNotAuthorizedError(
+                          f"issuer {issuer_id} is"
+                          " not accredited for"
+                          f" scope '{scope}'"
+                      )
+                  self._identity.require_identity(
+                      subject_zid
+                  )
+                  self._identity.require_identity(
+                      issuer_id
+                  )
+                  now = self._clock.now()
+                  credential = (
+                      self._credentials.issue(
+                          subject_zid=subject_zid,
+                          issuer_zid=issuer_id,
+                          credential_type=(
+                              CredentialType
+                              .CERTIFICATION
+                          ),
+                          title=title,
+                          detail=detail,
+                          valid_from=now,
+                          valid_until=valid_until,
+                      )
+                  )
+                  certificate_id = (
+                      f"CRT-{new_id()}"
+                  )
+                  content_sha = _content_sha(
+                      title=title,
+                      detail=detail,
+                      evidence=evidence,
+                      issued_at=now,
+                      valid_until=valid_until,
+                  )
+                  signature = self._signer.sign(
+                      _sig_payload(
+                          certificate_id=(
+                              certificate_id
+                          ),
+                          subject_zid=subject_zid,
+                          issuer_id=issuer_id,
+                          scope=scope,
+                          content_sha=content_sha,
+                      )
+                  )
+                  with (
+                      self._db.transaction()
+                      as cursor
+                  ):
+                      cursor.execute(
+                          "INSERT INTO certificates"
+                          " (certificate_id,"
+                          " subject_zid, issuer_id,"
+                          " scope, title, detail,"
+                          " evidence_json,"
+                          " content_sha,"
+                          " credential_id,"
+                          " signature, public_pem,"
+                          " issued_at, valid_until)"
+                          " VALUES (?, ?, ?, ?, ?, ?,"
+                          " ?, ?, ?, ?, ?, ?, ?)",
+                          (
+                              certificate_id,
+                              subject_zid,
+                              issuer_id,
+                              scope,
+                              title,
+                              detail,
+                              canonical_json_dumps(
+                                  list(evidence)
+                              ),
+                              content_sha,
+                              credential.credential_id,
+                              signature,
+                              self._public_pem,
+                              now,
+                              valid_until,
+                          ),
+                      )
+                      self._emit(
+                          cursor,
+                          event_type=(
+                              EVENT_CERT_ISSUED
+                          ),
+                          aggregate=(
+                              certificate_id
+                          ),
+                          payload={
+                              "subject": (
+                                  subject_zid
+                              ),
+                              "issuer": issuer_id,
+                              "scope": scope,
+                          },
+                      )
+                  self._audit.append(
+                      event_type=EVENT_CERT_ISSUED,
+                      actor=issuer_id,
+                      subject=certificate_id,
+                      payload={
+                          "subject": subject_zid,
+                          "scope": scope,
+                      },
+                  )
+                  return self.require_certificate(
+                      certificate_id
                   )
 
-              def reseal(
+              def _row_to_record(
+                  self, row: sqlite3.Row
+              ) -> CertificateRecord:
+                  import json
+
+                  raw_ev = row["evidence_json"]
+                  parsed = json.loads(str(raw_ev))
+                  ev_list = (
+                      [str(e) for e in parsed]
+                      if isinstance(parsed, list)
+                      else []
+                  )
+                  revoked_at = row["revoked_at"]
+                  _ = revoked_at
+                  return CertificateRecord(
+                      certificate_id=str(
+                          row["certificate_id"]
+                      ),
+                      subject_zid=str(
+                          row["subject_zid"]
+                      ),
+                      issuer_id=str(
+                          row["issuer_id"]
+                      ),
+                      scope=str(row["scope"]),
+                      title=str(row["title"]),
+                      detail=str(
+                          row["detail"]
+                      ),
+                      evidence=tuple(ev_list),
+                      credential_id=str(
+                          row["credential_id"]
+                      ),
+                      signature=bytes(
+                          row["signature"]
+                      ),
+                      public_pem=bytes(
+                          row["public_pem"]
+                      ),
+                      issued_at=float(
+                          row["issued_at"]
+                      ),
+                      valid_until=(
+                          float(
+                              row["valid_until"]
+                          )
+                          if row["valid_until"]
+                          is not None
+                          else None
+                      ),
+                      revoked=bool(
+                          int(row["revoked"])
+                      ),
+                  )
+
+              def get_certificate(
                   self,
-                  sealed: bytes,
                   *,
-                  aad: bytes = b"",
-              ) -> bytes:
-                  return self._crypto.reseal(
-                      sealed, aad=aad
+                  certificate_id: str,
+              ) -> CertificateRecord | None:
+                  row = self._db.query_one(
+                      "SELECT * FROM certificates"
+                      " WHERE certificate_id = ?",
+                      (certificate_id,),
+                  )
+                  if row is None:
+                      return None
+                  return self._row_to_record(
+                      row
                   )
 
-              def inspect_key_version(
-                  self, sealed: bytes
-              ) -> int:
+              def require_certificate(
+                  self,
+                  *,
+                  certificate_id: str,
+              ) -> CertificateRecord:
+                  record = self.get_certificate(
+                      certificate_id=(
+                          certificate_id
+                      )
+                  )
+                  if record is None:
+                      raise (
+                          CertificateNotFoundError(
+                              "unknown certificate:"
+                              f" {certificate_id}"
+                          )
+                      )
+                  return record
+
+              def verify_certificate(
+                  self,
+                  *,
+                  certificate_id: str,
+              ) -> CertificationVerdict:
+                  """Full evidence-backed check:
+                  signature, validity window, issuer
+                  accreditation, revocation."""
+                  row = self._db.query_one(
+                      "SELECT * FROM certificates"
+                      " WHERE certificate_id = ?",
+                      (certificate_id,),
+                  )
+                  if row is None:
+                      raise NotFoundError(
+                          "unknown certificate:"
+                          f" {certificate_id}"
+                      )
+                  record = self._row_to_record(
+                      row
+                  )
+                  content_sha = _content_sha(
+                      title=record.title,
+                      detail=record.detail,
+                      evidence=record.evidence,
+                      issued_at=(
+                          record.issued_at
+                      ),
+                      valid_until=(
+                          record.valid_until
+                      ),
+                  )
+                  verifier = Ed25519Verifier(
+                      record.public_pem
+                  )
+                  signature_valid = (
+                      verifier.verify(
+                          _sig_payload(
+                              certificate_id=(
+                                  certificate_id
+                              ),
+                              subject_zid=(
+                                  record.subject_zid
+                              ),
+                              issuer_id=(
+                                  record.issuer_id
+                              ),
+                              scope=record.scope,
+                              content_sha=(
+                                  content_sha
+                              ),
+                          ),
+                          record.signature,
+                      )
+                  )
+                  now = self._clock.now()
+                  within = (
+                      record.valid_until is None
+                      or now <= record.valid_until
+                  )
+                  authorized = (
+                      self._issuers.has_scope(
+                          issuer_id=(
+                              record.issuer_id
+                          ),
+                          scope=record.scope,
+                      )
+                  )
+                  not_revoked = (
+                      not record.revoked
+                  )
+                  valid = (
+                      signature_valid
+                      and within
+                      and authorized
+                      and not_revoked
+                  )
+                  return CertificationVerdict(
+                      certificate_id=(
+                          certificate_id
+                      ),
+                      signature_valid=(
+                          signature_valid
+                      ),
+                      within_validity=within,
+                      issuer_authorized=(
+                          authorized
+                      ),
+                      not_revoked=not_revoked,
+                      valid=valid,
+                      credential_id=(
+                          record.credential_id
+                      ),
+                      evidence={
+                          "subject": (
+                              record.subject_zid
+                          ),
+                          "issuer": (
+                              record.issuer_id
+                          ),
+                          "scope": record.scope,
+                          "issued_at": (
+                              record.issued_at
+                          ),
+                          "valid_until": (
+                              record.valid_until
+                          ),
+                      },
+                  )
+
+              def revoke_certificate(
+                  self,
+                  *,
+                  certificate_id: str,
+                  revoked_by: str,
+                  reason: str,
+              ) -> CertificateRecord:
+                  """Revoke the certificate AND its
+                  underlying credential (cascade)."""
+                  record = (
+                      self.require_certificate(
+                          certificate_id=(
+                              certificate_id
+                          )
+                      )
+                  )
+                  if record.revoked:
+                      raise AlreadyRevokedError(
+                          "already revoked:"
+                          f" {certificate_id}"
+                      )
+                  now = self._clock.now()
+                  with (
+                      self._db.transaction()
+                      as cursor
+                  ):
+                      cursor.execute(
+                          "UPDATE certificates"
+                          " SET revoked = 1,"
+                          " revoked_at = ?,"
+                          " revoked_reason = ?"
+                          " WHERE certificate_id"
+                          " = ?",
+                          (
+                              now,
+                              reason,
+                              certificate_id,
+                          ),
+                      )
+                      self._emit(
+                          cursor,
+                          event_type=(
+                              EVENT_CERT_REVOKED
+                          ),
+                          aggregate=(
+                              certificate_id
+                          ),
+                          payload={
+                              "reason": reason
+                          },
+                      )
+                  self._credentials.revoke(
+                      record.credential_id,
+                      revoked_by=revoked_by,
+                      reason=reason,
+                  )
+                  self._audit.append(
+                      event_type=(
+                          EVENT_CERT_REVOKED
+                      ),
+                      actor=revoked_by,
+                      subject=certificate_id,
+                      payload={"reason": reason},
+                  )
                   return (
-                      self._crypto.inspect_key_version(
-                          sealed
+                      self.require_certificate(
+                          certificate_id=(
+                              certificate_id
+                          )
                       )
                   )
 
-              def rotate(self) -> int:
-                  """Durable rotation; survives
-                  restarts."""
-                  version = (
-                      self._keyring.rotate()
+              def list_by_subject(
+                  self, *, subject_zid: str
+              ) -> tuple[CertificateRecord, ...]:
+                  rows = self._db.query_all(
+                      "SELECT * FROM certificates"
+                      " WHERE subject_zid = ?"
+                      " ORDER BY issued_at",
+                      (subject_zid,),
                   )
-                  self._crypto = self._reload()
-                  return version
+                  return tuple(
+                      self._row_to_record(row)
+                      for row in rows
+                  )
 
-              def key_history(
-                  self,
-              ) -> tuple[KeyRecord, ...]:
-                  return (
-                      self._keyring.history()
+              def list_by_scope(
+                  self, *, scope: str
+              ) -> tuple[CertificateRecord, ...]:
+                  rows = self._db.query_all(
+                      "SELECT * FROM certificates"
+                      " WHERE scope = ?"
+                      " ORDER BY issued_at",
+                      (scope,),
+                  )
+                  return tuple(
+                      self._row_to_record(row)
+                      for row in rows
                   )
           PYEOF
-          echo "=== ENCRYPTION ENGINE READY (integrated) ==="
+          echo "=== CERTIFICATION ENGINE READY (integrated) ==="
 
-      - name: Encryption proofs (4)
+      - name: Certification proofs (4)
         run: |
           set -euo pipefail
-          mkdir -p shared_engines/encryption/tests
-          cat > shared_engines/encryption/tests/test_encryption.py <<'PYEOF'
-          """Encryption engine proofs: zyra.enc.v1 reuse,
-          AAD binding, tamper detection via existing typed
-          error, and DURABLE rotation across restarts."""
+          mkdir -p shared_engines/certification/tests
+          cat > shared_engines/certification/tests/test_certification.py <<'PYEOF'
+          """Certification proofs: accredited issuance with
+          underlying credential, scope enforcement, expiry,
+          cascade revocation."""
           from __future__ import annotations
 
           from pathlib import Path
 
           import pytest
 
+          from shared_engines.audit.chain import AuditTrail
           from shared_engines.common.clocks import (
               FrozenClock,
           )
-          from shared_engines.common.errors import (
-              IntegrityError,
+          from shared_engines.events.contracts import (
+              EventCatalog,
           )
-          from shared_engines.encryption.engine import (
-              EncryptionEngine,
+          from shared_engines.events.outbox import Outbox
+          from shared_engines.identity.contracts import (
+              IdentityKind,
+          )
+          from shared_engines.identity.engine import (
+              IdentityEngine,
+          )
+          from shared_engines.certification.engine import (
+              CertificationEngine,
+          )
+          from shared_engines.certification.errors import (
+              IssuerNotRegisteredError,
+              ScopeNotAuthorizedError,
+          )
+          from shared_engines.certification.registry import (
+              IssuerRegistry,
           )
           from shared_engines.storage.database import (
               SQLiteAdapter,
           )
-
-          _FORMAT = b"zyra.enc.v1"
-
-
-          def _db(
-              tmp_path: Path, name: str
-          ) -> SQLiteAdapter:
-              return SQLiteAdapter(
-                  tmp_path / f"{name}.db"
-              )
+          from shared_engines.verification.credentials import (
+              CredentialRegistry,
+          )
+          from shared_engines.verification.signatures import (
+              Ed25519Signer,
+          )
 
 
-          def test_seal_uses_existing_format(
+          class _Net:
+              def __init__(
+                  self, tmp_path: Path
+              ) -> None:
+                  self.db = SQLiteAdapter(
+                      tmp_path / "net.db"
+                  )
+                  self.clock = FrozenClock()
+                  self.audit = AuditTrail(
+                      self.db, self.clock
+                  )
+                  self.outbox = Outbox(
+                      self.db, self.clock
+                  )
+                  self.outbox.ensure_schema()
+                  self.catalog = EventCatalog()
+                  for et in (
+                      "identity.registered",
+                      "identity.status_changed",
+                      "verification.credential"
+                      ".issued",
+                      "verification.credential"
+                      ".revoked",
+                      "certification.certificate"
+                      ".issued",
+                      "certification.certificate"
+                      ".revoked",
+                  ):
+                      self.catalog.register(et)
+                  self.identity = IdentityEngine(
+                      db=self.db,
+                      clock=self.clock,
+                      audit=self.audit,
+                      outbox=self.outbox,
+                      catalog=self.catalog,
+                  )
+                  self.credentials = (
+                      CredentialRegistry(
+                          self.db,
+                          self.clock,
+                          self.audit,
+                          self.outbox,
+                          self.catalog,
+                      )
+                  )
+                  self.issuers = IssuerRegistry(
+                      self.db, self.clock
+                  )
+                  signer, _ = (
+                      Ed25519Signer.generate()
+                  )
+                  self.certification = (
+                      CertificationEngine(
+                          self.db,
+                          self.clock,
+                          issuers=self.issuers,
+                          identity=self.identity,
+                          credentials=(
+                              self.credentials
+                          ),
+                          signer=signer,
+                          audit=self.audit,
+                          outbox=self.outbox,
+                      )
+                  )
+
+              def close(self) -> None:
+                  self.db.close()
+
+
+          def test_accredited_issue_and_verify(
               tmp_path: Path,
           ) -> None:
-              db = _db(tmp_path, "a")
+              net = _Net(tmp_path)
               try:
-                  engine = EncryptionEngine(
-                      db, FrozenClock()
+                  uni = (
+                      net.identity.register_identity(
+                          kind=(
+                              IdentityKind
+                              .INSTITUTION
+                          ),
+                          display_name="Uni SV",
+                          actor="bootstrap",
+                      )
                   )
-                  sealed = engine.seal(
-                      b"expediente confidencial"
+                  student = (
+                      net.identity.register_identity(
+                          kind=(
+                              IdentityKind.PERSON
+                          ),
+                          display_name="maria",
+                          actor="bootstrap",
+                      )
                   )
-                  assert (
-                      _FORMAT in sealed
+                  net.issuers.register_issuer(
+                      issuer_id=uni.zid,
+                      display_name="Uni SV",
+                      scopes=(
+                          "education",
+                          "professional",
+                      ),
                   )
-                  assert (
-                      engine.open(sealed)
-                      == (
-                          b"expediente"
-                          b" confidencial"
+                  cert = (
+                      net.certification
+                      .issue_certificate(
+                          subject_zid=student.zid,
+                          issuer_id=uni.zid,
+                          scope="education",
+                          title=(
+                              "Ingenieria en"
+                              " Informatica"
+                          ),
+                          detail=(
+                              "Titulo registrado"
+                          ),
+                          evidence=(
+                              "doc-123",
+                              "record-456",
+                          ),
                       )
                   )
                   assert (
-                      engine.inspect_key_version(
-                          sealed
+                      cert.credential_id
+                      != ""
+                  )
+                  underlying = (
+                      net.credentials.get(
+                          cert.credential_id
                       )
-                      == 1
+                  )
+                  assert underlying is not None
+                  assert (
+                      underlying.revoked is False
+                  )
+                  verdict = (
+                      net.certification
+                      .verify_certificate(
+                          certificate_id=(
+                              cert.certificate_id
+                          )
+                      )
+                  )
+                  assert verdict.valid is True
+                  assert (
+                      verdict.signature_valid
+                      is True
+                  )
+                  assert (
+                      verdict.issuer_authorized
+                      is True
+                  )
+                  assert (
+                      verdict.credential_id
+                      == cert.credential_id
                   )
               finally:
-                  db.close()
+                  net.close()
 
 
-          def test_aad_binding_and_tamper(
+          def test_unaccredited_or_scope_denied(
               tmp_path: Path,
           ) -> None:
-              db = _db(tmp_path, "b")
+              net = _Net(tmp_path)
               try:
-                  engine = EncryptionEngine(
-                      db, FrozenClock()
-                  )
-                  sealed = engine.seal(
-                      b"data",
-                      aad=b"record-42",
-                  )
-                  assert (
-                      engine.open(
-                          sealed,
-                          aad=b"record-42",
+                  stranger = (
+                      net.identity.register_identity(
+                          kind=(
+                              IdentityKind.PERSON
+                          ),
+                          display_name="x",
+                          actor="bootstrap",
                       )
-                      == b"data"
+                  )
+                  target = (
+                      net.identity.register_identity(
+                          kind=(
+                              IdentityKind.PERSON
+                          ),
+                          display_name="y",
+                          actor="bootstrap",
+                      )
                   )
                   with pytest.raises(
-                      IntegrityError
+                      IssuerNotRegisteredError
                   ):
-                      engine.open(sealed)
-                  tampered = bytearray(sealed)
-                  tampered[-3] ^= 0xFF
+                      net.certification.issue_certificate(
+                          subject_zid=target.zid,
+                          issuer_id=stranger.zid,
+                          scope="education",
+                          title="fake",
+                          detail="fake",
+                      )
+                  uni = (
+                      net.identity.register_identity(
+                          kind=(
+                              IdentityKind
+                              .INSTITUTION
+                          ),
+                          display_name="Uni",
+                          actor="bootstrap",
+                      )
+                  )
+                  net.issuers.register_issuer(
+                      issuer_id=uni.zid,
+                      display_name="Uni",
+                      scopes=("education",),
+                  )
                   with pytest.raises(
-                      IntegrityError
+                      ScopeNotAuthorizedError
                   ):
-                      engine.open(
-                          bytes(tampered),
-                          aad=b"record-42",
+                      net.certification.issue_certificate(
+                          subject_zid=target.zid,
+                          issuer_id=uni.zid,
+                          scope="medical",
+                          title="fake",
+                          detail="fake",
                       )
               finally:
-                  db.close()
+                  net.close()
 
 
-          def test_rotation_is_durable_across_restart(
+          def test_expired_certificate_invalid(
               tmp_path: Path,
           ) -> None:
-              db = _db(tmp_path, "c")
+              net = _Net(tmp_path)
               try:
-                  clock = FrozenClock()
-                  engine = EncryptionEngine(
-                      db, clock
-                  )
-                  old = engine.seal(b"v1 secret")
-                  assert (
-                      engine.inspect_key_version(
-                          old
+                  uni = (
+                      net.identity.register_identity(
+                          kind=(
+                              IdentityKind
+                              .INSTITUTION
+                          ),
+                          display_name="Board",
+                          actor="bootstrap",
                       )
-                      == 1
                   )
-                  new_version = engine.rotate()
-                  assert new_version == 2
-                  new = engine.seal(b"v2 secret")
-                  assert (
-                      engine.inspect_key_version(
-                          new
+                  pro = (
+                      net.identity.register_identity(
+                          kind=(
+                              IdentityKind.PERSON
+                          ),
+                          display_name="pro",
+                          actor="bootstrap",
                       )
-                      == 2
                   )
-                  # RESTART: fresh engine, same DB
-                  engine2 = EncryptionEngine(
-                      db, FrozenClock()
+                  net.issuers.register_issuer(
+                      issuer_id=uni.zid,
+                      display_name="Board",
+                      scopes=(
+                          "professional",
+                      ),
                   )
-                  assert (
-                      engine2.open(old)
-                      == b"v1 secret"
-                  )
-                  assert (
-                      engine2.open(new)
-                      == b"v2 secret"
-                  )
-                  states = [
-                      (r.version, r.state)
-                      for r in (
-                          engine2.key_history()
+                  cert = (
+                      net.certification
+                      .issue_certificate(
+                          subject_zid=pro.zid,
+                          issuer_id=uni.zid,
+                          scope="professional",
+                          title="Licencia",
+                          detail="2026",
+                          valid_until=(
+                              net.clock.now()
+                              + 10.0
+                          ),
                       )
-                  ]
-                  assert states == [
-                      (1, "RETIRED"),
-                      (2, "ACTIVE"),
-                  ]
+                  )
+                  early = (
+                      net.certification
+                      .verify_certificate(
+                          certificate_id=(
+                              cert.certificate_id
+                          )
+                      )
+                  )
+                  assert (
+                      early.within_validity
+                      is True
+                  )
+                  assert early.valid is True
+                  net.clock.advance(11)
+                  late = (
+                      net.certification
+                      .verify_certificate(
+                          certificate_id=(
+                              cert.certificate_id
+                          )
+                      )
+                  )
+                  assert (
+                      late.within_validity
+                      is False
+                  )
+                  assert (
+                      late.valid is False
+                  )
               finally:
-                  db.close()
+                  net.close()
 
 
-          def test_reseal_upgrades_version(
+          def test_revoke_cascades_to_credential(
               tmp_path: Path,
           ) -> None:
-              db = _db(tmp_path, "d")
+              net = _Net(tmp_path)
               try:
-                  engine = EncryptionEngine(
-                      db, FrozenClock()
-                  )
-                  v1 = engine.seal(b"legacy")
-                  engine.rotate()
-                  upgraded = engine.reseal(v1)
-                  assert (
-                      engine.inspect_key_version(
-                          upgraded
+                  uni = (
+                      net.identity.register_identity(
+                          kind=(
+                              IdentityKind
+                              .INSTITUTION
+                          ),
+                          display_name="Uni",
+                          actor="bootstrap",
                       )
-                      == 2
+                  )
+                  grad = (
+                      net.identity.register_identity(
+                          kind=(
+                              IdentityKind.PERSON
+                          ),
+                          display_name="g",
+                          actor="bootstrap",
+                      )
+                  )
+                  net.issuers.register_issuer(
+                      issuer_id=uni.zid,
+                      display_name="Uni",
+                      scopes=("education",),
+                  )
+                  cert = (
+                      net.certification
+                      .issue_certificate(
+                          subject_zid=grad.zid,
+                          issuer_id=uni.zid,
+                          scope="education",
+                          title="Diploma",
+                          detail="ok",
+                      )
+                  )
+                  before = (
+                      net.certification
+                      .verify_certificate(
+                          certificate_id=(
+                              cert.certificate_id
+                          )
+                      )
+                  )
+                  assert before.valid is True
+                  revoked = (
+                      net.certification
+                      .revoke_certificate(
+                          certificate_id=(
+                              cert.certificate_id
+                          ),
+                          revoked_by=uni.zid,
+                          reason="fraud detected",
+                      )
                   )
                   assert (
-                      engine.open(upgraded)
-                      == b"legacy"
+                      revoked.revoked is True
                   )
+                  after = (
+                      net.certification
+                      .verify_certificate(
+                          certificate_id=(
+                              cert.certificate_id
+                          )
+                      )
+                  )
+                  assert (
+                      after.valid is False
+                  )
+                  assert (
+                      after.not_revoked
+                      is False
+                  )
+                  underlying = (
+                      net.credentials.get(
+                          cert.credential_id
+                      )
+                  )
+                  assert underlying is not None
+                  assert (
+                      underlying.revoked is True
+                  )
+                  with pytest.raises(Exception):
+                      net.certification.revoke_certificate(
+                          certificate_id=(
+                              cert.certificate_id
+                          ),
+                          revoked_by=uni.zid,
+                          reason="again",
+                      )
               finally:
-                  db.close()
+                  net.close()
           PYEOF
-          echo "=== ENCRYPTION TESTS READY ==="
+          echo "=== CERTIFICATION TESTS READY ==="
 
       - name: Quality gates (mypy first; full regression)
         run: |
           set -euo pipefail
-          M="shared_engines/common shared_engines/storage shared_engines/events shared_engines/observability shared_engines/audit shared_engines/security shared_engines/identity shared_engines/verification shared_engines/runtime shared_engines/tokenization shared_engines/currency shared_engines/verifier shared_engines/hardening shared_engines/authority shared_engines/network shared_engines/telemetry shared_engines/logs shared_engines/consensus shared_engines/integrity shared_engines/encryption"
+          M="shared_engines/common shared_engines/storage shared_engines/events shared_engines/observability shared_engines/audit shared_engines/security shared_engines/identity shared_engines/verification shared_engines/runtime shared_engines/tokenization shared_engines/currency shared_engines/verifier shared_engines/hardening shared_engines/authority shared_engines/network shared_engines/telemetry shared_engines/logs shared_engines/consensus shared_engines/integrity shared_engines/encryption shared_engines/certification"
           python -m compileall -q $M main.py scripts shared_engines/tests
           echo "compile OK"
           find $M scripts -name '__pycache__' -type d -prune -exec rm -rf {} +
@@ -620,7 +1495,7 @@ jobs:
           if git diff --cached --quiet; then
             echo "No changes."
           else
-            git commit -m "zyra: engine 3/17 encryption - INTEGRATES security/crypto EnvelopeCrypto (zyra.enc.v1 reused, zero duplication); adds DurableKeyring closing the key-persistence gap (rotation survives restarts, retired versions kept, reseal upgrade); 4 proofs"
+            git commit -m "zyra: engine 4/17 certification - INTEGRATION layer over existing engines (IssuerRegistry accreditation+scopes new; IdentityEngine+CredentialRegistry+Ed25519 reused): accredited issuance with durable underlying credential, Ed25519-notarized certificates, validity window, cascade revocation; 4 proofs"
             git push origin "HEAD:${{ github.ref_name }}"
           fi
-          echo "=== ENGINE ENCRYPTION COMPLETE ==="
+          echo "=== ENGINE CERTIFICATION COMPLETE ==="

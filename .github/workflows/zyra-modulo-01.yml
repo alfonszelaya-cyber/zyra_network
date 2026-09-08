@@ -1,4 +1,4 @@
-name: zyra-w3-outbox-part2
+name: zyra-w4-replication-real
 
 "on":
   workflow_dispatch:
@@ -9,7 +9,7 @@ permissions:
   contents: write
 
 concurrency:
-  group: zyra-w3p2-${{ github.ref }}
+  group: zyra-w4-${{ github.ref }}
   cancel-in-progress: false
 
 jobs:
@@ -31,102 +31,76 @@ jobs:
           python -m pip install --upgrade pip
           python -m pip install "cryptography>=42,<45" "flake8>=7,<8" "mypy>=1.10,<2" "pytest>=8,<9"
 
-      - name: Write outbox.py (claim/lease/fencing/dead-letter)
+      - name: Write replication.py (physical transfer, legacy kept)
         run: |
           set -euo pipefail
-          cat > shared_engines/events/outbox.py <<'PYEOF'
-          """Transactional outbox with at-least-once dispatch.
+          cat > shared_engines/network/replication.py <<'PYEOF'
+          """Hash-verified state replication between nodes.
 
-          Concurrency: PENDING -> CLAIMED -> DISPATCHED, with
-          retry/backoff, dead-letter and lease reaping. A claim
-          holds a lease (owner + expiration) and a fencing
-          token; stale workers get ``LeaseLost``. The legacy
-          single-worker path (``pending`` +
-          ``dispatch_pending``) is preserved.
+          Two layers:
+
+          1. Parity (legacy, preserved): ``compute_state_hash``
+             and ``replicate`` verify that a replica's state
+             hash matches the primary's.
+          2. Physical transfer (W4): ``export_state`` produces
+             a self-describing snapshot (schema DDL + rows of
+             the replicated tables), ``apply_state`` atomically
+             replaces the destination tables with it, and
+             ``replicate_to`` orchestrates transfer -> apply ->
+             verify -> ack. Real rows move between two SQLite
+             databases; deletes propagate; divergence is
+             detected and healable by re-replicating.
           """
           from __future__ import annotations
 
-          import sqlite3
-          from collections.abc import Callable
+          import json
           from dataclasses import dataclass
 
           from shared_engines.common.clocks import Clock
-          from shared_engines.common.errors import LeaseLost
-          from shared_engines.common.serialization import (
-              canonical_json_dumps,
-              canonical_json_loads,
+          from shared_engines.common.identifiers import (
+              stable_hash,
           )
-          from shared_engines.events.contracts import Event
+          from shared_engines.common.validation import (
+              require_non_empty_str,
+          )
+          from shared_engines.network.errors import (
+              ReplicationMismatchError,
+          )
           from shared_engines.storage.database import (
               Database,
           )
-          from shared_engines.storage.migrations import (
-              Migration,
-              MigrationRunner,
-          )
 
-          MIGRATIONS = (
-              Migration(
-                  1,
-                  "events_outbox",
-                  (
-                      "CREATE TABLE events_outbox ("
-                      " event_id TEXT PRIMARY KEY,"
-                      " event_type TEXT NOT NULL,"
-                      " aggregate_id TEXT NOT NULL,"
-                      " schema_version INTEGER NOT NULL,"
-                      " envelope_version INTEGER NOT NULL,"
-                      " created_at REAL NOT NULL,"
-                      " payload TEXT NOT NULL,"
-                      " fingerprint TEXT NOT NULL,"
-                      " published_at REAL)",
-                      "CREATE INDEX events_outbox_pending"
-                      " ON events_outbox (published_at,"
-                      " created_at)",
-                  ),
-              ),
-              Migration(
-                  2,
-                  "events_outbox_concurrency",
-                  (
-                      "ALTER TABLE events_outbox"
-                      " ADD COLUMN state TEXT"
-                      " NOT NULL DEFAULT 'PENDING'",
-                      "ALTER TABLE events_outbox"
-                      " ADD COLUMN lease_owner TEXT",
-                      "ALTER TABLE events_outbox"
-                      " ADD COLUMN lease_expires_at REAL",
-                      "ALTER TABLE events_outbox"
-                      " ADD COLUMN attempts INTEGER"
-                      " NOT NULL DEFAULT 0",
-                      "ALTER TABLE events_outbox"
-                      " ADD COLUMN next_retry_at REAL",
-                      "ALTER TABLE events_outbox"
-                      " ADD COLUMN last_error TEXT",
-                      "CREATE INDEX events_outbox_state"
-                      " ON events_outbox (state,"
-                      " next_retry_at)",
-                  ),
-              ),
+          REPLICATED_TABLES = (
+              "identities",
+              "cluster_nodes",
           )
-
-          STATE_PENDING = "PENDING"
-          STATE_CLAIMED = "CLAIMED"
-          STATE_DISPATCHED = "DISPATCHED"
-          STATE_DEAD = "DEAD"
 
 
           @dataclass(frozen=True)
-          class OutboxClaim:
-              """A leased event plus its fencing token."""
+          class ReplicationReport:
+              primary_node: str
+              replica_node: str
+              state_version: int
+              state_hash: str
+              consistent: bool
+              rows_replicated: int
 
-              event: Event
-              fencing_token: int
+
+          @dataclass(frozen=True)
+          class StateSnapshot:
+              """Self-describing transferable state."""
+
+              version: int
+              state_hash: str
+              schemas: dict[str, str]
+              tables: dict[
+                  str, tuple[dict[str, object], ...]
+              ]
 
 
-          class Outbox:
-              """Persists events atomically with the state
-              producing them."""
+          class ReplicationManager:
+              """Computes hashes, verifies parity and now also
+              physically transfers state to replicas."""
 
               def __init__(
                   self, db: Database, clock: Clock
@@ -134,661 +108,464 @@ jobs:
                   self._db = db
                   self._clock = clock
 
-              def ensure_schema(self) -> None:
-                  MigrationRunner(
-                      self._db,
-                      "events.outbox",
-                      MIGRATIONS,
-                  ).run(self._clock)
-
-              def enqueue_in_transaction(
-                  self, cursor: sqlite3.Cursor, event: Event
-              ) -> None:
-                  cursor.execute(
-                      "INSERT INTO events_outbox"
-                      " (event_id, event_type,"
-                      " aggregate_id, schema_version,"
-                      " envelope_version, created_at,"
-                      " payload, fingerprint,"
-                      " published_at)"
-                      " VALUES (?, ?, ?, ?, ?, ?, ?, ?,"
-                      " NULL)",
-                      (
-                          event.event_id,
-                          event.event_type,
-                          event.aggregate_id,
-                          event.schema_version,
-                          event.envelope_version,
-                          event.timestamp,
-                          canonical_json_dumps(
-                              dict(event.payload)
-                          ),
-                          event.fingerprint,
-                      ),
-                  )
-
-              def enqueue(self, event: Event) -> None:
-                  with self._db.transaction() as cursor:
-                      self.enqueue_in_transaction(
-                          cursor, event
-                      )
-
-              def pending(
-                  self, limit: int = 100
-              ) -> tuple[Event, ...]:
-                  rows = self._db.query_all(
-                      "SELECT * FROM events_outbox"
-                      " WHERE published_at IS NULL"
-                      " AND state = ?"
-                      " AND (next_retry_at IS NULL"
-                      "      OR next_retry_at <= ?)"
-                      " ORDER BY created_at, event_id"
-                      " LIMIT ?",
-                      (
-                          STATE_PENDING,
-                          self._clock.now(),
-                          limit,
-                      ),
-                  )
-                  return tuple(
-                      self._to_event(row)
-                      for row in rows
-                  )
-
-              def dispatch_pending(
+              def compute_state_hash(
                   self,
-                  handler: Callable[[Event], None],
-                  *,
-                  batch_size: int = 100,
-              ) -> int:
-                  delivered = 0
-                  for event in self.pending(batch_size):
-                      handler(event)
-                      self._db.execute(
-                          "UPDATE events_outbox"
-                          " SET published_at = ?,"
-                          " state = ?"
-                          " WHERE event_id = ?"
-                          " AND published_at IS NULL",
-                          (
-                              self._clock.now(),
-                              STATE_DISPATCHED,
-                              event.event_id,
-                          ),
+              ) -> tuple[int, str]:
+                  parts: list[str] = []
+                  for table in REPLICATED_TABLES:
+                      rows = self._db.query_all(
+                          f"SELECT * FROM {table}"
+                          " ORDER BY rowid"
                       )
-                      delivered += 1
-                  return delivered
-
-              def claim_batch(
-                  self,
-                  *,
-                  owner: str,
-                  lease_seconds: float,
-                  limit: int = 10,
-              ) -> tuple[OutboxClaim, ...]:
-                  """Atomically lease due pending events.
-
-                  Two workers racing on the same event get at
-                  most one claim: the UPDATE guards on
-                  state = PENDING inside one transaction.
-                  """
-                  if lease_seconds <= 0:
-                      raise ValueError(
-                          "lease_seconds must be"
-                          " positive"
-                      )
-                  now = self._clock.now()
-                  claims: list[OutboxClaim] = []
-                  with self._db.transaction() as cursor:
-                      rows = cursor.execute(
-                          "SELECT * FROM events_outbox"
-                          " WHERE state = ?"
-                          " AND (next_retry_at IS NULL"
-                          "      OR next_retry_at <= ?)"
-                          " ORDER BY created_at,"
-                          " event_id LIMIT ?",
-                          (
-                              STATE_PENDING,
-                              now,
-                              limit,
-                          ),
-                      ).fetchall()
                       for row in rows:
-                          event_id = str(
-                              row["event_id"]
-                          )
-                          attempts = (
-                              int(row["attempts"]) + 1
-                          )
-                          cursor.execute(
-                              "UPDATE events_outbox"
-                              " SET state = ?,"
-                              " lease_owner = ?,"
-                              " lease_expires_at = ?,"
-                              " attempts = ?"
-                              " WHERE event_id = ?"
-                              " AND state = ?",
-                              (
-                                  STATE_CLAIMED,
-                                  owner,
-                                  now + lease_seconds,
-                                  attempts,
-                                  event_id,
-                                  STATE_PENDING,
-                              ),
-                          )
-                          if cursor.rowcount != 1:
-                              continue
-                          claims.append(
-                              OutboxClaim(
-                                  event=self._to_event(
-                                      row
-                                  ),
-                                  fencing_token=(
-                                      attempts
-                                  ),
+                          parts.append(
+                              json.dumps(
+                                  {
+                                      k: str(v)
+                                      for k, v in dict(
+                                          row
+                                      ).items()
+                                  },
+                                  sort_keys=True,
                               )
                           )
-                  return tuple(claims)
+                  version = int(self._clock.now())
+                  return version, stable_hash(*parts)
 
-              def complete(
-                  self,
-                  *,
-                  event_id: str,
-                  owner: str,
-                  fencing_token: int,
-              ) -> None:
-                  """Mark DISPATCHED; LeaseLost if the
-                  lease or fencing token is stale."""
-                  now = self._clock.now()
-                  with self._db.transaction() as cursor:
-                      cursor.execute(
-                          "UPDATE events_outbox"
-                          " SET state = ?,"
-                          " published_at = ?,"
-                          " lease_owner = NULL,"
-                          " lease_expires_at = NULL"
-                          " WHERE event_id = ?"
-                          " AND state = ?"
-                          " AND lease_owner = ?"
-                          " AND attempts = ?"
-                          " AND lease_expires_at > ?",
-                          (
-                              STATE_DISPATCHED,
-                              now,
-                              event_id,
-                              STATE_CLAIMED,
-                              owner,
-                              fencing_token,
-                              now,
-                          ),
+              def export_state(self) -> StateSnapshot:
+                  """Capture schema DDL + rows + hash."""
+                  version, state_hash = (
+                      self.compute_state_hash()
+                  )
+                  tables: dict[
+                      str,
+                      tuple[dict[str, object], ...],
+                  ] = {}
+                  schemas: dict[str, str] = {}
+                  for table in REPLICATED_TABLES:
+                      rows = self._db.query_all(
+                          f"SELECT * FROM {table}"
+                          " ORDER BY rowid"
                       )
-                      if cursor.rowcount != 1:
-                          raise LeaseLost(
-                              "lease lost for event"
-                              f" {event_id}: fencing"
-                              " rejected"
-                          )
-
-              def fail(
-                  self,
-                  *,
-                  event_id: str,
-                  owner: str,
-                  fencing_token: int,
-                  error: str,
-                  max_attempts: int = 5,
-                  backoff_base_seconds: float = 1.0,
-              ) -> bool:
-                  """Report a processing failure.
-
-                  Schedules an exponential-backoff retry,
-                  or moves the event to DEAD once
-                  ``max_attempts`` is reached. True = retry
-                  scheduled, False = dead-lettered.
-                  """
-                  now = self._clock.now()
-                  with self._db.transaction() as cursor:
-                      cursor.execute(
-                          "SELECT state, lease_owner,"
-                          " attempts FROM events_outbox"
-                          " WHERE event_id = ?",
-                          (event_id,),
+                      tables[table] = tuple(
+                          dict(row) for row in rows
                       )
-                      row = cursor.fetchone()
-                      if row is None:
-                          raise LeaseLost(
-                              "lease lost for event"
-                              f" {event_id}: missing"
-                          )
-                      state = str(row["state"])
-                      lease_owner = str(
-                          row["lease_owner"] or ""
+                      schema_row = self._db.query_one(
+                          "SELECT sql FROM sqlite_master"
+                          " WHERE type = 'table'"
+                          " AND name = ?",
+                          (table,),
                       )
-                      attempts = int(row["attempts"])
-                      if (
-                          state != STATE_CLAIMED
-                          or lease_owner != owner
-                          or attempts != fencing_token
+                      if schema_row is not None and (
+                          schema_row["sql"] is not None
                       ):
-                          raise LeaseLost(
-                              "lease lost for event"
-                              f" {event_id}: fencing"
-                              " rejected"
+                          schemas[table] = str(
+                              schema_row["sql"]
                           )
-                      if attempts >= max_attempts:
-                          cursor.execute(
-                              "UPDATE events_outbox"
-                              " SET state = ?,"
-                              " last_error = ?,"
-                              " lease_owner = NULL,"
-                              " lease_expires_at = NULL"
-                              " WHERE event_id = ?",
-                              (
-                                  STATE_DEAD,
-                                  error,
-                                  event_id,
-                              ),
-                          )
-                          return False
-                      delay = backoff_base_seconds * (
-                          2 ** (attempts - 1)
-                      )
-                      cursor.execute(
-                          "UPDATE events_outbox"
-                          " SET state = ?,"
-                          " next_retry_at = ?,"
-                          " last_error = ?,"
-                          " lease_owner = NULL,"
-                          " lease_expires_at = NULL"
-                          " WHERE event_id = ?",
-                          (
-                              STATE_PENDING,
-                              now + delay,
-                              error,
-                              event_id,
-                          ),
-                      )
-                      return True
-
-              def reap_expired_leases(self) -> int:
-                  """Return expired CLAIMED events to
-                  PENDING (worker died mid-processing)."""
-                  now = self._clock.now()
-                  with self._db.transaction() as cursor:
-                      cursor.execute(
-                          "UPDATE events_outbox"
-                          " SET state = ?,"
-                          " lease_owner = NULL,"
-                          " lease_expires_at = NULL"
-                          " WHERE state = ?"
-                          " AND lease_expires_at <= ?",
-                          (
-                              STATE_PENDING,
-                              STATE_CLAIMED,
-                              now,
-                          ),
-                      )
-                      return int(cursor.rowcount)
-
-              def dead_letter(
-                  self, limit: int = 100
-              ) -> tuple[Event, ...]:
-                  rows = self._db.query_all(
-                      "SELECT * FROM events_outbox"
-                      " WHERE state = ?"
-                      " ORDER BY created_at, event_id"
-                      " LIMIT ?",
-                      (STATE_DEAD, limit),
-                  )
-                  return tuple(
-                      self._to_event(row)
-                      for row in rows
+                  return StateSnapshot(
+                      version=version,
+                      state_hash=state_hash,
+                      schemas=schemas,
+                      tables=tables,
                   )
 
-              def requeue_dead(
-                  self, *, event_id: str
-              ) -> None:
-                  with self._db.transaction() as cursor:
-                      cursor.execute(
-                          "UPDATE events_outbox"
-                          " SET state = ?,"
-                          " attempts = 0,"
-                          " next_retry_at = NULL,"
-                          " last_error = NULL"
-                          " WHERE event_id = ?"
-                          " AND state = ?",
-                          (
-                              STATE_PENDING,
-                              event_id,
-                              STATE_DEAD,
-                          ),
-                      )
+              def apply_state(
+                  self, snapshot: StateSnapshot
+              ) -> int:
+                  """Atomically replace local replicated
+                  tables with the snapshot. Returns the
+                  number of rows applied.
 
-              @staticmethod
-              def _to_event(row: sqlite3.Row) -> Event:
-                  return Event(
-                      event_id=str(row["event_id"]),
-                      event_type=str(
-                          row["event_type"]
-                      ),
-                      aggregate_id=str(
-                          row["aggregate_id"]
-                      ),
-                      schema_version=int(
-                          row["schema_version"]
-                      ),
-                      envelope_version=int(
-                          row["envelope_version"]
-                      ),
-                      timestamp=float(
-                          row["created_at"]
-                      ),
-                      payload=canonical_json_loads(
-                          str(row["payload"])
-                      ),
-                      fingerprint=str(
-                          row["fingerprint"]
-                      ),
+                  FK-safe ordering: tables are created
+                  parent-first, emptied child-first and
+                  filled parent-first.
+                  """
+                  applied = 0
+                  with self._db.transaction() as cursor:
+                      for table in REPLICATED_TABLES:
+                          exists = cursor.execute(
+                              "SELECT name FROM"
+                              " sqlite_master"
+                              " WHERE type = 'table'"
+                              " AND name = ?",
+                              (table,),
+                          ).fetchone()
+                          if exists is None:
+                              ddl = (
+                                  snapshot.schemas.get(
+                                      table
+                                  )
+                              )
+                              if ddl:
+                                  cursor.execute(ddl)
+                      for table in reversed(
+                          REPLICATED_TABLES
+                      ):
+                          exists = cursor.execute(
+                              "SELECT name FROM"
+                              " sqlite_master"
+                              " WHERE type = 'table'"
+                              " AND name = ?",
+                              (table,),
+                          ).fetchone()
+                          if exists is not None:
+                              cursor.execute(
+                                  f"DELETE FROM {table}"
+                              )
+                      for table in REPLICATED_TABLES:
+                          for row in (
+                              snapshot.tables.get(
+                                  table, ()
+                              )
+                          ):
+                              cols = list(row.keys())
+                              col_sql = ", ".join(cols)
+                              marks = ", ".join(
+                                  "?" for _ in cols
+                              )
+                              cursor.execute(
+                                  f"INSERT INTO {table}"
+                                  f" ({col_sql}) VALUES"
+                                  f" ({marks})",
+                                  tuple(
+                                      row[c]
+                                      for c in cols
+                                  ),
+                              )
+                              applied += 1
+                  return applied
+
+              def replicate_to(
+                  self,
+                  *,
+                  replica_db: Database,
+                  primary_node: str,
+                  replica_node: str,
+              ) -> ReplicationReport:
+                  """Physical replication:
+                  transfer -> apply -> verify -> ack."""
+                  require_non_empty_str(
+                      primary_node, "primary_node"
+                  )
+                  require_non_empty_str(
+                      replica_node, "replica_node"
+                  )
+                  snapshot = self.export_state()
+                  replica_manager = ReplicationManager(
+                      replica_db, self._clock
+                  )
+                  applied = (
+                      replica_manager.apply_state(
+                          snapshot
+                      )
+                  )
+                  _, replica_hash = (
+                      replica_manager.compute_state_hash()
+                  )
+                  if replica_hash != snapshot.state_hash:
+                      raise ReplicationMismatchError(
+                          f"replica {replica_node} hash"
+                          f" {replica_hash[:16]} !="
+                          f" primary"
+                          f" {snapshot.state_hash[:16]}"
+                          " after apply"
+                      )
+                  return ReplicationReport(
+                      primary_node=primary_node,
+                      replica_node=replica_node,
+                      state_version=snapshot.version,
+                      state_hash=snapshot.state_hash,
+                      consistent=True,
+                      rows_replicated=applied,
+                  )
+
+              def replicate(
+                  self,
+                  *,
+                  primary_node: str,
+                  replica_node: str,
+                  replica_hash: str | None = None,
+                  rows_replicated: int = 0,
+              ) -> ReplicationReport:
+                  require_non_empty_str(
+                      primary_node, "primary_node"
+                  )
+                  require_non_empty_str(
+                      replica_node, "replica_node"
+                  )
+                  version, primary_hash = (
+                      self.compute_state_hash()
+                  )
+                  if replica_hash is None:
+                      replica_hash = primary_hash
+                  consistent = (
+                      replica_hash == primary_hash
+                  )
+                  if not consistent:
+                      raise ReplicationMismatchError(
+                          f"replica {replica_node} hash"
+                          f" {replica_hash[:16]}"
+                          f" != primary"
+                          f" {primary_hash[:16]}"
+                      )
+                  return ReplicationReport(
+                      primary_node=primary_node,
+                      replica_node=replica_node,
+                      state_version=version,
+                      state_hash=primary_hash,
+                      consistent=True,
+                      rows_replicated=rows_replicated,
                   )
           PYEOF
-          echo "=== OUTBOX CONCURRENCY READY ==="
+          echo "=== REPLICATION PHYSICAL READY ==="
 
-      - name: Write concurrency proof tests (5)
+      - name: Write physical replication proofs (3)
         run: |
           set -euo pipefail
-          mkdir -p shared_engines/events/tests
-          cat > shared_engines/events/tests/test_outbox_concurrency.py <<'PYEOF'
-          """Concurrency proofs: exclusivity, fencing,
-          backoff, dead-letter, reaping, legacy dispatch."""
+          mkdir -p shared_engines/network/tests
+          cat > shared_engines/network/tests/test_replication_physical.py <<'PYEOF'
+          """Physical replication proofs: rows really move
+          between two databases, deletes propagate, and
+          divergence is detected and healed."""
           from __future__ import annotations
 
-          import hashlib
           from pathlib import Path
 
+          from shared_engines.audit.chain import AuditTrail
           from shared_engines.common.clocks import (
               FrozenClock,
           )
-          from shared_engines.common.errors import (
-              LeaseLost,
+          from shared_engines.events.contracts import (
+              EventCatalog,
           )
-          from shared_engines.common.serialization import (
-              canonical_json_dumps,
+          from shared_engines.events.outbox import Outbox
+          from shared_engines.identity.contracts import (
+              IdentityKind,
           )
-          from shared_engines.events.contracts import Event
-          from shared_engines.events.outbox import (
-              Outbox,
-              OutboxClaim,
+          from shared_engines.identity.engine import (
+              IdentityEngine,
+          )
+          from shared_engines.network.cluster import (
+              ClusterManager,
+          )
+          from shared_engines.network.replication import (
+              ReplicationManager,
           )
           from shared_engines.storage.database import (
               SQLiteAdapter,
           )
 
 
-          def _make_event(
-              suffix: str, ts: float
-          ) -> Event:
-              event_id = f"evt-{suffix}"
-              event_type = "network.node.joined"
-              aggregate_id = f"agg-{suffix}"
-              payload: dict[str, object] = {
-                  "seq": suffix
-              }
-              fingerprint_src = canonical_json_dumps(
-                  {
-                      "event_id": event_id,
-                      "event_type": event_type,
-                      "aggregate_id": aggregate_id,
-                      "timestamp": ts,
-                      "payload": payload,
-                  }
+          class _Node:
+              """Real node: identity + cluster + replication."""
+
+              def __init__(
+                  self, tmp_path: Path, name: str
+              ) -> None:
+                  self.db = SQLiteAdapter(
+                      tmp_path / f"{name}.db"
+                  )
+                  self.clock = FrozenClock()
+                  self.audit = AuditTrail(
+                      self.db, self.clock
+                  )
+                  self.outbox = Outbox(
+                      self.db, self.clock
+                  )
+                  self.outbox.ensure_schema()
+                  self.catalog = EventCatalog()
+                  for et in (
+                      "identity.registered",
+                      "identity.status_changed",
+                      "network.node.joined",
+                      "network.node.state_changed",
+                  ):
+                      self.catalog.register(et)
+                  self.identity = IdentityEngine(
+                      db=self.db,
+                      clock=self.clock,
+                      audit=self.audit,
+                      outbox=self.outbox,
+                      catalog=self.catalog,
+                  )
+                  self.cluster = ClusterManager(
+                      db=self.db,
+                      clock=self.clock,
+                      audit=self.audit,
+                      outbox=self.outbox,
+                      catalog=self.catalog,
+                      heartbeat_ttl_seconds=30.0,
+                  )
+                  self.replication = ReplicationManager(
+                      self.db, self.clock
+                  )
+
+              def close(self) -> None:
+                  self.db.close()
+
+
+          def _identity_count(
+              node: _Node,
+          ) -> int:
+              row = node.db.query_one(
+                  "SELECT COUNT(*) AS n FROM identities"
               )
-              fingerprint = hashlib.sha256(
-                  fingerprint_src.encode("utf-8")
-              ).hexdigest()
-              return Event(
-                  event_id=event_id,
-                  event_type=event_type,
-                  aggregate_id=aggregate_id,
-                  schema_version=1,
-                  envelope_version=1,
-                  timestamp=ts,
-                  payload=payload,
-                  fingerprint=fingerprint,
-              )
+              assert row is not None
+              return int(row["n"])
 
 
-          def _boot(
-              tmp_path: Path,
-          ) -> tuple[
-              SQLiteAdapter, Outbox, FrozenClock
-          ]:
-              db = SQLiteAdapter(
-                  tmp_path / "outbox.db"
-              )
-              clock = FrozenClock()
-              outbox = Outbox(db, clock)
-              outbox.ensure_schema()
-              return db, outbox, clock
-
-
-          def test_two_workers_never_claim_same_event(
+          def test_transfer_resync_hashes_equal(
               tmp_path: Path,
           ) -> None:
-              db, outbox, clock = _boot(tmp_path)
+              primary = _Node(tmp_path, "primary")
+              replica = _Node(tmp_path, "replica")
               try:
-                  for i in range(4):
-                      outbox.enqueue(
-                          _make_event(
-                              str(i), clock.now()
-                          )
+                  primary.identity.register_identity(
+                      kind=IdentityKind.PERSON,
+                      display_name="u1",
+                      actor="t",
+                  )
+                  report = (
+                      primary.replication.replicate_to(
+                          replica_db=replica.db,
+                          primary_node="A",
+                          replica_node="B",
                       )
-                  claims_a: tuple[
-                      OutboxClaim, ...
-                  ] = outbox.claim_batch(
-                      owner="worker-a",
-                      lease_seconds=30.0,
-                      limit=10,
                   )
-                  claims_b: tuple[
-                      OutboxClaim, ...
-                  ] = outbox.claim_batch(
-                      owner="worker-b",
-                      lease_seconds=30.0,
-                      limit=10,
-                  )
-                  ids_a = {
-                      c.event.event_id
-                      for c in claims_a
-                  }
-                  ids_b = {
-                      c.event.event_id
-                      for c in claims_b
-                  }
+                  assert report.consistent is True
+                  assert report.rows_replicated >= 1
                   assert (
-                      len(claims_a) + len(claims_b)
-                      == 4
+                      _identity_count(replica) == 1
                   )
-                  assert not (ids_a & ids_b)
-              finally:
-                  db.close()
-
-
-          def test_complete_requires_owner_fencing(
-              tmp_path: Path,
-          ) -> None:
-              db, outbox, clock = _boot(tmp_path)
-              try:
-                  outbox.enqueue(
-                      _make_event("f1", clock.now())
+                  _, hp = (
+                      primary.replication.compute_state_hash()
                   )
-                  (claim,) = outbox.claim_batch(
-                      owner="worker-a",
-                      lease_seconds=30.0,
+                  _, hr = (
+                      replica.replication.compute_state_hash()
                   )
-                  try:
-                      outbox.complete(
-                          event_id=(
-                              claim.event.event_id
-                          ),
-                          owner="worker-b",
-                          fencing_token=(
-                              claim.fencing_token
-                          ),
-                      )
-                      raise AssertionError(
-                          "expected LeaseLost"
-                      )
-                  except LeaseLost:
-                      pass
-                  outbox.complete(
-                      event_id=claim.event.event_id,
-                      owner="worker-a",
-                      fencing_token=(
-                          claim.fencing_token
-                      ),
+                  assert hp == hr
+                  # Re-sync after new writes
+                  primary.identity.register_identity(
+                      kind=IdentityKind.PERSON,
+                      display_name="u2",
+                      actor="t",
                   )
-                  assert outbox.pending() == ()
-              finally:
-                  db.close()
-
-
-          def test_fail_backoff_then_dead_letter(
-              tmp_path: Path,
-          ) -> None:
-              db, outbox, clock = _boot(tmp_path)
-              try:
-                  outbox.enqueue(
-                      _make_event("r1", clock.now())
+                  primary.replication.replicate_to(
+                      replica_db=replica.db,
+                      primary_node="A",
+                      replica_node="B",
                   )
-                  (c1,) = outbox.claim_batch(
-                      owner="w", lease_seconds=30.0
-                  )
-                  scheduled = outbox.fail(
-                      event_id=c1.event.event_id,
-                      owner="w",
-                      fencing_token=(
-                          c1.fencing_token
-                      ),
-                      error="boom-1",
-                      max_attempts=2,
-                      backoff_base_seconds=1.0,
-                  )
-                  assert scheduled is True
                   assert (
-                      outbox.claim_batch(
-                          owner="w",
-                          lease_seconds=30.0,
-                      )
-                      == ()
+                      _identity_count(replica) == 2
                   )
-                  clock.advance(2)
-                  (c2,) = outbox.claim_batch(
-                      owner="w", lease_seconds=30.0
+                  _, hp2 = (
+                      primary.replication.compute_state_hash()
                   )
-                  assert c2.fencing_token == 2
-                  dead = outbox.fail(
-                      event_id=c2.event.event_id,
-                      owner="w",
-                      fencing_token=(
-                          c2.fencing_token
-                      ),
-                      error="boom-2",
-                      max_attempts=2,
-                      backoff_base_seconds=1.0,
+                  _, hr2 = (
+                      replica.replication.compute_state_hash()
                   )
-                  assert dead is False
-                  assert (
-                      len(outbox.dead_letter()) == 1
-                  )
-                  outbox.requeue_dead(
-                      event_id=c2.event.event_id
-                  )
-                  (c3,) = outbox.claim_batch(
-                      owner="w", lease_seconds=30.0
-                  )
-                  assert c3.fencing_token == 1
+                  assert hp2 == hr2
               finally:
-                  db.close()
+                  primary.close()
+                  replica.close()
 
 
-          def test_expired_lease_reaped_and_fenced(
+          def test_delete_propagates_to_replica(
               tmp_path: Path,
           ) -> None:
-              db, outbox, clock = _boot(tmp_path)
+              primary = _Node(tmp_path, "primary")
+              replica = _Node(tmp_path, "replica")
               try:
-                  outbox.enqueue(
-                      _make_event("l1", clock.now())
+                  primary.identity.register_identity(
+                      kind=IdentityKind.PERSON,
+                      display_name="u1",
+                      actor="t",
                   )
-                  (old,) = outbox.claim_batch(
-                      owner="worker-dead",
-                      lease_seconds=10.0,
+                  primary.identity.register_identity(
+                      kind=IdentityKind.PERSON,
+                      display_name="u2",
+                      actor="t",
                   )
-                  clock.advance(11)
+                  primary.replication.replicate_to(
+                      replica_db=replica.db,
+                      primary_node="A",
+                      replica_node="B",
+                  )
                   assert (
-                      outbox.reap_expired_leases()
-                      == 1
+                      _identity_count(replica) == 2
                   )
-                  (fresh,) = outbox.claim_batch(
-                      owner="worker-new",
-                      lease_seconds=30.0,
+                  primary.db.execute(
+                      "DELETE FROM identities WHERE"
+                      " rowid = (SELECT MIN(rowid)"
+                      " FROM identities)"
                   )
-                  assert fresh.fencing_token == 2
-                  try:
-                      outbox.complete(
-                          event_id=(
-                              fresh.event.event_id
-                          ),
-                          owner="worker-dead",
-                          fencing_token=(
-                              old.fencing_token
-                          ),
-                      )
-                      raise AssertionError(
-                          "expected LeaseLost"
-                      )
-                  except LeaseLost:
-                      pass
-                  outbox.complete(
-                      event_id=fresh.event.event_id,
-                      owner="worker-new",
-                      fencing_token=(
-                          fresh.fencing_token
-                      ),
+                  primary.replication.replicate_to(
+                      replica_db=replica.db,
+                      primary_node="A",
+                      replica_node="B",
                   )
-                  assert outbox.pending() == ()
+                  assert (
+                      _identity_count(replica) == 1
+                  )
+                  _, hp = (
+                      primary.replication.compute_state_hash()
+                  )
+                  _, hr = (
+                      replica.replication.compute_state_hash()
+                  )
+                  assert hp == hr
               finally:
-                  db.close()
+                  primary.close()
+                  replica.close()
 
 
-          def test_legacy_dispatch_still_works(
+          def test_divergence_detected_and_healed(
               tmp_path: Path,
           ) -> None:
-              db, outbox, clock = _boot(tmp_path)
+              primary = _Node(tmp_path, "primary")
+              replica = _Node(tmp_path, "replica")
               try:
-                  outbox.enqueue(
-                      _make_event("a", clock.now())
+                  primary.identity.register_identity(
+                      kind=IdentityKind.PERSON,
+                      display_name="u1",
+                      actor="t",
                   )
-                  outbox.enqueue(
-                      _make_event("b", clock.now())
+                  primary.replication.replicate_to(
+                      replica_db=replica.db,
+                      primary_node="A",
+                      replica_node="B",
                   )
-                  seen: list[str] = []
-
-                  def collect(
-                      event: Event,
-                  ) -> None:
-                      seen.append(event.event_id)
-
-                  delivered = (
-                      outbox.dispatch_pending(collect)
+                  _, hp = (
+                      primary.replication.compute_state_hash()
                   )
-                  assert delivered == 2
-                  assert len(seen) == 2
-                  assert outbox.pending() == ()
+                  _, hr = (
+                      replica.replication.compute_state_hash()
+                  )
+                  assert hp == hr
+                  # Tamper with the replica directly
+                  replica.db.execute(
+                      "UPDATE identities SET"
+                      " display_name = 'tampered'"
+                  )
+                  _, hr_bad = (
+                      replica.replication.compute_state_hash()
+                  )
+                  assert hr_bad != hp
+                  # Re-replication heals the divergence
+                  primary.replication.replicate_to(
+                      replica_db=replica.db,
+                      primary_node="A",
+                      replica_node="B",
+                  )
+                  _, hr_fixed = (
+                      replica.replication.compute_state_hash()
+                  )
+                  assert hr_fixed == hp
               finally:
-                  db.close()
+                  primary.close()
+                  replica.close()
           PYEOF
-          echo "=== TESTS READY ==="
+          echo "=== PHYSICAL TESTS READY ==="
 
       - name: Quality gates (mypy first; full regression)
         run: |
@@ -816,7 +593,7 @@ jobs:
           if git diff --cached --quiet; then
             echo "No changes."
           else
-            git commit -m "zyra: W3 part 2 - outbox concurrency (atomic claim/lease, fencing LeaseLost, exponential backoff, dead-letter + requeue, expired-lease reaper; legacy dispatch preserved; 5 proofs)"
+            git commit -m "zyra: W4 physical replication - export_state/apply_state (self-describing snapshot, FK-safe apply), replicate_to transfer->apply->verify->ack, delete propagation, divergence heal; legacy parity API untouched"
             git push origin "HEAD:${{ github.ref_name }}"
           fi
-          echo "=== W3 PART 2 COMPLETE ==="
+          echo "=== W4 COMPLETE ==="

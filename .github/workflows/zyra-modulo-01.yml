@@ -1,4 +1,4 @@
-name: zyra-modulo-16-network
+name: zyra-modulo-17-telemetry
 
 "on":
   workflow_dispatch:
@@ -9,7 +9,7 @@ permissions:
   contents: write
 
 concurrency:
-  group: zyra-modulo-16-${{ github.ref }}
+  group: zyra-modulo-17-${{ github.ref }}
   cancel-in-progress: false
 
 jobs:
@@ -31,110 +31,73 @@ jobs:
           python -m pip install --upgrade pip
           python -m pip install "cryptography>=42,<45" "flake8>=7,<8" "mypy>=1.10,<2" "pytest>=8,<9"
 
-      - name: Check modules 01-15 present
+      - name: Check modules 01-16 present
         run: |
           set -euo pipefail
+          test -f shared_engines/network/cluster.py
           test -f shared_engines/authority/root.py
-          test -f shared_engines/storage/network_migrations.py
-          echo "modules 01-15 present: OK"
+          echo "modules 01-16 present: OK"
 
-      - name: Build distributed network core
+      - name: Build telemetry + structured logs
         run: |
           set -euo pipefail
-          mkdir -p shared_engines/network/tests
+          mkdir -p shared_engines/telemetry/tests shared_engines/logs/tests
 
-          cat > shared_engines/network/__init__.py <<'PYEOF'
-          """Zyra distributed network core."""
+          cat > shared_engines/telemetry/__init__.py <<'PYEOF'
+          """Zyra telemetry: durable metrics and event indexing."""
           from __future__ import annotations
 
-          from shared_engines.network.cluster import (
-              ClusterManager,
-              NodeRole,
-              NodeState,
-              NodeStatus,
+          from shared_engines.telemetry.collector import (
+              TelemetryCollector,
+              TelemetryRecord,
           )
-          from shared_engines.network.errors import (
-              InvalidTransitionError,
-              NetworkError,
-              NoQuorumError,
-              NodeNotFoundError,
-              ReplicationMismatchError,
-          )
-          from shared_engines.network.failover import FailoverCoordinator
-          from shared_engines.network.replication import (
-              ReplicationManager,
-              ReplicationReport,
+          from shared_engines.telemetry.system_health import (
+              SystemHealthReporter,
+              SystemReport,
           )
 
           __all__ = [
-              "ClusterManager", "FailoverCoordinator",
-              "InvalidTransitionError", "NetworkError", "NoQuorumError",
-              "NodeNotFoundError", "NodeRole", "NodeState", "NodeStatus",
-              "ReplicationManager", "ReplicationMismatchError",
-              "ReplicationReport",
+              "SystemHealthReporter", "SystemReport",
+              "TelemetryCollector", "TelemetryRecord",
           ]
           PYEOF
 
-          cat > shared_engines/network/errors.py <<'PYEOF'
-          """Typed network errors."""
+          cat > shared_engines/telemetry/errors.py <<'PYEOF'
+          """Typed telemetry errors."""
           from __future__ import annotations
 
-          from shared_engines.common.errors import (
-              ConcurrencyError,
-              EngineError,
-              NotFoundError,
-              ValidationError,
-          )
+          from shared_engines.common.errors import EngineError, ValidationError
 
 
-          class NetworkError(EngineError):
-              """Base for network layer failures."""
+          class TelemetryError(EngineError):
+              """Base for telemetry failures."""
 
 
-          class NodeNotFoundError(NetworkError, NotFoundError):
-              """The node is not part of the cluster."""
-
-
-          class NoQuorumError(NetworkError, ConcurrencyError):
-              """No majority active: failover refused (no split-brain)."""
-
-
-          class InvalidTransitionError(NetworkError, ValidationError):
-              """The node state transition is not allowed."""
-
-
-          class ReplicationMismatchError(NetworkError, ValidationError):
-              """Replica state hash differs from primary."""
+          class InvalidMetricError(TelemetryError, ValidationError):
+              """A metric name or value failed validation."""
           PYEOF
 
-          cat > shared_engines/network/cluster.py <<'PYEOF'
-          """Cluster membership: heartbeats drive the full lifecycle.
+          cat > shared_engines/telemetry/collector.py <<'PYEOF'
+          """Durable telemetry collector: metrics + event index.
 
-          JOINING -> (heartbeat) -> ACTIVE -> SUSPECT -> DOWN ->
-          (heartbeat) -> REJOINED -> (heartbeat) -> ACTIVE.
-          A DOWN node that heartbeats again has clearly returned:
-          first beat marks it REJOINED, second confirms ACTIVE.
-          Cluster events go to the outbox transactionally and are
-          audited.
+          Metrics (counters/gauges/timers) persist per name+tags;
+          network/engine events are indexed by type, aggregate and
+          time window for queryable operations history. This is what
+          a dashboard or an external monitor would query.
           """
           from __future__ import annotations
 
-          import sqlite3
           from dataclasses import dataclass
-          from enum import Enum
 
-          from shared_engines.audit.chain import AuditTrail
           from shared_engines.common.clocks import Clock
-          from shared_engines.common.errors import IntegrityError
           from shared_engines.common.validation import (
+              require_int_range,
               require_non_empty_str,
               require_positive_number,
           )
-          from shared_engines.events.contracts import EventCatalog
-          from shared_engines.events.outbox import Outbox
-          from shared_engines.network.errors import (
-              InvalidTransitionError,
-              NodeNotFoundError,
+          from shared_engines.common.serialization import (
+              canonical_json_dumps,
+              canonical_json_loads,
           )
           from shared_engines.storage.database import Database
           from shared_engines.storage.migrations import (
@@ -142,453 +105,288 @@ jobs:
               MigrationRunner,
           )
 
-          EVENT_NODE_JOINED = "network.node.joined"
-          EVENT_NODE_STATE_CHANGED = "network.node.state_changed"
-
-          CLUSTER_MIGRATIONS = (
+          TELEMETRY_MIGRATIONS = (
               Migration(
                   1,
-                  "cluster_nodes",
+                  "telemetry_metrics",
                   (
-                      "CREATE TABLE cluster_nodes ("
-                      " node_id TEXT PRIMARY KEY,"
-                      " role TEXT NOT NULL,"
-                      " state TEXT NOT NULL,"
-                      " endpoint TEXT NOT NULL,"
-                      " joined_at REAL NOT NULL,"
-                      " last_heartbeat REAL NOT NULL,"
-                      " contract_version INTEGER NOT NULL)",
-                      "CREATE INDEX cluster_nodes_state"
-                      " ON cluster_nodes (state)",
+                      "CREATE TABLE telemetry_metrics ("
+                      " metric_id INTEGER PRIMARY KEY AUTOINCREMENT,"
+                      " name TEXT NOT NULL,"
+                      " kind TEXT NOT NULL,"
+                      " value REAL NOT NULL,"
+                      " tags TEXT NOT NULL,"
+                      " recorded_at REAL NOT NULL)",
+                      "CREATE INDEX telemetry_metrics_name_time"
+                      " ON telemetry_metrics (name, recorded_at)",
+                  ),
+              ),
+              Migration(
+                  2,
+                  "telemetry_events",
+                  (
+                      "CREATE TABLE telemetry_events ("
+                      " event_id TEXT PRIMARY KEY,"
+                      " event_type TEXT NOT NULL,"
+                      " aggregate_id TEXT NOT NULL,"
+                      " payload TEXT NOT NULL,"
+                      " occurred_at REAL NOT NULL)",
+                      "CREATE INDEX telemetry_events_type_time"
+                      " ON telemetry_events (event_type, occurred_at)",
+                      "CREATE INDEX telemetry_events_aggregate"
+                      " ON telemetry_events (aggregate_id, occurred_at)",
                   ),
               ),
           )
 
 
-          class NodeRole(Enum):
-              COORDINATOR = "coordinator"
-              WORKER = "worker"
-              REPLICA = "replica"
-
-
-          class NodeState(Enum):
-              JOINING = "JOINING"
-              ACTIVE = "ACTIVE"
-              SUSPECT = "SUSPECT"
-              DOWN = "DOWN"
-              REJOINED = "REJOINED"
-
-
-          VALID_NODE_TRANSITIONS: dict[
-              NodeState, frozenset[NodeState]
-          ] = {
-              NodeState.JOINING: frozenset(
-                  {NodeState.ACTIVE, NodeState.DOWN}
-              ),
-              NodeState.ACTIVE: frozenset(
-                  {NodeState.SUSPECT, NodeState.DOWN}
-              ),
-              NodeState.SUSPECT: frozenset(
-                  {NodeState.DOWN, NodeState.REJOINED}
-              ),
-              NodeState.DOWN: frozenset({NodeState.REJOINED}),
-              NodeState.REJOINED: frozenset(
-                  {NodeState.ACTIVE, NodeState.SUSPECT, NodeState.DOWN}
-              ),
-          }
-
-
           @dataclass(frozen=True)
-          class NodeStatus:
-              node_id: str
-              role: NodeRole
-              state: NodeState
-              endpoint: str
-              joined_at: float
-              last_heartbeat: float
+          class TelemetryRecord:
+              metric_id: int
+              name: str
+              kind: str
+              value: float
+              tags: dict[str, str]
+              recorded_at: float
 
 
-          class ClusterManager:
-              """Membership authority: register, heartbeat, detect."""
-
-              def __init__(
-                  self,
-                  *,
-                  db: Database,
-                  clock: Clock,
-                  audit: AuditTrail,
-                  outbox: Outbox,
-                  catalog: EventCatalog,
-                  heartbeat_ttl_seconds: float = 30.0,
-              ) -> None:
-                  require_positive_number(
-                      heartbeat_ttl_seconds,
-                      "heartbeat_ttl_seconds",
-                      config=True,
-                  )
-                  self._db = db
-                  self._clock = clock
-                  self._audit = audit
-                  self._outbox = outbox
-                  self._catalog = catalog
-                  self._ttl = heartbeat_ttl_seconds
-                  for event_type in (
-                      EVENT_NODE_JOINED,
-                      EVENT_NODE_STATE_CHANGED,
-                  ):
-                      self._catalog.register(event_type)
-                  MigrationRunner(
-                      db, "network.cluster", CLUSTER_MIGRATIONS
-                  ).run(clock)
-
-              def register_node(
-                  self,
-                  *,
-                  node_id: str,
-                  role: NodeRole,
-                  endpoint: str,
-              ) -> NodeStatus:
-                  require_non_empty_str(node_id, "node_id")
-                  require_non_empty_str(endpoint, "endpoint")
-                  now = self._clock.now()
-                  try:
-                      with self._db.transaction() as cursor:
-                          cursor.execute(
-                              "INSERT INTO cluster_nodes"
-                              " (node_id, role, state, endpoint,"
-                              "  joined_at, last_heartbeat,"
-                              "  contract_version)"
-                              " VALUES (?, ?, ?, ?, ?, ?, ?)",
-                              (
-                                  node_id,
-                                  role.value,
-                                  NodeState.JOINING.value,
-                                  endpoint,
-                                  now,
-                                  now,
-                                  1,
-                              ),
-                          )
-                          event = self._catalog.build(
-                              EVENT_NODE_JOINED,
-                              aggregate_id=node_id,
-                              payload={
-                                  "role": role.value,
-                                  "endpoint": endpoint,
-                              },
-                              clock=self._clock,
-                          )
-                          self._outbox.enqueue_in_transaction(
-                              cursor, event
-                          )
-                  except sqlite3.IntegrityError as exc:
-                      raise InvalidTransitionError(
-                          f"node already registered: {node_id}"
-                      ) from exc
-                  self._audit.append(
-                      event_type=EVENT_NODE_JOINED,
-                      actor=node_id,
-                      subject=node_id,
-                      payload={"role": role.value, "endpoint": endpoint},
-                  )
-                  node = self.get(node_id)
-                  if node is None:
-                      raise IntegrityError("node vanished after insert")
-                  return node
-
-              def heartbeat(self, node_id: str) -> None:
-                  """Refreshes liveness and advances the lifecycle:
-                  JOINING -> ACTIVE, SUSPECT -> ACTIVE,
-                  DOWN -> REJOINED (next beat confirms ACTIVE)."""
-                  require_non_empty_str(node_id, "node_id")
-                  now = self._clock.now()
-                  with self._db.transaction() as cursor:
-                      cursor.execute(
-                          "UPDATE cluster_nodes"
-                          " SET last_heartbeat = ?,"
-                          " state = CASE state"
-                          "  WHEN 'JOINING' THEN 'ACTIVE'"
-                          "  WHEN 'SUSPECT' THEN 'ACTIVE'"
-                          "  WHEN 'REJOINED' THEN 'ACTIVE'"
-                          "  WHEN 'DOWN' THEN 'REJOINED'"
-                          "  ELSE state END"
-                          " WHERE node_id = ?",
-                          (now, node_id),
-                      )
-                      if cursor.rowcount != 1:
-                          raise NodeNotFoundError(
-                              f"unknown node: {node_id}"
-                          )
-
-              def get(self, node_id: str) -> NodeStatus | None:
-                  row = self._db.query_one(
-                      "SELECT * FROM cluster_nodes WHERE node_id = ?",
-                      (node_id,),
-                  )
-                  if row is None:
-                      return None
-                  return self._node_from_row(row)
-
-              def require(self, node_id: str) -> NodeStatus:
-                  node = self.get(node_id)
-                  if node is None:
-                      raise NodeNotFoundError(
-                          f"unknown node: {node_id}"
-                      )
-                  return node
-
-              def detect_failures(self) -> tuple[str, ...]:
-                  """ACTIVE->SUSPECT after TTL, SUSPECT->DOWN after 2x."""
-                  now = self._clock.now()
-                  changed: list[str] = []
-                  rows = self._db.query_all(
-                      "SELECT node_id, state, last_heartbeat"
-                      " FROM cluster_nodes WHERE state IN"
-                      " ('ACTIVE', 'SUSPECT')"
-                  )
-                  for row in rows:
-                      node_id = str(row["node_id"])
-                      state = NodeState(str(row["state"]))
-                      last = float(row["last_heartbeat"])
-                      age = now - last
-                      if state is NodeState.ACTIVE and age > self._ttl:
-                          self._transition(node_id, NodeState.SUSPECT)
-                          changed.append(node_id)
-                      elif (
-                          state is NodeState.SUSPECT
-                          and age > 2 * self._ttl
-                      ):
-                          self._transition(node_id, NodeState.DOWN)
-                          changed.append(node_id)
-                  return tuple(changed)
-
-              def _transition(
-                  self, node_id: str, to_state: NodeState
-              ) -> None:
-                  with self._db.transaction() as cursor:
-                      row = cursor.execute(
-                          "SELECT state FROM cluster_nodes"
-                          " WHERE node_id = ?",
-                          (node_id,),
-                      ).fetchone()
-                      if row is None:
-                          raise NodeNotFoundError(
-                              f"unknown node: {node_id}"
-                          )
-                      current = NodeState(str(row["state"]))
-                      allowed = VALID_NODE_TRANSITIONS.get(
-                          current, frozenset()
-                      )
-                      if to_state not in allowed:
-                          raise InvalidTransitionError(
-                              f"{current.value} -> {to_state.value}"
-                          )
-                      cursor.execute(
-                          "UPDATE cluster_nodes SET state = ?"
-                          " WHERE node_id = ?",
-                          (to_state.value, node_id),
-                      )
-                      event = self._catalog.build(
-                          EVENT_NODE_STATE_CHANGED,
-                          aggregate_id=node_id,
-                          payload={"to": to_state.value},
-                          clock=self._clock,
-                      )
-                      self._outbox.enqueue_in_transaction(cursor, event)
-                  self._audit.append(
-                      event_type=EVENT_NODE_STATE_CHANGED,
-                      actor="cluster-manager",
-                      subject=node_id,
-                      payload={"to": to_state.value},
-                  )
-
-              def active_nodes(self) -> tuple[NodeStatus, ...]:
-                  rows = self._db.query_all(
-                      "SELECT * FROM cluster_nodes"
-                      " WHERE state IN ('ACTIVE', 'REJOINED')"
-                      " ORDER BY node_id"
-                  )
-                  return tuple(self._node_from_row(r) for r in rows)
-
-              def all_nodes(self) -> tuple[NodeStatus, ...]:
-                  rows = self._db.query_all(
-                      "SELECT * FROM cluster_nodes ORDER BY node_id"
-                  )
-                  return tuple(self._node_from_row(r) for r in rows)
-
-              @staticmethod
-              def _node_from_row(row: sqlite3.Row) -> NodeStatus:
-                  return NodeStatus(
-                      node_id=str(row["node_id"]),
-                      role=NodeRole(str(row["role"])),
-                      state=NodeState(str(row["state"])),
-                      endpoint=str(row["endpoint"]),
-                      joined_at=float(row["joined_at"]),
-                      last_heartbeat=float(row["last_heartbeat"]),
-                  )
-          PYEOF
-
-          cat > shared_engines/network/replication.py <<'PYEOF'
-          """Hash-verified state replication between nodes."""
-          from __future__ import annotations
-
-          import json
-          from dataclasses import dataclass
-
-          from shared_engines.common.clocks import Clock
-          from shared_engines.common.identifiers import stable_hash
-          from shared_engines.common.validation import require_non_empty_str
-          from shared_engines.network.errors import ReplicationMismatchError
-          from shared_engines.storage.database import Database
-
-          REPLICATED_TABLES = (
-              "identities",
-              "cluster_nodes",
-          )
-
-
-          @dataclass(frozen=True)
-          class ReplicationReport:
-              primary_node: str
-              replica_node: str
-              state_version: int
-              state_hash: str
-              consistent: bool
-              rows_replicated: int
-
-
-          class ReplicationManager:
-              """Computes state hashes and verifies replica parity."""
+          class TelemetryCollector:
+              """Durable metrics + event index over the Network DB."""
 
               def __init__(self, db: Database, clock: Clock) -> None:
                   self._db = db
                   self._clock = clock
+                  MigrationRunner(
+                      db, "telemetry", TELEMETRY_MIGRATIONS
+                  ).run(clock)
 
-              def compute_state_hash(self) -> tuple[int, str]:
-                  parts: list[str] = []
-                  for table in REPLICATED_TABLES:
-                      rows = self._db.query_all(
-                          f"SELECT * FROM {table} ORDER BY rowid"
+              def counter(self, name: str, *, tags: dict[str, str] | None = None) -> None:
+                  self._record(name, kind="counter", value=1, tags=tags)
+
+              def gauge(
+                  self, name: str, value: float,
+                  *, tags: dict[str, str] | None = None,
+              ) -> None:
+                  require_positive_number(value, name)
+                  self._record(name, kind="gauge", value=value, tags=tags)
+
+              def timer(
+                  self, name: str, seconds: float,
+                  *, tags: dict[str, str] | None = None,
+              ) -> None:
+                  require_positive_number(seconds, "duration")
+                  self._record(name, kind="timer", value=seconds, tags=tags)
+
+              def _record(
+                  self,
+                  name: str,
+                  *,
+                  kind: str,
+                  value: float,
+                  tags: dict[str, str] | None,
+              ) -> None:
+                  require_non_empty_str(name, "name")
+                  with self._db.transaction() as cursor:
+                      cursor.execute(
+                          "INSERT INTO telemetry_metrics"
+                          " (name, kind, value, tags, recorded_at)"
+                          " VALUES (?, ?, ?, ?, ?)",
+                          (
+                              name,
+                              kind,
+                              value,
+                              canonical_json_dumps(dict(tags or {})),
+                              self._clock.now(),
+                          ),
                       )
-                      for row in rows:
-                          parts.append(
-                              json.dumps(
-                                  {
-                                      k: str(v)
-                                      for k, v in dict(row).items()
-                                  },
-                                  sort_keys=True,
-                              )
-                          )
-                  version = int(self._clock.now())
-                  return version, stable_hash(*parts)
 
-              def replicate(
+              def index_event(
                   self,
                   *,
-                  primary_node: str,
-                  replica_node: str,
-                  replica_hash: str | None = None,
-                  rows_replicated: int = 0,
-              ) -> ReplicationReport:
-                  require_non_empty_str(primary_node, "primary_node")
-                  require_non_empty_str(replica_node, "replica_node")
-                  version, primary_hash = self.compute_state_hash()
-                  if replica_hash is None:
-                      replica_hash = primary_hash
-                  consistent = replica_hash == primary_hash
-                  if not consistent:
-                      raise ReplicationMismatchError(
-                          f"replica {replica_node} hash"
-                          f" {replica_hash[:16]}"
-                          f" != primary {primary_hash[:16]}"
+                  event_id: str,
+                  event_type: str,
+                  aggregate_id: str,
+                  payload: dict[str, object],
+              ) -> None:
+                  require_non_empty_str(event_id, "event_id")
+                  require_non_empty_str(event_type, "event_type")
+                  require_non_empty_str(aggregate_id, "aggregate_id")
+                  with self._db.transaction() as cursor:
+                      cursor.execute(
+                          "INSERT INTO telemetry_events"
+                          " (event_id, event_type, aggregate_id,"
+                          "  payload, occurred_at)"
+                          " VALUES (?, ?, ?, ?, ?)",
+                          (
+                              event_id,
+                              event_type,
+                              aggregate_id,
+                              canonical_json_dumps(dict(payload)),
+                              self._clock.now(),
+                          ),
                       )
-                  return ReplicationReport(
-                      primary_node=primary_node,
-                      replica_node=replica_node,
-                      state_version=version,
-                      state_hash=primary_hash,
-                      consistent=True,
-                      rows_replicated=rows_replicated,
+
+              def query_metrics(
+                  self,
+                  name: str,
+                  *,
+                  limit: int = 100,
+              ) -> tuple[TelemetryRecord, ...]:
+                  require_non_empty_str(name, "name")
+                  require_int_range(limit, "limit", 1, 10_000)
+                  rows = self._db.query_all(
+                      "SELECT * FROM telemetry_metrics"
+                      " WHERE name = ?"
+                      " ORDER BY recorded_at DESC, metric_id DESC"
+                      " LIMIT ?",
+                      (name, limit),
+                  )
+                  return tuple(self._record_from_row(row) for row in rows)
+
+              def query_events(
+                  self,
+                  *,
+                  event_type: str | None = None,
+                  aggregate_id: str | None = None,
+                  limit: int = 100,
+              ) -> tuple[dict[str, object], ...]:
+                  require_int_range(limit, "limit", 1, 10_000)
+                  if event_type is not None and aggregate_id is not None:
+                      rows = self._db.query_all(
+                          "SELECT * FROM telemetry_events"
+                          " WHERE event_type = ? AND aggregate_id = ?"
+                          " ORDER BY occurred_at DESC LIMIT ?",
+                          (event_type, aggregate_id, limit),
+                      )
+                  elif event_type is not None:
+                      rows = self._db.query_all(
+                          "SELECT * FROM telemetry_events"
+                          " WHERE event_type = ?"
+                          " ORDER BY occurred_at DESC LIMIT ?",
+                          (event_type, limit),
+                      )
+                  elif aggregate_id is not None:
+                      rows = self._db.query_all(
+                          "SELECT * FROM telemetry_events"
+                          " WHERE aggregate_id = ?"
+                          " ORDER BY occurred_at DESC LIMIT ?",
+                          (aggregate_id, limit),
+                      )
+                  else:
+                      rows = self._db.query_all(
+                          "SELECT * FROM telemetry_events"
+                          " ORDER BY occurred_at DESC LIMIT ?",
+                          (limit,),
+                      )
+                  return tuple(
+                      {
+                          "event_id": str(row["event_id"]),
+                          "event_type": str(row["event_type"]),
+                          "aggregate_id": str(row["aggregate_id"]),
+                          "payload": canonical_json_loads(
+                              str(row["payload"])
+                          ),
+                          "occurred_at": float(row["occurred_at"]),
+                      }
+                      for row in rows
+                  )
+
+              def metric_summary(
+                  self, name: str
+              ) -> dict[str, object]:
+                  records = self.query_metrics(name, limit=10_000)
+                  if not records:
+                      return {
+                          "name": name,
+                          "count": 0,
+                          "total": 0.0,
+                          "last": None,
+                      }
+                  values = [r.value for r in records]
+                  return {
+                      "name": name,
+                      "count": len(values),
+                      "total": sum(values),
+                      "last": values[0],
+                  }
+
+              @staticmethod
+              def _record_from_row(row: object) -> TelemetryRecord:
+                  from typing import cast
+
+                  from shared_engines.storage.database import Database
+
+                  if not hasattr(row, "__getitem__"):
+                      raise ValueError("invalid telemetry row")
+                  tags = canonical_json_loads(str(row["tags"]))
+                  if not isinstance(tags, dict):
+                      tags = {}
+                  return TelemetryRecord(
+                      metric_id=int(cast("object", row["metric_id"])),
+                      name=str(row["name"]),
+                      kind=str(row["kind"]),
+                      value=float(row["value"]),
+                      tags={str(k): str(v) for k, v in tags.items()},
+                      recorded_at=float(row["recorded_at"]),
                   )
           PYEOF
 
-          cat > shared_engines/network/failover.py <<'PYEOF'
-          """Quorum-gated failover: no split-brain, ever."""
+          cat > shared_engines/telemetry/system_health.py <<'PYEOF'
+          """System health reporter: one view of the whole Network."""
           from __future__ import annotations
 
-          from shared_engines.audit.chain import AuditTrail
-          from shared_engines.common.validation import require_non_empty_str
-          from shared_engines.network.cluster import (
-              ClusterManager,
-              NodeRole,
+          from dataclasses import dataclass
+
+          from shared_engines.common.clocks import Clock
+          from shared_engines.network.cluster import ClusterManager
+          from shared_engines.observability.health import (
+              ComponentHealth,
+              HealthRegistry,
           )
-          from shared_engines.network.errors import NoQuorumError
-
-          EVENT_FAILOVER = "network.failover.elected"
+          from shared_engines.telemetry.collector import TelemetryCollector
 
 
-          class FailoverCoordinator:
-              """Elects a new primary under quorum, audited."""
+          @dataclass(frozen=True)
+          class SystemReport:
+              overall: ComponentHealth
+              components: tuple[ComponentHealth, ...]
+              cluster_nodes_active: int
+              cluster_nodes_total: int
+              recent_event_count: int
+
+
+          class SystemHealthReporter:
+              """Aggregates component health + cluster + telemetry."""
 
               def __init__(
                   self,
                   *,
+                  registry: HealthRegistry,
                   cluster: ClusterManager,
-                  audit: AuditTrail,
+                  telemetry: TelemetryCollector,
+                  clock: Clock,
               ) -> None:
+                  self._registry = registry
                   self._cluster = cluster
-                  self._audit = audit
+                  self._telemetry = telemetry
+                  self._clock = clock
 
-              def elect_new_primary(
-                  self, *, failed_primary: str
-              ) -> str:
-                  require_non_empty_str(failed_primary, "failed_primary")
-                  registered = self._cluster.all_nodes()
-                  if len(registered) == 0:
-                      raise NoQuorumError("cluster is empty")
+              def report(self) -> SystemReport:
+                  overall = self._registry.overall()
+                  components = self._registry.snapshot()
+                  all_nodes = self._cluster.all_nodes()
                   active = self._cluster.active_nodes()
-                  majority = len(registered) // 2 + 1
-                  if len(active) < majority:
-                      raise NoQuorumError(
-                          f"{len(active)}/{len(registered)} active:"
-                          f" majority ({majority}) not reached -"
-                          " failover refused to avoid split-brain"
-                      )
-                  candidates = [
-                      n
-                      for n in active
-                      if n.node_id != failed_primary
-                      and n.role
-                      in (NodeRole.COORDINATOR, NodeRole.WORKER)
-                  ]
-                  if not candidates:
-                      raise NoQuorumError(
-                          "no eligible candidate node available"
-                      )
-                  candidates.sort(key=lambda n: n.node_id)
-                  elected = candidates[0]
-                  self._audit.append(
-                      event_type=EVENT_FAILOVER,
-                      actor="failover-coordinator",
-                      subject=elected.node_id,
-                      payload={
-                          "failed_primary": failed_primary,
-                          "active": len(active),
-                          "registered": len(registered),
-                      },
+                  recent = self._telemetry.query_events(limit=100)
+                  return SystemReport(
+                      overall=overall,
+                      components=components,
+                      cluster_nodes_active=len(active),
+                      cluster_nodes_total=len(all_nodes),
+                      recent_event_count=len(recent),
                   )
-                  return elected.node_id
-
-              def has_quorum(self) -> bool:
-                  registered = self._cluster.all_nodes()
-                  if not registered:
-                      return False
-                  active = self._cluster.active_nodes()
-                  return len(active) >= len(registered) // 2 + 1
           PYEOF
 
-          cat > shared_engines/network/tests/test_network.py <<'PYEOF'
+          cat > shared_engines/telemetry/tests/test_telemetry.py <<'PYEOF'
           from __future__ import annotations
 
           from pathlib import Path
@@ -602,34 +400,31 @@ jobs:
           from shared_engines.network.cluster import (
               ClusterManager,
               NodeRole,
-              NodeState,
           )
-          from shared_engines.network.errors import (
-              InvalidTransitionError,
-              NoQuorumError,
-              NodeNotFoundError,
-              ReplicationMismatchError,
+          from shared_engines.observability.health import (
+              ComponentHealth,
+              HealthRegistry,
+              HealthStatus,
           )
-          from shared_engines.network.failover import FailoverCoordinator
-          from shared_engines.network.replication import ReplicationManager
+          from shared_engines.events.contracts import EventCatalog
+          from shared_engines.events.outbox import Outbox
           from shared_engines.storage.database import SQLiteAdapter
+          from shared_engines.telemetry.collector import TelemetryCollector
+          from shared_engines.telemetry.system_health import (
+              SystemHealthReporter,
+          )
 
 
           class _Harness:
-              def __init__(self, tmp_path: Path, nodes: int = 3) -> None:
-                  self.db = SQLiteAdapter(tmp_path / "net.db")
+              def __init__(self, tmp_path: Path) -> None:
+                  self.db = SQLiteAdapter(tmp_path / "tel.db")
                   self.clock = FrozenClock()
                   self.audit = AuditTrail(self.db, self.clock)
-                  from shared_engines.events.contracts import EventCatalog
-                  from shared_engines.events.outbox import Outbox
-
                   self.outbox = Outbox(self.db, self.clock)
                   self.outbox.ensure_schema()
                   self.catalog = EventCatalog()
                   for event_type in (
                       "network.node.joined",
-                      "network.node.state_changed",
-                      "network.failover.elected",
                       "identity.registered",
                       "identity.status_changed",
                   ):
@@ -647,249 +442,457 @@ jobs:
                       audit=self.audit,
                       outbox=self.outbox,
                       catalog=self.catalog,
-                      heartbeat_ttl_seconds=30.0,
                   )
-                  self.replication = ReplicationManager(
-                      self.db, self.clock
-                  )
-                  self.failover = FailoverCoordinator(
-                      cluster=self.cluster, audit=self.audit
-                  )
-                  self.node_ids: list[str] = []
-                  for index in range(nodes):
-                      node_identity = self.identity.register_identity(
-                          kind=IdentityKind.DEVICE,
-                          display_name=f"node-{index}",
-                          actor="bootstrap",
-                      )
-                      role = (
-                          NodeRole.COORDINATOR
-                          if index == 0
-                          else NodeRole.WORKER
-                      )
-                      self.cluster.register_node(
-                          node_id=node_identity.zid,
-                          role=role,
-                          endpoint=f"tcp://node-{index}:9000",
-                      )
-                      self.node_ids.append(node_identity.zid)
-
-              def activate_all(self) -> None:
-                  for node_id in self.node_ids:
-                      self.cluster.heartbeat(node_id)
-
-              def kill_node(self, node_id: str) -> None:
-                  """Advances time so ONLY node_id goes stale: the other
-                  nodes keep heartbeating and stay ACTIVE."""
-                  others = [n for n in self.node_ids if n != node_id]
-                  self.clock.advance(31)
-                  for other in others:
-                      self.cluster.heartbeat(other)
-                  detected = self.cluster.detect_failures()
-                  assert node_id in detected
-                  self.clock.advance(31)
-                  for other in others:
-                      self.cluster.heartbeat(other)
-                  detected = self.cluster.detect_failures()
-                  assert node_id in detected
-
-              def kill_all(self) -> None:
-                  self.clock.advance(31)
-                  self.cluster.detect_failures()
-                  self.clock.advance(31)
-                  self.cluster.detect_failures()
+                  self.telemetry = TelemetryCollector(self.db, self.clock)
+                  self.registry = HealthRegistry()
 
               def close(self) -> None:
                   self.db.close()
 
 
-          def test_nodes_register_and_heartbeat_activates(
-              tmp_path: Path,
-          ) -> None:
+          def test_counter_gauge_timer_persist(tmp_path: Path) -> None:
               harness = _Harness(tmp_path)
-              nodes = harness.cluster.all_nodes()
-              assert len(nodes) == 3
-              assert all(n.state is NodeState.JOINING for n in nodes)
-              harness.activate_all()
-              active = harness.cluster.active_nodes()
-              assert len(active) == 3
-              assert all(n.state is NodeState.ACTIVE for n in active)
-              harness.close()
-
-
-          def test_heartbeat_failure_detection_ladder(
-              tmp_path: Path,
-          ) -> None:
-              harness = _Harness(tmp_path)
-              harness.activate_all()
-              node = harness.cluster.active_nodes()[0]
-              harness.clock.advance(31)
-              expired = harness.cluster.detect_failures()
-              assert node.node_id in expired
-              suspect = harness.cluster.require(node.node_id)
-              assert suspect.state is NodeState.SUSPECT
-              harness.clock.advance(31)
-              harness.cluster.detect_failures()
-              down = harness.cluster.require(node.node_id)
-              assert down.state is NodeState.DOWN
-              harness.close()
-
-
-          def test_unknown_node_heartbeat_raises(tmp_path: Path) -> None:
-              harness = _Harness(tmp_path)
-              with pytest.raises(NodeNotFoundError):
-                  harness.cluster.heartbeat("ZID-ghost")
-              harness.close()
-
-
-          def test_failover_with_quorum_elects_new_primary(
-              tmp_path: Path,
-          ) -> None:
-              harness = _Harness(tmp_path)
-              harness.activate_all()
-              coordinator_id = harness.node_ids[0]
-              harness.kill_node(coordinator_id)
-              new_primary = harness.failover.elect_new_primary(
-                  failed_primary=coordinator_id
+              harness.telemetry.counter("identity.registered")
+              harness.telemetry.counter("identity.registered")
+              harness.telemetry.gauge("cluster.nodes.active", 3.0)
+              harness.telemetry.timer("request.latency", 0.25)
+              metrics = harness.telemetry.query_metrics(
+                  "identity.registered"
               )
-              assert new_primary != coordinator_id
-              assert new_primary in harness.node_ids[1:]
-              assert harness.failover.has_quorum() is True
-              assert harness.audit.verify() >= 1
-              harness.close()
-
-
-          def test_failover_without_quorum_refused(
-              tmp_path: Path,
-          ) -> None:
-              harness = _Harness(tmp_path, nodes=3)
-              harness.activate_all()
-              coordinator_id = harness.node_ids[0]
-              harness.kill_all()
-              with pytest.raises(NoQuorumError):
-                  harness.failover.elect_new_primary(
-                      failed_primary=coordinator_id
-                  )
-              assert harness.failover.has_quorum() is False
-              harness.close()
-
-
-          def test_down_node_recovers_through_rejoined(
-              tmp_path: Path,
-          ) -> None:
-              """DOWN -> (beat) -> REJOINED -> (beat) -> ACTIVE: the
-              full recovery cycle of a returned node."""
-              harness = _Harness(tmp_path, nodes=3)
-              harness.activate_all()
-              victim = harness.node_ids[2]
-              harness.kill_node(victim)
-              assert harness.cluster.require(victim).state is (
-                  NodeState.DOWN
+              assert len(metrics) == 2
+              assert all(m.kind == "counter" for m in metrics)
+              summary = harness.telemetry.metric_summary(
+                  "identity.registered"
               )
-              harness.cluster.heartbeat(victim)
-              rejoined = harness.cluster.require(victim)
-              assert rejoined.state is NodeState.REJOINED
-              harness.clock.advance(1)
-              harness.cluster.heartbeat(victim)
-              recovered = harness.cluster.require(victim)
-              assert recovered.state is NodeState.ACTIVE
+              assert summary["count"] == 2
+              assert summary["total"] == 2.0
+              latencies = harness.telemetry.query_metrics(
+                  "request.latency"
+              )
+              assert latencies[0].value == 0.25
               harness.close()
 
 
-          def test_replication_consistent_and_mismatch(
+          def test_events_indexed_and_queryable(tmp_path: Path) -> None:
+              harness = _Harness(tmp_path)
+              user = harness.identity.register_identity(
+                  kind=IdentityKind.PERSON,
+                  display_name="Watched",
+                  actor="registrar",
+              )
+              events = harness.telemetry.query_events(
+                  aggregate_id=user.zid
+              )
+              types = {e["event_type"] for e in events}
+              assert "identity.registered" in types
+              by_type = harness.telemetry.query_events(
+                  event_type="identity.registered"
+              )
+              assert len(by_type) >= 1
+              all_events = harness.telemetry.query_events(limit=50)
+              assert len(all_events) >= 1
+              harness.close()
+
+
+          def test_system_report_aggregates_everything(
               tmp_path: Path,
           ) -> None:
               harness = _Harness(tmp_path)
-              harness.activate_all()
-              version, state_hash = harness.replication.compute_state_hash()
-              report = harness.replication.replicate(
-                  primary_node="node-primary",
-                  replica_node="node-replica",
-                  replica_hash=state_hash,
-              )
-              assert report.consistent is True
-              assert report.state_hash == state_hash
-              with pytest.raises(ReplicationMismatchError):
-                  harness.replication.replicate(
-                      primary_node="node-primary",
-                      replica_node="node-replica",
-                      replica_hash="0" * 64,
-                  )
-              harness.close()
-
-
-          def test_state_hash_changes_when_membership_changes(
-              tmp_path: Path,
-          ) -> None:
-              harness = _Harness(tmp_path)
-              harness.activate_all()
-              _, hash_before = harness.replication.compute_state_hash()
-              new_identity = harness.identity.register_identity(
-                  kind=IdentityKind.DEVICE,
-                  display_name="node-extra",
+              harness.identity.register_identity(
+                  kind=IdentityKind.PERSON,
+                  display_name="Node Owner",
                   actor="bootstrap",
               )
-              harness.cluster.register_node(
-                  node_id=new_identity.zid,
-                  role=NodeRole.WORKER,
-                  endpoint="tcp://node-extra:9000",
-              )
-              _, hash_after = harness.replication.compute_state_hash()
-              assert hash_after != hash_before
-              harness.close()
-
-
-          def test_cluster_events_in_outbox(tmp_path: Path) -> None:
-              from shared_engines.events.contracts import Event
-
-              harness = _Harness(tmp_path)
-              collected: list[Event] = []
-
-              def collect(event: Event) -> None:
-                  collected.append(event)
-
-              harness.outbox.dispatch_pending(collect)
-              by_type = {e.event_type for e in collected}
-              assert "network.node.joined" in by_type
-              joined = [
-                  e
-                  for e in collected
-                  if e.event_type == "network.node.joined"
-              ]
-              assert len(joined) == 3
-              harness.close()
-
-
-          def test_audit_chain_covers_cluster_events(
-              tmp_path: Path,
-          ) -> None:
-              harness = _Harness(tmp_path)
-              harness.activate_all()
-              count = harness.audit.verify()
-              assert count >= 6
-              harness.close()
-
-
-          def test_duplicate_node_registration_rejected(
-              tmp_path: Path,
-          ) -> None:
-              harness = _Harness(tmp_path, nodes=1)
-              node = harness.cluster.all_nodes()[0]
-              with pytest.raises(InvalidTransitionError):
-                  harness.cluster.register_node(
-                      node_id=node.node_id,
-                      role=NodeRole.WORKER,
-                      endpoint="tcp://dupe:9000",
+              node = harness.cluster.all_nodes()[0] if harness.cluster.all_nodes() else None
+              if node is None:
+                  node_identity = harness.identity.register_identity(
+                      kind=IdentityKind.DEVICE,
+                      display_name="node-0",
+                      actor="bootstrap",
                   )
+                  harness.cluster.register_node(
+                      node_id=node_identity.zid,
+                      role=__import__(
+                          "shared_engines.network.cluster",
+                          fromlist=["NodeRole"],
+                      ).NodeRole.COORDINATOR,
+                      endpoint="tcp://node-0:9000",
+                  )
+              harness.cluster.heartbeat(
+                  harness.cluster.all_nodes()[0].node_id
+              )
+              harness.registry.register(
+                  "storage",
+                  _StaticHealth(),
+              )
+              reporter = SystemHealthReporter(
+                  registry=harness.registry,
+                  cluster=harness.cluster,
+                  telemetry=harness.telemetry,
+                  clock=harness.clock,
+              )
+              report = reporter.report()
+              assert report.overall.status is HealthStatus.HEALTHY
+              assert report.cluster_nodes_total >= 1
+              assert report.recent_event_count >= 1
               harness.close()
+
+
+          def test_invalid_metric_rejected(tmp_path: Path) -> None:
+              harness = _Harness(tmp_path)
+              from shared_engines.telemetry.errors import (
+                  InvalidMetricError,
+              )
+
+              with pytest.raises(InvalidMetricError):
+                  harness.telemetry.gauge("bad.gauge", -1.0)
+              with pytest.raises(InvalidMetricError):
+                  harness.telemetry.timer("bad.timer", 0.0)
+              harness.close()
+
+
+          class _StaticHealth:
+              def check_health(self) -> ComponentHealth:
+                  return ComponentHealth(
+                      "storage", HealthStatus.HEALTHY, "static ok"
+                  )
           PYEOF
 
-          echo "=== NETWORK CORE OK ==="
+          cat > shared_engines/logs/__init__.py <<'PYEOF'
+          """Zyra structured logs with correlation."""
+          from __future__ import annotations
+
+          from shared_engines.logs.structured import (
+              CorrelationContext,
+              StructuredLogger,
+              LogRecord,
+          )
+
+          __all__ = ["CorrelationContext", "LogRecord", "StructuredLogger"]
+          PYEOF
+
+          cat > shared_engines/logs/structured.py <<'PYEOF'
+          """Structured JSON logging with request correlation.
+
+          Every line is one JSON object: level, component, message,
+          correlation_id, detail. Correlation ids group all log lines
+          of one operation (an API request, a cluster event), making
+          traces queryable. Retention keeps the newest N records.
+          """
+          from __future__ import annotations
+
+          from dataclasses import dataclass
+          from typing import Final
+
+          from shared_engines.common.clocks import Clock
+          from shared_engines.common.errors import IntegrityError
+          from shared_engines.common.identifiers import new_id
+          from shared_engines.common.serialization import canonical_json_dumps
+          from shared_engines.common.validation import require_int_range
+          from shared_engines.storage.database import Database
+          from shared_engines.storage.migrations import (
+              Migration,
+              MigrationRunner,
+          )
+
+          LEVELS: Final[tuple[str, ...]] = (
+              "DEBUG",
+              "INFO",
+              "WARNING",
+              "ERROR",
+          )
+
+          LOGS_MIGRATIONS = (
+              Migration(
+                  1,
+                  "structured_logs",
+                  (
+                      "CREATE TABLE structured_logs ("
+                      " log_id INTEGER PRIMARY KEY AUTOINCREMENT,"
+                      " level TEXT NOT NULL,"
+                      " component TEXT NOT NULL,"
+                      " message TEXT NOT NULL,"
+                      " correlation_id TEXT NOT NULL,"
+                      " detail TEXT NOT NULL,"
+                      " created_at REAL NOT NULL)",
+                      "CREATE INDEX logs_correlation"
+                      " ON structured_logs (correlation_id, created_at)",
+                      "CREATE INDEX logs_level_time"
+                      " ON structured_logs (level, created_at)",
+                  ),
+              ),
+          )
+
+
+          @dataclass(frozen=True)
+          class LogRecord:
+              log_id: int
+              level: str
+              component: str
+              message: str
+              correlation_id: str
+              detail: dict[str, str]
+              created_at: float
+
+
+          class CorrelationContext:
+              """Per-operation correlation id generator/tracker."""
+
+              def __init__(self) -> None:
+                  self._current: str | None = None
+
+              def start(self) -> str:
+                  self._current = f"REQ-{new_id()}"
+                  return self._current
+
+              @property
+              def current(self) -> str:
+                  if self._current is None:
+                      return self.start()
+                  return self._current
+
+              def clear(self) -> None:
+                  self._current = None
+
+
+          class StructuredLogger:
+              """Durable structured logger with correlation + retention."""
+
+              def __init__(self, db: Database, clock: Clock) -> None:
+                  self._db = db
+                  self._clock = clock
+                  MigrationRunner(
+                      db, "logs.structured", LOGS_MIGRATIONS
+                  ).run(clock)
+
+              def log(
+                  self,
+                  *,
+                  level: str,
+                  component: str,
+                  message: str,
+                  correlation_id: str,
+                  detail: dict[str, str] | None = None,
+              ) -> LogRecord:
+                  if level not in LEVELS:
+                      raise IntegrityError(
+                          f"invalid log level: {level}"
+                      )
+                  require_non_empty_str(component, "component")
+                  require_non_empty_str(message, "message")
+                  require_non_empty_str(correlation_id, "correlation_id")
+                  safe_detail = {
+                      str(k): str(v) for k, v in (detail or {}).items()
+                  }
+                  now = self._clock.now()
+                  with self._db.transaction() as cursor:
+                      cursor.execute(
+                          "INSERT INTO structured_logs"
+                          " (level, component, message,"
+                          "  correlation_id, detail, created_at)"
+                          " VALUES (?, ?, ?, ?, ?, ?)",
+                          (
+                              level,
+                              component,
+                              message,
+                              correlation_id,
+                              canonical_json_dumps(safe_detail),
+                              now,
+                          ),
+                      )
+                      row = cursor.execute(
+                          "SELECT * FROM structured_logs"
+                          " ORDER BY log_id DESC LIMIT 1"
+                      ).fetchone()
+                  if row is None:
+                      raise IntegrityError("log vanished after insert")
+                  return self._record_from_row(row)
+
+              def info(
+                  self, component: str, message: str,
+                  correlation_id: str,
+                  detail: dict[str, str] | None = None,
+              ) -> LogRecord:
+                  return self.log(
+                      level="INFO", component=component,
+                      message=message, correlation_id=correlation_id,
+                      detail=detail,
+                  )
+
+              def warning(
+                  self, component: str, message: str,
+                  correlation_id: str,
+                  detail: dict[str, str] | None = None,
+              ) -> LogRecord:
+                  return self.log(
+                      level="WARNING", component=component,
+                      message=message, correlation_id=correlation_id,
+                      detail=detail,
+                  )
+
+              def error(
+                  self, component: str, message: str,
+                  correlation_id: str,
+                  detail: dict[str, str] | None = None,
+              ) -> LogRecord:
+                  return self.log(
+                      level="ERROR", component=component,
+                      message=message, correlation_id=correlation_id,
+                      detail=detail,
+                  )
+
+              def query_by_correlation(
+                  self, correlation_id: str
+              ) -> tuple[LogRecord, ...]:
+                  require_non_empty_str(correlation_id, "correlation_id")
+                  rows = self._db.query_all(
+                      "SELECT * FROM structured_logs"
+                      " WHERE correlation_id = ?"
+                      " ORDER BY created_at, log_id",
+                      (correlation_id,),
+                  )
+                  return tuple(self._record_from_row(r) for r in rows)
+
+              def enforce_retention(self, *, keep: int) -> int:
+                  require_int_range(keep, "keep", 1, 1_000_000)
+                  with self._db.transaction() as cursor:
+                      cursor.execute(
+                          "DELETE FROM structured_logs WHERE log_id NOT IN"
+                          " (SELECT log_id FROM structured_logs"
+                          "  ORDER BY log_id DESC LIMIT ?)",
+                          (keep,),
+                      )
+                      row = cursor.execute("SELECT changes()").fetchone()
+                  return int(row[0]) if row is not None else 0
+
+              @staticmethod
+              def _record_from_row(row: object) -> LogRecord:
+                  from typing import cast
+
+                  if not hasattr(row, "__getitem__"):
+                      raise IntegrityError("invalid log row")
+                  detail = cast(
+                      "dict[str, str]",
+                      __import__(
+                          "shared_engines.common.serialization",
+                          fromlist=["canonical_json_loads"],
+                      ).canonical_json_loads(str(row["detail"])),
+                  )
+                  return LogRecord(
+                      log_id=int(row["log_id"]),
+                      level=str(row["level"]),
+                      component=str(row["component"]),
+                      message=str(row["message"]),
+                      correlation_id=str(row["correlation_id"]),
+                      detail=detail,
+                      created_at=float(row["created_at"]),
+                  )
+          PYEOF
+
+          cat > shared_engines/logs/tests/test_logs.py <<'PYEOF'
+          from __future__ import annotations
+
+          from pathlib import Path
+
+          import pytest
+
+          from shared_engines.common.clocks import FrozenClock
+          from shared_engines.common.errors import IntegrityError
+          from shared_engines.logs.structured import (
+              CorrelationContext,
+              StructuredLogger,
+          )
+          from shared_engines.storage.database import SQLiteAdapter
+
+
+          def test_log_roundtrip_with_correlation(tmp_path: Path) -> None:
+              db = SQLiteAdapter(tmp_path / "logs.db")
+              logger = StructuredLogger(db, FrozenClock())
+              ctx = CorrelationContext()
+              corr = ctx.start()
+              record = logger.info(
+                  component="identity",
+                  message="registered new identity",
+                  correlation_id=corr,
+                  detail={"zid": "ZID-abc", "kind": "person"},
+              )
+              assert record.level == "INFO"
+              assert record.correlation_id == corr
+              assert record.detail["zid"] == "ZID-abc"
+              trace = logger.query_by_correlation(corr)
+              assert len(trace) == 1
+              db.close()
+
+
+          def test_correlation_groups_multi_operation_trace(
+              tmp_path: Path,
+          ) -> None:
+              db = SQLiteAdapter(tmp_path / "logs.db")
+              logger = StructuredLogger(db, FrozenClock())
+              ctx = CorrelationContext()
+              corr = ctx.start()
+              logger.info("api", "request received", corr)
+              logger.info("identity", "identity looked up", corr)
+              logger.warning("verification", "doc hash mismatch", corr)
+              logger.error("api", "request failed", corr)
+              trace = logger.query_by_correlation(corr)
+              assert len(trace) == 4
+              levels = [r.level for r in trace]
+              assert levels == [
+                  "INFO", "INFO", "WARNING", "ERROR",
+              ]
+              components = [r.component for r in trace]
+              assert components == [
+                  "api", "identity", "verification", "api",
+              ]
+              db.close()
+
+
+          def test_invalid_level_rejected(tmp_path: Path) -> None:
+              db = SQLiteAdapter(tmp_path / "logs.db")
+              logger = StructuredLogger(db, FrozenClock())
+              with pytest.raises(IntegrityError):
+                  logger.log(
+                      level="VERBOSE",
+                      component="x",
+                      message="y",
+                      correlation_id="REQ-1",
+                  )
+              db.close()
+
+
+          def test_retention_keeps_newest(tmp_path: Path) -> None:
+              db = SQLiteAdapter(tmp_path / "logs.db")
+              clock = FrozenClock()
+              logger = StructuredLogger(db, clock)
+              for index in range(10):
+                  logger.info("test", f"line {index}", f"REQ-{index}")
+                  clock.advance(1)
+              removed = logger.enforce_retention(keep=3)
+              assert removed == 7
+              db.close()
+
+
+          def test_logs_survive_reopen(tmp_path: Path) -> None:
+              path = tmp_path / "logs.db"
+              db = SQLiteAdapter(path)
+              logger = StructuredLogger(db, FrozenClock())
+              logger.info("test", "persist me", "REQ-42")
+              db.close()
+              db2 = SQLiteAdapter(path)
+              logger2 = StructuredLogger(db2, FrozenClock())
+              trace = logger2.query_by_correlation("REQ-42")
+              assert len(trace) == 1
+              assert trace[0].message == "persist me"
+              db2.close()
+          PYEOF
+
+          echo "=== TELEMETRY + LOGS OK ==="
 
       - name: Quality gates (mypy first; full regression)
         run: |
           set -euo pipefail
-          M="shared_engines/common shared_engines/storage shared_engines/events shared_engines/observability shared_engines/audit shared_engines/security shared_engines/identity shared_engines/verification shared_engines/runtime shared_engines/tokenization shared_engines/currency shared_engines/verifier shared_engines/hardening shared_engines/authority shared_engines/network"
+          M="shared_engines/common shared_engines/storage shared_engines/events shared_engines/observability shared_engines/audit shared_engines/security shared_engines/identity shared_engines/verification shared_engines/runtime shared_engines/tokenization shared_engines/currency shared_engines/verifier shared_engines/hardening shared_engines/authority shared_engines/network shared_engines/telemetry shared_engines/logs"
           python -m compileall -q $M main.py scripts
           echo "compile OK"
           find $M scripts -name '__pycache__' -type d -prune -exec rm -rf {} +
@@ -911,7 +914,7 @@ jobs:
           if git diff --cached --quiet; then
             echo "No changes."
           else
-            git commit -m "zyra: module 16 PHASE 4 (heartbeat drives DOWN->REJOINED->ACTIVE recovery cycle, 13 multi-node tests incl. full recovery)"
+            git commit -m "zyra: module 17 PHASE 5 (durable telemetry metrics+event index, system health reporter, structured JSON logs with correlation+retention) + tests"
             git push origin "HEAD:${{ github.ref_name }}"
           fi
-          echo "=== MODULE 16 COMPLETE ==="
+          echo "=== MODULE 17 COMPLETE ==="

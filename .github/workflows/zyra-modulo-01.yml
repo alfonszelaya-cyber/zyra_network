@@ -108,7 +108,13 @@ jobs:
           PYEOF
 
           cat > shared_engines/network/cluster.py <<'PYEOF'
-          """Cluster membership: nodes, heartbeats, TTL failure detection."""
+          """Cluster membership: nodes, heartbeats, TTL failure detection.
+
+          Lifecycle: JOINING -> (first heartbeat) -> ACTIVE -> SUSPECT
+          -> DOWN -> REJOINED -> ACTIVE. A heartbeat reactivates
+          JOINING, SUSPECT and REJOINED nodes. Cluster events are
+          emitted to the outbox transactionally and audited.
+          """
           from __future__ import annotations
 
           import sqlite3
@@ -122,6 +128,8 @@ jobs:
               require_non_empty_str,
               require_positive_number,
           )
+          from shared_engines.events.contracts import EventCatalog
+          from shared_engines.events.outbox import Outbox
           from shared_engines.network.errors import (
               InvalidTransitionError,
               NodeNotFoundError,
@@ -207,6 +215,8 @@ jobs:
                   db: Database,
                   clock: Clock,
                   audit: AuditTrail,
+                  outbox: Outbox,
+                  catalog: EventCatalog,
                   heartbeat_ttl_seconds: float = 30.0,
               ) -> None:
                   require_positive_number(
@@ -217,7 +227,14 @@ jobs:
                   self._db = db
                   self._clock = clock
                   self._audit = audit
+                  self._outbox = outbox
+                  self._catalog = catalog
                   self._ttl = heartbeat_ttl_seconds
+                  for event_type in (
+                      EVENT_NODE_JOINED,
+                      EVENT_NODE_STATE_CHANGED,
+                  ):
+                      self._catalog.register(event_type)
                   MigrationRunner(
                       db, "network.cluster", CLUSTER_MIGRATIONS
                   ).run(clock)
@@ -250,6 +267,18 @@ jobs:
                                   1,
                               ),
                           )
+                          event = self._catalog.build(
+                              EVENT_NODE_JOINED,
+                              aggregate_id=node_id,
+                              payload={
+                                  "role": role.value,
+                                  "endpoint": endpoint,
+                              },
+                              clock=self._clock,
+                          )
+                          self._outbox.enqueue_in_transaction(
+                              cursor, event
+                          )
                   except sqlite3.IntegrityError as exc:
                       raise InvalidTransitionError(
                           f"node already registered: {node_id}"
@@ -266,6 +295,8 @@ jobs:
                   return node
 
               def heartbeat(self, node_id: str) -> None:
+                  """Refreshes liveness; reactivates JOINING, SUSPECT
+                  and REJOINED nodes to ACTIVE."""
                   require_non_empty_str(node_id, "node_id")
                   now = self._clock.now()
                   with self._db.transaction() as cursor:
@@ -273,7 +304,7 @@ jobs:
                           "UPDATE cluster_nodes"
                           " SET last_heartbeat = ?,"
                           " state = CASE WHEN state IN"
-                          "  ('SUSPECT', 'REJOINED')"
+                          "  ('JOINING', 'SUSPECT', 'REJOINED')"
                           "  THEN 'ACTIVE' ELSE state END"
                           " WHERE node_id = ?",
                           (now, node_id),
@@ -351,6 +382,13 @@ jobs:
                           " WHERE node_id = ?",
                           (to_state.value, node_id),
                       )
+                      event = self._catalog.build(
+                          EVENT_NODE_STATE_CHANGED,
+                          aggregate_id=node_id,
+                          payload={"to": to_state.value},
+                          clock=self._clock,
+                      )
+                      self._outbox.enqueue_in_transaction(cursor, event)
                   self._audit.append(
                       event_type=EVENT_NODE_STATE_CHANGED,
                       actor="cluster-manager",
@@ -394,9 +432,7 @@ jobs:
           from shared_engines.common.clocks import Clock
           from shared_engines.common.identifiers import stable_hash
           from shared_engines.common.validation import require_non_empty_str
-          from shared_engines.network.errors import (
-              ReplicationMismatchError,
-          )
+          from shared_engines.network.errors import ReplicationMismatchError
           from shared_engines.storage.database import Database
 
           REPLICATED_TABLES = (
@@ -604,6 +640,8 @@ jobs:
                       db=self.db,
                       clock=self.clock,
                       audit=self.audit,
+                      outbox=self.outbox,
+                      catalog=self.catalog,
                       heartbeat_ttl_seconds=30.0,
                   )
                   self.replication = ReplicationManager(
@@ -612,6 +650,7 @@ jobs:
                   self.failover = FailoverCoordinator(
                       cluster=self.cluster, audit=self.audit
                   )
+                  self.node_ids: list[str] = []
                   for index in range(nodes):
                       node_identity = self.identity.register_identity(
                           kind=IdentityKind.DEVICE,
@@ -628,11 +667,34 @@ jobs:
                           role=role,
                           endpoint=f"tcp://node-{index}:9000",
                       )
-                      self.cluster.heartbeat(node_identity.zid)
+                      self.node_ids.append(node_identity.zid)
 
               def activate_all(self) -> None:
-                  for node in self.cluster.all_nodes():
-                      self.cluster.heartbeat(node.node_id)
+                  for node_id in self.node_ids:
+                      self.cluster.heartbeat(node_id)
+
+              def kill_node(self, node_id: str) -> None:
+                  """Advances time so ONLY node_id goes stale: the other
+                  nodes keep heartbeating and stay ACTIVE."""
+                  others = [
+                      n for n in self.node_ids if n != node_id
+                  ]
+                  self.clock.advance(31)
+                  for other in others:
+                      self.cluster.heartbeat(other)
+                  harness_detect = self.cluster.detect_failures()
+                  assert node_id in harness_detect
+                  self.clock.advance(31)
+                  for other in others:
+                      self.cluster.heartbeat(other)
+                  harness_detect = self.cluster.detect_failures()
+                  assert node_id in harness_detect
+
+              def kill_all(self) -> None:
+                  self.clock.advance(31)
+                  self.cluster.detect_failures()
+                  self.clock.advance(31)
+                  self.cluster.detect_failures()
 
               def close(self) -> None:
                   self.db.close()
@@ -648,6 +710,9 @@ jobs:
               harness.activate_all()
               active = harness.cluster.active_nodes()
               assert len(active) == 3
+              assert all(
+                  n.state is NodeState.ACTIVE for n in active
+              )
               harness.close()
 
 
@@ -681,19 +746,14 @@ jobs:
           ) -> None:
               harness = _Harness(tmp_path)
               harness.activate_all()
-              coordinator = next(
-                  n
-                  for n in harness.cluster.all_nodes()
-                  if n.role is NodeRole.COORDINATOR
-              )
-              harness.clock.advance(31)
-              harness.cluster.detect_failures()
-              harness.clock.advance(31)
-              harness.cluster.detect_failures()
+              coordinator_id = harness.node_ids[0]
+              harness.kill_node(coordinator_id)
               new_primary = harness.failover.elect_new_primary(
-                  failed_primary=coordinator.node_id
+                  failed_primary=coordinator_id
               )
-              assert new_primary != coordinator.node_id
+              assert new_primary != coordinator_id
+              assert new_primary in harness.node_ids[1:]
+              assert harness.failover.has_quorum() is True
               assert harness.audit.verify() >= 1
               harness.close()
 
@@ -703,30 +763,29 @@ jobs:
           ) -> None:
               harness = _Harness(tmp_path, nodes=3)
               harness.activate_all()
-              coordinator = next(
-                  n
-                  for n in harness.cluster.all_nodes()
-                  if n.role is NodeRole.COORDINATOR
-              )
-              harness.clock.advance(31)
-              harness.cluster.detect_failures()
-              harness.clock.advance(31)
-              harness.cluster.detect_failures()
-              workers = [
-                  n
-                  for n in harness.cluster.all_nodes()
-                  if n.node_id != coordinator.node_id
-              ]
-              for worker in workers:
-                  harness.clock.advance(31)
-                  harness.cluster.detect_failures()
-                  harness.clock.advance(31)
-                  harness.cluster.detect_failures()
+              coordinator_id = harness.node_ids[0]
+              harness.kill_all()
               with pytest.raises(NoQuorumError):
                   harness.failover.elect_new_primary(
-                      failed_primary=coordinator.node_id
+                      failed_primary=coordinator_id
                   )
               assert harness.failover.has_quorum() is False
+              harness.close()
+
+
+          def test_rejoined_node_recovers_active(
+              tmp_path: Path,
+          ) -> None:
+              harness = _Harness(tmp_path, nodes=3)
+              harness.activate_all()
+              victim = harness.node_ids[2]
+              harness.kill_node(victim)
+              assert harness.cluster.require(victim).state is (
+                  NodeState.DOWN
+              )
+              harness.cluster.heartbeat(victim)
+              recovered = harness.cluster.require(victim)
+              assert recovered.state is NodeState.ACTIVE
               harness.close()
 
 
@@ -752,15 +811,22 @@ jobs:
               harness.close()
 
 
-          def test_state_hash_changes_when_state_changes(
+          def test_state_hash_changes_when_membership_changes(
               tmp_path: Path,
           ) -> None:
               harness = _Harness(tmp_path)
               harness.activate_all()
               _, hash_before = harness.replication.compute_state_hash()
-              node = harness.cluster.active_nodes()[0]
-              harness.cluster.heartbeat(node.node_id)
-              harness.clock.advance(1)
+              new_identity = harness.identity.register_identity(
+                  kind=IdentityKind.DEVICE,
+                  display_name="node-extra",
+                  actor="bootstrap",
+              )
+              harness.cluster.register_node(
+                  node_id=new_identity.zid,
+                  role=NodeRole.WORKER,
+                  endpoint="tcp://node-extra:9000",
+              )
               _, hash_after = harness.replication.compute_state_hash()
               assert hash_after != hash_before
               harness.close()
@@ -778,6 +844,12 @@ jobs:
               harness.outbox.dispatch_pending(collect)
               by_type = {e.event_type for e in collected}
               assert "network.node.joined" in by_type
+              joined = [
+                  e
+                  for e in collected
+                  if e.event_type == "network.node.joined"
+              ]
+              assert len(joined) == 3
               harness.close()
 
 
@@ -832,7 +904,7 @@ jobs:
           if git diff --cached --quiet; then
             echo "No changes."
           else
-            git commit -m "zyra: module 16 PHASE 4 (cluster TTL failure detection, hash-verified replication, quorum failover anti-split-brain, errors from errors.py) + tests"
+            git commit -m "zyra: module 16 PHASE 4 fixed (heartbeat activates JOINING nodes, cluster events to outbox transactionally, realistic kill_node tests) + 12 multi-node tests"
             git push origin "HEAD:${{ github.ref_name }}"
           fi
           echo "=== MODULE 16 COMPLETE ==="

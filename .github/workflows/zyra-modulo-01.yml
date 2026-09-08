@@ -108,12 +108,14 @@ jobs:
           PYEOF
 
           cat > shared_engines/network/cluster.py <<'PYEOF'
-          """Cluster membership: nodes, heartbeats, TTL failure detection.
+          """Cluster membership: heartbeats drive the full lifecycle.
 
-          Lifecycle: JOINING -> (first heartbeat) -> ACTIVE -> SUSPECT
-          -> DOWN -> REJOINED -> ACTIVE. A heartbeat reactivates
-          JOINING, SUSPECT and REJOINED nodes. Cluster events are
-          emitted to the outbox transactionally and audited.
+          JOINING -> (heartbeat) -> ACTIVE -> SUSPECT -> DOWN ->
+          (heartbeat) -> REJOINED -> (heartbeat) -> ACTIVE.
+          A DOWN node that heartbeats again has clearly returned:
+          first beat marks it REJOINED, second confirms ACTIVE.
+          Cluster events go to the outbox transactionally and are
+          audited.
           """
           from __future__ import annotations
 
@@ -295,17 +297,21 @@ jobs:
                   return node
 
               def heartbeat(self, node_id: str) -> None:
-                  """Refreshes liveness; reactivates JOINING, SUSPECT
-                  and REJOINED nodes to ACTIVE."""
+                  """Refreshes liveness and advances the lifecycle:
+                  JOINING -> ACTIVE, SUSPECT -> ACTIVE,
+                  DOWN -> REJOINED (next beat confirms ACTIVE)."""
                   require_non_empty_str(node_id, "node_id")
                   now = self._clock.now()
                   with self._db.transaction() as cursor:
                       cursor.execute(
                           "UPDATE cluster_nodes"
                           " SET last_heartbeat = ?,"
-                          " state = CASE WHEN state IN"
-                          "  ('JOINING', 'SUSPECT', 'REJOINED')"
-                          "  THEN 'ACTIVE' ELSE state END"
+                          " state = CASE state"
+                          "  WHEN 'JOINING' THEN 'ACTIVE'"
+                          "  WHEN 'SUSPECT' THEN 'ACTIVE'"
+                          "  WHEN 'REJOINED' THEN 'ACTIVE'"
+                          "  WHEN 'DOWN' THEN 'REJOINED'"
+                          "  ELSE state END"
                           " WHERE node_id = ?",
                           (now, node_id),
                       )
@@ -459,7 +465,6 @@ jobs:
                   self._clock = clock
 
               def compute_state_hash(self) -> tuple[int, str]:
-                  """Deterministic hash of the replicated state."""
                   parts: list[str] = []
                   for table in REPLICATED_TABLES:
                       rows = self._db.query_all(
@@ -676,19 +681,17 @@ jobs:
               def kill_node(self, node_id: str) -> None:
                   """Advances time so ONLY node_id goes stale: the other
                   nodes keep heartbeating and stay ACTIVE."""
-                  others = [
-                      n for n in self.node_ids if n != node_id
-                  ]
+                  others = [n for n in self.node_ids if n != node_id]
                   self.clock.advance(31)
                   for other in others:
                       self.cluster.heartbeat(other)
-                  harness_detect = self.cluster.detect_failures()
-                  assert node_id in harness_detect
+                  detected = self.cluster.detect_failures()
+                  assert node_id in detected
                   self.clock.advance(31)
                   for other in others:
                       self.cluster.heartbeat(other)
-                  harness_detect = self.cluster.detect_failures()
-                  assert node_id in harness_detect
+                  detected = self.cluster.detect_failures()
+                  assert node_id in detected
 
               def kill_all(self) -> None:
                   self.clock.advance(31)
@@ -710,9 +713,7 @@ jobs:
               harness.activate_all()
               active = harness.cluster.active_nodes()
               assert len(active) == 3
-              assert all(
-                  n.state is NodeState.ACTIVE for n in active
-              )
+              assert all(n.state is NodeState.ACTIVE for n in active)
               harness.close()
 
 
@@ -773,9 +774,11 @@ jobs:
               harness.close()
 
 
-          def test_rejoined_node_recovers_active(
+          def test_down_node_recovers_through_rejoined(
               tmp_path: Path,
           ) -> None:
+              """DOWN -> (beat) -> REJOINED -> (beat) -> ACTIVE: the
+              full recovery cycle of a returned node."""
               harness = _Harness(tmp_path, nodes=3)
               harness.activate_all()
               victim = harness.node_ids[2]
@@ -783,6 +786,10 @@ jobs:
               assert harness.cluster.require(victim).state is (
                   NodeState.DOWN
               )
+              harness.cluster.heartbeat(victim)
+              rejoined = harness.cluster.require(victim)
+              assert rejoined.state is NodeState.REJOINED
+              harness.clock.advance(1)
               harness.cluster.heartbeat(victim)
               recovered = harness.cluster.require(victim)
               assert recovered.state is NodeState.ACTIVE
@@ -904,7 +911,7 @@ jobs:
           if git diff --cached --quiet; then
             echo "No changes."
           else
-            git commit -m "zyra: module 16 PHASE 4 fixed (heartbeat activates JOINING nodes, cluster events to outbox transactionally, realistic kill_node tests) + 12 multi-node tests"
+            git commit -m "zyra: module 16 PHASE 4 (heartbeat drives DOWN->REJOINED->ACTIVE recovery cycle, 13 multi-node tests incl. full recovery)"
             git push origin "HEAD:${{ github.ref_name }}"
           fi
           echo "=== MODULE 16 COMPLETE ==="

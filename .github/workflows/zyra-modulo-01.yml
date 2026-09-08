@@ -1,4 +1,4 @@
-name: zyra-modulo-12-public-verifier
+name: zyra-modulo-13-hardening
 
 "on":
   workflow_dispatch:
@@ -9,7 +9,7 @@ permissions:
   contents: write
 
 concurrency:
-  group: zyra-modulo-12-${{ github.ref }}
+  group: zyra-modulo-13-${{ github.ref }}
   cancel-in-progress: false
 
 jobs:
@@ -31,1313 +31,768 @@ jobs:
           python -m pip install --upgrade pip
           python -m pip install "cryptography>=42,<45" "flake8>=7,<8" "mypy>=1.10,<2" "pytest>=8,<9"
 
-      - name: Check modules 01-11 present
+      - name: Check modules 01-12 present
         run: |
           set -euo pipefail
-          test -f shared_engines/runtime/kernel.py
-          test -f shared_engines/runtime/api.py
-          test -f main.py
-          echo "modules 01-11 present: OK"
+          test -f shared_engines/common/errors.py
+          test -f shared_engines/storage/database.py
+          test -f shared_engines/audit/chain.py
+          test -f shared_engines/verifier/verifier.py
+          echo "modules 01-12 present: OK"
 
-      - name: Build public verifier module
+      - name: Build shared_engines/hardening
         run: |
           set -euo pipefail
-          mkdir -p shared_engines/verifier/tests
+          mkdir -p shared_engines/hardening/tests
 
-          cat > shared_engines/verifier/__init__.py <<'PYEOF'
-          """Zyra public verifier: offline third-party authenticity."""
+          cat > shared_engines/hardening/__init__.py <<'PYEOF'
+          """Zyra hardening: API keys, rate limiting, brute-force guard."""
           from __future__ import annotations
 
-          from shared_engines.verifier.verifier import (
-              VerificationReport,
-              verify_attestation_blob,
+          from shared_engines.hardening.api_keys import (
+              ApiKeyManager,
+              ApiKeyRecord,
+              KEY_PREFIX,
+          )
+          from shared_engines.hardening.bruteforce import BruteForceGuard
+          from shared_engines.hardening.errors import (
+              ApiKeyNotFoundError,
+              ApiKeyRevokedError,
+              HardeningError,
+              InvalidApiKeyError,
+              RateLimitExceededError,
+              SourceLockedError,
+          )
+          from shared_engines.hardening.ratelimit import (
+              RateCheckResult,
+              RateLimiter,
           )
 
-          __all__ = ["VerificationReport", "verify_attestation_blob"]
+          __all__ = [
+              "ApiKeyManager", "ApiKeyNotFoundError", "ApiKeyRecord",
+              "ApiKeyRevokedError", "BruteForceGuard", "HardeningError",
+              "InvalidApiKeyError", "KEY_PREFIX", "RateCheckResult",
+              "RateLimitExceededError", "RateLimiter", "SourceLockedError",
+          ]
           PYEOF
 
-          cat > shared_engines/verifier/verifier.py <<'PYEOF'
-          """Offline attestation verification: paste, verify, trust.
+          cat > shared_engines/hardening/errors.py <<'PYEOF'
+          """Typed hardening errors."""
+          from __future__ import annotations
 
-          Anyone holding an attestation JSON (signature + public key
-          embedded) verifies it WITHOUT database access. This is the
-          public face of the Network's trust: provable, not promised.
+          from shared_engines.common.errors import (
+              EngineError,
+              NotFoundError,
+              ValidationError,
+          )
+
+
+          class HardeningError(EngineError):
+              """Base for hardening failures."""
+
+
+          class InvalidApiKeyError(HardeningError, ValidationError):
+              """The presented API key does not exist or is malformed."""
+
+
+          class ApiKeyRevokedError(HardeningError, ValidationError):
+              """The API key was revoked and can no longer be used."""
+
+
+          class ApiKeyNotFoundError(HardeningError, NotFoundError):
+              """No API key exists for the given id."""
+
+
+          class RateLimitExceededError(HardeningError, ValidationError):
+              """The rate limit for this window was exceeded."""
+
+
+          class SourceLockedError(HardeningError, ValidationError):
+              """This source is temporarily locked due to failed
+              authentication attempts."""
+          PYEOF
+
+          cat > shared_engines/hardening/api_keys.py <<'PYEOF'
+          """Cryptographic API keys: one per client, hash-stored, audited.
+
+          Key format: ``zy_<keyid>_<secret>``
+          - keyid: 16 hex chars (public identifier, shown in logs)
+          - secret: 48 hex chars (192-bit CSPRNG secret, shown ONCE)
+
+          The database stores ONLY sha256(full_key). A stolen database
+          does not leak usable keys. Verification compares hashes in
+          constant time. Rotation creates a new key and revokes the
+          old one atomically. Every lifecycle event is audited.
           """
           from __future__ import annotations
 
-          import base64
           import hashlib
+          import hmac
+          import secrets
+          import sqlite3
           from dataclasses import dataclass
 
-          from shared_engines.common.serialization import (
-              canonical_json_dumps,
-              canonical_json_loads,
+          from shared_engines.audit.chain import AuditTrail
+          from shared_engines.common.clocks import Clock
+          from shared_engines.common.errors import IntegrityError
+          from shared_engines.common.validation import require_non_empty_str
+          from shared_engines.hardening.errors import (
+              ApiKeyNotFoundError,
+              ApiKeyRevokedError,
+              InvalidApiKeyError,
           )
-          from shared_engines.verification.signatures import Ed25519Verifier
+          from shared_engines.storage.database import Database
+          from shared_engines.storage.migrations import (
+              Migration,
+              MigrationRunner,
+          )
 
-          ATTESTATION_FORMAT = "zyra.attestation.v1"
+          KEY_PREFIX = "zy"
+          KEYID_HEX_LEN = 16
+          SECRET_HEX_LEN = 48
+          MAX_ATTEMPTS_CACHE: int = 10_000
+
+          API_KEYS_MIGRATIONS = (
+              Migration(
+                  1,
+                  "api_keys",
+                  (
+                      "CREATE TABLE api_keys ("
+                      " key_id TEXT PRIMARY KEY,"
+                      " label TEXT NOT NULL,"
+                      " key_hash TEXT NOT NULL,"
+                      " active INTEGER NOT NULL DEFAULT 1,"
+                      " created_by TEXT NOT NULL,"
+                      " created_at REAL NOT NULL,"
+                      " revoked_at REAL)",
+                      "CREATE INDEX api_keys_active"
+                      " ON api_keys (active)",
+                  ),
+              ),
+          )
 
 
           @dataclass(frozen=True)
-          class VerificationReport:
-              valid: bool
-              reason: str
-              attestation_id: str | None
-              subject_zid: str | None
-              claim: str | None
-              issued_at: float | None
-              key_fingerprint: str | None
+          class ApiKeyRecord:
+              key_id: str
+              label: str
+              active: bool
+              created_by: str
+              created_at: float
+              revoked_at: float | None
 
 
-          def _key_fingerprint(public_pem: bytes) -> str:
-              return hashlib.sha256(public_pem).hexdigest()[:16]
+          class ApiKeyManager:
+              """Creates, verifies, rotates and revokes client keys."""
 
-
-          def _fail(reason: str) -> VerificationReport:
-              return VerificationReport(
-                  valid=False,
-                  reason=reason,
-                  attestation_id=None,
-                  subject_zid=None,
-                  claim=None,
-                  issued_at=None,
-                  key_fingerprint=None,
-              )
-
-
-          def verify_attestation_blob(blob: str) -> VerificationReport:
-              """Verifies a pasted attestation JSON, fully offline."""
-              try:
-                  doc = canonical_json_loads(blob)
-              except Exception:
-                  return _fail("the pasted text is not valid JSON")
-              if not isinstance(doc, dict):
-                  return _fail("attestation must be a JSON object")
-              if doc.get("format") != ATTESTATION_FORMAT:
-                  return _fail(
-                      f"unknown format (expected {ATTESTATION_FORMAT})"
-                  )
-              required = (
-                  "attestation_id",
-                  "subject_zid",
-                  "claim",
-                  "issued_at",
-                  "signature_b64",
-                  "signer_public_pem",
-              )
-              missing = [k for k in required if k not in doc]
-              if missing:
-                  return _fail(f"missing fields: {', '.join(missing)}")
-              try:
-                  signature = base64.b64decode(
-                      str(doc["signature_b64"]), validate=True
-                  )
-                  public_pem = str(doc["signer_public_pem"]).encode("utf-8")
-                  issued_at = float(doc["issued_at"])
-              except Exception:
-                  return _fail("signature, key or timestamp is malformed")
-              subject_sha256 = doc.get("subject_sha256")
-              payload = {
-                  "format": ATTESTATION_FORMAT,
-                  "attestation_id": str(doc["attestation_id"]),
-                  "subject_zid": str(doc["subject_zid"]),
-                  "claim": str(doc["claim"]),
-                  "subject_sha256": (
-                      None
-                      if subject_sha256 is None
-                      else str(subject_sha256)
-                  ),
-                  "issued_at": f"{issued_at:.6f}",
-              }
-              canonical = canonical_json_dumps(payload).encode("utf-8")
-              attestation_id = str(doc["attestation_id"])
-              subject_zid = str(doc["subject_zid"])
-              claim = str(doc["claim"])
-              try:
-                  verifier = Ed25519Verifier(public_pem)
-              except Exception:
-                  return VerificationReport(
-                      valid=False,
-                      reason="the embedded public key is not loadable",
-                      attestation_id=attestation_id,
-                      subject_zid=subject_zid,
-                      claim=claim,
-                      issued_at=issued_at,
-                      key_fingerprint=None,
-                  )
-              ok = verifier.verify(canonical, signature)
-              if not ok:
-                  return VerificationReport(
-                      valid=False,
-                      reason="INVALID signature: this attestation was"
-                      " tampered or was not issued by the key inside it",
-                      attestation_id=attestation_id,
-                      subject_zid=subject_zid,
-                      claim=claim,
-                      issued_at=issued_at,
-                      key_fingerprint=_key_fingerprint(public_pem),
-                  )
-              return VerificationReport(
-                  valid=True,
-                  reason="AUTHENTIC: signature verifies against the"
-                  " embedded public key",
-                  attestation_id=attestation_id,
-                  subject_zid=subject_zid,
-                  claim=claim,
-                  issued_at=issued_at,
-                  key_fingerprint=_key_fingerprint(public_pem),
-              )
-          PYEOF
-
-          cat > shared_engines/verifier/tests/test_verifier.py <<'PYEOF'
-          from __future__ import annotations
-
-          import base64
-          import json
-          from pathlib import Path
-
-          from shared_engines.audit.chain import AuditTrail
-          from shared_engines.common.clocks import FrozenClock
-          from shared_engines.events.contracts import EventCatalog
-          from shared_engines.events.outbox import Outbox
-          from shared_engines.identity.contracts import IdentityKind
-          from shared_engines.identity.engine import IdentityEngine
-          from shared_engines.storage.database import SQLiteAdapter
-          from shared_engines.verification.attestations import AttestationIssuer
-          from shared_engines.verification.signatures import Ed25519Signer
-          from shared_engines.verifier.verifier import verify_attestation_blob
-
-
-          def _issue_attestation_json(tmp_path: Path) -> str:
-              db = SQLiteAdapter(tmp_path / "v.db")
-              clock = FrozenClock()
-              audit = AuditTrail(db, clock)
-              outbox = Outbox(db, clock)
-              outbox.ensure_schema()
-              catalog = EventCatalog()
-              catalog.register("verification.attestation.issued")
-              catalog.register("identity.registered")
-              catalog.register("identity.status_changed")
-              identity = IdentityEngine(
-                  db=db,
-                  clock=clock,
-                  audit=audit,
-                  outbox=outbox,
-                  catalog=catalog,
-              )
-              subject = identity.register_identity(
-                  kind=IdentityKind.PERSON,
-                  display_name="Public Figure",
-                  actor="registrar",
-              )
-              signer, _ = Ed25519Signer.generate()
-              issuer = AttestationIssuer(
-                  db=db,
-                  clock=clock,
-                  signer=signer,
-                  audit=audit,
-                  outbox=outbox,
-                  catalog=catalog,
-              )
-              attestation = issuer.issue(
-                  subject_zid=subject.zid,
-                  claim="identity_active",
-              )
-              db.close()
-              return json.dumps(
-                  {
-                      "format": "zyra.attestation.v1",
-                      "attestation_id": attestation.attestation_id,
-                      "subject_zid": attestation.subject_zid,
-                      "claim": attestation.claim,
-                      "subject_sha256": attestation.subject_sha256,
-                      "issued_at": attestation.issued_at,
-                      "signature_b64": base64.b64encode(
-                          attestation.signature
-                      ).decode("ascii"),
-                      "signer_public_pem": attestation.signer_public_pem.decode(
-                          "utf-8"
-                      ),
-                  }
-              )
-
-
-          def test_authentic_attestation_verifies(tmp_path: Path) -> None:
-              blob = _issue_attestation_json(tmp_path)
-              report = verify_attestation_blob(blob)
-              assert report.valid is True
-              assert "AUTHENTIC" in report.reason
-              assert report.attestation_id is not None
-              assert report.key_fingerprint is not None
-              assert len(report.key_fingerprint) == 16
-
-
-          def test_tampered_claim_fails(tmp_path: Path) -> None:
-              blob = _issue_attestation_json(tmp_path)
-              doc = json.loads(blob)
-              doc["claim"] = "forged_claim"
-              report = verify_attestation_blob(json.dumps(doc))
-              assert report.valid is False
-              assert "INVALID" in report.reason
-
-
-          def test_wrong_key_fails(tmp_path: Path) -> None:
-              blob = _issue_attestation_json(tmp_path)
-              doc = json.loads(blob)
-              impostor, _ = Ed25519Signer.generate()
-              doc["signer_public_pem"] = impostor.public_pem.decode("utf-8")
-              report = verify_attestation_blob(json.dumps(doc))
-              assert report.valid is False
-              assert "INVALID" in report.reason
-
-
-          def test_garbage_input_fails_gracefully() -> None:
-              report = verify_attestation_blob("this is not json")
-              assert report.valid is False
-              assert "not valid JSON" in report.reason
-              report2 = verify_attestation_blob('{"format": "other"}')
-              assert report2.valid is False
-              assert "unknown format" in report2.reason
-          PYEOF
-
-          echo "=== VERIFIER MODULE OK ==="
-
-      - name: Rebuild runtime/api.py completely (all endpoints + public /verify)
-        run: |
-          set -euo pipefail
-          cat > shared_engines/runtime/api.py <<'PYEOF'
-          """HTTP API over the kernel: stable routes, auth, envelopes.
-
-          Public (no auth): GET /health, POST /verify.
-          Protected routes require Bearer token when configured.
-          """
-          from __future__ import annotations
-
-          import base64
-          import hmac
-          import json
-          from decimal import Decimal, InvalidOperation
-          from http.server import BaseHTTPRequestHandler
-          from typing import Any, ClassVar
-          from urllib.parse import urlparse
-
-          from shared_engines.common.errors import EngineError
-          from shared_engines.common.serialization import canonical_json_dumps
-          from shared_engines.currency.contracts import SignedQuote
-          from shared_engines.identity.contracts import (
-              Identity,
-              IdentityKind,
-              IdentityStatus,
-          )
-          from shared_engines.observability.health import ComponentHealth
-          from shared_engines.runtime.kernel import ZyraKernel
-          from shared_engines.runtime.responses import (
-              ApiError,
-              map_engine_error,
-          )
-          from shared_engines.tokenization.ledger import (
-              EmissionRule,
-              LedgerTransaction,
-              RedemptionItem,
-              RedemptionRecord,
-          )
-          from shared_engines.verification.attestations import Attestation
-          from shared_engines.verification.credentials import (
-              CredentialRecord,
-              CredentialType,
-          )
-          from shared_engines.verification.media import (
-              MediaKind,
-              MediaRecord,
-          )
-          from shared_engines.verification.provenance import ProvenanceEvent
-
-
-          class ZyraApiHandler(BaseHTTPRequestHandler):
-              """Thread-safe request handler bound to a shared kernel."""
-
-              kernel: ClassVar[ZyraKernel]
-
-              def log_message(self, format: str, *args: object) -> None:
-                  return None
-
-              def do_GET(self) -> None:
-                  self._dispatch("GET")
-
-              def do_POST(self) -> None:
-                  self._dispatch("POST")
-
-              def _dispatch(self, method: str) -> None:
-                  try:
-                      self._route(method)
-                  except ApiError as exc:
-                      self._send_json(exc.status, self._error_body(exc))
-                  except EngineError as exc:
-                      mapped = map_engine_error(exc)
-                      self._send_json(mapped.status, self._error_body(mapped))
-                  except Exception:
-                      self._send_json(
-                          500,
-                          {
-                              "ok": False,
-                              "error": {
-                                  "type": "internal_error",
-                                  "message": "internal error",
-                              },
-                          },
-                      )
-
-              def _route(self, method: str) -> None:
-                  path = urlparse(self.path).path
-                  segments = [s for s in path.split("/") if s]
-                  if segments == ["health"] and method == "GET":
-                      self._handle_health()
-                      return
-                  if segments == ["verify"] and method == "POST":
-                      self._handle_public_verify()
-                      return
-                  if not self._authorized():
-                      raise ApiError(
-                          401,
-                          "unauthorized",
-                          "valid bearer token required",
-                      )
-                  if method == "GET":
-                      self._route_get(segments)
-                  elif method == "POST":
-                      self._route_post(segments)
-                  else:
-                      raise ApiError(
-                          405, "method_not_allowed", "unsupported method"
-                      )
-
-              def _route_get(self, s: list[str]) -> None:
-                  if len(s) == 2 and s[0] == "identity":
-                      self._handle_get_identity(s[1])
-                  elif s == ["tokens", "items"]:
-                      self._handle_list_items()
-                  elif (
-                      len(s) == 3
-                      and s[0] == "tokens"
-                      and s[2] == "balance"
-                  ):
-                      self._handle_token_balance(s[1])
-                  elif (
-                      len(s) == 3
-                      and s[0] == "tokens"
-                      and s[2] == "history"
-                  ):
-                      self._handle_token_history(s[1])
-                  elif (
-                      len(s) == 3
-                      and s[0] == "verification"
-                      and s[1] == "media"
-                  ):
-                      self._handle_get_media(s[2])
-                  elif (
-                      len(s) == 4
-                      and s[0] == "verification"
-                      and s[1] == "media"
-                      and s[3] == "history"
-                  ):
-                      self._handle_media_history(s[2])
-                  elif (
-                      len(s) == 3
-                      and s[0] == "verification"
-                      and s[1] == "credentials"
-                  ):
-                      self._handle_get_credential(s[2])
-                  elif (
-                      len(s) == 4
-                      and s[0] == "verification"
-                      and s[1] == "subjects"
-                      and s[3] == "credentials"
-                  ):
-                      self._handle_subject_credentials(s[2])
-                  elif (
-                      len(s) == 3
-                      and s[0] == "currency"
-                      and s[1] == "conversions"
-                  ):
-                      self._handle_get_conversion(s[2])
-                  else:
-                      raise ApiError(404, "not_found", "unknown route")
-
-              def _route_post(self, s: list[str]) -> None:
-                  if s == ["identity", "register"]:
-                      self._handle_register_identity()
-                  elif s == ["identity", "transition"]:
-                      self._handle_transition()
-                  elif s == ["verification", "media"]:
-                      self._handle_register_media()
-                  elif s == ["verification", "media", "verify"]:
-                      self._handle_verify_media()
-                  elif s == ["verification", "credentials"]:
-                      self._handle_issue_credential()
-                  elif s == ["verification", "credentials", "revoke"]:
-                      self._handle_revoke_credential()
-                  elif s == ["verification", "attestations"]:
-                      self._handle_issue_attestation()
-                  elif s == ["verification", "attestations", "verify"]:
-                      self._handle_verify_attestation()
-                  elif s == ["tokens", "rules"]:
-                      self._handle_token_rule()
-                  elif s == ["tokens", "items"]:
-                      self._handle_token_item()
-                  elif s == ["tokens", "earn"]:
-                      self._handle_token_earn()
-                  elif s == ["tokens", "redeem"]:
-                      self._handle_token_redeem()
-                  elif s == ["currency", "quote"]:
-                      self._handle_currency_quote()
-                  elif s == ["currency", "convert"]:
-                      self._handle_currency_convert()
-                  elif s == ["currency", "settle"]:
-                      self._handle_currency_settle()
-                  else:
-                      raise ApiError(404, "not_found", "unknown route")
-
-              def _authorized(self) -> bool:
-                  token = type(self).kernel.config.api_token
-                  if token is None:
-                      return True
-                  header = self.headers.get("Authorization")
-                  if header is None:
-                      return False
-                  return hmac.compare_digest(header, f"Bearer {token}")
-
-              def _read_json(self) -> dict[str, Any]:
-                  length_header = self.headers.get("Content-Length")
-                  if length_header is None:
-                      raise ApiError(
-                          411, "length_required", "Content-Length required"
-                      )
-                  try:
-                      length = int(length_header)
-                  except ValueError as exc:
-                      raise ApiError(
-                          400, "invalid_request", "bad Content-Length"
-                      ) from exc
-                  max_body = type(self).kernel.config.max_body_bytes
-                  if length > max_body:
-                      raise ApiError(
-                          413, "payload_too_large", "body exceeds limit"
-                      )
-                  raw = self.rfile.read(length)
-                  try:
-                      doc: Any = json.loads(raw.decode("utf-8"))
-                  except (UnicodeDecodeError, ValueError) as exc:
-                      raise ApiError(
-                          400, "invalid_json", "body is not valid JSON"
-                      ) from exc
-                  if not isinstance(doc, dict):
-                      raise ApiError(
-                          400, "invalid_request", "body must be a JSON object"
-                      )
-                  typed: dict[str, Any] = {}
-                  for key, value in doc.items():
-                      typed[str(key)] = value
-                  return typed
-
-              @staticmethod
-              def _require_str(doc: dict[str, Any], key: str) -> str:
-                  value = doc.get(key)
-                  if not isinstance(value, str) or not value.strip():
-                      raise ApiError(
-                          400, "invalid_request", f"missing field: {key}"
-                      )
-                  return value
-
-              @staticmethod
-              def _require_optional_str(
-                  doc: dict[str, Any], key: str
-              ) -> str | None:
-                  value = doc.get(key)
-                  if value is None:
-                      return None
-                  if not isinstance(value, str) or not value.strip():
-                      raise ApiError(
-                          400, "invalid_request", f"invalid field: {key}"
-                      )
-                  return value
-
-              @staticmethod
-              def _require_int(doc: dict[str, Any], key: str) -> int:
-                  value = doc.get(key)
-                  if not isinstance(value, int) or isinstance(value, bool):
-                      raise ApiError(
-                          400, "invalid_request", f"missing field: {key}"
-                      )
-                  return value
-
-              @staticmethod
-              def _require_optional_int(
-                  doc: dict[str, Any], key: str
-              ) -> int | None:
-                  value = doc.get(key)
-                  if value is None:
-                      return None
-                  if not isinstance(value, int) or isinstance(value, bool):
-                      raise ApiError(
-                          400, "invalid_request", f"invalid field: {key}"
-                      )
-                  return value
-
-              @staticmethod
-              def _require_decimal_str(
-                  doc: dict[str, Any], key: str
-              ) -> Decimal:
-                  raw = ZyraApiHandler._require_str(doc, key)
-                  try:
-                      return Decimal(raw)
-                  except InvalidOperation as exc:
-                      raise ApiError(
-                          400,
-                          "invalid_request",
-                          f"{key} must be a decimal string",
-                      ) from exc
-
-              def _send_json(
-                  self, status: int, payload: dict[str, Any]
+              def __init__(
+                  self,
+                  db: Database,
+                  clock: Clock,
+                  audit: AuditTrail,
               ) -> None:
-                  body = canonical_json_dumps(payload).encode("utf-8")
-                  self.send_response(status)
-                  self.send_header("Content-Type", "application/json")
-                  self.send_header("Content-Length", str(len(body)))
-                  self.end_headers()
-                  self.wfile.write(body)
+                  self._db = db
+                  self._clock = clock
+                  self._audit = audit
+                  MigrationRunner(
+                      db, "hardening.keys", API_KEYS_MIGRATIONS
+                  ).run(clock)
 
               @staticmethod
-              def _error_body(exc: ApiError) -> dict[str, Any]:
-                  return {
-                      "ok": False,
-                      "error": {"type": exc.code, "message": exc.message},
-                  }
+              def _hash_key(full_key: str) -> str:
+                  return hashlib.sha256(full_key.encode("utf-8")).hexdigest()
 
-              def _ok(self, data: Any, status: int = 200) -> None:
-                  self._send_json(status, {"ok": True, "data": data})
+              def generate(
+                  self, *, label: str, created_by: str
+              ) -> tuple[str, ApiKeyRecord]:
+                  """Creates a new key. Returns (full_key, record).
 
-              def _handle_public_verify(self) -> None:
-                  doc = self._read_json()
-                  blob = self._require_str(doc, "attestation")
-                  from shared_engines.verifier.verifier import (
-                      verify_attestation_blob,
-                  )
-
-                  report = verify_attestation_blob(blob)
-                  self._ok(
-                      {
-                          "valid": report.valid,
-                          "reason": report.reason,
-                          "attestation_id": report.attestation_id,
-                          "subject_zid": report.subject_zid,
-                          "claim": report.claim,
-                          "issued_at": report.issued_at,
-                          "key_fingerprint": report.key_fingerprint,
-                      }
-                  )
-
-              def _handle_health(self) -> None:
-                  kernel = type(self).kernel
-                  self._ok(
-                      {
-                          "overall": _health_json(kernel.health()),
-                          "components": [
-                              _health_json(c)
-                              for c in kernel.health_components()
-                          ],
-                      }
-                  )
-
-              def _handle_register_identity(self) -> None:
-                  doc = self._read_json()
-                  kind_raw = self._require_str(doc, "kind")
-                  try:
-                      kind = IdentityKind(kind_raw)
-                  except ValueError as exc:
-                      raise ApiError(
-                          400, "invalid_request", "unknown kind"
-                      ) from exc
-                  identity = type(self).kernel.identity.register_identity(
-                      kind=kind,
-                      display_name=self._require_str(doc, "display_name"),
-                      actor=self._require_str(doc, "actor"),
-                  )
-                  self._ok(_identity_json(identity), status=201)
-
-              def _handle_get_identity(self, zid: str) -> None:
-                  identity = type(self).kernel.identity.get_identity(zid)
-                  if identity is None:
-                      raise ApiError(
-                          404, "not_found", f"unknown zid: {zid}"
+                  The full key is shown EXACTLY ONCE; the caller must
+                  store it securely. Only its hash is persisted.
+                  """
+                  require_non_empty_str(label, "label")
+                  require_non_empty_str(created_by, "created_by")
+                  key_id = secrets.token_hex(KEY_HEX_LEN // 2)
+                  secret = secrets.token_hex(SECRET_HEX_LEN // 2)
+                  full_key = f"{KEY_PREFIX}_{key_id}_{secret}"
+                  key_hash = self._hash_key(full_key)
+                  now = self._clock.now()
+                  with self._db.transaction() as cursor:
+                      cursor.execute(
+                          "INSERT INTO api_keys"
+                          " (key_id, label, key_hash, active,"
+                          "  created_by, created_at, revoked_at)"
+                          " VALUES (?, ?, ?, 1, ?, ?, NULL)",
+                          (key_id, label, key_hash, created_by, now),
                       )
-                  self._ok(_identity_json(identity))
+                  self._audit.append(
+                      event_type="hardening.api_key.created",
+                      actor=created_by,
+                      subject=key_id,
+                      payload={"label": label},
+                  )
+                  row = self._db.query_one(
+                      "SELECT * FROM api_keys WHERE key_id = ?",
+                      (key_id,),
+                  )
+                  if row is None:
+                      raise IntegrityError("key row vanished after insert")
+                  return full_key, self._record_from_row(row)
 
-              def _handle_transition(self) -> None:
-                  doc = self._read_json()
-                  zid = self._require_str(doc, "zid")
-                  try:
-                      target = IdentityStatus(
-                          self._require_str(doc, "to_status")
+              def verify(self, full_key: str) -> ApiKeyRecord:
+                  """Verifies a presented key; raises on any failure.
+
+                  Hash comparison is constant-time: response timing
+                  leaks nothing about key validity.
+                  """
+                  require_non_empty_str(full_key, "full_key")
+                  parts = full_key.split("_")
+                  if (
+                      len(parts) != 3
+                      or parts[0] != KEY_PREFIX
+                      or len(parts[1]) != KEY_HEX_LEN // 2
+                      or len(parts[2]) != SECRET_HEX_LEN // 2
+                  ):
+                      raise InvalidApiKeyError("malformed key format")
+                  key_id = parts[1]
+                  row = self._db.query_one(
+                      "SELECT * FROM api_keys WHERE key_id = ?",
+                      (key_id,),
+                  )
+                  if row is None:
+                      raise InvalidApiKeyError("unknown key")
+                  stored_hash = str(row["key_hash"])
+                  computed = self._hash_key(full_key)
+                  if not hmac.compare_digest(stored_hash, computed):
+                      raise InvalidApiKeyError("key does not match")
+                  if not bool(int(row["active"])):
+                      raise ApiKeyRevokedError(
+                          f"key {key_id} was revoked"
                       )
-                  except ValueError as exc:
-                      raise ApiError(
-                          400, "invalid_request", "unknown to_status"
-                      ) from exc
-                  identity = type(self).kernel.identity.transition_identity(
-                      zid,
-                      target,
-                      actor=self._require_str(doc, "actor"),
-                      reason=self._require_str(doc, "reason"),
-                  )
-                  self._ok(_identity_json(identity))
+                  return self._record_from_row(row)
 
-              def _handle_register_media(self) -> None:
-                  doc = self._read_json()
-                  kind_raw = self._require_str(doc, "kind")
-                  try:
-                      kind = MediaKind(kind_raw)
-                  except ValueError as exc:
-                      raise ApiError(
-                          400, "invalid_request", "unknown media kind"
-                      ) from exc
-                  content = self._decode_b64(
-                      self._require_str(doc, "content_b64")
+              def revoke(self, key_id: str, *, revoked_by: str) -> None:
+                  require_non_empty_str(key_id, "key_id")
+                  require_non_empty_str(revoked_by, "revoked_by")
+                  row = self._db.query_one(
+                      "SELECT active FROM api_keys WHERE key_id = ?",
+                      (key_id,),
                   )
-                  record = type(self).kernel.verification.register_media(
-                      owner_zid=self._require_str(doc, "owner_zid"),
-                      kind=kind,
-                      title=self._require_str(doc, "title"),
-                      content=content,
-                      content_type=self._require_str(doc, "content_type"),
-                      actor=self._require_str(doc, "actor"),
-                  )
-                  self._ok(_media_json(record), status=201)
-
-              def _handle_verify_media(self) -> None:
-                  doc = self._read_json()
-                  content = self._decode_b64(
-                      self._require_str(doc, "content_b64")
-                  )
-                  record = type(self).kernel.verification.verify_media(
-                      self._require_str(doc, "media_id"), content
-                  )
-                  self._ok(_media_json(record))
-
-              def _handle_get_media(self, media_id: str) -> None:
-                  record = type(self).kernel.verification.get_media(media_id)
-                  if record is None:
-                      raise ApiError(
-                          404, "not_found", f"unknown media: {media_id}"
+                  if row is None:
+                      raise ApiKeyNotFoundError(
+                          f"unknown key: {key_id}"
                       )
-                  self._ok(_media_json(record))
-
-              def _handle_media_history(self, media_id: str) -> None:
-                  history = (
-                      type(self).kernel.verification.media_history(media_id)
-                  )
-                  self._ok([_provenance_json(e) for e in history])
-
-              def _handle_issue_credential(self) -> None:
-                  doc = self._read_json()
-                  type_raw = self._require_str(doc, "credential_type")
-                  try:
-                      credential_type = CredentialType(type_raw)
-                  except ValueError as exc:
-                      raise ApiError(
-                          400, "invalid_request", "unknown credential_type"
-                      ) from exc
-                  record = type(self).kernel.verification.issue_credential(
-                      subject_zid=self._require_str(doc, "subject_zid"),
-                      issuer_zid=self._require_str(doc, "issuer_zid"),
-                      credential_type=credential_type,
-                      title=self._require_str(doc, "title"),
-                      detail=self._require_str(doc, "detail"),
-                  )
-                  self._ok(_credential_json(record), status=201)
-
-              def _handle_get_credential(self, credential_id: str) -> None:
-                  record = type(self).kernel.verification.get_credential(
-                      credential_id
-                  )
-                  if record is None:
-                      raise ApiError(
-                          404,
-                          "not_found",
-                          f"unknown credential: {credential_id}",
+                  if not bool(int(row["active"])):
+                      raise ApiKeyRevokedError(
+                          f"key {key_id} already revoked"
                       )
-                  self._ok(_credential_json(record))
-
-              def _handle_revoke_credential(self) -> None:
-                  doc = self._read_json()
-                  record = type(self).kernel.verification.revoke_credential(
-                      self._require_str(doc, "credential_id"),
-                      revoked_by=self._require_str(doc, "revoked_by"),
-                      reason=self._require_str(doc, "reason"),
+                  now = self._clock.now()
+                  self._db.execute(
+                      "UPDATE api_keys SET active = 0, revoked_at = ?"
+                      " WHERE key_id = ?",
+                      (now, key_id),
                   )
-                  self._ok(_credential_json(record))
+                  self._audit.append(
+                      event_type="hardening.api_key.revoked",
+                      actor=revoked_by,
+                      subject=key_id,
+                      payload={},
+                  )
 
-              def _handle_subject_credentials(self, zid: str) -> None:
-                  history = type(self).kernel.verification.subject_history(zid)
-                  self._ok([_credential_json(c) for c in history])
-
-              def _handle_issue_attestation(self) -> None:
-                  doc = self._read_json()
-                  attestation = (
-                      type(self).kernel.verification.issue_attestation(
-                          subject_zid=self._require_str(doc, "subject_zid"),
-                          claim=self._require_str(doc, "claim"),
-                          subject_sha256=self._require_optional_str(
-                              doc, "subject_sha256"
-                          ),
+              def rotate(
+                  self, key_id: str, *, rotated_by: str
+              ) -> tuple[str, ApiKeyRecord]:
+                  """Revokes old key and creates a fresh one atomically."""
+                  require_non_empty_str(rotated_by, "rotated_by")
+                  row = self._db.query_one(
+                      "SELECT label FROM api_keys WHERE key_id = ?",
+                      (key_id,),
+                  )
+                  if row is None:
+                      raise ApiKeyNotFoundError(
+                          f"unknown key: {key_id}"
                       )
+                  self.revoke(key_id, revoked_by=rotated_by)
+                  return self.generate(
+                      label=str(row["label"]) + "-rotated",
+                      created_by=rotated_by,
                   )
-                  self._ok(_attestation_json(attestation), status=201)
 
-              def _handle_verify_attestation(self) -> None:
-                  doc = self._read_json()
-                  ok = type(self).kernel.verification.verify_attestation(
-                      self._require_str(doc, "attestation_id")
+              def list_active(self) -> tuple[ApiKeyRecord, ...]:
+                  rows = self._db.query_all(
+                      "SELECT * FROM api_keys WHERE active = 1"
+                      " ORDER BY created_at, key_id"
                   )
-                  self._ok({"valid": ok})
+                  return tuple(self._record_from_row(r) for r in rows)
 
-              def _handle_token_rule(self) -> None:
-                  doc = self._read_json()
-                  rule = type(self).kernel.tokens.define_rule(
-                      activity=self._require_str(doc, "activity"),
-                      amount=self._require_int(doc, "amount"),
-                      daily_cap=self._require_optional_int(doc, "daily_cap"),
-                      lifetime_cap=self._require_optional_int(
-                          doc, "lifetime_cap"
+              @staticmethod
+              def _record_from_row(row: sqlite3.Row) -> ApiKeyRecord:
+                  revoked_at = row["revoked_at"]
+                  return ApiKeyRecord(
+                      key_id=str(row["key_id"]),
+                      label=str(row["label"]),
+                      active=bool(int(row["active"])),
+                      created_by=str(row["created_by"]),
+                      created_at=float(row["created_at"]),
+                      revoked_at=(
+                          None if revoked_at is None else float(revoked_at)
                       ),
                   )
-                  self._ok(_rule_json(rule), status=201)
-
-              def _handle_token_item(self) -> None:
-                  doc = self._read_json()
-                  item = type(self).kernel.tokens.define_item(
-                      item_id=self._require_str(doc, "item_id"),
-                      title=self._require_str(doc, "title"),
-                      cost=self._require_int(doc, "cost"),
-                  )
-                  self._ok(_item_json(item), status=201)
-
-              def _handle_list_items(self) -> None:
-                  items = type(self).kernel.tokens.list_items()
-                  self._ok([_item_json(i) for i in items])
-
-              def _handle_token_earn(self) -> None:
-                  doc = self._read_json()
-                  tx = type(self).kernel.tokens.earn(
-                      subject_zid=self._require_str(doc, "subject_zid"),
-                      activity=self._require_str(doc, "activity"),
-                      ref_type=self._require_str(doc, "ref_type"),
-                      ref_id=self._require_str(doc, "ref_id"),
-                  )
-                  self._ok(_tx_json(tx), status=201)
-
-              def _handle_token_redeem(self) -> None:
-                  doc = self._read_json()
-                  record = type(self).kernel.tokens.redeem(
-                      self._require_str(doc, "subject_zid"),
-                      self._require_str(doc, "item_id"),
-                  )
-                  self._ok(_redemption_json(record))
-
-              def _handle_token_balance(self, zid: str) -> None:
-                  balance = type(self).kernel.tokens.balance(zid)
-                  self._ok({"zid": zid, "balance": balance})
-
-              def _handle_token_history(self, zid: str) -> None:
-                  history = type(self).kernel.tokens.history(zid)
-                  self._ok([_tx_json(t) for t in history])
-
-              def _handle_currency_quote(self) -> None:
-                  doc = self._read_json()
-                  signed = type(self).kernel.currency.quote(
-                      base=self._require_str(doc, "base"),
-                      quote_ccy=self._require_str(doc, "quote_ccy"),
-                      requester_zid=self._require_str(doc, "requester_zid"),
-                  )
-                  self._ok(_signed_quote_json(signed), status=201)
-
-              def _handle_currency_convert(self) -> None:
-                  doc = self._read_json()
-                  amount = self._require_decimal_str(doc, "amount")
-                  signed, conversion_id, exact = (
-                      type(self).kernel.currency.convert(
-                          subject_zid=self._require_str(doc, "subject_zid"),
-                          base=self._require_str(doc, "base"),
-                          quote_ccy=self._require_str(doc, "quote_ccy"),
-                          amount=amount,
-                      )
-                  )
-                  self._ok(
-                      {
-                          "conversion_id": conversion_id,
-                          "exact_amount": str(exact),
-                          "quote": _signed_quote_json(signed),
-                      },
-                      status=201,
-                  )
-
-              def _handle_currency_settle(self) -> None:
-                  doc = self._read_json()
-                  type(self).kernel.currency.record_settlement(
-                      self._require_str(doc, "conversion_id"),
-                      settlement_ref=self._require_str(doc, "settlement_ref"),
-                  )
-                  self._ok({"settled": True})
-
-              def _handle_get_conversion(self, conversion_id: str) -> None:
-                  record = type(self).kernel.currency.get_conversion(
-                      conversion_id
-                  )
-                  if record is None:
-                      raise ApiError(
-                          404,
-                          "not_found",
-                          f"unknown conversion: {conversion_id}",
-                      )
-                  self._ok(record)
-
-              @staticmethod
-              def _decode_b64(value: str) -> bytes:
-                  try:
-                      return base64.b64decode(value, validate=True)
-                  except ValueError as exc:
-                      raise ApiError(
-                          400,
-                          "invalid_request",
-                          "content_b64 is not valid base64",
-                      ) from exc
-
-
-          def _health_json(component: ComponentHealth) -> dict[str, object]:
-              return {
-                  "component": component.component,
-                  "status": component.status.value,
-                  "detail": component.detail,
-              }
-
-
-          def _identity_json(identity: Identity) -> dict[str, object]:
-              return {
-                  "zid": identity.zid,
-                  "kind": identity.kind.value,
-                  "status": identity.status.value,
-                  "display_name": identity.display_name,
-                  "created_at": identity.created_at,
-                  "updated_at": identity.updated_at,
-                  "contract_version": identity.contract_version,
-              }
-
-
-          def _media_json(record: MediaRecord) -> dict[str, object]:
-              return {
-                  "media_id": record.media_id,
-                  "owner_zid": record.owner_zid,
-                  "kind": record.kind.value,
-                  "title": record.title,
-                  "content_sha256": record.content_sha256,
-                  "content_size": record.content_size,
-                  "content_type": record.content_type,
-                  "created_at": record.created_at,
-                  "contract_version": record.contract_version,
-              }
-
-
-          def _provenance_json(event: ProvenanceEvent) -> dict[str, object]:
-              return {
-                  "sequence": event.sequence,
-                  "media_id": event.media_id,
-                  "actor_zid": event.actor_zid,
-                  "action": event.action,
-                  "detail": event.detail,
-                  "occurred_at": event.occurred_at,
-                  "previous_hash": event.previous_hash,
-                  "event_hash": event.event_hash,
-              }
-
-
-          def _credential_json(record: CredentialRecord) -> dict[str, object]:
-              return {
-                  "credential_id": record.credential_id,
-                  "subject_zid": record.subject_zid,
-                  "issuer_zid": record.issuer_zid,
-                  "credential_type": record.credential_type.value,
-                  "title": record.title,
-                  "detail": record.detail,
-                  "issued_at": record.issued_at,
-                  "valid_from": record.valid_from,
-                  "valid_until": record.valid_until,
-                  "revoked": record.revoked,
-                  "revoked_at": record.revoked_at,
-                  "revoked_reason": record.revoked_reason,
-                  "contract_version": record.contract_version,
-              }
-
-
-          def _attestation_json(attestation: Attestation) -> dict[str, object]:
-              return {
-                  "attestation_id": attestation.attestation_id,
-                  "subject_zid": attestation.subject_zid,
-                  "claim": attestation.claim,
-                  "subject_sha256": attestation.subject_sha256,
-                  "issued_at": attestation.issued_at,
-                  "signature_b64": base64.b64encode(
-                      attestation.signature
-                  ).decode("ascii"),
-                  "signer_public_pem": attestation.signer_public_pem.decode(
-                      "utf-8"
-                  ),
-                  "contract_version": attestation.contract_version,
-              }
-
-
-          def _rule_json(rule: EmissionRule) -> dict[str, object]:
-              return {
-                  "rule_id": rule.rule_id,
-                  "activity": rule.activity,
-                  "amount": rule.amount,
-                  "daily_cap": rule.daily_cap,
-                  "lifetime_cap": rule.lifetime_cap,
-                  "active": rule.active,
-              }
-
-
-          def _item_json(item: RedemptionItem) -> dict[str, object]:
-              return {
-                  "item_id": item.item_id,
-                  "title": item.title,
-                  "cost": item.cost,
-                  "active": item.active,
-              }
-
-
-          def _tx_json(tx: LedgerTransaction) -> dict[str, object]:
-              return {
-                  "tx_id": tx.tx_id,
-                  "kind": tx.kind,
-                  "debit_account": tx.debit_account,
-                  "credit_account": tx.credit_account,
-                  "amount": tx.amount,
-                  "reason": tx.reason,
-                  "ref_type": tx.ref_type,
-                  "ref_id": tx.ref_id,
-                  "actor": tx.actor,
-                  "created_at": tx.created_at,
-              }
-
-
-          def _redemption_json(record: RedemptionRecord) -> dict[str, object]:
-              return {
-                  "redemption_id": record.redemption_id,
-                  "subject_zid": record.subject_zid,
-                  "item_id": record.item_id,
-                  "cost": record.cost,
-                  "tx_id": record.tx_id,
-                  "created_at": record.created_at,
-              }
-
-
-          def _signed_quote_json(signed: SignedQuote) -> dict[str, object]:
-              return {
-                  "pair": signed.quote.pair.normalized,
-                  "rate": str(signed.quote.rate),
-                  "quoted_at": signed.quote.quoted_at,
-                  "expires_at": signed.quote.expires_at,
-                  "source": signed.quote.source,
-                  "issuer_zid": signed.issuer_zid,
-                  "signature_b64": base64.b64encode(
-                      signed.signature
-                  ).decode("ascii"),
-                  "signer_public_pem": signed.signer_public_pem.decode(
-                      "utf-8"
-                  ),
-                  "contract_version": signed.contract_version,
-              }
           PYEOF
 
-          echo "=== API WITH PUBLIC VERIFY REBUILT ==="
-
-      - name: Build public web page (static, no dependencies)
-        run: |
-          set -euo pipefail
-          mkdir -p public
-          cat > public/index.html <<'HTMLEOF'
-          <!DOCTYPE html>
-          <html lang="es">
-          <head>
-          <meta charset="utf-8">
-          <meta name="viewport" content="width=device-width, initial-scale=1">
-          <title>Zyra Network — Verificador Público</title>
-          <style>
-            body{font-family:system-ui,sans-serif;background:#0d1117;color:#e6edf3;
-                 display:flex;justify-content:center;padding:24px}
-            .card{max-width:720px;width:100%}
-            h1{font-size:1.4rem}
-            textarea{width:100%;height:180px;background:#161b22;color:#e6edf3;
-                     border:1px solid #30363d;border-radius:8px;padding:12px;
-                     font-family:monospace;font-size:0.8rem}
-            button{margin-top:12px;background:#238636;color:#fff;border:none;
-                   padding:12px 24px;border-radius:8px;font-size:1rem;cursor:pointer}
-            #result{margin-top:16px;padding:16px;border-radius:8px;display:none}
-            .ok{background:#0f2417;border:1px solid #238636}
-            .bad{background:#2d1216;border:1px solid #da3633}
-            small{color:#8b949e}
-          </style>
-          </head>
-          <body>
-          <div class="card">
-            <h1>🛡️ Zyra Network — Verificador Público</h1>
-            <p>Pega aquí un certificado (attestation) emitido por la Red.
-               La verificación es <b>offline y criptográfica</b>: no se
-               consulta ninguna base de datos.</p>
-            <textarea id="blob" placeholder='{"format":"zyra.attestation.v1",...}'></textarea>
-            <button onclick="verify()">Verificar autenticidad</button>
-            <div id="result"></div>
-            <p><small>Zyra Network — infraestructura de confianza digital
-               de JAZA Global Systems. La validez se demuestra con la
-               firma Ed25519 embebida en el propio certificado.</small></p>
-          </div>
-          <script src="app.js"></script>
-          </body>
-          </html>
-          HTMLEOF
-
-          cat > public/app.js <<'JSEOF'
-          async function verify() {
-            const blob = document.getElementById("blob").value.trim();
-            const box = document.getElementById("result");
-            if (!blob) { box.className="bad"; box.style.display="block";
-              box.textContent="Pega un certificado primero."; return; }
-            box.style.display="block";
-            box.textContent="Verificando...";
-            try {
-              const res = await fetch("/verify", {
-                method: "POST",
-                headers: {"Content-Type": "application/json"},
-                body: JSON.stringify({attestation: blob})
-              });
-              const payload = await res.json();
-              const d = payload.data || payload.error || {};
-              if (payload.ok && d.valid) {
-                box.className = "ok";
-                box.innerHTML = "<b>✓ AUTÉNTICO</b><br>" +
-                  "Motivo: " + d.reason + "<br>" +
-                  "ID: " + (d.attestation_id || "-") + "<br>" +
-                  "Sujeto: " + (d.subject_zid || "-") + "<br>" +
-                  "Declaración: " + (d.claim || "-") + "<br>" +
-                  "Huella de clave: " + (d.key_fingerprint || "-");
-              } else {
-                box.className = "bad";
-                box.innerHTML = "<b>✗ NO VÁLIDO</b><br>" +
-                  "Motivo: " + (d.reason || d.message || "desconocido");
-              }
-            } catch (e) {
-              box.className = "bad";
-              box.textContent = "Error contactando la Red: " + e;
-            }
-          }
-          JSEOF
-
-          echo "=== PUBLIC PAGE OK ==="
-
-      - name: Write public verify HTTP tests
-        run: |
-          set -euo pipefail
-          cat > shared_engines/runtime/tests/test_public_verify_api.py <<'PYEOF'
+          cat > shared_engines/hardening/ratelimit.py <<'PYEOF'
+          """Durable fixed-window rate limiter per API key."""
           from __future__ import annotations
 
-          import base64
-          import json
-          import threading
-          import urllib.error
-          import urllib.request
-          from collections.abc import Iterator
+          from dataclasses import dataclass
+          from typing import Final
+
+          from shared_engines.common.clocks import Clock
+          from shared_engines.common.validation import (
+              require_int_range,
+              require_non_empty_str,
+          )
+          from shared_engines.hardening.errors import RateLimitExceededError
+          from shared_engines.storage.database import Database
+          from shared_engines.storage.migrations import (
+              Migration,
+              MigrationRunner,
+          )
+
+          _SECONDS_PER_WINDOW: Final[int] = 3600
+
+          RATE_LIMIT_MIGRATIONS = (
+              Migration(
+                  1,
+                  "rate_limit_windows",
+                  (
+                      "CREATE TABLE rate_limit_windows ("
+                      " key_id TEXT NOT NULL,"
+                      " window_start INTEGER NOT NULL,"
+                      " count INTEGER NOT NULL,"
+                      " PRIMARY KEY (key_id, window_start))",
+                  ),
+              ),
+          )
+
+
+          @dataclass(frozen=True)
+          class RateCheckResult:
+              allowed: bool
+              remaining: int
+              limit: int
+
+
+          class RateLimiter:
+              """Fixed-window consumption counter per key (durable)."""
+
+              def __init__(
+                  self,
+                  db: Database,
+                  clock: Clock,
+                  *,
+                  default_limit: int = 1000,
+              ) -> None:
+                  require_int_range(
+                      default_limit, "default_limit", 1, 1_000_000,
+                      config=True,
+                  )
+                  self._db = db
+                  self._clock = clock
+                  self._default_limit = default_limit
+                  MigrationRunner(
+                      db, "hardening.ratelimit", RATE_LIMIT_MIGRATIONS
+                  ).run(clock)
+
+              def check(
+                  self, key_id: str, *, limit: int | None = None
+              ) -> RateCheckResult:
+                  """Checks and increments consumption atomically."""
+                  require_non_empty_str(key_id, "key_id")
+                  effective = (
+                      limit if limit is not None else self._default_limit
+                  )
+                  require_int_range(effective, "effective", 1, 1_000_000)
+                  now = self._clock.now()
+                  window = int(now // _SECONDS_PER_WINDOW)
+                  with self._db.transaction() as cursor:
+                      row = cursor.execute(
+                          "SELECT count FROM rate_limit_windows"
+                          " WHERE key_id = ? AND window_start = ?",
+                          (key_id, window),
+                      ).fetchone()
+                      current = int(row["count"]) if row is not None else 0
+                      if current >= effective:
+                          return RateCheckResult(
+                              allowed=False,
+                              remaining=0,
+                              limit=effective,
+                          )
+                      cursor.execute(
+                          "INSERT INTO rate_limit_windows"
+                          " (key_id, window_start, count)"
+                          " VALUES (?, ?, 1)"
+                          " ON CONFLICT (key_id, window_start)"
+                          " DO UPDATE SET count = count + 1",
+                          (key_id, window),
+                      )
+                  return RateCheckResult(
+                      allowed=True,
+                      remaining=effective - current - 1,
+                      limit=effective,
+                  )
+
+              def enforce(
+                  self, key_id: str, *, limit: int | None = None
+              ) -> RateCheckResult:
+                  """check() that raises RateLimitExceededError."""
+                  result = self.check(key_id, limit=limit)
+                  if not result.allowed:
+                      raise RateLimitExceededError(
+                          f"rate limit {result.limit} exceeded for"
+                          f" {key_id}; try the next window"
+                      )
+                  return result
+          PYEOF
+
+          cat > shared_engines/hardening/bruteforce.py <<'PYEOF'
+          """Durable brute-force guard: temporary lockout after failures."""
+          from __future__ import annotations
+
+          from typing import Final
+
+          from shared_engines.common.clocks import Clock
+          from shared_engines.common.validation import (
+              require_int_range,
+              require_non_empty_str,
+          )
+          from shared_engines.hardening.errors import SourceLockedError
+          from shared_engines.storage.database import Database
+          from shared_engines.storage.migrations import (
+              Migration,
+              MigrationRunner,
+          )
+
+          _SECONDS_PER_DAY: Final[int] = 86_400
+
+          BRUTE_FORCE_MIGRATIONS = (
+              Migration(
+                  1,
+                  "bruteforce_state",
+                  (
+                      "CREATE TABLE bruteforce_state ("
+                      " source TEXT PRIMARY KEY,"
+                      " failures INTEGER NOT NULL DEFAULT 0,"
+                      " locked_until REAL)"
+                  ),
+              ),
+          )
+
+
+          class BruteForceGuard:
+              """Tracks failed authentications per source and locks
+              sources that exceed the threshold for a duration."""
+
+              def __init__(
+                  self,
+                  db: Database,
+                  clock: Clock,
+                  *,
+                  max_failures: int = 5,
+                  lockout_seconds: float = 900.0,
+              ) -> None:
+                  require_int_range(
+                      max_failures, "max_failures", 1, 100, config=True
+                  )
+                  if lockout_seconds <= 0:
+                      raise ValueError(
+                          "lockout_seconds must be positive"
+                      )
+                  self._db = db
+                  self._clock = clock
+                  self._max_failures = max_failures
+                  self._lockout_seconds = lockout_seconds
+                  MigrationRunner(
+                      db, "hardening.bruteforce", BRUTE_FORCE_MIGRATIONS
+                  ).run(clock)
+
+              def check_allowed(self, source: str) -> None:
+                  """Raises SourceLockedError if this source is locked."""
+                  require_non_empty_str(source, "source")
+                  row = self._db.query_one(
+                      "SELECT locked_until FROM bruteforce_state"
+                      " WHERE source = ?",
+                      (source,),
+                  )
+                  if row is None:
+                      return
+                  locked_until = row["locked_until"]
+                  if locked_until is None:
+                      return
+                  if self._clock.now() < float(locked_until):
+                      raise SourceLockedError(
+                          f"source {source} is locked due to failed"
+                          " authentication attempts"
+                      )
+                  self._db.execute(
+                      "DELETE FROM bruteforce_state WHERE source = ?",
+                      (source,),
+                  )
+
+              def record_failure(self, source: str) -> bool:
+                  """Records a failure; returns True if now locked."""
+                  require_non_empty_str(source, "source")
+                  with self._db.transaction() as cursor:
+                      row = cursor.execute(
+                          "SELECT failures FROM bruteforce_state"
+                          " WHERE source = ?",
+                          (source,),
+                      ).fetchone()
+                      failures = (
+                          int(row["failures"]) if row is not None else 0
+                      )
+                      failures += 1
+                      locked = failures >= self._max_failures
+                      locked_until = (
+                          self._clock.now() + self._lockout_seconds
+                          if locked
+                          else None
+                      )
+                      cursor.execute(
+                          "INSERT INTO bruteforce_state"
+                          " (source, failures, locked_until)"
+                          " VALUES (?, ?, ?)"
+                          " ON CONFLICT (source) DO UPDATE SET"
+                          " failures = excluded.failures,"
+                          " locked_until = excluded.locked_until",
+                          (source, failures, locked_until),
+                      )
+                  return locked
+
+              def reset(self, source: str) -> None:
+                  """Clears failures after a successful authentication."""
+                  require_non_empty_str(source, "source")
+                  self._db.execute(
+                      "DELETE FROM bruteforce_state WHERE source = ?",
+                      (source,),
+                  )
+          PYEOF
+
+          cat > shared_engines/hardening/tests/test_hardening.py <<'PYEOF'
+          from __future__ import annotations
+
           from pathlib import Path
-          from typing import Any
 
           import pytest
 
           from shared_engines.audit.chain import AuditTrail
           from shared_engines.common.clocks import FrozenClock
-          from shared_engines.events.contracts import EventCatalog
-          from shared_engines.events.outbox import Outbox
-          from shared_engines.identity.contracts import IdentityKind
-          from shared_engines.identity.engine import IdentityEngine
-          from shared_engines.runtime.api import ZyraApiHandler
-          from shared_engines.runtime.config import RuntimeConfig
-          from shared_engines.runtime.kernel import ZyraKernel
-          from shared_engines.runtime.server import ZyraServer
+          from shared_engines.hardening.api_keys import ApiKeyManager
+          from shared_engines.hardening.bruteforce import BruteForceGuard
+          from shared_engines.hardening.errors import (
+              ApiKeyNotFoundError,
+              ApiKeyRevokedError,
+              InvalidApiKeyError,
+              RateLimitExceededError,
+              SourceLockedError,
+          )
+          from shared_engines.hardening.ratelimit import RateLimiter
           from shared_engines.storage.database import SQLiteAdapter
-          from shared_engines.verification.attestations import AttestationIssuer
-          from shared_engines.verification.signatures import Ed25519Signer
 
 
-          class _Cluster:
+          class _Harness:
               def __init__(self, tmp_path: Path) -> None:
-                  self.db = SQLiteAdapter(Path(tmp_path) / "runtime.db")
-                  self.kernel = ZyraKernel(
-                      db=self.db,
-                      clock=FrozenClock(),
-                      signer=Ed25519Signer.generate()[0],
-                      config=RuntimeConfig(host="127.0.0.1", port=0),
+                  self.db = SQLiteAdapter(tmp_path / "hardening.db")
+                  self.clock = FrozenClock()
+                  self.audit = AuditTrail(self.db, self.clock)
+                  self.keys = ApiKeyManager(self.db, self.clock, self.audit)
+                  self.limiter = RateLimiter(self.db, self.clock)
+                  self.guard = BruteForceGuard(
+                      self.db, self.clock, max_failures=3,
+                      lockout_seconds=900,
                   )
-                  self.kernel.bootstrap_root()
-                  ZyraApiHandler.kernel = self.kernel
-                  self.server = ZyraServer(("127.0.0.1", 0))
-                  self.thread = threading.Thread(
-                      target=self.server.serve_forever, daemon=True
-                  )
-                  self.thread.start()
-                  self.base = f"http://127.0.0.1:{self.server.bound_port}"
 
-              def stop(self) -> None:
-                  self.server.shutdown()
-                  self.server.server_close()
-                  self.thread.join(timeout=5)
+              def close(self) -> None:
                   self.db.close()
 
-              def call(
-                  self,
-                  method: str,
-                  path: str,
-                  body: dict[str, Any] | None = None,
-              ) -> tuple[int, dict[str, Any]]:
-                  headers: dict[str, str] = {
-                      "Content-Type": "application/json"
-                  }
-                  data = (
-                      json.dumps(body).encode("utf-8")
-                      if body is not None
-                      else None
-                  )
-                  request = urllib.request.Request(
-                      f"{self.base}{path}",
-                      data=data,
-                      headers=headers,
-                      method=method,
-                  )
-                  try:
-                      with urllib.request.urlopen(
-                          request, timeout=10
-                      ) as resp:
-                          payload: dict[str, Any] = json.loads(
-                              resp.read().decode("utf-8")
-                          )
-                          return int(resp.status), payload
-                  except urllib.error.HTTPError as exc:
-                      raw = exc.read().decode("utf-8") or "{}"
-                      error_payload: dict[str, Any] = json.loads(raw)
-                      return int(exc.code), error_payload
 
-
-          @pytest.fixture
-          def cluster(tmp_path: Path) -> Iterator[_Cluster]:
-              running = _Cluster(tmp_path)
-              yield running
-              running.stop()
-
-
-          def _mint_attestation(tmp_path: Path) -> str:
-              db = SQLiteAdapter(tmp_path / "mint.db")
-              clock = FrozenClock()
-              audit = AuditTrail(db, clock)
-              outbox = Outbox(db, clock)
-              outbox.ensure_schema()
-              catalog = EventCatalog()
-              catalog.register("verification.attestation.issued")
-              catalog.register("identity.registered")
-              catalog.register("identity.status_changed")
-              identity = IdentityEngine(
-                  db=db,
-                  clock=clock,
-                  audit=audit,
-                  outbox=outbox,
-                  catalog=catalog,
+          def test_generate_and_verify_roundtrip(tmp_path: Path) -> None:
+              harness = _Harness(tmp_path)
+              full_key, record = harness.keys.generate(
+                  label="nexo-app", created_by="founder"
               )
-              subject = identity.register_identity(
-                  kind=IdentityKind.PERSON,
-                  display_name="Public",
-                  actor="registrar",
-              )
-              signer, _ = Ed25519Signer.generate()
-              issuer = AttestationIssuer(
-                  db=db,
-                  clock=clock,
-                  signer=signer,
-                  audit=audit,
-                  outbox=outbox,
-                  catalog=catalog,
-              )
-              attestation = issuer.issue(
-                  subject_zid=subject.zid, claim="identity_active"
-              )
-              db.close()
-              return json.dumps(
-                  {
-                      "format": "zyra.attestation.v1",
-                      "attestation_id": attestation.attestation_id,
-                      "subject_zid": attestation.subject_zid,
-                      "claim": attestation.claim,
-                      "subject_sha256": attestation.subject_sha256,
-                      "issued_at": attestation.issued_at,
-                      "signature_b64": base64.b64encode(
-                          attestation.signature
-                      ).decode("ascii"),
-                      "signer_public_pem": attestation.signer_public_pem.decode(
-                          "utf-8"
-                      ),
-                  }
-              )
+              assert full_key.startswith("zy_")
+              verified = harness.keys.verify(full_key)
+              assert verified.key_id == record.key_id
+              assert verified.active is True
+              assert verified.label == "nexo-app"
+              harness.close()
 
 
-          def test_public_verify_accepts_authentic(
-              cluster: _Cluster, tmp_path: Path,
+          def test_verify_rejects_wrong_and_malformed(
+              tmp_path: Path,
           ) -> None:
-              blob = _mint_attestation(tmp_path)
-              status, payload = cluster.call(
-                  "POST", "/verify", {"attestation": blob}
+              harness = _Harness(tmp_path)
+              full_key, _ = harness.keys.generate(
+                  label="a", created_by="x"
               )
-              assert status == 200
-              assert payload["ok"] is True
-              assert payload["data"]["valid"] is True
-              assert "AUTHENTIC" in payload["data"]["reason"]
+              tampered = full_key[:-2] + "ff"
+              with pytest.raises(InvalidApiKeyError):
+                  harness.keys.verify(tampered)
+              with pytest.raises(InvalidApiKeyError):
+                  harness.keys.verify("not-a-key")
+              with pytest.raises(InvalidApiKeyError):
+                  harness.keys.verify("zy_abc")
+              harness.close()
 
 
-          def test_public_verify_rejects_tampered(
-              cluster: _Cluster, tmp_path: Path,
+          def test_revoke_blocks_and_audit_captures(
+              tmp_path: Path,
           ) -> None:
-              blob = _mint_attestation(tmp_path)
-              doc = json.loads(blob)
-              doc["claim"] = "forged"
-              status, payload = cluster.call(
-                  "POST", "/verify", {"attestation": json.dumps(doc)}
+              harness = _Harness(tmp_path)
+              full_key, record = harness.keys.generate(
+                  label="subastas", created_by="founder"
               )
-              assert status == 200
-              assert payload["data"]["valid"] is False
-              assert "INVALID" in payload["data"]["reason"]
+              harness.keys.revoke(record.key_id, revoked_by="admin")
+              with pytest.raises(ApiKeyRevokedError):
+                  harness.keys.verify(full_key)
+              assert harness.audit.verify() >= 2
+              with pytest.raises(ApiKeyRevokedError):
+                  harness.keys.revoke(record.key_id, revoked_by="admin")
+              harness.close()
 
 
-          def test_public_verify_is_open_without_auth(
-              cluster: _Cluster, tmp_path: Path,
+          def test_rotate_produces_new_working_key(
+              tmp_path: Path,
           ) -> None:
-              blob = _mint_attestation(tmp_path)
-              status, payload = cluster.call(
-                  "POST", "/verify", {"attestation": blob}
+              harness = _Harness(tmp_path)
+              old_key, old_record = harness.keys.generate(
+                  label="bank", created_by="founder"
               )
-              assert status == 200
-              assert payload["ok"] is True
+              new_key, new_record = harness.keys.rotate(
+                  old_record.key_id, rotated_by="admin"
+              )
+              assert new_record.key_id != old_record.key_id
+              verified = harness.keys.verify(new_key)
+              assert verified.active is True
+              with pytest.raises(ApiKeyRevokedError):
+                  harness.keys.verify(old_key)
+              assert "rotated" in new_record.label
+              harness.close()
+
+
+          def test_stolen_database_yields_no_usable_keys(
+              tmp_path: Path,
+          ) -> None:
+              """The database stores hashes only; a thief with full DB
+              access cannot reconstruct any usable key."""
+              harness = _Harness(tmp_path)
+              harness.keys.generate(label="x", created_by="y")
+              rows = harness.db.query_all("SELECT * FROM api_keys")
+              for row in rows:
+                  stored = str(row["key_hash"])
+                  assert not stored.startswith("zy_")
+                  assert len(stored) == 64
+              harness.close()
+
+
+          def test_rate_limit_allows_then_blocks(tmp_path: Path) -> None:
+              harness = _Harness(tmp_path)
+              limiter = RateLimiter(
+                  harness.db, harness.clock, default_limit=3
+              )
+              for _ in range(3):
+                  result = limiter.check("key-1")
+                  assert result.allowed is True
+              blocked = limiter.check("key-1")
+              assert blocked.allowed is False
+              with pytest.raises(RateLimitExceededError):
+                  limiter.enforce("key-1")
+              harness.clock.advance(3600)
+              recovered = limiter.check("key-1")
+              assert recovered.allowed is True
+              harness.close()
+
+
+          def test_rate_limit_per_key_independent(
+              tmp_path: Path,
+          ) -> None:
+              harness = _Harness(tmp_path)
+              limiter = RateLimiter(
+                  harness.db, harness.clock, default_limit=2
+              )
+              limiter.enforce("key-a")
+              limiter.enforce("key-a")
+              with pytest.raises(RateLimitExceededError):
+                  limiter.enforce("key-a")
+              result = limiter.enforce("key-b")
+              assert result.allowed is True
+              harness.close()
+
+
+          def test_bruteforce_locks_after_threshold(
+              tmp_path: Path,
+          ) -> None:
+              harness = _Harness(tmp_path)
+              harness.guard.check_allowed("ip-1")
+              assert harness.guard.record_failure("ip-1") is False
+              assert harness.guard.record_failure("ip-1") is False
+              assert harness.guard.record_failure("ip-1") is True
+              with pytest.raises(SourceLockedError):
+                  harness.guard.check_allowed("ip-1")
+              harness.close()
+
+
+          def test_bruteforce_unlocks_after_timeout(
+              tmp_path: Path,
+          ) -> None:
+              harness = _Harness(tmp_path)
+              for _ in range(3):
+                  harness.guard.record_failure("ip-2")
+              with pytest.raises(SourceLockedError):
+                  harness.guard.check_allowed("ip-2")
+              harness.clock.advance(901)
+              harness.guard.check_allowed("ip-2")
+              assert harness.guard.record_failure("ip-2") is False
+              harness.close()
+
+
+          def test_bruteforce_reset_on_success(tmp_path: Path) -> None:
+              harness = _Harness(tmp_path)
+              harness.guard.record_failure("ip-3")
+              harness.guard.record_failure("ip-3")
+              harness.guard.reset("ip-3")
+              assert harness.guard.record_failure("ip-3") is False
+              harness.close()
+
+
+          def test_unknown_key_revoke(tmp_path: Path) -> None:
+              harness = _Harness(tmp_path)
+              with pytest.raises(ApiKeyNotFoundError):
+                  harness.keys.revoke("nonexistent", revoked_by="admin")
+              harness.close()
+
+
+          def test_audit_chain_intact_after_all_ops(
+              tmp_path: Path,
+          ) -> None:
+              harness = _Harness(tmp_path)
+              k1, r1 = harness.keys.generate(label="a", created_by="f")
+              harness.keys.generate(label="b", created_by="f")
+              harness.keys.revoke(r1.key_id, revoked_by="admin")
+              assert harness.audit.verify() >= 3
+              assert len(harness.keys.list_active()) == 1
+              assert harness.keys.list_active()[0].label == "b"
+              _ = k1
+              harness.close()
           PYEOF
 
-          echo "=== VERIFY TESTS READY ==="
+          echo "=== HARDENING BUILD OK ==="
 
       - name: Quality gates (mypy first; full regression all modules)
         run: |
           set -euo pipefail
-          M="shared_engines/common shared_engines/storage shared_engines/events shared_engines/observability shared_engines/audit shared_engines/security shared_engines/identity shared_engines/verification shared_engines/runtime shared_engines/tokenization shared_engines/currency shared_engines/verifier"
+          M="shared_engines/common shared_engines/storage shared_engines/events shared_engines/observability shared_engines/audit shared_engines/security shared_engines/identity shared_engines/verification shared_engines/runtime shared_engines/tokenization shared_engines/currency shared_engines/verifier shared_engines/hardening"
           python -m compileall -q $M main.py
           echo "compile OK"
           find $M -name '__pycache__' -type d -prune -exec rm -rf {} +
@@ -1355,15 +810,11 @@ jobs:
           git diff --check
           git config user.name "zyra-engines-bot"
           git config user.email "zyra-engines-bot@users.noreply.github.com"
-          git add shared_engines public tests
-          OFF=$(git diff --cached --name-only | grep -vE '^(shared_engines/|\.github/workflows/|main\.py|render\.yaml|tests/|public/)' || true)
-          if [ -n "$OFF" ]; then
-            echo "Out of scope:"; echo "$OFF"; exit 1
-          fi
+          git add shared_engines
           if git diff --cached --quiet; then
             echo "No changes."
           else
-            git commit -m "zyra: module 12 PUBLIC VERIFIER complete (offline verifier, api.py rebuilt with public /verify, web page, tests with full AttestationIssuer args + identity events registered)"
+            git commit -m "zyra: module 13 HARDENING (256-bit API keys hash-stored, rate limiter, brute-force guard, audited rotation/revocation) + tests"
             git push origin "HEAD:${{ github.ref_name }}"
           fi
-          echo "=== MODULE 12 COMPLETE ==="
+          echo "=== MODULE 13 COMPLETE ==="

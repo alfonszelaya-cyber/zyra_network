@@ -1,4 +1,4 @@
-name: zyra-w2-storage-part1
+name: zyra-w3-outbox-part2
 
 "on":
   workflow_dispatch:
@@ -9,7 +9,7 @@ permissions:
   contents: write
 
 concurrency:
-  group: zyra-w2p1-${{ github.ref }}
+  group: zyra-w3p2-${{ github.ref }}
   cancel-in-progress: false
 
 jobs:
@@ -31,508 +31,764 @@ jobs:
           python -m pip install --upgrade pip
           python -m pip install "cryptography>=42,<45" "flake8>=7,<8" "mypy>=1.10,<2" "pytest>=8,<9"
 
-      - name: Write database.py (typed close + self-heal reopen)
+      - name: Write outbox.py (claim/lease/fencing/dead-letter)
         run: |
           set -euo pipefail
-          cat > shared_engines/storage/database.py <<'PYEOF'
-          """SQLite persistence with explicit transaction semantics."""
+          cat > shared_engines/events/outbox.py <<'PYEOF'
+          """Transactional outbox with at-least-once dispatch.
+
+          Concurrency: PENDING -> CLAIMED -> DISPATCHED, with
+          retry/backoff, dead-letter and lease reaping. A claim
+          holds a lease (owner + expiration) and a fencing
+          token; stale workers get ``LeaseLost``. The legacy
+          single-worker path (``pending`` +
+          ``dispatch_pending``) is preserved.
+          """
           from __future__ import annotations
 
-          import os
           import sqlite3
-          import threading
-          from contextlib import (
-              AbstractContextManager,
-              contextmanager,
-          )
-          from pathlib import Path
-          from typing import (
-              Any,
-              Iterator,
-              Protocol,
-              Sequence,
-          )
+          from collections.abc import Callable
+          from dataclasses import dataclass
 
-          from shared_engines.common.errors import (
-              EngineError,
-              IntegrityError,
+          from shared_engines.common.clocks import Clock
+          from shared_engines.common.errors import LeaseLost
+          from shared_engines.common.serialization import (
+              canonical_json_dumps,
+              canonical_json_loads,
           )
-          from shared_engines.common.validation import (
-              require_int_range,
+          from shared_engines.events.contracts import Event
+          from shared_engines.storage.database import (
+              Database,
+          )
+          from shared_engines.storage.migrations import (
+              Migration,
+              MigrationRunner,
           )
 
+          MIGRATIONS = (
+              Migration(
+                  1,
+                  "events_outbox",
+                  (
+                      "CREATE TABLE events_outbox ("
+                      " event_id TEXT PRIMARY KEY,"
+                      " event_type TEXT NOT NULL,"
+                      " aggregate_id TEXT NOT NULL,"
+                      " schema_version INTEGER NOT NULL,"
+                      " envelope_version INTEGER NOT NULL,"
+                      " created_at REAL NOT NULL,"
+                      " payload TEXT NOT NULL,"
+                      " fingerprint TEXT NOT NULL,"
+                      " published_at REAL)",
+                      "CREATE INDEX events_outbox_pending"
+                      " ON events_outbox (published_at,"
+                      " created_at)",
+                  ),
+              ),
+              Migration(
+                  2,
+                  "events_outbox_concurrency",
+                  (
+                      "ALTER TABLE events_outbox"
+                      " ADD COLUMN state TEXT"
+                      " NOT NULL DEFAULT 'PENDING'",
+                      "ALTER TABLE events_outbox"
+                      " ADD COLUMN lease_owner TEXT",
+                      "ALTER TABLE events_outbox"
+                      " ADD COLUMN lease_expires_at REAL",
+                      "ALTER TABLE events_outbox"
+                      " ADD COLUMN attempts INTEGER"
+                      " NOT NULL DEFAULT 0",
+                      "ALTER TABLE events_outbox"
+                      " ADD COLUMN next_retry_at REAL",
+                      "ALTER TABLE events_outbox"
+                      " ADD COLUMN last_error TEXT",
+                      "CREATE INDEX events_outbox_state"
+                      " ON events_outbox (state,"
+                      " next_retry_at)",
+                  ),
+              ),
+          )
 
-          class DatabaseClosedError(EngineError):
-              """Operation attempted on a closed database."""
+          STATE_PENDING = "PENDING"
+          STATE_CLAIMED = "CLAIMED"
+          STATE_DISPATCHED = "DISPATCHED"
+          STATE_DEAD = "DEAD"
 
 
-          class Database(Protocol):
-              """Minimal synchronous storage surface."""
+          @dataclass(frozen=True)
+          class OutboxClaim:
+              """A leased event plus its fencing token."""
 
-              def execute(
-                  self, sql: str, params: Sequence[Any] = ()
-              ) -> sqlite3.Cursor:
-                  ...
-
-              def query_all(
-                  self, sql: str, params: Sequence[Any] = ()
-              ) -> list[sqlite3.Row]:
-                  ...
-
-              def query_one(
-                  self, sql: str, params: Sequence[Any] = ()
-              ) -> sqlite3.Row | None:
-                  ...
-
-              def transaction(
-                  self,
-              ) -> AbstractContextManager[sqlite3.Cursor]:
-                  ...
-
-              def ping(self) -> bool:
-                  ...
-
-              def integrity_check(self) -> None:
-                  ...
-
-              def close(self) -> None:
-                  ...
+              event: Event
+              fencing_token: int
 
 
-          class SQLiteAdapter:
-              """Thread-safe adapter with lifecycle guarantees.
-
-              1. After ``close()`` every operation raises
-                 ``DatabaseClosedError`` (an ``EngineError``);
-                 raw sqlite3 errors never escape.
-              2. If the file is replaced on disk (snapshot
-                 restore), the next operation detects the inode
-                 swap and transparently reopens, so adapters
-                 opened before the restore serve restored state.
-              """
+          class Outbox:
+              """Persists events atomically with the state
+              producing them."""
 
               def __init__(
-                  self,
-                  path: str | Path,
-                  *,
-                  busy_timeout_ms: int = 5000,
+                  self, db: Database, clock: Clock
               ) -> None:
-                  require_int_range(
-                      busy_timeout_ms,
-                      "busy_timeout_ms",
-                      1,
-                      600_000,
-                      config=True,
-                  )
-                  target = Path(path)
-                  if str(target) != ":memory:":
-                      target.parent.mkdir(
-                          parents=True, exist_ok=True
-                      )
-                  self._lock = threading.RLock()
-                  self._closed = False
-                  self._file_path: Path | None = (
-                      None
-                      if str(target) == ":memory:"
-                      else target
-                  )
-                  self._identity: tuple[int, int] | None
-                  self._identity = None
-                  self._timeout_ms = int(busy_timeout_ms)
-                  self._conn = self._connect()
-                  self._mark_identity()
+                  self._db = db
+                  self._clock = clock
 
-              def _connect(self) -> sqlite3.Connection:
-                  path_str = (
-                      ":memory:"
-                      if self._file_path is None
-                      else str(self._file_path)
-                  )
-                  conn = sqlite3.connect(
-                      path_str,
-                      timeout=self._timeout_ms / 1000.0,
-                      isolation_level=None,
-                      check_same_thread=False,
-                  )
-                  conn.row_factory = sqlite3.Row
-                  conn.execute("PRAGMA journal_mode=WAL")
-                  conn.execute("PRAGMA synchronous=FULL")
-                  conn.execute("PRAGMA foreign_keys=ON")
-                  conn.execute(
-                      "PRAGMA busy_timeout="
-                      f"{self._timeout_ms}"
-                  )
-                  return conn
+              def ensure_schema(self) -> None:
+                  MigrationRunner(
+                      self._db,
+                      "events.outbox",
+                      MIGRATIONS,
+                  ).run(self._clock)
 
-              def _mark_identity(self) -> None:
-                  if self._file_path is None:
-                      self._identity = None
-                      return
-                  try:
-                      st = os.stat(self._file_path)
-                  except OSError:
-                      self._identity = None
-                      return
-                  self._identity = (st.st_dev, st.st_ino)
+              def enqueue_in_transaction(
+                  self, cursor: sqlite3.Cursor, event: Event
+              ) -> None:
+                  cursor.execute(
+                      "INSERT INTO events_outbox"
+                      " (event_id, event_type,"
+                      " aggregate_id, schema_version,"
+                      " envelope_version, created_at,"
+                      " payload, fingerprint,"
+                      " published_at)"
+                      " VALUES (?, ?, ?, ?, ?, ?, ?, ?,"
+                      " NULL)",
+                      (
+                          event.event_id,
+                          event.event_type,
+                          event.aggregate_id,
+                          event.schema_version,
+                          event.envelope_version,
+                          event.timestamp,
+                          canonical_json_dumps(
+                              dict(event.payload)
+                          ),
+                          event.fingerprint,
+                      ),
+                  )
 
-              def _reopen_if_swapped(self) -> None:
-                  if self._closed or self._file_path is None:
-                      return
-                  try:
-                      st = os.stat(self._file_path)
-                  except OSError:
-                      return
-                  if self._identity == (
-                      st.st_dev,
-                      st.st_ino,
-                  ):
-                      return
-                  self._conn.close()
-                  self._conn = self._connect()
-                  self._mark_identity()
-
-              def _ensure_open(self) -> None:
-                  if self._closed:
-                      raise DatabaseClosedError(
-                          "database is closed:"
-                          " operation refused"
+              def enqueue(self, event: Event) -> None:
+                  with self._db.transaction() as cursor:
+                      self.enqueue_in_transaction(
+                          cursor, event
                       )
 
-              def execute(
-                  self, sql: str, params: Sequence[Any] = ()
-              ) -> sqlite3.Cursor:
-                  with self._lock:
-                      self._ensure_open()
-                      self._reopen_if_swapped()
-                      return self._conn.execute(
-                          sql, tuple(params)
-                      )
+              def pending(
+                  self, limit: int = 100
+              ) -> tuple[Event, ...]:
+                  rows = self._db.query_all(
+                      "SELECT * FROM events_outbox"
+                      " WHERE published_at IS NULL"
+                      " AND state = ?"
+                      " AND (next_retry_at IS NULL"
+                      "      OR next_retry_at <= ?)"
+                      " ORDER BY created_at, event_id"
+                      " LIMIT ?",
+                      (
+                          STATE_PENDING,
+                          self._clock.now(),
+                          limit,
+                      ),
+                  )
+                  return tuple(
+                      self._to_event(row)
+                      for row in rows
+                  )
 
-              def query_all(
-                  self, sql: str, params: Sequence[Any] = ()
-              ) -> list[sqlite3.Row]:
-                  with self._lock:
-                      self._ensure_open()
-                      self._reopen_if_swapped()
-                      rows: list[sqlite3.Row] = (
-                          self._conn.execute(
-                              sql, tuple(params)
-                          ).fetchall()
-                      )
-                      return rows
-
-              def query_one(
-                  self, sql: str, params: Sequence[Any] = ()
-              ) -> sqlite3.Row | None:
-                  with self._lock:
-                      self._ensure_open()
-                      self._reopen_if_swapped()
-                      row: sqlite3.Row | None = (
-                          self._conn.execute(
-                              sql, tuple(params)
-                          ).fetchone()
-                      )
-                      return row
-
-              @contextmanager
-              def transaction(
+              def dispatch_pending(
                   self,
-              ) -> Iterator[sqlite3.Cursor]:
-                  with self._lock:
-                      self._ensure_open()
-                      self._reopen_if_swapped()
-                      self._conn.execute("BEGIN IMMEDIATE")
-                      cursor = self._conn.cursor()
-                      try:
-                          yield cursor
-                      except BaseException:
-                          self._conn.execute("ROLLBACK")
-                          raise
-                      self._conn.execute("COMMIT")
+                  handler: Callable[[Event], None],
+                  *,
+                  batch_size: int = 100,
+              ) -> int:
+                  delivered = 0
+                  for event in self.pending(batch_size):
+                      handler(event)
+                      self._db.execute(
+                          "UPDATE events_outbox"
+                          " SET published_at = ?,"
+                          " state = ?"
+                          " WHERE event_id = ?"
+                          " AND published_at IS NULL",
+                          (
+                              self._clock.now(),
+                              STATE_DISPATCHED,
+                              event.event_id,
+                          ),
+                      )
+                      delivered += 1
+                  return delivered
 
-              def ping(self) -> bool:
-                  try:
-                      with self._lock:
-                          if self._closed:
-                              return False
-                          self._reopen_if_swapped()
-                          self._conn.execute(
-                              "SELECT 1"
-                          ).fetchone()
-                  except sqlite3.Error:
-                      return False
-                  return True
+              def claim_batch(
+                  self,
+                  *,
+                  owner: str,
+                  lease_seconds: float,
+                  limit: int = 10,
+              ) -> tuple[OutboxClaim, ...]:
+                  """Atomically lease due pending events.
 
-              def integrity_check(self) -> None:
-                  row = self.query_one(
-                      "PRAGMA integrity_check"
+                  Two workers racing on the same event get at
+                  most one claim: the UPDATE guards on
+                  state = PENDING inside one transaction.
+                  """
+                  if lease_seconds <= 0:
+                      raise ValueError(
+                          "lease_seconds must be"
+                          " positive"
+                      )
+                  now = self._clock.now()
+                  claims: list[OutboxClaim] = []
+                  with self._db.transaction() as cursor:
+                      rows = cursor.execute(
+                          "SELECT * FROM events_outbox"
+                          " WHERE state = ?"
+                          " AND (next_retry_at IS NULL"
+                          "      OR next_retry_at <= ?)"
+                          " ORDER BY created_at,"
+                          " event_id LIMIT ?",
+                          (
+                              STATE_PENDING,
+                              now,
+                              limit,
+                          ),
+                      ).fetchall()
+                      for row in rows:
+                          event_id = str(
+                              row["event_id"]
+                          )
+                          attempts = (
+                              int(row["attempts"]) + 1
+                          )
+                          cursor.execute(
+                              "UPDATE events_outbox"
+                              " SET state = ?,"
+                              " lease_owner = ?,"
+                              " lease_expires_at = ?,"
+                              " attempts = ?"
+                              " WHERE event_id = ?"
+                              " AND state = ?",
+                              (
+                                  STATE_CLAIMED,
+                                  owner,
+                                  now + lease_seconds,
+                                  attempts,
+                                  event_id,
+                                  STATE_PENDING,
+                              ),
+                          )
+                          if cursor.rowcount != 1:
+                              continue
+                          claims.append(
+                              OutboxClaim(
+                                  event=self._to_event(
+                                      row
+                                  ),
+                                  fencing_token=(
+                                      attempts
+                                  ),
+                              )
+                          )
+                  return tuple(claims)
+
+              def complete(
+                  self,
+                  *,
+                  event_id: str,
+                  owner: str,
+                  fencing_token: int,
+              ) -> None:
+                  """Mark DISPATCHED; LeaseLost if the
+                  lease or fencing token is stale."""
+                  now = self._clock.now()
+                  with self._db.transaction() as cursor:
+                      cursor.execute(
+                          "UPDATE events_outbox"
+                          " SET state = ?,"
+                          " published_at = ?,"
+                          " lease_owner = NULL,"
+                          " lease_expires_at = NULL"
+                          " WHERE event_id = ?"
+                          " AND state = ?"
+                          " AND lease_owner = ?"
+                          " AND attempts = ?"
+                          " AND lease_expires_at > ?",
+                          (
+                              STATE_DISPATCHED,
+                              now,
+                              event_id,
+                              STATE_CLAIMED,
+                              owner,
+                              fencing_token,
+                              now,
+                          ),
+                      )
+                      if cursor.rowcount != 1:
+                          raise LeaseLost(
+                              "lease lost for event"
+                              f" {event_id}: fencing"
+                              " rejected"
+                          )
+
+              def fail(
+                  self,
+                  *,
+                  event_id: str,
+                  owner: str,
+                  fencing_token: int,
+                  error: str,
+                  max_attempts: int = 5,
+                  backoff_base_seconds: float = 1.0,
+              ) -> bool:
+                  """Report a processing failure.
+
+                  Schedules an exponential-backoff retry,
+                  or moves the event to DEAD once
+                  ``max_attempts`` is reached. True = retry
+                  scheduled, False = dead-lettered.
+                  """
+                  now = self._clock.now()
+                  with self._db.transaction() as cursor:
+                      cursor.execute(
+                          "SELECT state, lease_owner,"
+                          " attempts FROM events_outbox"
+                          " WHERE event_id = ?",
+                          (event_id,),
+                      )
+                      row = cursor.fetchone()
+                      if row is None:
+                          raise LeaseLost(
+                              "lease lost for event"
+                              f" {event_id}: missing"
+                          )
+                      state = str(row["state"])
+                      lease_owner = str(
+                          row["lease_owner"] or ""
+                      )
+                      attempts = int(row["attempts"])
+                      if (
+                          state != STATE_CLAIMED
+                          or lease_owner != owner
+                          or attempts != fencing_token
+                      ):
+                          raise LeaseLost(
+                              "lease lost for event"
+                              f" {event_id}: fencing"
+                              " rejected"
+                          )
+                      if attempts >= max_attempts:
+                          cursor.execute(
+                              "UPDATE events_outbox"
+                              " SET state = ?,"
+                              " last_error = ?,"
+                              " lease_owner = NULL,"
+                              " lease_expires_at = NULL"
+                              " WHERE event_id = ?",
+                              (
+                                  STATE_DEAD,
+                                  error,
+                                  event_id,
+                              ),
+                          )
+                          return False
+                      delay = backoff_base_seconds * (
+                          2 ** (attempts - 1)
+                      )
+                      cursor.execute(
+                          "UPDATE events_outbox"
+                          " SET state = ?,"
+                          " next_retry_at = ?,"
+                          " last_error = ?,"
+                          " lease_owner = NULL,"
+                          " lease_expires_at = NULL"
+                          " WHERE event_id = ?",
+                          (
+                              STATE_PENDING,
+                              now + delay,
+                              error,
+                              event_id,
+                          ),
+                      )
+                      return True
+
+              def reap_expired_leases(self) -> int:
+                  """Return expired CLAIMED events to
+                  PENDING (worker died mid-processing)."""
+                  now = self._clock.now()
+                  with self._db.transaction() as cursor:
+                      cursor.execute(
+                          "UPDATE events_outbox"
+                          " SET state = ?,"
+                          " lease_owner = NULL,"
+                          " lease_expires_at = NULL"
+                          " WHERE state = ?"
+                          " AND lease_expires_at <= ?",
+                          (
+                              STATE_PENDING,
+                              STATE_CLAIMED,
+                              now,
+                          ),
+                      )
+                      return int(cursor.rowcount)
+
+              def dead_letter(
+                  self, limit: int = 100
+              ) -> tuple[Event, ...]:
+                  rows = self._db.query_all(
+                      "SELECT * FROM events_outbox"
+                      " WHERE state = ?"
+                      " ORDER BY created_at, event_id"
+                      " LIMIT ?",
+                      (STATE_DEAD, limit),
                   )
-                  result = (
-                      str(row[0])
-                      if row is not None
-                      else ""
+                  return tuple(
+                      self._to_event(row)
+                      for row in rows
                   )
-                  if result != "ok":
-                      raise IntegrityError(
-                          "sqlite integrity check"
-                          f" failed: {result}"
+
+              def requeue_dead(
+                  self, *, event_id: str
+              ) -> None:
+                  with self._db.transaction() as cursor:
+                      cursor.execute(
+                          "UPDATE events_outbox"
+                          " SET state = ?,"
+                          " attempts = 0,"
+                          " next_retry_at = NULL,"
+                          " last_error = NULL"
+                          " WHERE event_id = ?"
+                          " AND state = ?",
+                          (
+                              STATE_PENDING,
+                              event_id,
+                              STATE_DEAD,
+                          ),
                       )
 
-              def backup_to(self, destination: Path) -> None:
-                  """Consistent online backup (sqlite API)."""
-                  destination.parent.mkdir(
-                      parents=True, exist_ok=True
+              @staticmethod
+              def _to_event(row: sqlite3.Row) -> Event:
+                  return Event(
+                      event_id=str(row["event_id"]),
+                      event_type=str(
+                          row["event_type"]
+                      ),
+                      aggregate_id=str(
+                          row["aggregate_id"]
+                      ),
+                      schema_version=int(
+                          row["schema_version"]
+                      ),
+                      envelope_version=int(
+                          row["envelope_version"]
+                      ),
+                      timestamp=float(
+                          row["created_at"]
+                      ),
+                      payload=canonical_json_loads(
+                          str(row["payload"])
+                      ),
+                      fingerprint=str(
+                          row["fingerprint"]
+                      ),
                   )
-                  with self._lock:
-                      self._ensure_open()
-                      target = sqlite3.connect(
-                          str(destination)
-                      )
-                      try:
-                          self._conn.backup(target)
-                      finally:
-                          target.close()
-
-              def close(self) -> None:
-                  with self._lock:
-                      if not self._closed:
-                          self._closed = True
-                          self._conn.close()
           PYEOF
-          echo "=== DATABASE HARDENED ==="
+          echo "=== OUTBOX CONCURRENCY READY ==="
 
-      - name: Write snapshots.py (durable fsync restore)
+      - name: Write concurrency proof tests (5)
         run: |
           set -euo pipefail
-          cat > shared_engines/storage/snapshots.py <<'PYEOF'
-          """Snapshot manager: labeled, verified, retention."""
+          mkdir -p shared_engines/events/tests
+          cat > shared_engines/events/tests/test_outbox_concurrency.py <<'PYEOF'
+          """Concurrency proofs: exclusivity, fencing,
+          backoff, dead-letter, reaping, legacy dispatch."""
           from __future__ import annotations
 
           import hashlib
-          import json
-          import os
-          import re
-          import sqlite3
-          from dataclasses import dataclass
           from pathlib import Path
 
-          from shared_engines.common.clocks import Clock
-          from shared_engines.common.errors import (
-              IntegrityError,
+          from shared_engines.common.clocks import (
+              FrozenClock,
           )
-          from shared_engines.common.identifiers import new_id
+          from shared_engines.common.errors import (
+              LeaseLost,
+          )
+          from shared_engines.common.serialization import (
+              canonical_json_dumps,
+          )
+          from shared_engines.events.contracts import Event
+          from shared_engines.events.outbox import (
+              Outbox,
+              OutboxClaim,
+          )
           from shared_engines.storage.database import (
               SQLiteAdapter,
           )
 
 
-          def _sha256_file(path: Path) -> str:
-              digest = hashlib.sha256()
-              with path.open("rb") as handle:
-                  for chunk in iter(
-                      lambda: handle.read(512 * 1024), b""
-                  ):
-                      digest.update(chunk)
-              return digest.hexdigest()
-
-
-          @dataclass(frozen=True)
-          class SnapshotRecord:
-              path: Path
-              label: str
-              created_at: float
-              sha256: str
-              size_bytes: int
-
-
-          class SnapshotManager:
-              def __init__(
-                  self,
-                  adapter: SQLiteAdapter,
-                  clock: Clock,
-                  snapshot_dir: Path,
-              ) -> None:
-                  self._adapter = adapter
-                  self._clock = clock
-                  self._dir = Path(snapshot_dir)
-                  self._dir.mkdir(
-                      parents=True, exist_ok=True
-                  )
-
-              def _manifest(self, path: Path) -> Path:
-                  return path.with_suffix(
-                      ".manifest.json"
-                  )
-
-              def create(
-                  self, *, label: str
-              ) -> SnapshotRecord:
-                  safe = re.sub(
-                      r"[^a-z0-9_-]+", "-", label.lower()
-                  )
-                  safe = safe.strip("-") or "snap"
-                  stamp = (
-                      f"{int(self._clock.now())}-"
-                      f"{new_id()[:8]}"
-                  )
-                  path = self._dir / (
-                      f"snapshot-{stamp}-{safe}.db"
-                  )
-                  self._adapter.backup_to(path)
-                  digest = _sha256_file(path)
-                  created_at = self._clock.now()
-                  manifest: dict[str, object] = {
-                      "label": safe,
-                      "created_at": created_at,
-                      "sha256": digest,
+          def _make_event(
+              suffix: str, ts: float
+          ) -> Event:
+              event_id = f"evt-{suffix}"
+              event_type = "network.node.joined"
+              aggregate_id = f"agg-{suffix}"
+              payload: dict[str, object] = {
+                  "seq": suffix
+              }
+              fingerprint_src = canonical_json_dumps(
+                  {
+                      "event_id": event_id,
+                      "event_type": event_type,
+                      "aggregate_id": aggregate_id,
+                      "timestamp": ts,
+                      "payload": payload,
                   }
-                  self._manifest(path).write_text(
-                      json.dumps(manifest),
-                      encoding="utf-8",
-                  )
-                  self.verify(path)
-                  return SnapshotRecord(
-                      path=path,
-                      label=safe,
-                      created_at=created_at,
-                      sha256=digest,
-                      size_bytes=path.stat().st_size,
-                  )
+              )
+              fingerprint = hashlib.sha256(
+                  fingerprint_src.encode("utf-8")
+              ).hexdigest()
+              return Event(
+                  event_id=event_id,
+                  event_type=event_type,
+                  aggregate_id=aggregate_id,
+                  schema_version=1,
+                  envelope_version=1,
+                  timestamp=ts,
+                  payload=payload,
+                  fingerprint=fingerprint,
+              )
 
-              def verify(self, path: Path) -> str:
-                  if not path.exists():
-                      raise IntegrityError(
-                          f"snapshot missing: {path}"
+
+          def _boot(
+              tmp_path: Path,
+          ) -> tuple[
+              SQLiteAdapter, Outbox, FrozenClock
+          ]:
+              db = SQLiteAdapter(
+                  tmp_path / "outbox.db"
+              )
+              clock = FrozenClock()
+              outbox = Outbox(db, clock)
+              outbox.ensure_schema()
+              return db, outbox, clock
+
+
+          def test_two_workers_never_claim_same_event(
+              tmp_path: Path,
+          ) -> None:
+              db, outbox, clock = _boot(tmp_path)
+              try:
+                  for i in range(4):
+                      outbox.enqueue(
+                          _make_event(
+                              str(i), clock.now()
+                          )
                       )
-                  manifest_path = self._manifest(path)
-                  if not manifest_path.exists():
-                      raise IntegrityError(
-                          "snapshot manifest missing:"
-                          f" {manifest_path}"
-                      )
-                  manifest = json.loads(
-                      manifest_path.read_text(
-                          encoding="utf-8"
-                      )
+                  claims_a: tuple[
+                      OutboxClaim, ...
+                  ] = outbox.claim_batch(
+                      owner="worker-a",
+                      lease_seconds=30.0,
+                      limit=10,
                   )
-                  digest = _sha256_file(path)
-                  if not isinstance(manifest, dict) or (
-                      digest != manifest.get("sha256")
-                  ):
-                      raise IntegrityError(
-                          "snapshot hash does not match"
-                          " manifest"
-                      )
-                  connection = sqlite3.connect(
-                      f"file:{path}?mode=ro", uri=True
+                  claims_b: tuple[
+                      OutboxClaim, ...
+                  ] = outbox.claim_batch(
+                      owner="worker-b",
+                      lease_seconds=30.0,
+                      limit=10,
+                  )
+                  ids_a = {
+                      c.event.event_id
+                      for c in claims_a
+                  }
+                  ids_b = {
+                      c.event.event_id
+                      for c in claims_b
+                  }
+                  assert (
+                      len(claims_a) + len(claims_b)
+                      == 4
+                  )
+                  assert not (ids_a & ids_b)
+              finally:
+                  db.close()
+
+
+          def test_complete_requires_owner_fencing(
+              tmp_path: Path,
+          ) -> None:
+              db, outbox, clock = _boot(tmp_path)
+              try:
+                  outbox.enqueue(
+                      _make_event("f1", clock.now())
+                  )
+                  (claim,) = outbox.claim_batch(
+                      owner="worker-a",
+                      lease_seconds=30.0,
                   )
                   try:
-                      row = connection.execute(
-                          "PRAGMA integrity_check"
-                      ).fetchone()
-                  finally:
-                      connection.close()
-                  if row is None or str(row[0]) != "ok":
-                      raise IntegrityError(
-                          "snapshot failed"
-                          " integrity_check"
+                      outbox.complete(
+                          event_id=(
+                              claim.event.event_id
+                          ),
+                          owner="worker-b",
+                          fencing_token=(
+                              claim.fencing_token
+                          ),
                       )
-                  return digest
-
-              def list_snapshots(
-                  self,
-              ) -> tuple[SnapshotRecord, ...]:
-                  records: list[SnapshotRecord] = []
-                  for path in sorted(
-                      self._dir.glob("snapshot-*.db")
-                  ):
-                      manifest_path = self._manifest(path)
-                      if not manifest_path.exists():
-                          continue
-                      manifest = json.loads(
-                          manifest_path.read_text(
-                              encoding="utf-8"
-                          )
+                      raise AssertionError(
+                          "expected LeaseLost"
                       )
-                      if not isinstance(manifest, dict):
-                          continue
-                      records.append(
-                          SnapshotRecord(
-                              path=path,
-                              label=str(
-                                  manifest.get(
-                                      "label", ""
-                                  )
-                              ),
-                              created_at=float(
-                                  str(
-                                      manifest.get(
-                                          "created_at",
-                                          0.0,
-                                      )
-                                  )
-                              ),
-                              sha256=str(
-                                  manifest.get(
-                                      "sha256", ""
-                                  )
-                              ),
-                              size_bytes=(
-                                  path.stat().st_size
-                              ),
-                          )
-                      )
-                  records.sort(
-                      key=lambda r: r.created_at,
-                      reverse=True,
+                  except LeaseLost:
+                      pass
+                  outbox.complete(
+                      event_id=claim.event.event_id,
+                      owner="worker-a",
+                      fencing_token=(
+                          claim.fencing_token
+                      ),
                   )
-                  return tuple(records)
+                  assert outbox.pending() == ()
+              finally:
+                  db.close()
 
-              def enforce_retention(
-                  self, *, keep: int
-              ) -> tuple[Path, ...]:
-                  if keep < 1:
-                      raise IntegrityError(
-                          "keep must be >= 1"
+
+          def test_fail_backoff_then_dead_letter(
+              tmp_path: Path,
+          ) -> None:
+              db, outbox, clock = _boot(tmp_path)
+              try:
+                  outbox.enqueue(
+                      _make_event("r1", clock.now())
+                  )
+                  (c1,) = outbox.claim_batch(
+                      owner="w", lease_seconds=30.0
+                  )
+                  scheduled = outbox.fail(
+                      event_id=c1.event.event_id,
+                      owner="w",
+                      fencing_token=(
+                          c1.fencing_token
+                      ),
+                      error="boom-1",
+                      max_attempts=2,
+                      backoff_base_seconds=1.0,
+                  )
+                  assert scheduled is True
+                  assert (
+                      outbox.claim_batch(
+                          owner="w",
+                          lease_seconds=30.0,
                       )
-                  records = self.list_snapshots()
-                  removed: list[Path] = []
-                  for record in records[keep:]:
-                      record.path.unlink(missing_ok=True)
-                      self._manifest(
-                          record.path
-                      ).unlink(missing_ok=True)
-                      removed.append(record.path)
-                  return tuple(removed)
-
-              def restore(
-                  self, path: Path, target: Path
-              ) -> None:
-                  """Restore a verified snapshot.
-
-                  Durable swap: temp file, fsync, atomic
-                  replace. Open adapters detect the inode
-                  swap and transparently reopen.
-                  """
-                  self.verify(path)
-                  target.parent.mkdir(
-                      parents=True, exist_ok=True
+                      == ()
                   )
-                  for suffix in ("-wal", "-shm"):
-                      Path(
-                          str(target) + suffix
-                      ).unlink(missing_ok=True)
-                  tmp = target.with_name(
-                      f"{target.name}.restore-"
-                      f"{new_id()[:8]}"
+                  clock.advance(2)
+                  (c2,) = outbox.claim_batch(
+                      owner="w", lease_seconds=30.0
                   )
-                  with open(tmp, "wb") as handle:
-                      handle.write(path.read_bytes())
-                      handle.flush()
-                      os.fsync(handle.fileno())
-                  os.replace(tmp, target)
+                  assert c2.fencing_token == 2
+                  dead = outbox.fail(
+                      event_id=c2.event.event_id,
+                      owner="w",
+                      fencing_token=(
+                          c2.fencing_token
+                      ),
+                      error="boom-2",
+                      max_attempts=2,
+                      backoff_base_seconds=1.0,
+                  )
+                  assert dead is False
+                  assert (
+                      len(outbox.dead_letter()) == 1
+                  )
+                  outbox.requeue_dead(
+                      event_id=c2.event.event_id
+                  )
+                  (c3,) = outbox.claim_batch(
+                      owner="w", lease_seconds=30.0
+                  )
+                  assert c3.fencing_token == 1
+              finally:
+                  db.close()
+
+
+          def test_expired_lease_reaped_and_fenced(
+              tmp_path: Path,
+          ) -> None:
+              db, outbox, clock = _boot(tmp_path)
+              try:
+                  outbox.enqueue(
+                      _make_event("l1", clock.now())
+                  )
+                  (old,) = outbox.claim_batch(
+                      owner="worker-dead",
+                      lease_seconds=10.0,
+                  )
+                  clock.advance(11)
+                  assert (
+                      outbox.reap_expired_leases()
+                      == 1
+                  )
+                  (fresh,) = outbox.claim_batch(
+                      owner="worker-new",
+                      lease_seconds=30.0,
+                  )
+                  assert fresh.fencing_token == 2
+                  try:
+                      outbox.complete(
+                          event_id=(
+                              fresh.event.event_id
+                          ),
+                          owner="worker-dead",
+                          fencing_token=(
+                              old.fencing_token
+                          ),
+                      )
+                      raise AssertionError(
+                          "expected LeaseLost"
+                      )
+                  except LeaseLost:
+                      pass
+                  outbox.complete(
+                      event_id=fresh.event.event_id,
+                      owner="worker-new",
+                      fencing_token=(
+                          fresh.fencing_token
+                      ),
+                  )
+                  assert outbox.pending() == ()
+              finally:
+                  db.close()
+
+
+          def test_legacy_dispatch_still_works(
+              tmp_path: Path,
+          ) -> None:
+              db, outbox, clock = _boot(tmp_path)
+              try:
+                  outbox.enqueue(
+                      _make_event("a", clock.now())
+                  )
+                  outbox.enqueue(
+                      _make_event("b", clock.now())
+                  )
+                  seen: list[str] = []
+
+                  def collect(
+                      event: Event,
+                  ) -> None:
+                      seen.append(event.event_id)
+
+                  delivered = (
+                      outbox.dispatch_pending(collect)
+                  )
+                  assert delivered == 2
+                  assert len(seen) == 2
+                  assert outbox.pending() == ()
+              finally:
+                  db.close()
           PYEOF
-          echo "=== SNAPSHOTS HARDENED ==="
+          echo "=== TESTS READY ==="
 
       - name: Quality gates (mypy first; full regression)
         run: |
@@ -560,7 +816,7 @@ jobs:
           if git diff --cached --quiet; then
             echo "No changes."
           else
-            git commit -m "zyra: W2 part 1 - storage lifecycle (typed DatabaseClosedError, self-heal reopen on restore inode swap, fsync durable snapshot restore, contextlib canonical import)"
+            git commit -m "zyra: W3 part 2 - outbox concurrency (atomic claim/lease, fencing LeaseLost, exponential backoff, dead-letter + requeue, expired-lease reaper; legacy dispatch preserved; 5 proofs)"
             git push origin "HEAD:${{ github.ref_name }}"
           fi
-          echo "=== W2 PART 1 COMPLETE ==="
+          echo "=== W3 PART 2 COMPLETE ==="

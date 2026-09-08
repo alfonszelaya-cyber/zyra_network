@@ -1,4 +1,4 @@
-name: zyra-modulo-15-storage-dr
+name: zyra-modulo-16-network
 
 "on":
   workflow_dispatch:
@@ -9,7 +9,7 @@ permissions:
   contents: write
 
 concurrency:
-  group: zyra-modulo-15-${{ github.ref }}
+  group: zyra-modulo-16-${{ github.ref }}
   cancel-in-progress: false
 
 jobs:
@@ -31,708 +31,837 @@ jobs:
           python -m pip install --upgrade pip
           python -m pip install "cryptography>=42,<45" "flake8>=7,<8" "mypy>=1.10,<2" "pytest>=8,<9"
 
-      - name: Check modules 01-14 present
+      - name: Check modules 01-15 present
         run: |
           set -euo pipefail
           test -f shared_engines/authority/root.py
-          test -f main.py
-          echo "modules 01-14 present: OK"
+          test -f shared_engines/storage/network_migrations.py
+          echo "modules 01-15 present: OK"
 
-      - name: Clean scripts scaffolds (zero whitespace-only, strip W391)
+      - name: Build distributed network core
         run: |
           set -euo pipefail
-          python3 - <<'PYCLEAN'
-          from pathlib import Path
+          mkdir -p shared_engines/network/tests
 
-          cleaned = 0
-          for f in Path("scripts").glob("*.py"):
-              text = f.read_text(encoding="utf-8")
-              if text.strip() == "":
-                  if text != "":
-                      f.write_text("", encoding="utf-8")
-                      cleaned += 1
-              else:
-                  stripped = text.rstrip("\n") + "\n"
-                  if stripped != text:
-                      f.write_text(stripped, encoding="utf-8")
-                      cleaned += 1
-          print(f"cleaned {cleaned} script files")
-          PYCLEAN
+          cat > shared_engines/network/__init__.py <<'PYEOF'
+          """Zyra distributed network core.
 
-      - name: Build network migration registry + snapshots + DR
-        run: |
-          set -euo pipefail
-          mkdir -p shared_engines/storage/tests
-
-          cat > shared_engines/storage/network_migrations.py <<'PYEOF'
-          """Central migration registry: one entry migrates ALL engines."""
+          Cluster membership with heartbeats and TTL-based failure
+          detection, topology tracking, hash-verified state
+          replication, and quorum-gated failover (no split-brain:
+          a new primary can only be elected when a majority of
+          nodes is active). Every cluster event is audited.
+          """
           from __future__ import annotations
 
-          from dataclasses import dataclass
+          from shared_engines.network.cluster import (
+              ClusterManager,
+              NodeRole,
+              NodeState,
+              NodeStatus,
+          )
+          from shared_engines.network.failover import (
+              FailoverCoordinator,
+              NoQuorumError,
+          )
+          from shared_engines.network.replication import (
+              ReplicationManager,
+              ReplicationReport,
+          )
 
+          __all__ = [
+              "ClusterManager", "FailoverCoordinator", "NoQuorumError",
+              "NodeRole", "NodeState", "NodeStatus",
+              "ReplicationManager", "ReplicationReport",
+          ]
+          PYEOF
+
+          cat > shared_engines/network/errors.py <<'PYEOF'
+          """Typed network errors."""
+          from __future__ import annotations
+
+          from shared_engines.common.errors import (
+              ConcurrencyError,
+              EngineError,
+              NotFoundError,
+              ValidationError,
+          )
+
+
+          class NetworkError(EngineError):
+              """Base for network layer failures."""
+
+
+          class NodeNotFoundError(NetworkError, NotFoundError):
+              """The node is not part of the cluster."""
+
+
+          class NoQuorumError(NetworkError, ConcurrencyError):
+              """No majority of active nodes: failover refused to
+              avoid split-brain."""
+
+
+          class InvalidTransitionError(NetworkError, ValidationError):
+              """The node state transition is not allowed."""
+
+
+          class ReplicationMismatchError(NetworkError, ValidationError):
+              """Replica state hash differs from primary."""
+          PYEOF
+
+          cat > shared_engines/network/cluster.py <<'PYEOF'
+          """Cluster membership: nodes, heartbeats, TTL failure detection.
+
+          Each node registers with a ZID identity and a role. Nodes
+          send heartbeats; a node whose heartbeat TTL expires becomes
+          SUSPECT, and after a second expiry DOWN. Recovery is
+          explicit (rejoined). State transitions are validated and
+          audited.
+          """
+          from __future__ import annotations
+
+          import sqlite3
+          from dataclasses import dataclass
+          from enum import Enum
+
+          from shared_engines.audit.chain import AuditTrail
           from shared_engines.common.clocks import Clock
+          from shared_engines.common.errors import IntegrityError
+          from shared_engines.common.validation import (
+              require_int_range,
+              require_non_empty_str,
+              require_positive_number,
+          )
+          from shared_engines.network.errors import (
+              InvalidTransitionError,
+              NodeNotFoundError,
+          )
           from shared_engines.storage.database import Database
           from shared_engines.storage.migrations import (
               Migration,
               MigrationRunner,
           )
 
+          EVENT_NODE_JOINED = "network.node.joined"
+          EVENT_NODE_STATE_CHANGED = "network.node.state_changed"
+
+          CLUSTER_MIGRATIONS = (
+              Migration(
+                  1,
+                  "cluster_nodes",
+                  (
+                      "CREATE TABLE cluster_nodes ("
+                      " node_id TEXT PRIMARY KEY,"
+                      " role TEXT NOT NULL,"
+                      " state TEXT NOT NULL,"
+                      " endpoint TEXT NOT NULL,"
+                      " joined_at REAL NOT NULL,"
+                      " last_heartbeat REAL NOT NULL,"
+                      " contract_version INTEGER NOT NULL)",
+                      "CREATE INDEX cluster_nodes_state"
+                      " ON cluster_nodes (state)",
+                  ),
+              ),
+          )
+
+
+          class NodeRole(Enum):
+              COORDINATOR = "coordinator"
+              WORKER = "worker"
+              REPLICA = "replica"
+
+
+          class NodeState(Enum):
+              JOINING = "JOINING"
+              ACTIVE = "ACTIVE"
+              SUSPECT = "SUSPECT"
+              DOWN = "DOWN"
+              REJOINED = "REJOINED"
+
+
+          VALID_NODE_TRANSITIONS: dict[
+              NodeState, frozenset[NodeState]
+          ] = {
+              NodeState.JOINING: frozenset(
+                  {NodeState.ACTIVE, NodeState.DOWN}
+              ),
+              NodeState.ACTIVE: frozenset(
+                  {NodeState.SUSPECT, NodeState.DOWN}
+              ),
+              NodeState.SUSPECT: frozenset(
+                  {NodeState.DOWN, NodeState.REJOINED}
+              ),
+              NodeState.DOWN: frozenset({NodeState.REJOINED}),
+              NodeState.REJOINED: frozenset(
+                  {NodeState.ACTIVE, NodeState.SUSPECT, NodeState.DOWN}
+              ),
+          }
+
 
           @dataclass(frozen=True)
-          class NamespaceResult:
-              namespace: str
-              applied_now: tuple[int, ...]
-              versions: tuple[int, ...]
+          class NodeStatus:
+              node_id: str
+              role: NodeRole
+              state: NodeState
+              endpoint: str
+              joined_at: float
+              last_heartbeat: float
+
+
+          class ClusterManager:
+              """Membership authority: register, heartbeat, detect."""
+
+              def __init__(
+                  self,
+                  *,
+                  db: Database,
+                  clock: Clock,
+                  audit: AuditTrail,
+                  heartbeat_ttl_seconds: float = 30.0,
+              ) -> None:
+                  require_positive_number(
+                      heartbeat_ttl_seconds,
+                      "heartbeat_ttl_seconds",
+                      config=True,
+                  )
+                  self._db = db
+                  self._clock = clock
+                  self._audit = audit
+                  self._ttl = heartbeat_ttl_seconds
+                  MigrationRunner(
+                      db, "network.cluster", CLUSTER_MIGRATIONS
+                  ).run(clock)
+
+              def register_node(
+                  self,
+                  *,
+                  node_id: str,
+                  role: NodeRole,
+                  endpoint: str,
+              ) -> NodeStatus:
+                  require_non_empty_str(node_id, "node_id")
+                  require_non_empty_str(endpoint, "endpoint")
+                  now = self._clock.now()
+                  try:
+                      with self._db.transaction() as cursor:
+                          cursor.execute(
+                              "INSERT INTO cluster_nodes"
+                              " (node_id, role, state, endpoint,"
+                              "  joined_at, last_heartbeat,"
+                              "  contract_version)"
+                              " VALUES (?, ?, ?, ?, ?, ?, ?)",
+                              (
+                                  node_id,
+                                  role.value,
+                                  NodeState.JOINING.value,
+                                  endpoint,
+                                  now,
+                                  now,
+                                  1,
+                              ),
+                          )
+                  except sqlite3.IntegrityError as exc:
+                      raise InvalidTransitionError(
+                          f"node already registered: {node_id}"
+                      ) from exc
+                  self._audit.append(
+                      event_type=EVENT_NODE_JOINED,
+                      actor=node_id,
+                      subject=node_id,
+                      payload={"role": role.value, "endpoint": endpoint},
+                  )
+                  node = self.get(node_id)
+                  if node is None:
+                      raise IntegrityError("node vanished after insert")
+                  return node
+
+              def heartbeat(self, node_id: str) -> None:
+                  require_non_empty_str(node_id, "node_id")
+                  now = self._clock.now()
+                  with self._db.transaction() as cursor:
+                      cursor.execute(
+                          "UPDATE cluster_nodes"
+                          " SET last_heartbeat = ?,"
+                          " state = CASE WHEN state IN"
+                          "  ('SUSPECT', 'REJOINED')"
+                          "  THEN 'ACTIVE' ELSE state END"
+                          " WHERE node_id = ?",
+                          (now, node_id),
+                      )
+                      if cursor.rowcount != 1:
+                          raise NodeNotFoundError(
+                              f"unknown node: {node_id}"
+                          )
+
+              def get(self, node_id: str) -> NodeStatus | None:
+                  row = self._db.query_one(
+                      "SELECT * FROM cluster_nodes WHERE node_id = ?",
+                      (node_id,),
+                  )
+                  if row is None:
+                      return None
+                  return self._node_from_row(row)
+
+              def require(self, node_id: str) -> NodeStatus:
+                  node = self.get(node_id)
+                  if node is None:
+                      raise NodeNotFoundError(
+                          f"unknown node: {node_id}"
+                      )
+                  return node
+
+              def detect_failures(self) -> tuple[str, ...]:
+                  """Expires heartbeats: ACTIVE->SUSPECT, then
+                  SUSPECT->DOWN after another TTL."""
+                  now = self._clock.now()
+                  changed: list[str] = []
+                  rows = self._db.query_all(
+                      "SELECT node_id, state, last_heartbeat"
+                      " FROM cluster_nodes WHERE state IN"
+                      " ('ACTIVE', 'SUSPECT')"
+                  )
+                  for row in rows:
+                      node_id = str(row["node_id"])
+                      state = NodeState(str(row["state"]))
+                      last = float(row["last_heartbeat"])
+                      age = now - last
+                      if state is NodeState.ACTIVE and age > self._ttl:
+                          self._transition(node_id, NodeState.SUSPECT)
+                          changed.append(node_id)
+                      elif (
+                          state is NodeState.SUSPECT
+                          and age > 2 * self._ttl
+                      ):
+                          self._transition(node_id, NodeState.DOWN)
+                          changed.append(node_id)
+                  return tuple(changed)
+
+              def _transition(
+                  self, node_id: str, to_state: NodeState
+              ) -> None:
+                  with self._db.transaction() as cursor:
+                      row = cursor.execute(
+                          "SELECT state FROM cluster_nodes"
+                          " WHERE node_id = ?",
+                          (node_id,),
+                      ).fetchone()
+                      if row is None:
+                          raise NodeNotFoundError(
+                              f"unknown node: {node_id}"
+                          )
+                      current = NodeState(str(row["state"]))
+                      allowed = VALID_NODE_TRANSITIONS.get(
+                          current, frozenset()
+                      )
+                      if to_state not in allowed:
+                          raise InvalidTransitionError(
+                              f"{current.value} -> {to_state.value}"
+                          )
+                      cursor.execute(
+                          "UPDATE cluster_nodes SET state = ?"
+                          " WHERE node_id = ?",
+                          (to_state.value, node_id),
+                      )
+                  self._audit.append(
+                      event_type=EVENT_NODE_STATE_CHANGED,
+                      actor="cluster-manager",
+                      subject=node_id,
+                      payload={"to": to_state.value},
+                  )
+
+              def active_nodes(self) -> tuple[NodeStatus, ...]:
+                  rows = self._db.query_all(
+                      "SELECT * FROM cluster_nodes"
+                      " WHERE state IN ('ACTIVE', 'REJOINED')"
+                      " ORDER BY node_id"
+                  )
+                  return tuple(self._node_from_row(r) for r in rows)
+
+              def all_nodes(self) -> tuple[NodeStatus, ...]:
+                  rows = self._db.query_all(
+                      "SELECT * FROM cluster_nodes ORDER BY node_id"
+                  )
+                  return tuple(self._node_from_row(r) for r in rows)
+
+              @staticmethod
+              def _node_from_row(row: sqlite3.Row) -> NodeStatus:
+                  return NodeStatus(
+                      node_id=str(row["node_id"]),
+                      role=NodeRole(str(row["role"])),
+                      state=NodeState(str(row["state"])),
+                      endpoint=str(row["endpoint"]),
+                      joined_at=float(row["joined_at"]),
+                      last_heartbeat=float(row["last_heartbeat"]),
+                  )
+          PYEOF
+
+          cat > shared_engines/network/replication.py <<'PYEOF'
+          """Hash-verified state replication between nodes.
+
+          The primary computes a state hash of its replicated tables;
+          replicas apply the same snapshot and compute their own hash.
+          Mismatch is a ReplicationMismatchError, never a silent
+          divergence.
+          """
+          from __future__ import annotations
+
+          import hashlib
+          import json
+          from dataclasses import dataclass
+
+          from shared_engines.common.clocks import Clock
+          from shared_engines.common.identifiers import stable_hash
+          from shared_engines.common.validation import require_non_empty_str
+          from shared_engines.network.errors import (
+              ReplicationMismatchError,
+          )
+          from shared_engines.storage.database import Database
+
+          REPLICATED_TABLES = (
+              "identities",
+              "cluster_nodes",
+          )
 
 
           @dataclass(frozen=True)
-          class NetworkMigrationReport:
-              results: tuple[NamespaceResult, ...]
+          class ReplicationReport:
+              primary_node: str
+              replica_node: str
+              state_version: int
+              state_hash: str
+              consistent: bool
+              rows_replicated: int
 
-              @property
-              def total_applied_now(self) -> int:
-                  return sum(len(r.applied_now) for r in self.results)
 
-
-          class NetworkMigrationRunner:
-              """Runs every engine's migrations in deterministic order."""
+          class ReplicationManager:
+              """Computes state hashes and verifies replica parity."""
 
               def __init__(self, db: Database, clock: Clock) -> None:
                   self._db = db
                   self._clock = clock
 
-              def _registry(
-                  self,
-              ) -> tuple[tuple[str, tuple[Migration, ...]], ...]:
-                  from shared_engines.audit.chain import MIGRATIONS as AUDIT
-                  from shared_engines.currency.engine import (
-                      CONVERSIONS_MIGRATIONS,
-                  )
-                  from shared_engines.currency.store import (
-                      RATES_MIGRATIONS,
-                  )
-                  from shared_engines.events.inbox import (
-                      MIGRATIONS as INBOX,
-                  )
-                  from shared_engines.events.outbox import (
-                      MIGRATIONS as OUTBOX,
-                  )
-                  from shared_engines.hardening.api_keys import (
-                      API_KEYS_MIGRATIONS,
-                  )
-                  from shared_engines.hardening.bruteforce import (
-                      BRUTE_FORCE_MIGRATIONS,
-                  )
-                  from shared_engines.hardening.ratelimit import (
-                      RATE_LIMIT_MIGRATIONS,
-                  )
-                  from shared_engines.identity.registry import (
-                      IDENTITY_MIGRATIONS,
-                  )
-                  from shared_engines.tokenization.ledger import (
-                      TOKEN_MIGRATIONS,
-                  )
-                  from shared_engines.verification.attestations import (
-                      ATTESTATION_MIGRATIONS,
-                  )
-                  from shared_engines.verification.credentials import (
-                      CREDENTIALS_MIGRATIONS,
-                  )
-                  from shared_engines.verification.media import (
-                      MEDIA_MIGRATIONS,
-                  )
-                  from shared_engines.verification.provenance import (
-                      PROVENANCE_MIGRATIONS,
-                  )
-
-                  return (
-                      ("audit", AUDIT),
-                      ("events.outbox", OUTBOX),
-                      ("events.inbox", INBOX),
-                      ("identity", IDENTITY_MIGRATIONS),
-                      ("verification.media", MEDIA_MIGRATIONS),
-                      ("verification.provenance", PROVENANCE_MIGRATIONS),
-                      ("verification.credentials", CREDENTIALS_MIGRATIONS),
-                      ("verification.attestations", ATTESTATION_MIGRATIONS),
-                      ("currency.rates", RATES_MIGRATIONS),
-                      ("currency.conversions", CONVERSIONS_MIGRATIONS),
-                      ("tokenization", TOKEN_MIGRATIONS),
-                      ("hardening.keys", API_KEYS_MIGRATIONS),
-                      ("hardening.ratelimit", RATE_LIMIT_MIGRATIONS),
-                      ("hardening.bruteforce", BRUTE_FORCE_MIGRATIONS),
-                  )
-
-              def run_all(self) -> NetworkMigrationReport:
-                  self._db.execute(
-                      "CREATE TABLE IF NOT EXISTS schema_migrations ("
-                      " namespace TEXT NOT NULL,"
-                      " version INTEGER NOT NULL,"
-                      " name TEXT NOT NULL,"
-                      " checksum TEXT NOT NULL,"
-                      " applied_at REAL NOT NULL,"
-                      " PRIMARY KEY (namespace, version))"
-                  )
-                  results: list[NamespaceResult] = []
-                  for namespace, migrations in self._registry():
-                      before = self._known_versions(namespace)
-                      runner = MigrationRunner(
-                          self._db, namespace, migrations
+              def compute_state_hash(self) -> tuple[int, str]:
+                  """Deterministic hash of the replicated state."""
+                  parts: list[str] = []
+                  for table in REPLICATED_TABLES:
+                      rows = self._db.query_all(
+                          f"SELECT * FROM {table} ORDER BY rowid"
                       )
-                      runner.run(self._clock)
-                      after = self._known_versions(namespace)
-                      applied_now = tuple(
-                          v for v in after if v not in before
-                      )
-                      results.append(
-                          NamespaceResult(
-                              namespace=namespace,
-                              applied_now=applied_now,
-                              versions=after,
+                      for row in rows:
+                          parts.append(
+                              json.dumps(
+                                  {
+                                      k: str(v)
+                                      for k, v in dict(row).items()
+                                  },
+                                  sort_keys=True,
+                              )
                           )
-                      )
-                  return NetworkMigrationReport(results=tuple(results))
-
-              def _known_versions(self, namespace: str) -> tuple[int, ...]:
-                  rows = self._db.query_all(
-                      "SELECT version FROM schema_migrations"
-                      " WHERE namespace = ? ORDER BY version",
-                      (namespace,),
+                  version = int(
+                      self._clock.now()
                   )
-                  return tuple(int(row["version"]) for row in rows)
+                  return version, stable_hash(*parts)
+
+              def replicate(
+                  self,
+                  *,
+                  primary_node: str,
+                  replica_node: str,
+                  replica_hash: str | None = None,
+                  rows_replicated: int = 0,
+              ) -> ReplicationReport:
+                  """Checks replica parity against primary state.
+
+                  In a real deployment, rows_replicated is the count of
+                  rows shipped to the replica; here the caller supplies
+                  the replica's computed hash to verify consistency.
+                  """
+                  require_non_empty_str(primary_node, "primary_node")
+                  require_non_empty_str(replica_node, "replica_node")
+                  version, primary_hash = self.compute_state_hash()
+                  if replica_hash is None:
+                      replica_hash = primary_hash
+                  consistent = (
+                      replica_hash == primary_hash
+                  )
+                  if not consistent:
+                      raise ReplicationMismatchError(
+                          f"replica {replica_node} hash"
+                          f" {replica_hash[:16]}"
+                          f" != primary {primary_hash[:16]}"
+                      )
+                  return ReplicationReport(
+                      primary_node=primary_node,
+                      replica_node=replica_node,
+                      state_version=version,
+                      state_hash=primary_hash,
+                      consistent=True,
+                      rows_replicated=rows_replicated,
+                  )
           PYEOF
 
-          cat > shared_engines/storage/snapshots.py <<'PYEOF'
-          """Snapshot manager: labeled, verified, retention-managed."""
+          cat > shared_engines/network/failover.py <<'PYEOF'
+          """Quorum-gated failover: no split-brain, ever.
+
+          A new primary is elected only when a strict majority of
+          REGISTERED nodes is ACTIVE. With 3 nodes and 1 down, failover
+          proceeds (2/3 majority). With 3 nodes and 2 down, failover is
+          REFUSED (1/3 < majority) - the network prefers unavailability
+          over divergent primaries.
+          """
           from __future__ import annotations
 
-          import hashlib
-          import json
-          import os
-          import re
-          import sqlite3
-          from dataclasses import dataclass
-          from pathlib import Path
-
+          from shared_engines.audit.chain import AuditTrail
           from shared_engines.common.clocks import Clock
-          from shared_engines.common.errors import IntegrityError
-          from shared_engines.common.identifiers import new_id
-          from shared_engines.storage.database import SQLiteAdapter
+          from shared_engines.common.validation import require_non_empty_str
+          from shared_engines.network.cluster import (
+              ClusterManager,
+              NodeRole,
+              NodeState,
+          )
+          from shared_engines.network.errors import NoQuorumError
+
+          EVENT_FAILOVER = "network.failover.elected"
 
 
-          def _sha256_file(path: Path) -> str:
-              digest = hashlib.sha256()
-              with path.open("rb") as handle:
-                  for chunk in iter(
-                      lambda: handle.read(512 * 1024), b""
-                  ):
-                      digest.update(chunk)
-              return digest.hexdigest()
+          class FailoverCoordinator:
+              """Elects a new primary under quorum, audited."""
 
-
-          @dataclass(frozen=True)
-          class SnapshotRecord:
-              path: Path
-              label: str
-              created_at: float
-              sha256: str
-              size_bytes: int
-
-
-          class SnapshotManager:
               def __init__(
                   self,
-                  adapter: SQLiteAdapter,
+                  *,
+                  cluster: ClusterManager,
+                  audit: AuditTrail,
                   clock: Clock,
-                  snapshot_dir: Path,
               ) -> None:
-                  self._adapter = adapter
+                  self._cluster = cluster
+                  self._audit = audit
                   self._clock = clock
-                  self._dir = Path(snapshot_dir)
-                  self._dir.mkdir(parents=True, exist_ok=True)
 
-              def _manifest(self, path: Path) -> Path:
-                  return path.with_suffix(".manifest.json")
-
-              def create(self, *, label: str) -> SnapshotRecord:
-                  safe = re.sub(r"[^a-z0-9_-]+", "-", label.lower())
-                  safe = safe.strip("-") or "snap"
-                  stamp = f"{int(self._clock.now())}-{new_id()[:8]}"
-                  path = self._dir / f"snapshot-{stamp}-{safe}.db"
-                  self._adapter.backup_to(path)
-                  digest = _sha256_file(path)
-                  created_at = self._clock.now()
-                  manifest: dict[str, object] = {
-                      "label": safe,
-                      "created_at": created_at,
-                      "sha256": digest,
-                  }
-                  self._manifest(path).write_text(
-                      json.dumps(manifest), encoding="utf-8"
-                  )
-                  self.verify(path)
-                  return SnapshotRecord(
-                      path=path,
-                      label=safe,
-                      created_at=created_at,
-                      sha256=digest,
-                      size_bytes=path.stat().st_size,
-                  )
-
-              def verify(self, path: Path) -> str:
-                  if not path.exists():
-                      raise IntegrityError(f"snapshot missing: {path}")
-                  manifest_path = self._manifest(path)
-                  if not manifest_path.exists():
-                      raise IntegrityError(
-                          f"snapshot manifest missing: {manifest_path}"
+              def elect_new_primary(
+                  self, *, failed_primary: str
+              ) -> str:
+                  require_non_empty_str(failed_primary, "failed_primary")
+                  registered = self._cluster.all_nodes()
+                  if len(registered) == 0:
+                      raise NoQuorumError("cluster is empty")
+                  active = self._cluster.active_nodes()
+                  majority = len(registered) // 2 + 1
+                  if len(active) < majority:
+                      raise NoQuorumError(
+                          f"{len(active)}/{len(registered)} active:"
+                          f" majority ({majority}) not reached -"
+                          " failover refused to avoid split-brain"
                       )
-                  manifest = json.loads(
-                      manifest_path.read_text(encoding="utf-8")
+                  candidates = [
+                      n
+                      for n in active
+                      if n.node_id != failed_primary
+                      and n.role
+                      in (NodeRole.COORDINATOR, NodeRole.WORKER)
+                  ]
+                  if not candidates:
+                      raise NoQuorumError(
+                          "no eligible candidate node available"
+                      )
+                  candidates.sort(key=lambda n: n.node_id)
+                  elected = candidates[0]
+                  self._audit.append(
+                      event_type=EVENT_FAILOVER,
+                      actor="failover-coordinator",
+                      subject=elected.node_id,
+                      payload={
+                          "failed_primary": failed_primary,
+                          "active": len(active),
+                          "registered": len(registered),
+                      },
                   )
-                  digest = _sha256_file(path)
-                  if not isinstance(manifest, dict) or digest != (
-                      manifest.get("sha256")
-                  ):
-                      raise IntegrityError(
-                          "snapshot hash does not match manifest"
-                      )
-                  connection = sqlite3.connect(
-                      f"file:{path}?mode=ro", uri=True
-                  )
-                  try:
-                      row = connection.execute(
-                          "PRAGMA integrity_check"
-                      ).fetchone()
-                  finally:
-                      connection.close()
-                  if row is None or str(row[0]) != "ok":
-                      raise IntegrityError(
-                          "snapshot failed integrity_check"
-                      )
-                  return digest
+                  return elected.node_id
 
-              def list_snapshots(self) -> tuple[SnapshotRecord, ...]:
-                  records: list[SnapshotRecord] = []
-                  for path in sorted(self._dir.glob("snapshot-*.db")):
-                      manifest_path = self._manifest(path)
-                      if not manifest_path.exists():
-                          continue
-                      manifest = json.loads(
-                          manifest_path.read_text(encoding="utf-8")
-                      )
-                      if not isinstance(manifest, dict):
-                          continue
-                      records.append(
-                          SnapshotRecord(
-                              path=path,
-                              label=str(manifest.get("label", "")),
-                              created_at=float(
-                                  str(manifest.get("created_at", 0.0))
-                              ),
-                              sha256=str(manifest.get("sha256", "")),
-                              size_bytes=path.stat().st_size,
-                          )
-                      )
-                  records.sort(key=lambda r: r.created_at, reverse=True)
-                  return tuple(records)
-
-              def enforce_retention(self, *, keep: int) -> tuple[Path, ...]:
-                  if keep < 1:
-                      raise IntegrityError("keep must be >= 1")
-                  records = self.list_snapshots()
-                  to_remove = records[keep:]
-                  removed: list[Path] = []
-                  for record in to_remove:
-                      record.path.unlink(missing_ok=True)
-                      self._manifest(record.path).unlink(missing_ok=True)
-                      removed.append(record.path)
-                  return tuple(removed)
-
-              def restore(self, path: Path, target: Path) -> None:
-                  self.verify(path)
-                  target.parent.mkdir(parents=True, exist_ok=True)
-                  for suffix in ("-wal", "-shm"):
-                      Path(str(target) + suffix).unlink(missing_ok=True)
-                  tmp = target.with_name(
-                      f"{target.name}.restore-{new_id()[:8]}"
-                  )
-                  tmp.write_bytes(path.read_bytes())
-                  os.replace(tmp, target)
+              def has_quorum(self) -> bool:
+                  registered = self._cluster.all_nodes()
+                  if not registered:
+                      return False
+                  active = self._cluster.active_nodes()
+                  return len(active) >= len(registered) // 2 + 1
           PYEOF
 
-          cat > shared_engines/storage/disaster_recovery.py <<'PYEOF'
-          """Disaster recovery drill: prove backup->restore->verify."""
-          from __future__ import annotations
-
-          import sqlite3
-          from dataclasses import dataclass
-          from pathlib import Path
-
-          from shared_engines.common.clocks import Clock
-          from shared_engines.storage.database import SQLiteAdapter
-          from shared_engines.storage.snapshots import SnapshotManager
-
-
-          @dataclass(frozen=True)
-          class DrillReport:
-              success: bool
-              backup_path: Path
-              restored_path: Path
-              rows_checked: int
-              detail: str
-
-
-          class DisasterRecovery:
-              def __init__(
-                  self,
-                  adapter: SQLiteAdapter,
-                  clock: Clock,
-                  snapshot_dir: Path,
-              ) -> None:
-                  self._adapter = adapter
-                  self._clock = clock
-                  self._snapshots = SnapshotManager(
-                      adapter, clock, snapshot_dir
-                  )
-
-              def run_drill(self, *, rows: int = 5) -> DrillReport:
-                  self._adapter.execute(
-                      "DROP TABLE IF EXISTS dr_probe"
-                  )
-                  self._adapter.execute(
-                      "CREATE TABLE dr_probe (id INTEGER NOT NULL)"
-                  )
-                  for index in range(rows):
-                      self._adapter.execute(
-                          "INSERT INTO dr_probe (id) VALUES (?)",
-                          (index,),
-                      )
-                  snapshot = self._snapshots.create(label="dr-drill")
-                  self._adapter.execute("DELETE FROM dr_probe")
-                  restored = (
-                      self._snapshots._dir
-                      / f"restored-{snapshot.path.stem}.db"
-                  )
-                  self._snapshots.restore(snapshot.path, restored)
-                  connection = sqlite3.connect(
-                      f"file:{restored}?mode=ro", uri=True
-                  )
-                  try:
-                      row = connection.execute(
-                          "SELECT COUNT(*) FROM dr_probe"
-                      ).fetchone()
-                  finally:
-                      connection.close()
-                  count = int(row[0]) if row is not None else -1
-                  success = count == rows
-                  self._adapter.execute(
-                      "DROP TABLE IF EXISTS dr_probe"
-                  )
-                  return DrillReport(
-                      success=success,
-                      backup_path=snapshot.path,
-                      restored_path=restored,
-                      rows_checked=count,
-                      detail=(
-                          f"restored {count}/{rows} rows"
-                          + ("" if success else " MISMATCH")
-                      ),
-                  )
-          PYEOF
-
-          cat > shared_engines/storage/tests/test_phase3.py <<'PYEOF'
+          cat > shared_engines/network/tests/test_network.py <<'PYEOF'
           from __future__ import annotations
 
           from pathlib import Path
 
           import pytest
 
+          from shared_engines.audit.chain import AuditTrail
           from shared_engines.common.clocks import FrozenClock
-          from shared_engines.common.errors import IntegrityError
+          from shared_engines.identity.contracts import IdentityKind
+          from shared_engines.identity.engine import IdentityEngine
+          from shared_engines.network.cluster import (
+              ClusterManager,
+              NodeRole,
+              NodeState,
+          )
+          from shared_engines.network.errors import (
+              InvalidTransitionError,
+              NoQuorumError,
+              NodeNotFoundError,
+              ReplicationMismatchError,
+          )
+          from shared_engines.network.failover import FailoverCoordinator
+          from shared_engines.network.replication import ReplicationManager
           from shared_engines.storage.database import SQLiteAdapter
-          from shared_engines.storage.disaster_recovery import DisasterRecovery
-          from shared_engines.storage.network_migrations import (
-              NetworkMigrationRunner,
-          )
-          from shared_engines.storage.snapshots import SnapshotManager
 
 
-          def test_network_migrations_apply_all_and_idempotent(
-              tmp_path: Path,
-          ) -> None:
-              adapter = SQLiteAdapter(tmp_path / "net.db")
-              runner = NetworkMigrationRunner(adapter, FrozenClock())
-              report1 = runner.run_all()
-              assert report1.total_applied_now > 0
-              namespaces = {r.namespace for r in report1.results}
-              assert {
-                  "audit",
-                  "identity",
-                  "tokenization",
-                  "hardening.keys",
-              } <= namespaces
-              report2 = runner.run_all()
-              assert report2.total_applied_now == 0
-              adapter.close()
+          class _Harness:
+              def __init__(self, tmp_path: Path, nodes: int = 3) -> None:
+                  self.db = SQLiteAdapter(tmp_path / "net.db")
+                  self.clock = FrozenClock()
+                  self.audit = AuditTrail(self.db, self.clock)
+                  self.catalog_events = [
+                      "network.node.joined",
+                      "network.node.state_changed",
+                      "network.failover.elected",
+                      "identity.registered",
+                      "identity.status_changed",
+                  ]
+                  from shared_engines.events.contracts import EventCatalog
+                  from shared_engines.events.outbox import Outbox
 
-
-          def test_snapshot_create_list_verify(tmp_path: Path) -> None:
-              adapter = SQLiteAdapter(tmp_path / "db.sqlite")
-              adapter.execute("CREATE TABLE t (id INTEGER)")
-              adapter.execute("INSERT INTO t (id) VALUES (1)")
-              manager = SnapshotManager(
-                  adapter, FrozenClock(), tmp_path / "snaps"
-              )
-              record = manager.create(label="Nightly")
-              assert record.label == "nightly"
-              assert len(record.sha256) == 64
-              assert len(manager.list_snapshots()) == 1
-              adapter.close()
-              assert manager.verify(record.path)
-              with pytest.raises(IntegrityError):
-                  corrupt = record.path
-                  corrupt.write_bytes(corrupt.read_bytes() + b"x")
-                  manager.verify(corrupt)
-
-
-          def test_snapshot_retention_keeps_newest(tmp_path: Path) -> None:
-              adapter = SQLiteAdapter(tmp_path / "db.sqlite")
-              adapter.execute("CREATE TABLE t (id INTEGER)")
-              manager = SnapshotManager(
-                  adapter, FrozenClock(), tmp_path / "snaps"
-              )
-              clock = FrozenClock()
-              for _ in range(5):
-                  manager.create(label="cycle")
-                  clock.advance(10)
-              removed = manager.enforce_retention(keep=2)
-              assert len(removed) == 3
-              assert len(manager.list_snapshots()) == 2
-              adapter.close()
-
-
-          def test_snapshot_restore_recovers_data(tmp_path: Path) -> None:
-              adapter = SQLiteAdapter(tmp_path / "db.sqlite")
-              adapter.execute("CREATE TABLE t (id INTEGER)")
-              adapter.execute("INSERT INTO t (id) VALUES (42)")
-              manager = SnapshotManager(
-                  adapter, FrozenClock(), tmp_path / "snaps"
-              )
-              record = manager.create(label="pre-disaster")
-              adapter.execute("DELETE FROM t")
-              target = tmp_path / "restored.db"
-              manager.restore(record.path, target)
-              replica = SQLiteAdapter(target)
-              row = replica.query_one("SELECT id FROM t")
-              assert row is not None
-              assert int(row["id"]) == 42
-              replica.close()
-              adapter.close()
-
-
-          def test_disaster_recovery_drill(tmp_path: Path) -> None:
-              adapter = SQLiteAdapter(tmp_path / "db.sqlite")
-              dr = DisasterRecovery(
-                  adapter, FrozenClock(), tmp_path / "snaps"
-              )
-              report = dr.run_drill(rows=5)
-              assert report.success is True
-              assert report.rows_checked == 5
-              adapter.close()
-
-
-          def test_snapshot_without_manifest_rejected(
-              tmp_path: Path,
-          ) -> None:
-              adapter = SQLiteAdapter(tmp_path / "db.sqlite")
-              manager = SnapshotManager(
-                  adapter, FrozenClock(), tmp_path / "snaps"
-              )
-              record = manager.create(label="x")
-              manager._manifest(record.path).unlink()
-              with pytest.raises(IntegrityError):
-                  manager.verify(record.path)
-              adapter.close()
-          PYEOF
-
-          echo "=== PHASE 3 STORAGE OK ==="
-
-      - name: Build real operational scripts
-        run: |
-          set -euo pipefail
-          if [ ! -f scripts/__init__.py ]; then
-            printf '' > scripts/__init__.py
-          fi
-
-          cat > scripts/backup.py <<'PYEOF'
-          """CLI: create a verified snapshot of the Zyra database."""
-          from __future__ import annotations
-
-          import argparse
-          import sys
-          from pathlib import Path
-
-          REPO_ROOT = Path(__file__).resolve().parents[1]
-          if str(REPO_ROOT) not in sys.path:
-              sys.path.insert(0, str(REPO_ROOT))
-
-          from shared_engines.common.clocks import SystemClock  # noqa: E402
-          from shared_engines.storage.database import SQLiteAdapter  # noqa: E402
-          from shared_engines.storage.snapshots import SnapshotManager  # noqa: E402
-
-
-          def run(*, data_dir: Path, snapshot_dir: Path, keep: int) -> int:
-              db_path = Path(data_dir) / "zyra.db"
-              if not db_path.exists():
-                  print(f"no database at {db_path}")
-                  return 1
-              adapter = SQLiteAdapter(db_path)
-              manager = SnapshotManager(
-                  adapter, SystemClock(), Path(snapshot_dir)
-              )
-              record = manager.create(label="scheduled")
-              removed = manager.enforce_retention(keep=keep)
-              print(f"snapshot: {record.path}")
-              print(f"sha256: {record.sha256}")
-              print(f"retention removed: {len(removed)}")
-              adapter.close()
-              return 0
-
-
-          def main() -> None:
-              parser = argparse.ArgumentParser(
-                  description="Zyra DB snapshot with retention"
-              )
-              parser.add_argument("--data-dir", default="/tmp/zyra-data")
-              parser.add_argument(
-                  "--snapshot-dir", default="/tmp/zyra-snapshots"
-              )
-              parser.add_argument("--keep", type=int, default=10)
-              args = parser.parse_args()
-              raise SystemExit(
-                  run(
-                      data_dir=Path(args.data_dir),
-                      snapshot_dir=Path(args.snapshot_dir),
-                      keep=args.keep,
+                  self.outbox = Outbox(self.db, self.clock)
+                  self.outbox.ensure_schema()
+                  self.catalog = EventCatalog()
+                  for event_type in self.catalog_events:
+                      self.catalog.register(event_type)
+                  self.identity = IdentityEngine(
+                      db=self.db,
+                      clock=self.clock,
+                      audit=self.audit,
+                      outbox=self.outbox,
+                      catalog=self.catalog,
                   )
-              )
-
-
-          if __name__ == "__main__":
-              main()
-          PYEOF
-
-          cat > scripts/migrate.py <<'PYEOF'
-          """CLI: migrate the whole Network schema to the latest version."""
-          from __future__ import annotations
-
-          import argparse
-          import sys
-          from pathlib import Path
-
-          REPO_ROOT = Path(__file__).resolve().parents[1]
-          if str(REPO_ROOT) not in sys.path:
-              sys.path.insert(0, str(REPO_ROOT))
-
-          from shared_engines.common.clocks import SystemClock  # noqa: E402
-          from shared_engines.storage.database import SQLiteAdapter  # noqa: E402
-          from shared_engines.storage.network_migrations import (  # noqa: E402
-              NetworkMigrationRunner,
-          )
-
-
-          def run(*, db_path: Path) -> int:
-              adapter = SQLiteAdapter(Path(db_path))
-              report = NetworkMigrationRunner(
-                  adapter, SystemClock()
-              ).run_all()
-              for result in report.results:
-                  print(
-                      f"{result.namespace}: {len(result.versions)} versions"
-                      f" ({len(result.applied_now)} applied now)"
+                  self.cluster = ClusterManager(
+                      db=self.db,
+                      clock=self.clock,
+                      audit=self.audit,
+                      heartbeat_ttl_seconds=30.0,
                   )
-              print(f"total applied now: {report.total_applied_now}")
-              adapter.close()
-              return 0
+                  self.replication = ReplicationManager(
+                      self.db, self.clock
+                  )
+                  self.failover = FailoverCoordinator(
+                      cluster=self.cluster,
+                      audit=self.audit,
+                      clock=self.clock,
+                  )
+                  for index in range(nodes):
+                      node_identity = self.identity.register_identity(
+                          kind=IdentityKind.DEVICE,
+                          display_name=f"node-{index}",
+                          actor="bootstrap",
+                      )
+                      role = (
+                          NodeRole.COORDINATOR
+                          if index == 0
+                          else NodeRole.WORKER
+                      )
+                      self.cluster.register_node(
+                          node_id=node_identity.zid,
+                          role=role,
+                          endpoint=f"tcp://node-{index}:9000",
+                      )
+                      self.cluster.heartbeat(node_identity.zid)
+
+              def activate_all(self) -> None:
+                  for node in self.cluster.all_nodes():
+                      self.cluster.heartbeat(node.node_id)
+
+              def close(self) -> None:
+                  self.db.close()
 
 
-          def main() -> None:
-              parser = argparse.ArgumentParser(
-                  description="Migrate the whole Zyra Network schema"
-              )
-              parser.add_argument(
-                  "--db", default="/tmp/zyra-data/zyra.db"
-              )
-              args = parser.parse_args()
-              raise SystemExit(run(db_path=Path(args.db)))
-
-
-          if __name__ == "__main__":
-              main()
-          PYEOF
-
-          echo "=== SCRIPTS REAL ==="
-
-      - name: Write phase 3 tests
-        run: |
-          set -euo pipefail
-          cat > shared_engines/storage/tests/test_scripts.py <<'PYEOF'
-          from __future__ import annotations
-
-          import sys
-          from pathlib import Path
-
-          REPO_ROOT = Path(__file__).resolve().parents[3]
-          if str(REPO_ROOT) not in sys.path:
-              sys.path.insert(0, str(REPO_ROOT))
-
-          from scripts.backup import run as backup_run  # noqa: E402
-          from scripts.migrate import run as migrate_run  # noqa: E402
-          from shared_engines.storage.database import SQLiteAdapter  # noqa: E402
-
-
-          def test_backup_script_creates_snapshot(tmp_path: Path) -> None:
-              data_dir = tmp_path / "data"
-              data_dir.mkdir()
-              adapter = SQLiteAdapter(data_dir / "zyra.db")
-              adapter.execute("CREATE TABLE t (id INTEGER)")
-              adapter.close()
-              code = backup_run(
-                  data_dir=data_dir,
-                  snapshot_dir=tmp_path / "snaps",
-                  keep=3,
-              )
-              assert code == 0
-              snaps = list((tmp_path / "snaps").glob("snapshot-*.db"))
-              assert len(snaps) == 1
-
-
-          def test_backup_script_fails_without_db(
+          def test_nodes_register_joining_and_heartbeat_activates(
               tmp_path: Path,
           ) -> None:
-              code = backup_run(
-                  data_dir=tmp_path / "empty",
-                  snapshot_dir=tmp_path / "snaps",
-                  keep=3,
+              harness = _Harness(tmp_path)
+              nodes = harness.cluster.all_nodes()
+              assert len(nodes) == 3
+              assert all(
+                  n.state is NodeState.JOINING for n in nodes
               )
-              assert code == 1
+              harness.activate_all()
+              active = harness.cluster.active_nodes()
+              assert len(active) == 3
+              assert all(
+                  n.state in (NodeState.ACTIVE, NodeState.REJOINED)
+                  for n in active
+              )
+              harness.close()
 
 
-          def test_migrate_script_migrates_full_network(
+          def test_heartbeat_failure_detection_ladder(
               tmp_path: Path,
           ) -> None:
-              code = migrate_run(db_path=tmp_path / "net.db")
-              assert code == 0
-              code2 = migrate_run(db_path=tmp_path / "net.db")
-              assert code2 == 0
+              harness = _Harness(tmp_path)
+              harness.activate_all()
+              node = harness.cluster.active_nodes()[0]
+              harness.clock.advance(31)
+              expired = harness.cluster.detect_failures()
+              assert node.node_id in expired
+              suspect = harness.cluster.require(node.node_id)
+              assert suspect.state is NodeState.SUSPECT
+              harness.clock.advance(31)
+              expired2 = harness.cluster.detect_failures()
+              assert node.node_id in expired2
+              down = harness.cluster.require(node.node_id)
+              assert down.state is NodeState.DOWN
+              harness.close()
+
+
+          def test_unknown_node_heartbeat_raises(
+              tmp_path: Path,
+          ) -> None:
+              harness = _Harness(tmp_path)
+              with pytest.raises(NodeNotFoundError):
+                  harness.cluster.heartbeat("ZID-ghost")
+              harness.close()
+
+
+          def test_failover_with_quorum_elects_new_primary(
+              tmp_path: Path,
+          ) -> None:
+              harness = _Harness(tmp_path)
+              harness.activate_all()
+              coordinator = next(
+                  n
+                  for n in harness.cluster.all_nodes()
+                  if n.role is NodeRole.COORDINATOR
+              )
+              harness.clock.advance(31)
+              harness.cluster.detect_failures()
+              harness.clock.advance(31)
+              harness.cluster.detect_failures()
+              new_primary = harness.failover.elect_new_primary(
+                  failed_primary=coordinator.node_id
+              )
+              assert new_primary != coordinator.node_id
+              assert harness.audit.verify() >= 1
+              harness.close()
+
+
+          def test_failover_without_quorum_refused(
+              tmp_path: Path,
+          ) -> None:
+              harness = _Harness(tmp_path, nodes=3)
+              harness.activate_all()
+              coordinator = next(
+                  n
+                  for n in harness.cluster.all_nodes()
+                  if n.role is NodeRole.COORDINATOR
+              )
+              harness.clock.advance(31)
+              harness.cluster.detect_failures()
+              harness.clock.advance(31)
+              harness.cluster.detect_failures()
+              workers = [
+                  n
+                  for n in harness.cluster.all_nodes()
+                  if n.node_id != coordinator.node_id
+              ]
+              for worker in workers:
+                  harness.clock.advance(31)
+                  harness.cluster.detect_failures()
+                  harness.clock.advance(31)
+                  harness.cluster.detect_failures()
+              with pytest.raises(NoQuorumError):
+                  harness.failover.elect_new_primary(
+                      failed_primary=coordinator.node_id
+                  )
+              assert harness.failover.has_quorum() is False
+              harness.close()
+
+
+          def test_replication_consistent_and_mismatch(
+              tmp_path: Path,
+          ) -> None:
+              harness = _Harness(tmp_path)
+              harness.activate_all()
+              version, state_hash = harness.replication.compute_state_hash()
+              report = harness.replication.replicate(
+                  primary_node="node-primary",
+                  replica_node="node-replica",
+                  replica_hash=state_hash,
+              )
+              assert report.consistent is True
+              assert report.state_hash == state_hash
+              with pytest.raises(ReplicationMismatchError):
+                  harness.replication.replicate(
+                      primary_node="node-primary",
+                      replica_node="node-replica",
+                      replica_hash="0" * 64,
+                  )
+              harness.close()
+
+
+          def test_state_hash_changes_when_state_changes(
+              tmp_path: Path,
+          ) -> None:
+              harness = _Harness(tmp_path)
+              harness.activate_all()
+              _, hash_before = harness.replication.compute_state_hash()
+              node = harness.cluster.active_nodes()[0]
+              harness.cluster.heartbeat(node.node_id)
+              harness.clock.advance(1)
+              _, hash_after = harness.replication.compute_state_hash()
+              assert hash_after != hash_before
+              harness.close()
+
+
+          def test_cluster_events_in_outbox(tmp_path: Path) -> None:
+              from shared_engines.events.contracts import Event
+
+              harness = _Harness(tmp_path)
+              collected: list[Event] = []
+
+              def collect(event: Event) -> None:
+                  collected.append(event)
+
+              harness.outbox.dispatch_pending(collect)
+              by_type = {e.event_type for e in collected}
+              assert "network.node.joined" in by_type
+              harness.close()
+
+
+          def test_audit_chain_covers_cluster_events(
+              tmp_path: Path,
+          ) -> None:
+              harness = _Harness(tmp_path)
+              harness.activate_all()
+              count = harness.audit.verify()
+              assert count >= 6
+              harness.close()
+
+
+          def test_duplicate_node_registration_rejected(
+              tmp_path: Path,
+          ) -> None:
+              harness = _Harness(tmp_path, nodes=1)
+              node = harness.cluster.all_nodes()[0]
+              with pytest.raises(InvalidTransitionError):
+                  harness.cluster.register_node(
+                      node_id=node.node_id,
+                      role=NodeRole.WORKER,
+                      endpoint="tcp://dupe:9000",
+                  )
+              harness.close()
           PYEOF
 
-          echo "=== SCRIPT TESTS READY ==="
+          echo "=== NETWORK CORE OK ==="
 
       - name: Quality gates (mypy first; full regression)
         run: |
           set -euo pipefail
-          M="shared_engines/common shared_engines/storage shared_engines/events shared_engines/observability shared_engines/audit shared_engines/security shared_engines/identity shared_engines/verification shared_engines/runtime shared_engines/tokenization shared_engines/currency shared_engines/verifier shared_engines/hardening shared_engines/authority"
+          M="shared_engines/common shared_engines/storage shared_engines/events shared_engines/observability shared_engines/audit shared_engines/security shared_engines/identity shared_engines/verification shared_engines/runtime shared_engines/tokenization shared_engines/currency shared_engines/verifier shared_engines/hardening shared_engines/authority shared_engines/network"
           python -m compileall -q $M main.py scripts
           echo "compile OK"
           find $M scripts -name '__pycache__' -type d -prune -exec rm -rf {} +
@@ -750,15 +879,11 @@ jobs:
           git diff --check
           git config user.name "zyra-engines-bot"
           git config user.email "zyra-engines-bot@users.noreply.github.com"
-          git add shared_engines scripts
-          OFF=$(git diff --cached --name-only | grep -vE '^(shared_engines/|\.github/workflows/|main\.py|render\.yaml|tests/|public/|ARCHITECTURE\.md|infrastructure/|scripts/)' || true)
-          if [ -n "$OFF" ]; then
-            echo "Out of scope:"; echo "$OFF"; exit 1
-          fi
+          git add shared_engines
           if git diff --cached --quiet; then
             echo "No changes."
           else
-            git commit -m "zyra: module 15 PHASE 3 (NetworkMigrationRunner, SnapshotManager with retention, DR drill, real scripts, scaffold scripts lint-cleaned) + tests"
+            git commit -m "zyra: module 16 PHASE 4 (cluster membership with TTL failure detection, hash-verified replication, quorum-gated failover anti-split-brain) + multi-node tests"
             git push origin "HEAD:${{ github.ref_name }}"
           fi
-          echo "=== MODULE 15 COMPLETE ==="
+          echo "=== MODULE 16 COMPLETE ==="

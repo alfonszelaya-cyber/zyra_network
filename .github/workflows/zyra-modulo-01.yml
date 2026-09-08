@@ -1,4 +1,4 @@
-name: zyra-w8-engine-consensus
+name: zyra-w9-engine-integrity
 
 "on":
   workflow_dispatch:
@@ -9,7 +9,7 @@ permissions:
   contents: write
 
 concurrency:
-  group: zyra-w8-${{ github.ref }}
+  group: zyra-w9-${{ github.ref }}
   cancel-in-progress: false
 
 jobs:
@@ -31,28 +31,30 @@ jobs:
           python -m pip install --upgrade pip
           python -m pip install "cryptography>=42,<45" "flake8>=7,<8" "mypy>=1.10,<2" "pytest>=8,<9"
 
-      - name: Fill consensus engine (contracts, errors, engine)
+      - name: Fill integrity engine (contracts, errors, engine)
         run: |
           set -euo pipefail
-          cat > shared_engines/consensus/contracts.py <<'PYEOF'
-          """Consensus contracts."""
+          cat > shared_engines/integrity/contracts.py <<'PYEOF'
+          """Integrity contracts."""
           from __future__ import annotations
 
           from dataclasses import dataclass
 
 
           @dataclass(frozen=True)
-          class LeaseState:
-              """Current lease of a resource."""
+          class IntegrityProof:
+              """A durable, verifiable content proof."""
 
-              resource: str
-              holder_id: str
-              fencing_token: int
-              expires_at: float
+              proof_id: str
+              subject: str
+              algorithm: str
+              digest: str
+              size_bytes: int
+              created_at: float
           PYEOF
 
-          cat > shared_engines/consensus/errors.py <<'PYEOF'
-          """Typed consensus errors."""
+          cat > shared_engines/integrity/errors.py <<'PYEOF'
+          """Typed integrity errors."""
           from __future__ import annotations
 
           from shared_engines.common.errors import (
@@ -60,48 +62,54 @@ jobs:
           )
 
 
-          class ConsensusError(EngineError):
-              """Base consensus error."""
+          class UnsupportedAlgorithmError(
+              EngineError
+          ):
+              """Requested digest algorithm is not
+              available."""
 
 
-          class AlreadyVotedError(ConsensusError):
-              """Voter already voted in this term."""
-
-
-          class LeaseHeldError(ConsensusError):
-              """Lease held by another member."""
-
-
-          class NoLeaseError(ConsensusError):
-              """No current lease for the resource."""
+          class ProofNotFoundError(EngineError):
+              """No proof stored for the subject."""
           PYEOF
 
-          cat > shared_engines/consensus/engine.py <<'PYEOF'
-          """Distributed consensus: membership, terms, votes,
-          quorum leader election and fenced leases.
+          cat > shared_engines/integrity/engine.py <<'PYEOF'
+          """Integrity engine: hashing, durable proofs and
+          tamper detection for content and files.
 
-          Durability: every mutation runs in one SQLite
-          transaction. Fencing: the lease fencing token IS
-          the consensus term - a new term invalidates every
-          lease granted in an older term, so a stale holder
-          can never act on stale authority.
+          Complements (never duplicates) the audit chain:
+          the audit chain proves the ORDER of network
+          events; this engine proves the CONTENT of data.
+          An app stores a proof once, then can re-verify
+          at any time that the bytes are still exactly the
+          originals.
+
+          Proofs are durable (SQLite) and recomputable:
+          verify re-hashes the current bytes and compares
+          against the stored digest. Any modification,
+          however small, fails verification.
           """
           from __future__ import annotations
 
+          import hashlib
+          import sqlite3
+          from pathlib import Path
+
           from shared_engines.common.clocks import Clock
+          from shared_engines.common.errors import (
+              NotFoundError,
+          )
+          from shared_engines.common.identifiers import (
+              new_id,
+          )
           from shared_engines.common.validation import (
-              require_int_range,
               require_non_empty_str,
-              require_positive_number,
           )
-          from shared_engines.consensus.contracts import (
-              LeaseState,
+          from shared_engines.integrity.contracts import (
+              IntegrityProof,
           )
-          from shared_engines.consensus.errors import (
-              AlreadyVotedError,
-              ConsensusError,
-              LeaseHeldError,
-              NoLeaseError,
+          from shared_engines.integrity.errors import (
+              UnsupportedAlgorithmError,
           )
           from shared_engines.storage.database import (
               Database,
@@ -111,504 +119,249 @@ jobs:
               MigrationRunner,
           )
 
+          ALGORITHMS = {
+              "sha256": hashlib.sha256,
+              "sha512": hashlib.sha512,
+          }
+
           _MIGRATIONS = (
               Migration(
                   1,
-                  "consensus",
+                  "integrity",
                   (
-                      "CREATE TABLE consensus_members ("
-                      " member_id TEXT PRIMARY KEY,"
-                      " joined_at REAL NOT NULL,"
-                      " active INTEGER NOT NULL"
-                      " DEFAULT 1)",
-                      "CREATE TABLE consensus_state ("
-                      " key TEXT PRIMARY KEY,"
-                      " value TEXT NOT NULL)",
-                      "CREATE TABLE consensus_votes ("
-                      " term INTEGER NOT NULL,"
-                      " voter_id TEXT NOT NULL,"
-                      " candidate_id TEXT NOT NULL,"
-                      " PRIMARY KEY (term, voter_id))",
-                      "CREATE TABLE consensus_leases ("
-                      " resource TEXT PRIMARY KEY,"
-                      " holder_id TEXT NOT NULL,"
-                      " term INTEGER NOT NULL,"
-                      " expires_at REAL NOT NULL)",
+                      "CREATE TABLE integrity_proofs ("
+                      " proof_id TEXT PRIMARY KEY,"
+                      " subject TEXT NOT NULL,"
+                      " algorithm TEXT NOT NULL,"
+                      " digest TEXT NOT NULL,"
+                      " size_bytes INTEGER NOT NULL,"
+                      " created_at REAL NOT NULL)",
+                      "CREATE INDEX integrity_subject"
+                      " ON integrity_proofs"
+                      " (subject, created_at)",
                   ),
               ),
           )
 
 
-          class ConsensusEngine:
-              """Term-based consensus with fenced leases."""
+          class IntegrityEngine:
+              """Content proofs with tamper detection."""
 
               def __init__(
                   self,
                   db: Database,
                   clock: Clock,
                   *,
-                  member_id: str,
+                  algorithm: str = "sha256",
               ) -> None:
-                  require_non_empty_str(
-                      member_id, "member_id"
-                  )
+                  if algorithm not in ALGORITHMS:
+                      raise (
+                          UnsupportedAlgorithmError(
+                              "unsupported algorithm:"
+                              f" {algorithm}"
+                          )
+                      )
                   self._db = db
                   self._clock = clock
-                  self._member_id = member_id
+                  self._algorithm = algorithm
+                  self._hasher = ALGORITHMS[
+                      algorithm
+                  ]
                   MigrationRunner(
-                      db, "consensus", _MIGRATIONS
+                      db, "integrity", _MIGRATIONS
                   ).run(clock)
-                  row = db.query_one(
-                      "SELECT value FROM"
-                      " consensus_state"
-                      " WHERE key = 'term'"
-                  )
-                  if row is None:
-                      with db.transaction() as cursor:
-                          cursor.execute(
-                              "INSERT OR IGNORE INTO"
-                              " consensus_state"
-                              " (key, value) VALUES"
-                              " ('term', '0')"
-                          )
 
-              def register_member(
-                  self, member_id: str
-              ) -> None:
-                  require_non_empty_str(
-                      member_id, "member_id"
-                  )
-                  with self._db.transaction() as cursor:
-                      cursor.execute(
-                          "INSERT INTO"
-                          " consensus_members"
-                          " (member_id, joined_at,"
-                          " active) VALUES (?, ?, 1)"
-                          " ON CONFLICT(member_id)"
-                          " DO UPDATE SET active = 1",
-                          (
-                              member_id,
-                              self._clock.now(),
-                          ),
-                      )
-
-              def deactivate_member(
-                  self, member_id: str
-              ) -> None:
-                  require_non_empty_str(
-                      member_id, "member_id"
-                  )
-                  with self._db.transaction() as cursor:
-                      cursor.execute(
-                          "UPDATE consensus_members"
-                          " SET active = 0"
-                          " WHERE member_id = ?",
-                          (member_id,),
-                      )
-
-              def active_members(
-                  self,
-              ) -> tuple[str, ...]:
-                  rows = self._db.query_all(
-                      "SELECT member_id FROM"
-                      " consensus_members"
-                      " WHERE active = 1"
-                      " ORDER BY member_id"
-                  )
-                  return tuple(
-                      str(r["member_id"])
-                      for r in rows
-                  )
-
-              def member_count(self) -> int:
-                  row = self._db.query_one(
-                      "SELECT COUNT(*) AS n FROM"
-                      " consensus_members"
-                      " WHERE active = 1"
-                  )
-                  return (
-                      int(row["n"])
-                      if row is not None
-                      else 0
-                  )
-
-              def quorum_size(self) -> int:
-                  return (
-                      self.member_count() // 2 + 1
-                  )
-
-              def current_term(self) -> int:
-                  row = self._db.query_one(
-                      "SELECT value FROM"
-                      " consensus_state"
-                      " WHERE key = 'term'"
-                  )
-                  if row is None:
-                      raise ConsensusError(
-                          "consensus state missing"
-                      )
-                  return int(str(row["value"]))
-
-              def leader(self) -> str | None:
-                  row = self._db.query_one(
-                      "SELECT value FROM"
-                      " consensus_state"
-                      " WHERE key = 'leader'"
-                  )
-                  if row is None:
-                      return None
-                  value = str(row["value"])
-                  return value or None
-
-              def _require_active(
-                  self, member_id: str
-              ) -> None:
-                  row = self._db.query_one(
-                      "SELECT active FROM"
-                      " consensus_members"
-                      " WHERE member_id = ?",
-                      (member_id,),
-                  )
-                  if row is None or int(
-                      row["active"]
-                  ) != 1:
-                      raise ConsensusError(
-                          "member not active:"
-                          f" {member_id}"
-                      )
-
-              def start_new_term(self) -> int:
-                  with self._db.transaction() as cursor:
-                      row = cursor.execute(
-                          "SELECT value FROM"
-                          " consensus_state"
-                          " WHERE key = 'term'"
-                      ).fetchone()
-                      term = (
-                          int(str(row["value"])) + 1
-                          if row is not None
-                          else 1
-                      )
-                      cursor.execute(
-                          "INSERT INTO"
-                          " consensus_state"
-                          " (key, value) VALUES"
-                          " ('term', ?)"
-                          " ON CONFLICT(key) DO"
-                          " UPDATE SET value ="
-                          " excluded.value",
-                          (str(term),),
-                      )
-                      cursor.execute(
-                          "DELETE FROM"
-                          " consensus_state"
-                          " WHERE key = 'leader'"
-                      )
-                  return term
-
-              def vote(
-                  self,
-                  *,
-                  term: int,
-                  candidate_id: str,
-              ) -> None:
-                  require_int_range(
-                      term, "term", 1, 2**62
-                  )
-                  require_non_empty_str(
-                      candidate_id, "candidate_id"
-                  )
-                  self._require_active(
-                      self._member_id
-                  )
-                  if term != self.current_term():
-                      raise ConsensusError(
-                          f"stale term {term}:"
-                          " current term is"
-                          f" {self.current_term()}"
-                      )
-                  from sqlite3 import IntegrityError
-
-                  try:
-                      with (
-                          self._db.transaction()
-                          as cursor
-                      ):
-                          cursor.execute(
-                              "INSERT INTO"
-                              " consensus_votes"
-                              " (term, voter_id,"
-                              " candidate_id)"
-                              " VALUES (?, ?, ?)",
-                              (
-                                  term,
-                                  self._member_id,
-                                  candidate_id,
-                              ),
-                          )
-                  except IntegrityError as exc:
-                      raise AlreadyVotedError(
-                          "member"
-                          f" {self._member_id}"
-                          " already voted in term"
-                          f" {term}"
-                      ) from exc
-
-              def elect_leader(
-                  self, *, term: int
+              def digest_bytes(
+                  self, data: bytes
               ) -> str:
-                  if term != self.current_term():
-                      raise ConsensusError(
-                          f"stale term {term}"
-                      )
-                  rows = self._db.query_all(
-                      "SELECT candidate_id,"
-                      " COUNT(*) AS n FROM"
-                      " consensus_votes"
-                      " WHERE term = ?"
-                      " GROUP BY candidate_id"
-                      " ORDER BY n DESC,"
-                      " candidate_id ASC",
-                      (term,),
+                  return self._hasher(
+                      data
+                  ).hexdigest()
+
+              def digest_file(
+                  self, path: Path
+              ) -> str:
+                  """Streaming digest: constant memory
+                  regardless of file size."""
+                  digest = self._hasher()
+                  with Path(path).open("rb") as fh:
+                      for chunk in iter(
+                          lambda: fh.read(
+                              512 * 1024
+                          ),
+                          b"",
+                      ):
+                          digest.update(chunk)
+                  return digest.hexdigest()
+
+              def issue_proof(
+                  self,
+                  *,
+                  subject: str,
+                  data: bytes,
+              ) -> IntegrityProof:
+                  """Store a durable proof for content."""
+                  require_non_empty_str(
+                      subject, "subject"
                   )
-                  if not rows:
-                      raise ConsensusError(
-                          "no votes in term"
-                          f" {term}"
-                      )
-                  top = int(rows[0]["n"])
-                  quorum = self.quorum_size()
-                  if top < quorum:
-                      raise ConsensusError(
-                          "quorum not reached:"
-                          f" best has {top}/"
-                          f"{quorum} votes"
-                      )
-                  if len(rows) > 1 and int(
-                      rows[1]["n"]
-                  ) >= top:
-                      raise ConsensusError(
-                          "contested election:"
-                          " tie at top"
-                      )
-                  elected = str(
-                      rows[0]["candidate_id"]
-                  )
-                  self._require_active(elected)
-                  with self._db.transaction() as cursor:
+                  digest = self.digest_bytes(data)
+                  proof_id = f"PRF-{new_id()}"
+                  created_at = self._clock.now()
+                  with (
+                      self._db.transaction()
+                      as cursor
+                  ):
                       cursor.execute(
                           "INSERT INTO"
-                          " consensus_state"
-                          " (key, value) VALUES"
-                          " ('leader', ?)"
-                          " ON CONFLICT(key) DO"
-                          " UPDATE SET value ="
-                          " excluded.value",
-                          (elected,),
-                      )
-                  return elected
-
-              def acquire_lease(
-                  self,
-                  *,
-                  resource: str,
-                  holder_id: str,
-                  lease_seconds: float,
-              ) -> int:
-                  require_non_empty_str(
-                      resource, "resource"
-                  )
-                  self._require_active(holder_id)
-                  require_positive_number(
-                      lease_seconds, "lease_seconds"
-                  )
-                  now = self._clock.now()
-                  term = self.current_term()
-                  with self._db.transaction() as cursor:
-                      row = cursor.execute(
-                          "SELECT holder_id, term,"
-                          " expires_at FROM"
-                          " consensus_leases"
-                          " WHERE resource = ?",
-                          (resource,),
-                      ).fetchone()
-                      if row is not None:
-                          held_by = str(
-                              row["holder_id"]
-                          )
-                          lease_term = int(
-                              row["term"]
-                          )
-                          expires = float(
-                              row["expires_at"]
-                          )
-                          if (
-                              lease_term == term
-                              and expires > now
-                              and held_by
-                              != holder_id
-                          ):
-                              raise LeaseHeldError(
-                                  "lease"
-                                  f" '{resource}'"
-                                  " held by"
-                                  f" '{held_by}'"
-                                  " (fencing"
-                                  f" {lease_term})"
-                              )
-                      cursor.execute(
-                          "INSERT INTO"
-                          " consensus_leases"
-                          " (resource, holder_id,"
-                          " term, expires_at)"
-                          " VALUES (?, ?, ?, ?)"
-                          " ON CONFLICT(resource)"
-                          " DO UPDATE SET"
-                          " holder_id ="
-                          " excluded.holder_id,"
-                          " term = excluded.term,"
-                          " expires_at ="
-                          " excluded.expires_at",
+                          " integrity_proofs"
+                          " (proof_id, subject,"
+                          " algorithm, digest,"
+                          " size_bytes, created_at)"
+                          " VALUES (?, ?, ?, ?, ?, ?)",
                           (
-                              resource,
-                              holder_id,
-                              term,
-                              now + lease_seconds,
+                              proof_id,
+                              subject,
+                              self._algorithm,
+                              digest,
+                              len(data),
+                              created_at,
                           ),
                       )
-                  return term
-
-              def renew_lease(
-                  self,
-                  *,
-                  resource: str,
-                  holder_id: str,
-                  lease_seconds: float,
-              ) -> int:
-                  require_non_empty_str(
-                      resource, "resource"
+                  return IntegrityProof(
+                      proof_id=proof_id,
+                      subject=subject,
+                      algorithm=self._algorithm,
+                      digest=digest,
+                      size_bytes=len(data),
+                      created_at=created_at,
                   )
-                  require_positive_number(
-                      lease_seconds, "lease_seconds"
-                  )
-                  now = self._clock.now()
-                  term = self.current_term()
-                  with self._db.transaction() as cursor:
-                      row = cursor.execute(
-                          "SELECT holder_id, term"
-                          " FROM consensus_leases"
-                          " WHERE resource = ?",
-                          (resource,),
-                      ).fetchone()
-                      if row is None:
-                          raise NoLeaseError(
-                              "no lease for"
-                              f" '{resource}'"
-                          )
-                      holder = str(
-                          row["holder_id"]
-                      )
-                      lease_term = int(row["term"])
-                      if holder != holder_id:
-                          raise LeaseHeldError(
-                              "lease"
-                              f" '{resource}' held"
-                              f" by '{holder}'"
-                          )
-                      if lease_term != term:
-                          raise NoLeaseError(
-                              f"lease '{resource}'"
-                              " fenced: term"
-                              f" {lease_term} !="
-                              f" {term}"
-                          )
-                      cursor.execute(
-                          "UPDATE consensus_leases"
-                          " SET expires_at = ?"
-                          " WHERE resource = ?",
-                          (
-                              now + lease_seconds,
-                              resource,
-                          ),
-                      )
-                  return term
 
-              def release_lease(
-                  self,
-                  *,
-                  resource: str,
-                  holder_id: str,
-              ) -> None:
+              def get_proof(
+                  self, *, proof_id: str
+              ) -> IntegrityProof:
                   require_non_empty_str(
-                      resource, "resource"
-                  )
-                  with self._db.transaction() as cursor:
-                      row = cursor.execute(
-                          "SELECT holder_id FROM"
-                          " consensus_leases"
-                          " WHERE resource = ?",
-                          (resource,),
-                      ).fetchone()
-                      if row is None:
-                          raise NoLeaseError(
-                              "no lease for"
-                              f" '{resource}'"
-                          )
-                      if str(
-                          row["holder_id"]
-                      ) != holder_id:
-                          raise LeaseHeldError(
-                              "lease"
-                              f" '{resource}' held"
-                              " by someone else"
-                          )
-                      cursor.execute(
-                          "DELETE FROM"
-                          " consensus_leases"
-                          " WHERE resource = ?",
-                          (resource,),
-                      )
-
-              def lease_holder(
-                  self, resource: str
-              ) -> LeaseState | None:
-                  require_non_empty_str(
-                      resource, "resource"
+                      proof_id, "proof_id"
                   )
                   row = self._db.query_one(
                       "SELECT * FROM"
-                      " consensus_leases"
-                      " WHERE resource = ?",
-                      (resource,),
+                      " integrity_proofs"
+                      " WHERE proof_id = ?",
+                      (proof_id,),
                   )
                   if row is None:
-                      return None
-                  return LeaseState(
-                      resource=str(
-                          row["resource"]
+                      raise NotFoundError(
+                          "proof not found:"
+                          f" {proof_id}"
+                      )
+                  return self._proof_from_row(row)
+
+              def proofs_for(
+                  self, *, subject: str
+              ) -> tuple[IntegrityProof, ...]:
+                  require_non_empty_str(
+                      subject, "subject"
+                  )
+                  rows = self._db.query_all(
+                      "SELECT * FROM"
+                      " integrity_proofs"
+                      " WHERE subject = ?"
+                      " ORDER BY created_at DESC",
+                      (subject,),
+                  )
+                  return tuple(
+                      self._proof_from_row(row)
+                      for row in rows
+                  )
+
+              def verify_proof(
+                  self,
+                  *,
+                  proof_id: str,
+                  data: bytes,
+              ) -> bool:
+                  """Re-hash the current bytes and
+                  compare with the stored digest.
+                  False means the content was altered
+                  after the proof was issued."""
+                  proof = self.get_proof(
+                      proof_id=proof_id
+                  )
+                  if (
+                      proof.algorithm
+                      not in ALGORITHMS
+                  ):
+                      raise (
+                          UnsupportedAlgorithmError(
+                              "proof algorithm"
+                              " unknown:"
+                              f" {proof.algorithm}"
+                          )
+                      )
+                  current = ALGORITHMS[
+                      proof.algorithm
+                  ](data).hexdigest()
+                  return current == proof.digest
+
+              def verify_latest(
+                  self,
+                  *,
+                  subject: str,
+                  data: bytes,
+              ) -> bool:
+                  """Verify against the most recent
+                  proof of a subject. No proof at all
+                  -> NotFoundError."""
+                  proofs = self.proofs_for(
+                      subject=subject
+                  )
+                  if not proofs:
+                      raise NotFoundError(
+                          "no proof for subject:"
+                          f" {subject}"
+                      )
+                  return self.verify_proof(
+                      proof_id=proofs[
+                          0
+                      ].proof_id,
+                      data=data,
+                  )
+
+              @staticmethod
+              def _proof_from_row(
+                  row: sqlite3.Row,
+              ) -> IntegrityProof:
+                  return IntegrityProof(
+                      proof_id=str(
+                          row["proof_id"]
                       ),
-                      holder_id=str(
-                          row["holder_id"]
+                      subject=str(
+                          row["subject"]
                       ),
-                      fencing_token=int(
-                          row["term"]
+                      algorithm=str(
+                          row["algorithm"]
                       ),
-                      expires_at=float(
-                          row["expires_at"]
+                      digest=str(row["digest"]),
+                      size_bytes=int(
+                          row["size_bytes"]
+                      ),
+                      created_at=float(
+                          row["created_at"]
                       ),
                   )
           PYEOF
-          echo "=== CONSENSUS ENGINE READY ==="
+          echo "=== INTEGRITY ENGINE READY ==="
 
-      - name: Consensus proofs (4)
+      - name: Integrity proofs tests (4)
         run: |
           set -euo pipefail
-          mkdir -p shared_engines/consensus/tests
-          cat > shared_engines/consensus/tests/test_consensus.py <<'PYEOF'
-          """Consensus proofs: quorum, vote-once, leader
-          election, term fencing of leases."""
+          mkdir -p shared_engines/integrity/tests
+          cat > shared_engines/integrity/tests/test_integrity.py <<'PYEOF'
+          """Integrity proofs: deterministic digests,
+          streaming file hashing, tamper detection and
+          unknown-proof errors."""
           from __future__ import annotations
 
+          import hashlib
           from pathlib import Path
 
           import pytest
@@ -616,165 +369,174 @@ jobs:
           from shared_engines.common.clocks import (
               FrozenClock,
           )
-          from shared_engines.consensus.engine import (
-              ConsensusEngine,
+          from shared_engines.common.errors import (
+              NotFoundError,
           )
-          from shared_engines.consensus.errors import (
-              AlreadyVotedError,
-              ConsensusError,
-              LeaseHeldError,
-              NoLeaseError,
+          from shared_engines.integrity.engine import (
+              IntegrityEngine,
+          )
+          from shared_engines.integrity.errors import (
+              UnsupportedAlgorithmError,
           )
           from shared_engines.storage.database import (
               SQLiteAdapter,
           )
 
 
-          def _cluster(
+          def _engine(
               tmp_path: Path,
           ) -> tuple[
               SQLiteAdapter,
+              IntegrityEngine,
               FrozenClock,
-              ConsensusEngine,
-              ConsensusEngine,
-              ConsensusEngine,
           ]:
               db = SQLiteAdapter(
-                  tmp_path / "consensus.db"
+                  tmp_path / "integrity.db"
               )
               clock = FrozenClock()
-              a = ConsensusEngine(
-                  db, clock, member_id="a"
-              )
-              b = ConsensusEngine(
-                  db, clock, member_id="b"
-              )
-              c = ConsensusEngine(
-                  db, clock, member_id="c"
-              )
-              a.register_member("a")
-              a.register_member("b")
-              a.register_member("c")
-              return db, clock, a, b, c
+              engine = IntegrityEngine(db, clock)
+              return db, engine, clock
 
 
-          def test_membership_and_quorum(
+          def test_deterministic_digest(
               tmp_path: Path,
           ) -> None:
-              db, clock, a, b, c = _cluster(tmp_path)
+              db, engine, clock = _engine(tmp_path)
               try:
-                  assert a.active_members() == (
-                      "a",
-                      "b",
-                      "c",
+                  d1 = engine.digest_bytes(
+                      b"zyra network"
                   )
-                  assert a.quorum_size() == 2
-                  a.deactivate_member("c")
-                  assert a.member_count() == 2
-                  assert a.quorum_size() == 2
+                  d2 = engine.digest_bytes(
+                      b"zyra network"
+                  )
+                  assert d1 == d2
+                  assert (
+                      d1
+                      == hashlib.sha256(
+                          b"zyra network"
+                      ).hexdigest()
+                  )
+                  d3 = engine.digest_bytes(
+                      b"zyra network "
+                  )
+                  assert d3 != d1
               finally:
                   db.close()
 
 
-          def test_vote_once_per_term(
+          def test_file_digest_streams(
               tmp_path: Path,
           ) -> None:
-              db, clock, a, b, c = _cluster(tmp_path)
+              db, engine, clock = _engine(tmp_path)
               try:
-                  term = a.start_new_term()
-                  assert term == 1
-                  a.vote(term=term, candidate_id="b")
-                  with pytest.raises(
-                      AlreadyVotedError
-                  ):
-                      a.vote(
-                          term=term,
-                          candidate_id="c",
-                      )
+                  blob = tmp_path / "doc.bin"
+                  payload = b"patient record" * 10_000
+                  blob.write_bytes(payload)
+                  assert (
+                      engine.digest_file(blob)
+                      == hashlib.sha256(
+                          payload
+                      ).hexdigest()
+                  )
               finally:
                   db.close()
 
 
-          def test_elect_leader_requires_quorum(
+          def test_issue_and_verify_detects_tampering(
               tmp_path: Path,
           ) -> None:
-              db, clock, a, b, c = _cluster(tmp_path)
+              db, engine, clock = _engine(tmp_path)
               try:
-                  term = a.start_new_term()
-                  b.vote(term=term, candidate_id="c")
-                  with pytest.raises(
-                      ConsensusError
-                  ):
-                      c.elect_leader(term=term)
-                  a.vote(
-                      term=term, candidate_id="c"
+                  original = (
+                      b"birth record: Bebe Perez"
+                  )
+                  proof = engine.issue_proof(
+                      subject="doc-1",
+                      data=original,
                   )
                   assert (
-                      c.elect_leader(term=term)
-                      == "c"
+                      engine.verify_proof(
+                          proof_id=proof.proof_id,
+                          data=original,
+                      )
+                      is True
                   )
-                  assert c.leader() == "c"
+                  altered = (
+                      b"birth record: Faked Name"
+                  )
+                  assert (
+                      engine.verify_proof(
+                          proof_id=proof.proof_id,
+                          data=altered,
+                      )
+                      is False
+                  )
+                  assert (
+                      engine.verify_latest(
+                          subject="doc-1",
+                          data=original,
+                      )
+                      is True
+                  )
+                  assert (
+                      engine.verify_latest(
+                          subject="doc-1",
+                          data=altered,
+                      )
+                      is False
+                  )
               finally:
                   db.close()
 
 
-          def test_new_term_fences_leases(
+          def test_unknown_proof_and_algorithm(
               tmp_path: Path,
           ) -> None:
-              db, clock, a, b, c = _cluster(tmp_path)
+              db, engine, clock = _engine(tmp_path)
               try:
-                  term1 = a.start_new_term()
-                  token = a.acquire_lease(
-                      resource="primary-lock",
-                      holder_id="a",
-                      lease_seconds=100.0,
-                  )
-                  assert token == term1
                   with pytest.raises(
-                      LeaseHeldError
+                      NotFoundError
                   ):
-                      b.acquire_lease(
-                          resource="primary-lock",
-                          holder_id="b",
-                          lease_seconds=100.0,
+                      engine.verify_proof(
+                          proof_id="PRF-nope",
+                          data=b"x",
                       )
-                  term2 = a.start_new_term()
-                  assert term2 == term1 + 1
-                  assert a.leader() is None
-                  held = a.lease_holder(
-                      "primary-lock"
-                  )
-                  assert held is not None
-                  with pytest.raises(NoLeaseError):
-                      a.renew_lease(
-                          resource="primary-lock",
-                          holder_id="a",
-                          lease_seconds=100.0,
+                  with pytest.raises(
+                      NotFoundError
+                  ):
+                      engine.verify_latest(
+                          subject="ghost",
+                          data=b"x",
                       )
-                  fresh = b.acquire_lease(
-                      resource="primary-lock",
-                      holder_id="b",
-                      lease_seconds=100.0,
-                  )
-                  assert fresh == term2
-                  a.release_lease(
-                      resource="primary-lock",
-                      holder_id="b",
-                  )
-                  with pytest.raises(NoLeaseError):
-                      a.release_lease(
-                          resource="primary-lock",
-                          holder_id="b",
+                  with pytest.raises(
+                      UnsupportedAlgorithmError
+                  ):
+                      IntegrityEngine(
+                          db,
+                          clock,
+                          algorithm="md5",
                       )
+                  sha512_engine = IntegrityEngine(
+                      db, clock, algorithm="sha512"
+                  )
+                  d = sha512_engine.digest_bytes(
+                      b"x"
+                  )
+                  assert (
+                      d
+                      == hashlib.sha512(
+                          b"x"
+                      ).hexdigest()
+                  )
               finally:
                   db.close()
           PYEOF
-          echo "=== CONSENSUS TESTS READY ==="
+          echo "=== INTEGRITY TESTS READY ==="
 
       - name: Quality gates (mypy first; full regression)
         run: |
           set -euo pipefail
-          M="shared_engines/common shared_engines/storage shared_engines/events shared_engines/observability shared_engines/audit shared_engines/security shared_engines/identity shared_engines/verification shared_engines/runtime shared_engines/tokenization shared_engines/currency shared_engines/verifier shared_engines/hardening shared_engines/authority shared_engines/network shared_engines/telemetry shared_engines/logs"
+          M="shared_engines/common shared_engines/storage shared_engines/events shared_engines/observability shared_engines/audit shared_engines/security shared_engines/identity shared_engines/verification shared_engines/runtime shared_engines/tokenization shared_engines/currency shared_engines/verifier shared_engines/hardening shared_engines/authority shared_engines/network shared_engines/telemetry shared_engines/logs shared_engines/consensus shared_engines/integrity"
           python -m compileall -q $M main.py scripts shared_engines/tests
           echo "compile OK"
           find $M scripts -name '__pycache__' -type d -prune -exec rm -rf {} +
@@ -797,7 +559,7 @@ jobs:
           if git diff --cached --quiet; then
             echo "No changes."
           else
-            git commit -m "zyra: engine 1/17 consensus - membership/quorum, terms, vote-once, quorum-gated leader election, fenced leases (term = fencing token, new term fences old leases); 4 proofs"
+            git commit -m "zyra: engine 2/17 integrity - sha256/sha512 digests (bytes + streaming file), durable content proofs, tamper detection via re-hash compare, NotFound/UnsupportedAlgorithm typed errors; 4 proofs"
             git push origin "HEAD:${{ github.ref_name }}"
           fi
-          echo "=== ENGINE CONSENSUS COMPLETE ==="
+          echo "=== ENGINE INTEGRITY COMPLETE ==="

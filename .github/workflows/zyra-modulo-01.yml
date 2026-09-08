@@ -51,14 +51,18 @@ jobs:
               TelemetryCollector,
               TelemetryRecord,
           )
+          from shared_engines.telemetry.errors import (
+              InvalidMetricError,
+              TelemetryError,
+          )
           from shared_engines.telemetry.system_health import (
               SystemHealthReporter,
               SystemReport,
           )
 
           __all__ = [
-              "SystemHealthReporter", "SystemReport",
-              "TelemetryCollector", "TelemetryRecord",
+              "InvalidMetricError", "SystemHealthReporter", "SystemReport",
+              "TelemetryCollector", "TelemetryError", "TelemetryRecord",
           ]
           PYEOF
 
@@ -82,22 +86,23 @@ jobs:
 
           Metrics (counters/gauges/timers) persist per name+tags;
           network/engine events are indexed by type, aggregate and
-          time window for queryable operations history. This is what
-          a dashboard or an external monitor would query.
+          time for queryable operations history. This is what a
+          dashboard or an external monitor would query.
           """
           from __future__ import annotations
 
+          import sqlite3
           from dataclasses import dataclass
 
           from shared_engines.common.clocks import Clock
+          from shared_engines.common.serialization import (
+              canonical_json_dumps,
+              canonical_json_loads,
+          )
           from shared_engines.common.validation import (
               require_int_range,
               require_non_empty_str,
               require_positive_number,
-          )
-          from shared_engines.common.serialization import (
-              canonical_json_dumps,
-              canonical_json_loads,
           )
           from shared_engines.storage.database import Database
           from shared_engines.storage.migrations import (
@@ -160,22 +165,35 @@ jobs:
                       db, "telemetry", TELEMETRY_MIGRATIONS
                   ).run(clock)
 
-              def counter(self, name: str, *, tags: dict[str, str] | None = None) -> None:
-                  self._record(name, kind="counter", value=1, tags=tags)
+              def counter(
+                  self,
+                  name: str,
+                  *,
+                  tags: dict[str, str] | None = None,
+              ) -> None:
+                  self._record(name, kind="counter", value=1.0, tags=tags)
 
               def gauge(
-                  self, name: str, value: float,
-                  *, tags: dict[str, str] | None = None,
+                  self,
+                  name: str,
+                  value: float,
+                  *,
+                  tags: dict[str, str] | None = None,
               ) -> None:
                   require_positive_number(value, name)
                   self._record(name, kind="gauge", value=value, tags=tags)
 
               def timer(
-                  self, name: str, seconds: float,
-                  *, tags: dict[str, str] | None = None,
+                  self,
+                  name: str,
+                  seconds: float,
+                  *,
+                  tags: dict[str, str] | None = None,
               ) -> None:
                   require_positive_number(seconds, "duration")
-                  self._record(name, kind="timer", value=seconds, tags=tags)
+                  self._record(
+                      name, kind="timer", value=seconds, tags=tags
+                  )
 
               def _record(
                   self,
@@ -291,9 +309,7 @@ jobs:
                       for row in rows
                   )
 
-              def metric_summary(
-                  self, name: str
-              ) -> dict[str, object]:
+              def metric_summary(self, name: str) -> dict[str, object]:
                   records = self.query_metrics(name, limit=10_000)
                   if not records:
                       return {
@@ -311,18 +327,12 @@ jobs:
                   }
 
               @staticmethod
-              def _record_from_row(row: object) -> TelemetryRecord:
-                  from typing import cast
-
-                  from shared_engines.storage.database import Database
-
-                  if not hasattr(row, "__getitem__"):
-                      raise ValueError("invalid telemetry row")
+              def _record_from_row(row: sqlite3.Row) -> TelemetryRecord:
                   tags = canonical_json_loads(str(row["tags"]))
                   if not isinstance(tags, dict):
                       tags = {}
                   return TelemetryRecord(
-                      metric_id=int(cast("object", row["metric_id"])),
+                      metric_id=int(row["metric_id"]),
                       name=str(row["name"]),
                       kind=str(row["kind"]),
                       value=float(row["value"]),
@@ -340,7 +350,6 @@ jobs:
           from shared_engines.common.clocks import Clock
           from shared_engines.network.cluster import ClusterManager
           from shared_engines.observability.health import (
-              ComponentHealth,
               HealthRegistry,
           )
           from shared_engines.telemetry.collector import TelemetryCollector
@@ -348,8 +357,8 @@ jobs:
 
           @dataclass(frozen=True)
           class SystemReport:
-              overall: ComponentHealth
-              components: tuple[ComponentHealth, ...]
+              overall_status: str
+              components_detail: tuple[str, ...]
               cluster_nodes_active: int
               cluster_nodes_total: int
               recent_event_count: int
@@ -378,8 +387,11 @@ jobs:
                   active = self._cluster.active_nodes()
                   recent = self._telemetry.query_events(limit=100)
                   return SystemReport(
-                      overall=overall,
-                      components=components,
+                      overall_status=overall.status.value,
+                      components_detail=tuple(
+                          f"{c.component}:{c.status.value}"
+                          for c in components
+                      ),
                       cluster_nodes_active=len(active),
                       cluster_nodes_total=len(all_nodes),
                       recent_event_count=len(recent),
@@ -397,10 +409,7 @@ jobs:
           from shared_engines.common.clocks import FrozenClock
           from shared_engines.identity.contracts import IdentityKind
           from shared_engines.identity.engine import IdentityEngine
-          from shared_engines.network.cluster import (
-              ClusterManager,
-              NodeRole,
-          )
+          from shared_engines.network.cluster import ClusterManager, NodeRole
           from shared_engines.observability.health import (
               ComponentHealth,
               HealthRegistry,
@@ -410,9 +419,17 @@ jobs:
           from shared_engines.events.outbox import Outbox
           from shared_engines.storage.database import SQLiteAdapter
           from shared_engines.telemetry.collector import TelemetryCollector
+          from shared_engines.telemetry.errors import InvalidMetricError
           from shared_engines.telemetry.system_health import (
               SystemHealthReporter,
           )
+
+
+          class _StaticHealth:
+              def check_health(self) -> ComponentHealth:
+                  return ComponentHealth(
+                      "storage", HealthStatus.HEALTHY, "static ok"
+                  )
 
 
           class _Harness:
@@ -503,28 +520,18 @@ jobs:
                   display_name="Node Owner",
                   actor="bootstrap",
               )
-              node = harness.cluster.all_nodes()[0] if harness.cluster.all_nodes() else None
-              if node is None:
-                  node_identity = harness.identity.register_identity(
-                      kind=IdentityKind.DEVICE,
-                      display_name="node-0",
-                      actor="bootstrap",
-                  )
-                  harness.cluster.register_node(
-                      node_id=node_identity.zid,
-                      role=__import__(
-                          "shared_engines.network.cluster",
-                          fromlist=["NodeRole"],
-                      ).NodeRole.COORDINATOR,
-                      endpoint="tcp://node-0:9000",
-                  )
-              harness.cluster.heartbeat(
-                  harness.cluster.all_nodes()[0].node_id
+              node_identity = harness.identity.register_identity(
+                  kind=IdentityKind.DEVICE,
+                  display_name="node-0",
+                  actor="bootstrap",
               )
-              harness.registry.register(
-                  "storage",
-                  _StaticHealth(),
+              harness.cluster.register_node(
+                  node_id=node_identity.zid,
+                  role=NodeRole.COORDINATOR,
+                  endpoint="tcp://node-0:9000",
               )
+              harness.cluster.heartbeat(node_identity.zid)
+              harness.registry.register("storage", _StaticHealth())
               reporter = SystemHealthReporter(
                   registry=harness.registry,
                   cluster=harness.cluster,
@@ -532,18 +539,15 @@ jobs:
                   clock=harness.clock,
               )
               report = reporter.report()
-              assert report.overall.status is HealthStatus.HEALTHY
+              assert report.overall_status == "healthy"
               assert report.cluster_nodes_total >= 1
               assert report.recent_event_count >= 1
+              assert len(report.components_detail) >= 1
               harness.close()
 
 
           def test_invalid_metric_rejected(tmp_path: Path) -> None:
               harness = _Harness(tmp_path)
-              from shared_engines.telemetry.errors import (
-                  InvalidMetricError,
-              )
-
               with pytest.raises(InvalidMetricError):
                   harness.telemetry.gauge("bad.gauge", -1.0)
               with pytest.raises(InvalidMetricError):
@@ -551,11 +555,17 @@ jobs:
               harness.close()
 
 
-          class _StaticHealth:
-              def check_health(self) -> ComponentHealth:
-                  return ComponentHealth(
-                      "storage", HealthStatus.HEALTHY, "static ok"
-                  )
+          def test_telemetry_survives_reopen(tmp_path: Path) -> None:
+              path = tmp_path / "tel.db"
+              db = SQLiteAdapter(path)
+              telemetry = TelemetryCollector(db, FrozenClock())
+              telemetry.counter("persist.test")
+              db.close()
+              db2 = SQLiteAdapter(path)
+              telemetry2 = TelemetryCollector(db2, FrozenClock())
+              records = telemetry2.query_metrics("persist.test")
+              assert len(records) == 1
+              db2.close()
           PYEOF
 
           cat > shared_engines/logs/__init__.py <<'PYEOF'
@@ -564,8 +574,8 @@ jobs:
 
           from shared_engines.logs.structured import (
               CorrelationContext,
-              StructuredLogger,
               LogRecord,
+              StructuredLogger,
           )
 
           __all__ = ["CorrelationContext", "LogRecord", "StructuredLogger"]
@@ -576,19 +586,26 @@ jobs:
 
           Every line is one JSON object: level, component, message,
           correlation_id, detail. Correlation ids group all log lines
-          of one operation (an API request, a cluster event), making
-          traces queryable. Retention keeps the newest N records.
+          of one operation into a queryable trace. Retention keeps
+          the newest N records.
           """
           from __future__ import annotations
 
+          import sqlite3
           from dataclasses import dataclass
           from typing import Final
 
           from shared_engines.common.clocks import Clock
           from shared_engines.common.errors import IntegrityError
           from shared_engines.common.identifiers import new_id
-          from shared_engines.common.serialization import canonical_json_dumps
-          from shared_engines.common.validation import require_int_range
+          from shared_engines.common.serialization import (
+              canonical_json_dumps,
+              canonical_json_loads,
+          )
+          from shared_engines.common.validation import (
+              require_int_range,
+              require_non_empty_str,
+          )
           from shared_engines.storage.database import Database
           from shared_engines.storage.migrations import (
               Migration,
@@ -681,7 +698,7 @@ jobs:
                   require_non_empty_str(component, "component")
                   require_non_empty_str(message, "message")
                   require_non_empty_str(correlation_id, "correlation_id")
-                  safe_detail = {
+                  safe_detail: dict[str, str] = {
                       str(k): str(v) for k, v in (detail or {}).items()
                   }
                   now = self._clock.now()
@@ -709,35 +726,47 @@ jobs:
                   return self._record_from_row(row)
 
               def info(
-                  self, component: str, message: str,
+                  self,
+                  component: str,
+                  message: str,
                   correlation_id: str,
                   detail: dict[str, str] | None = None,
               ) -> LogRecord:
                   return self.log(
-                      level="INFO", component=component,
-                      message=message, correlation_id=correlation_id,
+                      level="INFO",
+                      component=component,
+                      message=message,
+                      correlation_id=correlation_id,
                       detail=detail,
                   )
 
               def warning(
-                  self, component: str, message: str,
+                  self,
+                  component: str,
+                  message: str,
                   correlation_id: str,
                   detail: dict[str, str] | None = None,
               ) -> LogRecord:
                   return self.log(
-                      level="WARNING", component=component,
-                      message=message, correlation_id=correlation_id,
+                      level="WARNING",
+                      component=component,
+                      message=message,
+                      correlation_id=correlation_id,
                       detail=detail,
                   )
 
               def error(
-                  self, component: str, message: str,
+                  self,
+                  component: str,
+                  message: str,
                   correlation_id: str,
                   detail: dict[str, str] | None = None,
               ) -> LogRecord:
                   return self.log(
-                      level="ERROR", component=component,
-                      message=message, correlation_id=correlation_id,
+                      level="ERROR",
+                      component=component,
+                      message=message,
+                      correlation_id=correlation_id,
                       detail=detail,
                   )
 
@@ -757,27 +786,25 @@ jobs:
                   require_int_range(keep, "keep", 1, 1_000_000)
                   with self._db.transaction() as cursor:
                       cursor.execute(
-                          "DELETE FROM structured_logs WHERE log_id NOT IN"
+                          "DELETE FROM structured_logs"
+                          " WHERE log_id NOT IN"
                           " (SELECT log_id FROM structured_logs"
                           "  ORDER BY log_id DESC LIMIT ?)",
                           (keep,),
                       )
-                      row = cursor.execute("SELECT changes()").fetchone()
+                      row = cursor.execute(
+                          "SELECT changes()"
+                      ).fetchone()
                   return int(row[0]) if row is not None else 0
 
               @staticmethod
-              def _record_from_row(row: object) -> LogRecord:
-                  from typing import cast
-
-                  if not hasattr(row, "__getitem__"):
-                      raise IntegrityError("invalid log row")
-                  detail = cast(
-                      "dict[str, str]",
-                      __import__(
-                          "shared_engines.common.serialization",
-                          fromlist=["canonical_json_loads"],
-                      ).canonical_json_loads(str(row["detail"])),
-                  )
+              def _record_from_row(row: sqlite3.Row) -> LogRecord:
+                  detail_raw = canonical_json_loads(str(row["detail"]))
+                  if not isinstance(detail_raw, dict):
+                      detail_raw = {}
+                  detail: dict[str, str] = {
+                      str(k): str(v) for k, v in detail_raw.items()
+                  }
                   return LogRecord(
                       log_id=int(row["log_id"]),
                       level=str(row["level"]),
@@ -838,12 +865,13 @@ jobs:
               trace = logger.query_by_correlation(corr)
               assert len(trace) == 4
               levels = [r.level for r in trace]
-              assert levels == [
-                  "INFO", "INFO", "WARNING", "ERROR",
-              ]
+              assert levels == ["INFO", "INFO", "WARNING", "ERROR"]
               components = [r.component for r in trace]
               assert components == [
-                  "api", "identity", "verification", "api",
+                  "api",
+                  "identity",
+                  "verification",
+                  "api",
               ]
               db.close()
 
@@ -914,7 +942,7 @@ jobs:
           if git diff --cached --quiet; then
             echo "No changes."
           else
-            git commit -m "zyra: module 17 PHASE 5 (durable telemetry metrics+event index, system health reporter, structured JSON logs with correlation+retention) + tests"
+            git commit -m "zyra: module 17 PHASE 5 (durable telemetry metrics+event index with sqlite3.Row typing, system report, structured JSON logs with correlation+retention) + tests"
             git push origin "HEAD:${{ github.ref_name }}"
           fi
           echo "=== MODULE 17 COMPLETE ==="

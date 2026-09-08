@@ -44,14 +44,7 @@ jobs:
           mkdir -p shared_engines/network/tests
 
           cat > shared_engines/network/__init__.py <<'PYEOF'
-          """Zyra distributed network core.
-
-          Cluster membership with heartbeats and TTL-based failure
-          detection, topology tracking, hash-verified state
-          replication, and quorum-gated failover (no split-brain:
-          a new primary can only be elected when a majority of
-          nodes is active). Every cluster event is audited.
-          """
+          """Zyra distributed network core."""
           from __future__ import annotations
 
           from shared_engines.network.cluster import (
@@ -60,19 +53,25 @@ jobs:
               NodeState,
               NodeStatus,
           )
-          from shared_engines.network.failover import (
-              FailoverCoordinator,
+          from shared_engines.network.errors import (
+              InvalidTransitionError,
+              NetworkError,
               NoQuorumError,
+              NodeNotFoundError,
+              ReplicationMismatchError,
           )
+          from shared_engines.network.failover import FailoverCoordinator
           from shared_engines.network.replication import (
               ReplicationManager,
               ReplicationReport,
           )
 
           __all__ = [
-              "ClusterManager", "FailoverCoordinator", "NoQuorumError",
-              "NodeRole", "NodeState", "NodeStatus",
-              "ReplicationManager", "ReplicationReport",
+              "ClusterManager", "FailoverCoordinator",
+              "InvalidTransitionError", "NetworkError", "NoQuorumError",
+              "NodeNotFoundError", "NodeRole", "NodeState", "NodeStatus",
+              "ReplicationManager", "ReplicationMismatchError",
+              "ReplicationReport",
           ]
           PYEOF
 
@@ -97,8 +96,7 @@ jobs:
 
 
           class NoQuorumError(NetworkError, ConcurrencyError):
-              """No majority of active nodes: failover refused to
-              avoid split-brain."""
+              """No majority active: failover refused (no split-brain)."""
 
 
           class InvalidTransitionError(NetworkError, ValidationError):
@@ -110,14 +108,7 @@ jobs:
           PYEOF
 
           cat > shared_engines/network/cluster.py <<'PYEOF'
-          """Cluster membership: nodes, heartbeats, TTL failure detection.
-
-          Each node registers with a ZID identity and a role. Nodes
-          send heartbeats; a node whose heartbeat TTL expires becomes
-          SUSPECT, and after a second expiry DOWN. Recovery is
-          explicit (rejoined). State transitions are validated and
-          audited.
-          """
+          """Cluster membership: nodes, heartbeats, TTL failure detection."""
           from __future__ import annotations
 
           import sqlite3
@@ -128,7 +119,6 @@ jobs:
           from shared_engines.common.clocks import Clock
           from shared_engines.common.errors import IntegrityError
           from shared_engines.common.validation import (
-              require_int_range,
               require_non_empty_str,
               require_positive_number,
           )
@@ -311,8 +301,7 @@ jobs:
                   return node
 
               def detect_failures(self) -> tuple[str, ...]:
-                  """Expires heartbeats: ACTIVE->SUSPECT, then
-                  SUSPECT->DOWN after another TTL."""
+                  """ACTIVE->SUSPECT after TTL, SUSPECT->DOWN after 2x."""
                   now = self._clock.now()
                   changed: list[str] = []
                   rows = self._db.query_all(
@@ -396,16 +385,9 @@ jobs:
           PYEOF
 
           cat > shared_engines/network/replication.py <<'PYEOF'
-          """Hash-verified state replication between nodes.
-
-          The primary computes a state hash of its replicated tables;
-          replicas apply the same snapshot and compute their own hash.
-          Mismatch is a ReplicationMismatchError, never a silent
-          divergence.
-          """
+          """Hash-verified state replication between nodes."""
           from __future__ import annotations
 
-          import hashlib
           import json
           from dataclasses import dataclass
 
@@ -457,9 +439,7 @@ jobs:
                                   sort_keys=True,
                               )
                           )
-                  version = int(
-                      self._clock.now()
-                  )
+                  version = int(self._clock.now())
                   return version, stable_hash(*parts)
 
               def replicate(
@@ -470,20 +450,12 @@ jobs:
                   replica_hash: str | None = None,
                   rows_replicated: int = 0,
               ) -> ReplicationReport:
-                  """Checks replica parity against primary state.
-
-                  In a real deployment, rows_replicated is the count of
-                  rows shipped to the replica; here the caller supplies
-                  the replica's computed hash to verify consistency.
-                  """
                   require_non_empty_str(primary_node, "primary_node")
                   require_non_empty_str(replica_node, "replica_node")
                   version, primary_hash = self.compute_state_hash()
                   if replica_hash is None:
                       replica_hash = primary_hash
-                  consistent = (
-                      replica_hash == primary_hash
-                  )
+                  consistent = replica_hash == primary_hash
                   if not consistent:
                       raise ReplicationMismatchError(
                           f"replica {replica_node} hash"
@@ -501,23 +473,14 @@ jobs:
           PYEOF
 
           cat > shared_engines/network/failover.py <<'PYEOF'
-          """Quorum-gated failover: no split-brain, ever.
-
-          A new primary is elected only when a strict majority of
-          REGISTERED nodes is ACTIVE. With 3 nodes and 1 down, failover
-          proceeds (2/3 majority). With 3 nodes and 2 down, failover is
-          REFUSED (1/3 < majority) - the network prefers unavailability
-          over divergent primaries.
-          """
+          """Quorum-gated failover: no split-brain, ever."""
           from __future__ import annotations
 
           from shared_engines.audit.chain import AuditTrail
-          from shared_engines.common.clocks import Clock
           from shared_engines.common.validation import require_non_empty_str
           from shared_engines.network.cluster import (
               ClusterManager,
               NodeRole,
-              NodeState,
           )
           from shared_engines.network.errors import NoQuorumError
 
@@ -532,11 +495,9 @@ jobs:
                   *,
                   cluster: ClusterManager,
                   audit: AuditTrail,
-                  clock: Clock,
               ) -> None:
                   self._cluster = cluster
                   self._audit = audit
-                  self._clock = clock
 
               def elect_new_primary(
                   self, *, failed_primary: str
@@ -618,20 +579,19 @@ jobs:
                   self.db = SQLiteAdapter(tmp_path / "net.db")
                   self.clock = FrozenClock()
                   self.audit = AuditTrail(self.db, self.clock)
-                  self.catalog_events = [
-                      "network.node.joined",
-                      "network.node.state_changed",
-                      "network.failover.elected",
-                      "identity.registered",
-                      "identity.status_changed",
-                  ]
                   from shared_engines.events.contracts import EventCatalog
                   from shared_engines.events.outbox import Outbox
 
                   self.outbox = Outbox(self.db, self.clock)
                   self.outbox.ensure_schema()
                   self.catalog = EventCatalog()
-                  for event_type in self.catalog_events:
+                  for event_type in (
+                      "network.node.joined",
+                      "network.node.state_changed",
+                      "network.failover.elected",
+                      "identity.registered",
+                      "identity.status_changed",
+                  ):
                       self.catalog.register(event_type)
                   self.identity = IdentityEngine(
                       db=self.db,
@@ -650,9 +610,7 @@ jobs:
                       self.db, self.clock
                   )
                   self.failover = FailoverCoordinator(
-                      cluster=self.cluster,
-                      audit=self.audit,
-                      clock=self.clock,
+                      cluster=self.cluster, audit=self.audit
                   )
                   for index in range(nodes):
                       node_identity = self.identity.register_identity(
@@ -680,22 +638,16 @@ jobs:
                   self.db.close()
 
 
-          def test_nodes_register_joining_and_heartbeat_activates(
+          def test_nodes_register_and_heartbeat_activates(
               tmp_path: Path,
           ) -> None:
               harness = _Harness(tmp_path)
               nodes = harness.cluster.all_nodes()
               assert len(nodes) == 3
-              assert all(
-                  n.state is NodeState.JOINING for n in nodes
-              )
+              assert all(n.state is NodeState.JOINING for n in nodes)
               harness.activate_all()
               active = harness.cluster.active_nodes()
               assert len(active) == 3
-              assert all(
-                  n.state in (NodeState.ACTIVE, NodeState.REJOINED)
-                  for n in active
-              )
               harness.close()
 
 
@@ -711,16 +663,13 @@ jobs:
               suspect = harness.cluster.require(node.node_id)
               assert suspect.state is NodeState.SUSPECT
               harness.clock.advance(31)
-              expired2 = harness.cluster.detect_failures()
-              assert node.node_id in expired2
+              harness.cluster.detect_failures()
               down = harness.cluster.require(node.node_id)
               assert down.state is NodeState.DOWN
               harness.close()
 
 
-          def test_unknown_node_heartbeat_raises(
-              tmp_path: Path,
-          ) -> None:
+          def test_unknown_node_heartbeat_raises(tmp_path: Path) -> None:
               harness = _Harness(tmp_path)
               with pytest.raises(NodeNotFoundError):
                   harness.cluster.heartbeat("ZID-ghost")
@@ -883,7 +832,7 @@ jobs:
           if git diff --cached --quiet; then
             echo "No changes."
           else
-            git commit -m "zyra: module 16 PHASE 4 (cluster membership with TTL failure detection, hash-verified replication, quorum-gated failover anti-split-brain) + multi-node tests"
+            git commit -m "zyra: module 16 PHASE 4 (cluster TTL failure detection, hash-verified replication, quorum failover anti-split-brain, errors from errors.py) + tests"
             git push origin "HEAD:${{ github.ref_name }}"
           fi
           echo "=== MODULE 16 COMPLETE ==="

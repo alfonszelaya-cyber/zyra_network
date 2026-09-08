@@ -1,4 +1,8 @@
-"""HTTP API over the kernel: stable routes, auth, envelopes."""
+"""HTTP API over the kernel: stable routes, auth, envelopes.
+
+Public (no auth): GET /health, POST /verify.
+Protected routes require Bearer token when configured.
+"""
 from __future__ import annotations
 
 import base64
@@ -80,6 +84,9 @@ class ZyraApiHandler(BaseHTTPRequestHandler):
         segments = [s for s in path.split("/") if s]
         if segments == ["health"] and method == "GET":
             self._handle_health()
+            return
+        if segments == ["verify"] and method == "POST":
+            self._handle_public_verify()
             return
         if not self._authorized():
             raise ApiError(
@@ -301,6 +308,26 @@ class ZyraApiHandler(BaseHTTPRequestHandler):
 
     def _ok(self, data: Any, status: int = 200) -> None:
         self._send_json(status, {"ok": True, "data": data})
+
+    def _handle_public_verify(self) -> None:
+        doc = self._read_json()
+        blob = self._require_str(doc, "attestation")
+        from shared_engines.verifier.verifier import (
+            verify_attestation_blob,
+        )
+
+        report = verify_attestation_blob(blob)
+        self._ok(
+            {
+                "valid": report.valid,
+                "reason": report.reason,
+                "attestation_id": report.attestation_id,
+                "subject_zid": report.subject_zid,
+                "claim": report.claim,
+                "issued_at": report.issued_at,
+                "key_fingerprint": report.key_fingerprint,
+            }
+        )
 
     def _handle_health(self) -> None:
         kernel = type(self).kernel

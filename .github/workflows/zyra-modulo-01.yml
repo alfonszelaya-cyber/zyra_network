@@ -1,4 +1,4 @@
-name: zyra-w14-engine-reputation
+name: zyra-w15-triple-engine
 
 "on":
   workflow_dispatch:
@@ -9,13 +9,13 @@ permissions:
   contents: write
 
 concurrency:
-  group: zyra-w14-${{ github.ref }}
+  group: zyra-w15-${{ github.ref }}
   cancel-in-progress: false
 
 jobs:
   build:
     runs-on: ubuntu-latest
-    timeout-minutes: 25
+    timeout-minutes: 30
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -31,18 +31,275 @@ jobs:
           python -m pip install --upgrade pip
           python -m pip install "cryptography>=42,<45" "flake8>=7,<8" "mypy>=1.10,<2" "pytest>=8,<9"
 
-      - name: Clean engine init (W391)
+      - name: Clean engine inits (W391)
         run: |
           set -euo pipefail
-          f="shared_engines/reputation/__init__.py"
-          [ -f "$f" ] && printf '"""ZYRA Network engine package."""\n' > "$f"
-          echo "init cleaned"
+          for f in compression scalability supervisor; do
+            p="shared_engines/$f/__init__.py"
+            [ -f "$p" ] && printf '"""ZYRA Network engine package."""\n' > "$p"
+          done
+          echo "inits cleaned"
 
-      - name: Fill reputation engine (evidence-backed scoring)
+      - name: Engine compression
         run: |
           set -euo pipefail
-          cat > shared_engines/reputation/errors.py <<'PYEOF'
-          """Typed reputation errors."""
+          cat > shared_engines/compression/errors.py <<'PYEOF'
+          """Typed compression errors."""
+          from __future__ import annotations
+
+          from shared_engines.common.errors import (
+              EngineError,
+              IntegrityError,
+          )
+
+
+          class CompressionLimitError(EngineError):
+              """Input or output exceeds configured
+              limits (decompression-bomb guard)."""
+
+
+          class MalformedEnvelopeError(
+              IntegrityError
+          ):
+              """Envelope is not a valid Zyra
+              compression envelope."""
+          PYEOF
+
+          cat > shared_engines/compression/engine.py <<'PYEOF'
+          """Compression engine: gzip with bomb guards.
+
+          Envelope is canonical JSON (zyra.comp.v1) carrying
+          the declared original size and the SHA-256 of the
+          plaintext. Decompression is STREAMING with a hard
+          output cap: a bomb cannot allocate memory beyond
+          the limit even if its header lies. Size and hash
+          are re-verified after inflation.
+
+          Pure utility layer: callers (engines above) are
+          responsible for auditing their own use of it.
+          """
+          from __future__ import annotations
+
+          import base64
+          import gzip
+          import hashlib
+          import zlib
+          from dataclasses import dataclass
+
+          from shared_engines.common.errors import (
+              IntegrityError,
+          )
+          from shared_engines.common.serialization import (
+              canonical_json_dumps,
+              canonical_json_loads,
+          )
+          from shared_engines.common.validation import (
+              require_int_range,
+          )
+          from shared_engines.compression.errors import (
+              CompressionLimitError,
+              MalformedEnvelopeError,
+          )
+
+          _FORMAT = "zyra.comp.v1"
+          _ALGO = "gzip"
+          _STEP = 64 * 1024
+
+
+          @dataclass(frozen=True)
+          class CompressionResult:
+              envelope: bytes
+              original_size: int
+              compressed_size: int
+              sha256: str
+
+
+          class CompressionEngine:
+              """Bounded gzip compress/decompress."""
+
+              def __init__(
+                  self,
+                  *,
+                  max_input_bytes: int = 10_000_000,
+                  max_output_bytes: int = 50_000_000,
+              ) -> None:
+                  require_int_range(
+                      max_input_bytes,
+                      "max_input_bytes",
+                      1,
+                      10**12,
+                      config=True,
+                  )
+                  require_int_range(
+                      max_output_bytes,
+                      "max_output_bytes",
+                      1,
+                      10**12,
+                      config=True,
+                  )
+                  self._max_in = max_input_bytes
+                  self._max_out = max_output_bytes
+
+              def compress(
+                  self, data: bytes
+              ) -> CompressionResult:
+                  if not data:
+                      raise ValueError(
+                          "data required"
+                      )
+                  if len(data) > self._max_in:
+                      raise CompressionLimitError(
+                          "input exceeds"
+                          f" {self._max_in} bytes"
+                      )
+                  compressed = gzip.compress(data)
+                  sha = hashlib.sha256(
+                      data
+                  ).hexdigest()
+                  envelope = canonical_json_dumps(
+                      {
+                          "format": _FORMAT,
+                          "algo": _ALGO,
+                          "original_size": len(
+                              data
+                          ),
+                          "sha256": sha,
+                          "data": base64.b64encode(
+                              compressed
+                          ).decode("ascii"),
+                      }
+                  ).encode("utf-8")
+                  return CompressionResult(
+                      envelope=envelope,
+                      original_size=len(data),
+                      compressed_size=len(
+                          envelope
+                      ),
+                      sha256=sha,
+                  )
+
+              def decompress(
+                  self, envelope: bytes
+              ) -> bytes:
+                  """Streaming inflate with hard cap;
+                  declared size + real size + hash all
+                  verified."""
+                  try:
+                      doc = canonical_json_loads(
+                          envelope.decode("utf-8")
+                      )
+                  except Exception as exc:
+                      raise (
+                          MalformedEnvelopeError(
+                              "envelope not"
+                              " decodable"
+                          )
+                      ) from exc
+                  if not isinstance(doc, dict) or (
+                      doc.get("format") != _FORMAT
+                      or doc.get("algo") != _ALGO
+                  ):
+                      raise (
+                          MalformedEnvelopeError(
+                              "unknown envelope"
+                              " format"
+                          )
+                      )
+                  declared = int(
+                      doc["original_size"]
+                  )
+                  if declared > self._max_out:
+                      raise CompressionLimitError(
+                          "declared size exceeds"
+                          f" {self._max_out} bytes"
+                      )
+                  compressed = base64.b64decode(
+                      str(doc["data"]),
+                      validate=True,
+                  )
+                  data = self._gunzip_limited(
+                      compressed
+                  )
+                  if len(data) != declared:
+                      raise IntegrityError(
+                          "size mismatch:"
+                          f" {len(data)} !="
+                          f" {declared}"
+                      )
+                  if (
+                      hashlib.sha256(
+                          data
+                      ).hexdigest()
+                      != doc["sha256"]
+                  ):
+                      raise IntegrityError(
+                          "sha256 mismatch after"
+                          " inflate"
+                      )
+                  return data
+
+              def _gunzip_limited(
+                  self, compressed: bytes
+              ) -> bytes:
+                  deco = zlib.decompressobj(wbits=31)
+                  out = bytearray()
+                  start = 0
+                  total = len(compressed)
+                  while start < total and not deco.eof:
+                      end = start + _STEP
+                      part = compressed[start:end]
+                      room = (
+                          self._max_out
+                          - len(out)
+                          + 1
+                      )
+                      out += deco.decompress(
+                          part, room
+                      )
+                      if len(out) > self._max_out:
+                          raise (
+                              CompressionLimitError(
+                                  "inflated output"
+                                  " exceeds limit"
+                              )
+                          )
+                      start = end
+                  while (
+                      not deco.eof
+                      and deco.unconsumed_tail
+                  ):
+                      room = (
+                          self._max_out
+                          - len(out)
+                          + 1
+                      )
+                      out += deco.decompress(
+                          deco.unconsumed_tail,
+                          room,
+                      )
+                      if len(out) > self._max_out:
+                          raise (
+                              CompressionLimitError(
+                                  "inflated output"
+                                  " exceeds limit"
+                              )
+                          )
+                  if not deco.eof:
+                      raise (
+                          MalformedEnvelopeError(
+                              "truncated gzip"
+                              " stream"
+                          )
+                      )
+                  return bytes(out)
+          PYEOF
+          echo "=== COMPRESSION READY ==="
+
+      - name: Engine scalability
+        run: |
+          set -euo pipefail
+          cat > shared_engines/scalability/errors.py <<'PYEOF'
+          """Typed scalability errors."""
           from __future__ import annotations
 
           from shared_engines.common.errors import (
@@ -50,195 +307,43 @@ jobs:
           )
 
 
-          class SelfReputationError(EngineError):
-              """An entity cannot rate itself."""
-
-
-          class UnknownEntityError(EngineError):
-              """Subject or actor identity unknown."""
-
-
-          class EmptyEvidenceError(EngineError):
-              """Evidence bytes are required."""
+          class CapacityNotDefinedError(
+              EngineError
+          ):
+              """Resource has no registered capacity."""
           PYEOF
 
-          cat > shared_engines/reputation/contracts.py <<'PYEOF'
-          """Reputation contracts."""
-          from __future__ import annotations
+          cat > shared_engines/scalability/engine.py <<'PYEOF'
+          """Scalability engine: capacity, backpressure,
+          deterministic partitioning.
 
-          from dataclasses import dataclass
+          - Capacity: bounded resources; admission refuses
+            beyond the limit using the common BackpressureError.
+          - Partitioning: stable sha256-based keys, so an
+            entity always maps to the same partition while
+            spreading load evenly.
 
-          KIND_POSITIVE = "positive"
-          KIND_NEGATIVE = "negative"
-
-          EVENT_KINDS = (
-              KIND_POSITIVE,
-              KIND_NEGATIVE,
-          )
-
-
-          @dataclass(frozen=True)
-          class ReputationEvent:
-              """One evidence-backed reputation event."""
-
-              event_id: str
-              seq: int
-              subject_zid: str
-              actor_zid: str
-              kind: str
-              weight: float
-              evidence_sha: str
-              proof_id: str
-              created_at: float
-
-
-          @dataclass(frozen=True)
-          class ReputationSummary:
-              """Computed, evidence-backed state."""
-
-              subject_zid: str
-              score: int
-              positive_events: int
-              negative_events: int
-              last_event_at: float | None
-          PYEOF
-
-          cat > shared_engines/reputation/policy.py <<'PYEOF'
-          """Reputation policy: explicit, inspectable rules.
-
-          Score is NEVER a magic increment: every event
-          contributes weight * sign, decayed by a half-life.
-          The policy is a frozen value injected at
-          construction, so different deployments can use
-          different rules while the arithmetic stays
-          transparent and auditable.
-          """
-          from __future__ import annotations
-
-          from dataclasses import dataclass
-
-          from shared_engines.common.validation import (
-              require_positive_number,
-          )
-
-
-          @dataclass(frozen=True)
-          class ReputationPolicy:
-              """Scoring rules (all positive numbers)."""
-
-              weight_per_event: float = 10.0
-              half_life_seconds: float = 100.0
-
-              def __post_init__(self) -> None:
-                  require_positive_number(
-                      self.weight_per_event,
-                      "weight_per_event",
-                  )
-                  require_positive_number(
-                      self.half_life_seconds,
-                      "half_life_seconds",
-                  )
-
-              def decay_factor(
-                  self,
-                  *,
-                  age_seconds: float,
-              ) -> float:
-                  """0.5 ** (age / half_life): fresh
-                  evidence counts fully; old evidence
-                  fades. float() wrapping because
-                  float ** float is typed Any in the
-                  stdlib stubs (may be complex)."""
-                  if age_seconds <= 0.0:
-                      return 1.0
-                  exponent = (
-                      -age_seconds
-                      / self.half_life_seconds
-                  )
-                  return float(2.0**exponent)
-          PYEOF
-
-          cat > shared_engines/reputation/engine.py <<'PYEOF'
-          """Reputation engine: evidence -> score, nothing
-          else.
-
-          Flow per event:
-
-              actor (another ZID, never self)
-                    |
-                    v
-              evidence bytes (real content)
-                    |
-                    v
-              IntegrityEngine.issue_proof
-              (durable, verifiable SHA-256)
-                    |
-                    v
-              reputation_events append-only row
-              (seq per subject, evidence_sha, proof_id)
-                    |
-                    v
-              score = sum(sign * weight
-                          * decay(age))
-              (policy-driven, transparent)
-
-          Guarantees:
-
-          - No self-rating: actor != subject, both must
-            be known identities.
-          - Evidence inmutable: every event carries a
-            verifiable integrity proof id; the evidence
-            hash is stored, so tampering with history
-            is detectable by recomputing.
-          - Deterministic score: pure function of the
-            event list, the policy and the clock.
-          - Every event is audited and emitted as
-            reputation.event.recorded.
-
-          Deliberately separate from TokenLedger: tokens
-          are spendable currency; reputation is earned
-          trust with evidence and time decay.
+          Pure utility layer for engines that need bounded
+          queues/shards; composition roots decide policy.
           """
           from __future__ import annotations
 
           import hashlib
-          import sqlite3
+          from dataclasses import dataclass
 
-          from shared_engines.audit.chain import AuditTrail
           from shared_engines.common.clocks import Clock
           from shared_engines.common.errors import (
-              NotFoundError,
-          )
-          from shared_engines.common.identifiers import (
-              new_id,
+              BackpressureError,
           )
           from shared_engines.common.serialization import (
               canonical_json_dumps,
           )
           from shared_engines.common.validation import (
+              require_int_range,
               require_non_empty_str,
           )
-          from shared_engines.events.outbox import Outbox
-          from shared_engines.identity.engine import (
-              IdentityEngine,
-          )
-          from shared_engines.integrity.engine import (
-              IntegrityEngine,
-          )
-          from shared_engines.reputation.contracts import (
-              EVENT_KINDS,
-              KIND_NEGATIVE,
-              KIND_POSITIVE,
-              ReputationEvent,
-              ReputationSummary,
-          )
-          from shared_engines.reputation.errors import (
-              EmptyEvidenceError,
-              SelfReputationError,
-              UnknownEntityError,
-          )
-          from shared_engines.reputation.policy import (
-              ReputationPolicy,
+          from shared_engines.scalability.errors import (
+              CapacityNotDefinedError,
           )
           from shared_engines.storage.database import (
               Database,
@@ -248,391 +353,768 @@ jobs:
               MigrationRunner,
           )
 
-          EVENT_RECORDED = (
-              "reputation.event.recorded"
-          )
-
           _MIGRATIONS = (
               Migration(
                   1,
-                  "reputation_events",
+                  "scalability_capacity",
                   (
                       "CREATE TABLE"
-                      " reputation_events ("
-                      " event_id TEXT PRIMARY KEY,"
-                      " seq INTEGER NOT NULL,"
-                      " subject_zid TEXT NOT NULL,"
-                      " actor_zid TEXT NOT NULL,"
-                      " kind TEXT NOT NULL,"
-                      " weight REAL NOT NULL,"
-                      " evidence_sha TEXT NOT NULL,"
-                      " proof_id TEXT NOT NULL,"
-                      " created_at REAL NOT NULL)",
-                      "CREATE INDEX rep_subject"
-                      " ON reputation_events"
-                      " (subject_zid, seq)",
+                      " scalability_capacity ("
+                      " resource TEXT PRIMARY KEY,"
+                      " max_items INTEGER NOT NULL,"
+                      " used INTEGER NOT NULL,"
+                      " updated_at REAL NOT NULL)",
                   ),
               ),
           )
 
 
-          class ReputationEngine:
-              """Evidence-backed trust scoring."""
+          @dataclass(frozen=True)
+          class CapacityRecord:
+              resource: str
+              max_items: int
+              used: int
+
+
+          class ScalabilityEngine:
+              """Bounded resources + stable shards."""
+
+              def __init__(
+                  self, db: Database, clock: Clock
+              ) -> None:
+                  self._db = db
+                  self._clock = clock
+                  MigrationRunner(
+                      db,
+                      "scalability",
+                      _MIGRATIONS,
+                  ).run(clock)
+
+              def define_capacity(
+                  self,
+                  *,
+                  resource: str,
+                  max_items: int,
+              ) -> CapacityRecord:
+                  require_non_empty_str(
+                      resource, "resource"
+                  )
+                  require_int_range(
+                      max_items,
+                      "max_items",
+                      1,
+                      10**12,
+                  )
+                  with (
+                      self._db.transaction()
+                      as cursor
+                  ):
+                      cursor.execute(
+                          "INSERT INTO"
+                          " scalability_capacity"
+                          " (resource, max_items,"
+                          "  used, updated_at)"
+                          " VALUES (?, ?, 0, ?)"
+                          " ON CONFLICT(resource)"
+                          " DO UPDATE SET"
+                          " max_items ="
+                          " excluded.max_items,"
+                          " updated_at ="
+                          " excluded.updated_at",
+                          (
+                              resource,
+                              max_items,
+                              self._clock.now(),
+                          ),
+                      )
+                  return self.usage(
+                      resource=resource
+                  )
+
+              def _row(
+                  self, resource: str
+              ) -> CapacityRecord:
+                  row = self._db.query_one(
+                      "SELECT * FROM"
+                      " scalability_capacity"
+                      " WHERE resource = ?",
+                      (resource,),
+                  )
+                  if row is None:
+                      raise (
+                          CapacityNotDefinedError(
+                              "no capacity for"
+                              f" '{resource}'"
+                          )
+                      )
+                  return CapacityRecord(
+                      resource=str(
+                          row["resource"]
+                      ),
+                      max_items=int(
+                          row["max_items"]
+                      ),
+                      used=int(row["used"]),
+                  )
+
+              def admit(
+                  self,
+                  *,
+                  resource: str,
+                  requested: int = 1,
+              ) -> CapacityRecord:
+                  """Take n slots or refuse with the
+                  common BackpressureError."""
+                  require_int_range(
+                      requested, "requested", 1, 10**9
+                  )
+                  current = self._row(resource)
+                  projected = (
+                      current.used + requested
+                  )
+                  if projected > current.max_items:
+                      raise BackpressureError(
+                          f"'{resource}' full:"
+                          f" {current.used}/"
+                          f"{current.max_items},"
+                          f" requested {requested}"
+                      )
+                  with (
+                      self._db.transaction()
+                      as cursor
+                  ):
+                      cursor.execute(
+                          "UPDATE"
+                          " scalability_capacity"
+                          " SET used = ?,"
+                          " updated_at = ?"
+                          " WHERE resource = ?"
+                          " AND used + ? <="
+                          " max_items",
+                          (
+                              projected,
+                              self._clock.now(),
+                              resource,
+                              requested,
+                          ),
+                      )
+                  return CapacityRecord(
+                      resource=resource,
+                      max_items=(
+                          current.max_items
+                      ),
+                      used=projected,
+                  )
+
+              def release(
+                  self,
+                  *,
+                  resource: str,
+                  amount: int = 1,
+              ) -> CapacityRecord:
+                  require_int_range(
+                      amount, "amount", 1, 10**9
+                  )
+                  current = self._row(resource)
+                  freed = max(
+                      0, current.used - amount
+                  )
+                  with (
+                      self._db.transaction()
+                      as cursor
+                  ):
+                      cursor.execute(
+                          "UPDATE"
+                          " scalability_capacity"
+                          " SET used = ?,"
+                          " updated_at = ?"
+                          " WHERE resource = ?",
+                          (
+                              freed,
+                              self._clock.now(),
+                              resource,
+                          ),
+                      )
+                  return CapacityRecord(
+                      resource=resource,
+                      max_items=(
+                          current.max_items
+                      ),
+                      used=freed,
+                  )
+
+              def usage(
+                  self, *, resource: str
+              ) -> CapacityRecord:
+                  require_non_empty_str(
+                      resource, "resource"
+                  )
+                  return self._row(resource)
+
+              @staticmethod
+              def partition_key(
+                  *,
+                  entity_id: str,
+                  partitions: int,
+              ) -> int:
+                  """Stable shard: same entity always
+                  maps to the same partition."""
+                  require_non_empty_str(
+                      entity_id, "entity_id"
+                  )
+                  require_int_range(
+                      partitions,
+                      "partitions",
+                      1,
+                      10_000,
+                  )
+                  digest = hashlib.sha256(
+                      canonical_json_dumps(
+                          {"e": entity_id}
+                      ).encode("utf-8")
+                  ).hexdigest()
+                  return int(digest, 16) % partitions
+          PYEOF
+          echo "=== SCALABILITY READY ==="
+
+      - name: Engine supervisor
+        run: |
+          set -euo pipefail
+          cat > shared_engines/supervisor/errors.py <<'PYEOF'
+          """Typed supervisor errors."""
+          from __future__ import annotations
+
+          from shared_engines.common.errors import (
+              EngineError,
+          )
+
+
+          class UnknownComponentError(EngineError):
+              """Component not registered."""
+
+
+          class QuarantinedError(EngineError):
+              """Component exceeded its restart budget
+              and is quarantined."""
+          PYEOF
+
+          cat > shared_engines/supervisor/engine.py <<'PYEOF'
+          """Supervisor engine: component lifecycle with a
+          restart budget.
+
+          States: REGISTERED -> RUNNING <-> FAILED, with
+          QUARANTINED as terminal when the restart budget is
+          exhausted (a component that keeps dying is stopped
+          from thrashing the Network). Every failure and
+          restart is audited via the existing AuditTrail.
+          """
+          from __future__ import annotations
+
+          from dataclasses import dataclass
+
+          from shared_engines.audit.chain import AuditTrail
+          from shared_engines.common.clocks import Clock
+          from shared_engines.common.validation import (
+              require_int_range,
+              require_non_empty_str,
+          )
+          from shared_engines.storage.database import (
+              Database,
+          )
+          from shared_engines.storage.migrations import (
+              Migration,
+              MigrationRunner,
+          )
+          from shared_engines.supervisor.errors import (
+              QuarantinedError,
+              UnknownComponentError,
+          )
+
+          STATE_REGISTERED = "REGISTERED"
+          STATE_RUNNING = "RUNNING"
+          STATE_FAILED = "FAILED"
+          STATE_QUARANTINED = "QUARANTINED"
+
+          EVENT_SUPERVISOR_RESTART = (
+              "supervisor.component.restarted"
+          )
+          EVENT_SUPERVISOR_FAILED = (
+              "supervisor.component.failed"
+          )
+
+          _MIGRATIONS = (
+              Migration(
+                  1,
+                  "supervisor_components",
+                  (
+                      "CREATE TABLE"
+                      " supervisor_components ("
+                      " name TEXT PRIMARY KEY,"
+                      " kind TEXT NOT NULL,"
+                      " state TEXT NOT NULL,"
+                      " max_restarts INTEGER"
+                      " NOT NULL,"
+                      " failures INTEGER NOT NULL"
+                      " DEFAULT 0,"
+                      " restarts INTEGER NOT NULL"
+                      " DEFAULT 0,"
+                      " last_reason TEXT,"
+                      " last_transition REAL"
+                      " NOT NULL)",
+                  ),
+              ),
+          )
+
+
+          @dataclass(frozen=True)
+          class ComponentRecord:
+              name: str
+              kind: str
+              state: str
+              failures: int
+              restarts: int
+              max_restarts: int
+              last_reason: str | None
+
+
+          class SupervisorEngine:
+              """Lifecycle with restart budget."""
 
               def __init__(
                   self,
                   db: Database,
                   clock: Clock,
                   *,
-                  identity: IdentityEngine,
-                  integrity: IntegrityEngine,
                   audit: AuditTrail,
-                  outbox: Outbox,
-                  policy: ReputationPolicy
-                  | None = None,
               ) -> None:
                   self._db = db
                   self._clock = clock
-                  self._identity = identity
-                  self._integrity = integrity
                   self._audit = audit
-                  self._outbox = outbox
-                  self._policy = (
-                      policy or ReputationPolicy()
-                  )
                   MigrationRunner(
                       db,
-                      "reputation",
+                      "supervisor",
                       _MIGRATIONS,
                   ).run(clock)
 
-              def _emit(
-                  self,
-                  cursor: sqlite3.Cursor,
-                  *,
-                  subject_zid: str,
-                  event_id: str,
-                  kind: str,
-              ) -> None:
-                  uid = hashlib.sha256(
-                      canonical_json_dumps(
-                          {
-                              "e": event_id,
-                              "u": new_id(),
-                          }
-                      ).encode("utf-8")
-                  ).hexdigest()[:32]
-                  fp = hashlib.sha256(
-                      canonical_json_dumps(
-                          {
-                              "id": uid,
-                              "ty": EVENT_RECORDED,
-                          }
-                      ).encode("utf-8")
-                  ).hexdigest()
-                  cursor.execute(
-                      "INSERT INTO events_outbox"
-                      " (event_id, event_type,"
-                      " aggregate_id, schema_version,"
-                      " envelope_version, created_at,"
-                      " payload, fingerprint,"
-                      " published_at)"
-                      " VALUES (?, ?, ?, 1, 1, ?, ?,"
-                      " ?, NULL)",
-                      (
-                          uid,
-                          EVENT_RECORDED,
-                          subject_zid,
-                          self._clock.now(),
-                          canonical_json_dumps(
-                              {
-                                  "event_id": event_id,
-                                  "kind": kind,
-                              }
-                          ),
-                          fp,
+              def _row(self, name: str) -> ComponentRecord:
+                  row = self._db.query_one(
+                      "SELECT * FROM"
+                      " supervisor_components"
+                      " WHERE name = ?",
+                      (name,),
+                  )
+                  if row is None:
+                      raise UnknownComponentError(
+                          f"unknown component:"
+                          f" {name}"
+                      )
+                  return ComponentRecord(
+                      name=str(row["name"]),
+                      kind=str(row["kind"]),
+                      state=str(row["state"]),
+                      failures=int(
+                          row["failures"]
+                      ),
+                      restarts=int(
+                          row["restarts"]
+                      ),
+                      max_restarts=int(
+                          row["max_restarts"]
+                      ),
+                      last_reason=(
+                          str(
+                              row["last_reason"]
+                          )
+                          if row["last_reason"]
+                          is not None
+                          else None
                       ),
                   )
 
-              def record_event(
+              def register(
                   self,
                   *,
-                  subject_zid: str,
-                  actor_zid: str,
+                  name: str,
                   kind: str,
-                  evidence: bytes,
-              ) -> ReputationEvent:
-                  """One evidence-backed reputation
-                  event. Refuses self-rating, unknown
-                  entities, empty evidence and unknown
-                  kinds."""
+                  max_restarts: int = 3,
+              ) -> ComponentRecord:
                   require_non_empty_str(
-                      subject_zid, "subject_zid"
+                      name, "name"
                   )
                   require_non_empty_str(
-                      actor_zid, "actor_zid"
+                      kind, "kind"
                   )
-                  if kind not in EVENT_KINDS:
-                      raise ValueError(
-                          f"unknown kind: {kind}"
-                      )
-                  if actor_zid == subject_zid:
-                      raise SelfReputationError(
-                          "an entity cannot rate"
-                          " itself"
-                      )
-                  if not evidence:
-                      raise EmptyEvidenceError(
-                          "evidence bytes required"
-                      )
-                  try:
-                      self._identity.require_identity(
-                          subject_zid
-                      )
-                  except Exception as exc:
-                      raise UnknownEntityError(
-                          "unknown subject:"
-                          f" {subject_zid}"
-                      ) from exc
-                  try:
-                      self._identity.require_identity(
-                          actor_zid
-                      )
-                  except Exception as exc:
-                      raise UnknownEntityError(
-                          "unknown actor:"
-                          f" {actor_zid}"
-                      ) from exc
-                  event_id = f"REP-{new_id()}"
-                  proof = self._integrity.issue_proof(
-                      subject=event_id,
-                      data=evidence,
+                  require_int_range(
+                      max_restarts,
+                      "max_restarts",
+                      1,
+                      100,
                   )
-                  evidence_sha = (
-                      self._integrity.digest_bytes(
-                          evidence
-                      )
-                  )
-                  now = self._clock.now()
                   with (
                       self._db.transaction()
                       as cursor
                   ):
-                      row = cursor.execute(
-                          "SELECT COALESCE(MAX(seq),"
-                          " 0) AS last FROM"
-                          " reputation_events"
-                          " WHERE subject_zid = ?",
-                          (subject_zid,),
-                      ).fetchone()
-                      seq = (
-                          int(row["last"]) + 1
-                          if row is not None
-                          else 1
-                      )
                       cursor.execute(
                           "INSERT INTO"
-                          " reputation_events"
-                          " (event_id, seq,"
-                          "  subject_zid, actor_zid,"
-                          "  kind, weight,"
-                          "  evidence_sha, proof_id,"
-                          "  created_at)"
-                          " VALUES (?, ?, ?, ?, ?, ?,"
-                          "  ?, ?, ?)",
+                          " supervisor_components"
+                          " (name, kind, state,"
+                          "  max_restarts,"
+                          "  last_transition)"
+                          " VALUES (?, ?, ?, ?, ?)"
+                          " ON CONFLICT(name) DO"
+                          " NOTHING",
                           (
-                              event_id,
-                              seq,
-                              subject_zid,
-                              actor_zid,
+                              name,
                               kind,
-                              self._policy
-                              .weight_per_event,
-                              evidence_sha,
-                              proof.proof_id,
-                              now,
+                              STATE_REGISTERED,
+                              max_restarts,
+                              self._clock.now(),
                           ),
                       )
-                      self._emit(
-                          cursor,
-                          subject_zid=subject_zid,
-                          event_id=event_id,
-                          kind=kind,
+                  return self._row(name)
+
+              def mark_running(
+                  self, *, name: str
+              ) -> ComponentRecord:
+                  current = self._row(name)
+                  if (
+                      current.state
+                      == STATE_QUARANTINED
+                  ):
+                      raise QuarantinedError(
+                          f"'{name}' is"
+                          " quarantined"
+                      )
+                  with (
+                      self._db.transaction()
+                      as cursor
+                  ):
+                      cursor.execute(
+                          "UPDATE"
+                          " supervisor_components"
+                          " SET state = ?,"
+                          " last_transition = ?"
+                          " WHERE name = ?",
+                          (
+                              STATE_RUNNING,
+                              self._clock.now(),
+                              name,
+                          ),
+                      )
+                  return self._row(name)
+
+              def mark_failed(
+                  self,
+                  *,
+                  name: str,
+                  reason: str,
+              ) -> ComponentRecord:
+                  current = self._row(name)
+                  require_non_empty_str(
+                      reason, "reason"
+                  )
+                  with (
+                      self._db.transaction()
+                      as cursor
+                  ):
+                      cursor.execute(
+                          "UPDATE"
+                          " supervisor_components"
+                          " SET state = ?,"
+                          " failures = failures + 1,"
+                          " last_reason = ?,"
+                          " last_transition = ?"
+                          " WHERE name = ?",
+                          (
+                              STATE_FAILED,
+                              reason,
+                              self._clock.now(),
+                              name,
+                          ),
                       )
                   self._audit.append(
-                      event_type=EVENT_RECORDED,
-                      actor=actor_zid,
-                      subject=subject_zid,
-                      payload={
-                          "event_id": event_id,
-                          "kind": kind,
-                          "proof_id": (
-                              proof.proof_id
+                      event_type=(
+                          EVENT_SUPERVISOR_FAILED
+                      ),
+                      actor="supervisor",
+                      subject=name,
+                      payload={"reason": reason},
+                  )
+                  return self._row(name)
+
+              def record_restart(
+                  self,
+                  *,
+                  name: str,
+                  actor: str,
+              ) -> ComponentRecord:
+                  """One supervised restart; over budget
+                  the component is quarantined."""
+                  require_non_empty_str(
+                      actor, "actor"
+                  )
+                  current = self._row(name)
+                  restarts = (
+                      current.restarts + 1
+                  )
+                  if (
+                      restarts
+                      > current.max_restarts
+                  ):
+                      state = STATE_QUARANTINED
+                  else:
+                      state = STATE_RUNNING
+                  with (
+                      self._db.transaction()
+                      as cursor
+                  ):
+                      cursor.execute(
+                          "UPDATE"
+                          " supervisor_components"
+                          " SET state = ?,"
+                          " restarts = ?,"
+                          " last_transition = ?"
+                          " WHERE name = ?",
+                          (
+                              state,
+                              restarts,
+                              self._clock.now(),
+                              name,
                           ),
+                      )
+                  self._audit.append(
+                      event_type=(
+                          EVENT_SUPERVISOR_RESTART
+                      ),
+                      actor=actor,
+                      subject=name,
+                      payload={
+                          "restarts": restarts,
+                          "state": state,
                       },
                   )
-                  return ReputationEvent(
-                      event_id=event_id,
-                      seq=seq,
-                      subject_zid=subject_zid,
-                      actor_zid=actor_zid,
-                      kind=kind,
-                      weight=self._policy
-                      .weight_per_event,
-                      evidence_sha=evidence_sha,
-                      proof_id=proof.proof_id,
-                      created_at=now,
-                  )
+                  record = self._row(name)
+                  if (
+                      record.state
+                      == STATE_QUARANTINED
+                  ):
+                      raise QuarantinedError(
+                          f"'{name}' exceeded"
+                          " restart budget"
+                          f" ({record.restarts}"
+                          ">"
+                          f"{record.max_restarts})"
+                          " - quarantined"
+                      )
+                  return record
 
-              def _events(
-                  self, *, subject_zid: str
-              ) -> tuple[ReputationEvent, ...]:
+              def snapshot(
+                  self,
+              ) -> tuple[ComponentRecord, ...]:
                   rows = self._db.query_all(
-                      "SELECT * FROM"
-                      " reputation_events"
-                      " WHERE subject_zid = ?"
-                      " ORDER BY seq",
-                      (subject_zid,),
+                      "SELECT name FROM"
+                      " supervisor_components"
+                      " ORDER BY name"
                   )
                   return tuple(
-                      ReputationEvent(
-                          event_id=str(
-                              r["event_id"]
-                          ),
-                          seq=int(r["seq"]),
-                          subject_zid=str(
-                              r["subject_zid"]
-                          ),
-                          actor_zid=str(
-                              r["actor_zid"]
-                          ),
-                          kind=str(r["kind"]),
-                          weight=float(
-                              r["weight"]
-                          ),
-                          evidence_sha=str(
-                              r["evidence_sha"]
-                          ),
-                          proof_id=str(
-                              r["proof_id"]
-                          ),
-                          created_at=float(
-                              r["created_at"]
-                          ),
+                      self._row(
+                          str(r["name"])
                       )
                       for r in rows
                   )
-
-              def score(
-                  self, *, subject_zid: str
-              ) -> int:
-                  """Deterministic decayed score:
-                  sum(sign * weight * decay(age)),
-                  floored at zero."""
-                  require_non_empty_str(
-                      subject_zid, "subject_zid"
-                  )
-                  now = self._clock.now()
-                  total = 0.0
-                  for ev in self._events(
-                      subject_zid=subject_zid
-                  ):
-                      age = max(
-                          0.0,
-                          now - ev.created_at,
-                      )
-                      factor = (
-                          self._policy.decay_factor(
-                              age_seconds=age
-                          )
-                      )
-                      sign = (
-                          1.0
-                          if ev.kind == KIND_POSITIVE
-                          else -1.0
-                      )
-                      total += (
-                          sign
-                          * self._policy
-                          .weight_per_event
-                          * factor
-                      )
-                  return max(
-                      0, int(round(total))
-                  )
-
-              def summary(
-                  self, *, subject_zid: str
-              ) -> ReputationSummary:
-                  events = self._events(
-                      subject_zid=subject_zid
-                  )
-                  positives = sum(
-                      1
-                      for e in events
-                      if e.kind == KIND_POSITIVE
-                  )
-                  negatives = sum(
-                      1
-                      for e in events
-                      if e.kind == KIND_NEGATIVE
-                  )
-                  last = (
-                      max(
-                          e.created_at
-                          for e in events
-                      )
-                      if events
-                      else None
-                  )
-                  return ReputationSummary(
-                      subject_zid=subject_zid,
-                      score=self.score(
-                          subject_zid=subject_zid
-                      ),
-                      positive_events=positives,
-                      negative_events=negatives,
-                      last_event_at=last,
-                  )
-
-              def verify_evidence(
-                  self,
-                  *,
-                  event_id: str,
-                  evidence: bytes,
-              ) -> bool:
-                  """Re-verify historic evidence against
-                  its stored integrity proof."""
-                  row = self._db.query_one(
-                      "SELECT proof_id FROM"
-                      " reputation_events"
-                      " WHERE event_id = ?",
-                      (event_id,),
-                  )
-                  if row is None:
-                      raise NotFoundError(
-                          "unknown reputation"
-                          f" event: {event_id}"
-                      )
-                  return (
-                      self._integrity.verify_proof(
-                          proof_id=str(
-                              row["proof_id"]
-                          ),
-                          data=evidence,
-                      )
-                  )
           PYEOF
-          echo "=== REPUTATION ENGINE READY ==="
+          echo "=== SUPERVISOR READY ==="
 
-      - name: Reputation proofs (4)
+      - name: Engine proofs (compression x3, scalability x3, supervisor x3)
         run: |
           set -euo pipefail
-          mkdir -p shared_engines/reputation/tests
-          cat > shared_engines/reputation/tests/test_reputation.py <<'PYEOF'
-          """Reputation proofs: evidence-backed scoring,
-          self-rating refused, mixed signs, temporal decay,
-          evidence re-verification."""
+          mkdir -p shared_engines/compression/tests shared_engines/scalability/tests shared_engines/supervisor/tests
+
+          cat > shared_engines/compression/tests/test_compression.py <<'PYEOF'
+          """Compression proofs: roundtrip, bomb guard,
+          corrupted envelope."""
+          from __future__ import annotations
+
+          import gzip
+
+          import pytest
+
+          from shared_engines.common.errors import (
+              IntegrityError,
+          )
+          from shared_engines.compression.engine import (
+              CompressionEngine,
+          )
+          from shared_engines.compression.errors import (
+              CompressionLimitError,
+              MalformedEnvelopeError,
+          )
+
+
+          def test_roundtrip_and_sizes() -> None:
+              engine = CompressionEngine()
+              data = b"expediente completo" * 1000
+              result = engine.compress(data)
+              assert (
+                  result.original_size == len(data)
+              )
+              assert (
+                  result.compressed_size
+                  < len(data)
+              )
+              assert (
+                  engine.decompress(
+                      result.envelope
+                  )
+                  == data
+              )
+
+
+          def test_bomb_guard() -> None:
+              small = CompressionEngine(
+                  max_input_bytes=1_000_000,
+                  max_output_bytes=100_000,
+              )
+              bomb = b"\x00" * 1_000_000
+              tiny = b"\x00" * 500_000
+              envelope = small.compress(tiny)
+              with pytest.raises(
+                  CompressionLimitError
+              ):
+                  small.decompress(
+                      envelope.envelope
+                  )
+              bigger = b"\x00" * 2_000_000
+              with pytest.raises(
+                  CompressionLimitError
+              ):
+                  small.compress(bigger)
+              assert len(gzip.compress(bomb)) < 10_000
+
+
+          def test_corrupted_envelope() -> None:
+              engine = CompressionEngine()
+              with pytest.raises(
+                  MalformedEnvelopeError
+              ):
+                  engine.decompress(b"not-json")
+              result = engine.compress(b"data")
+              broken = (
+                  result.envelope[:-4]
+                  + b'????}'
+              )
+              with pytest.raises(IntegrityError):
+                  engine.decompress(broken)
+          PYEOF
+
+          cat > shared_engines/scalability/tests/test_scalability.py <<'PYEOF'
+          """Scalability proofs: bounded admission with
+          BackpressureError, release, stable partitioning."""
+          from __future__ import annotations
+
+          from pathlib import Path
+
+          import pytest
+
+          from shared_engines.common.clocks import (
+              FrozenClock,
+          )
+          from shared_engines.common.errors import (
+              BackpressureError,
+          )
+          from shared_engines.scalability.engine import (
+              ScalabilityEngine,
+          )
+          from shared_engines.scalability.errors import (
+              CapacityNotDefinedError,
+          )
+          from shared_engines.storage.database import (
+              SQLiteAdapter,
+          )
+
+
+          def _engine(tmp_path: Path) -> ScalabilityEngine:
+              db = SQLiteAdapter(
+                  tmp_path / "scale.db"
+              )
+              clock = FrozenClock()
+              return ScalabilityEngine(db, clock)
+
+
+          def test_admission_until_backpressure(
+              tmp_path: Path,
+          ) -> None:
+              engine = _engine(tmp_path)
+              engine.define_capacity(
+                  resource="queue-a", max_items=3
+              )
+              assert engine.admit(
+                  resource="queue-a"
+              ).used == 1
+              assert engine.admit(
+                  resource="queue-a"
+              ).used == 2
+              assert engine.admit(
+                  resource="queue-a"
+              ).used == 3
+              with pytest.raises(
+                  BackpressureError
+              ):
+                  engine.admit(resource="queue-a")
+              with pytest.raises(
+                  CapacityNotDefinedError
+              ):
+                  engine.admit(resource="ghost")
+
+
+          def test_release_reopens_capacity(
+              tmp_path: Path,
+          ) -> None:
+              engine = _engine(tmp_path)
+              engine.define_capacity(
+                  resource="q", max_items=2
+              )
+              engine.admit(resource="q")
+              engine.admit(resource="q")
+              with pytest.raises(
+                  BackpressureError
+              ):
+                  engine.admit(resource="q")
+              freed = engine.release(
+                  resource="q", amount=1
+              )
+              assert freed.used == 1
+              assert engine.admit(
+                  resource="q"
+              ).used == 2
+
+
+          def test_partition_key_stable_and_ranged(
+              tmp_path: Path,
+          ) -> None:
+              k1 = ScalabilityEngine.partition_key(
+                  entity_id="ZID-123",
+                  partitions=8,
+              )
+              k2 = ScalabilityEngine.partition_key(
+                  entity_id="ZID-123",
+                  partitions=8,
+              )
+              assert k1 == k2
+              assert 0 <= k1 < 8
+              spread = {
+                  ScalabilityEngine.partition_key(
+                      entity_id=f"e{i}",
+                      partitions=8,
+                  )
+                  for i in range(200)
+              }
+              assert len(spread) > 5
+          PYEOF
+
+          cat > shared_engines/supervisor/tests/test_supervisor.py <<'PYEOF'
+          """Supervisor proofs: lifecycle with audit,
+          restart budget to quarantine, unknown refused."""
           from __future__ import annotations
 
           from pathlib import Path
@@ -643,303 +1125,152 @@ jobs:
           from shared_engines.common.clocks import (
               FrozenClock,
           )
-          from shared_engines.events.contracts import (
-              EventCatalog,
-          )
-          from shared_engines.events.outbox import Outbox
-          from shared_engines.identity.contracts import (
-              IdentityKind,
-          )
-          from shared_engines.identity.engine import (
-              IdentityEngine,
-          )
-          from shared_engines.integrity.engine import (
-              IntegrityEngine,
-          )
-          from shared_engines.reputation.engine import (
-              ReputationEngine,
-          )
-          from shared_engines.reputation.errors import (
-              EmptyEvidenceError,
-              SelfReputationError,
-              UnknownEntityError,
-          )
-          from shared_engines.reputation.policy import (
-              ReputationPolicy,
-          )
           from shared_engines.storage.database import (
               SQLiteAdapter,
           )
-          from shared_engines.telemetry.collector import (
-              TelemetryCollector,
+          from shared_engines.supervisor.engine import (
+              SupervisorEngine,
+          )
+          from shared_engines.supervisor.errors import (
+              QuarantinedError,
+              UnknownComponentError,
           )
 
 
-          class _Net:
-              def __init__(
-                  self, tmp_path: Path
-              ) -> None:
-                  self.db = SQLiteAdapter(
-                      tmp_path / "net.db"
-                  )
-                  self.clock = FrozenClock()
-                  self.audit = AuditTrail(
-                      self.db, self.clock
-                  )
-                  self.outbox = Outbox(
-                      self.db, self.clock
-                  )
-                  self.outbox.ensure_schema()
-                  self.catalog = EventCatalog()
-                  for et in (
-                      "identity.registered",
-                      "identity.status_changed",
-                      "reputation.event.recorded",
-                  ):
-                      self.catalog.register(et)
-                  self.identity = IdentityEngine(
-                      db=self.db,
-                      clock=self.clock,
-                      audit=self.audit,
-                      outbox=self.outbox,
-                      catalog=self.catalog,
-                  )
-                  self.integrity = IntegrityEngine(
-                      self.db, self.clock
-                  )
-                  self.telemetry = TelemetryCollector(
-                      self.db, self.clock
-                  )
-                  self.policy = ReputationPolicy(
-                      weight_per_event=10.0,
-                      half_life_seconds=100.0,
-                  )
-                  self.reputation = ReputationEngine(
-                      self.db,
-                      self.clock,
-                      identity=self.identity,
-                      integrity=self.integrity,
-                      audit=self.audit,
-                      outbox=self.outbox,
-                      policy=self.policy,
-                  )
-
-              def person(
-                  self, name: str
-              ) -> str:
-                  identity = (
-                      self.identity.register_identity(
-                          kind=(
-                              IdentityKind.PERSON
-                          ),
-                          display_name=name,
-                          actor="bootstrap",
-                      )
-                  )
-                  return identity.zid
-
-              def close(self) -> None:
-                  self.db.close()
+          def _engine(
+              tmp_path: Path,
+          ) -> tuple[SQLiteAdapter, SupervisorEngine]:
+              db = SQLiteAdapter(
+                  tmp_path / "sup.db"
+              )
+              clock = FrozenClock()
+              audit = AuditTrail(db, clock)
+              return db, SupervisorEngine(
+                  db, clock, audit=audit
+              )
 
 
-          def test_evidence_backed_score(
+          def test_lifecycle_with_audit(
               tmp_path: Path,
           ) -> None:
-              net = _Net(tmp_path)
+              db, engine = _engine(tmp_path)
               try:
-                  employer = net.person("employer")
-                  worker = net.person("worker")
-                  evidence = (
-                      b"contract 2026 signed"
+                  comp = engine.register(
+                      name="engine-x",
+                      kind="worker",
+                      max_restarts=3,
                   )
-                  event = net.reputation.record_event(
-                      subject_zid=worker,
-                      actor_zid=employer,
-                      kind="positive",
-                      evidence=evidence,
+                  assert comp.state == "REGISTERED"
+                  running = engine.mark_running(
+                      name="engine-x"
                   )
-                  assert event.seq == 1
-                  summary = (
-                      net.reputation.summary(
-                          subject_zid=worker
+                  assert running.state == "RUNNING"
+                  failed = engine.mark_failed(
+                      name="engine-x",
+                      reason="socket hangup",
+                  )
+                  assert failed.state == "FAILED"
+                  assert failed.failures == 1
+                  restarted = (
+                      engine.record_restart(
+                          name="engine-x",
+                          actor="ops",
                       )
                   )
-                  assert summary.score == 10
                   assert (
-                      summary.positive_events == 1
+                      restarted.state == "RUNNING"
                   )
-                  assert (
-                      summary.negative_events == 0
+                  assert restarted.restarts == 1
+                  assert engine.mark_failed(
+                      name="engine-x",
+                      reason="again",
+                  ).failures == 2
+                  entries = engine.snapshot()
+                  assert len(entries) == 1
+              finally:
+                  db.close()
+
+
+          def test_restart_budget_quarantines(
+              tmp_path: Path,
+          ) -> None:
+              db, engine = _engine(tmp_path)
+              try:
+                  engine.register(
+                      name="flaky",
+                      kind="worker",
+                      max_restarts=2,
                   )
-                  assert (
-                      net.reputation.verify_evidence(
-                          event_id=event.event_id,
-                          evidence=evidence,
+                  engine.mark_running(name="flaky")
+                  for round_no in range(2):
+                      engine.mark_failed(
+                          name="flaky",
+                          reason=(
+                              f"crash-{round_no}"
+                          ),
                       )
-                      is True
-                  )
-                  assert (
-                      net.reputation.verify_evidence(
-                          event_id=event.event_id,
-                          evidence=b"faked",
-                      )
-                      is False
-                  )
-                  net.telemetry.ingest_outbox(
-                      net.outbox
-                  )
-                  events = (
-                      net.telemetry.query_events(
-                          event_type=(
-                              "reputation.event"
-                              ".recorded"
+                      record = (
+                          engine.record_restart(
+                              name="flaky",
+                              actor="ops",
                           )
                       )
+                      assert (
+                          record.state == "RUNNING"
+                      )
+                  engine.mark_failed(
+                      name="flaky",
+                      reason="final crash",
                   )
-                  assert len(events) >= 1
+                  with pytest.raises(
+                      QuarantinedError
+                  ):
+                      engine.record_restart(
+                          name="flaky",
+                          actor="ops",
+                      )
+                  record = engine.snapshot()[0]
+                  assert (
+                      record.state
+                      == "QUARANTINED"
+                  )
+                  with pytest.raises(
+                      QuarantinedError
+                  ):
+                      engine.mark_running(
+                          name="flaky"
+                      )
               finally:
-                  net.close()
+                  db.close()
 
 
-          def test_self_rating_and_unknown_refused(
+          def test_unknown_component_refused(
               tmp_path: Path,
           ) -> None:
-              net = _Net(tmp_path)
+              db, engine = _engine(tmp_path)
               try:
-                  worker = net.person("worker")
                   with pytest.raises(
-                      SelfReputationError
+                      UnknownComponentError
                   ):
-                      net.reputation.record_event(
-                          subject_zid=worker,
-                          actor_zid=worker,
-                          kind="positive",
-                          evidence=b"self",
+                      engine.mark_running(
+                          name="ghost"
                       )
                   with pytest.raises(
-                      UnknownEntityError
+                      UnknownComponentError
                   ):
-                      net.reputation.record_event(
-                          subject_zid=worker,
-                          actor_zid="ZID-ghost",
-                          kind="positive",
-                          evidence=b"e",
+                      engine.mark_failed(
+                          name="ghost",
+                          reason="x",
                       )
-                  employer = net.person("employer")
-                  with pytest.raises(
-                      EmptyEvidenceError
-                  ):
-                      net.reputation.record_event(
-                          subject_zid=worker,
-                          actor_zid=employer,
-                          kind="positive",
-                          evidence=b"",
-                      )
-                  with pytest.raises(ValueError):
-                      net.reputation.record_event(
-                          subject_zid=worker,
-                          actor_zid=employer,
-                          kind="magical",
-                          evidence=b"e",
-                      )
-                  assert (
-                      net.reputation.summary(
-                          subject_zid=worker
-                      ).score
-                      == 0
-                  )
               finally:
-                  net.close()
-
-
-          def test_mixed_signs_cancel(
-              tmp_path: Path,
-          ) -> None:
-              net = _Net(tmp_path)
-              try:
-                  a = net.person("a")
-                  b = net.person("b")
-                  c = net.person("c")
-                  worker = net.person("worker")
-                  net.reputation.record_event(
-                      subject_zid=worker,
-                      actor_zid=a,
-                      kind="positive",
-                      evidence=b"good-1",
-                  )
-                  net.reputation.record_event(
-                      subject_zid=worker,
-                      actor_zid=b,
-                      kind="positive",
-                      evidence=b"good-2",
-                  )
-                  net.reputation.record_event(
-                      subject_zid=worker,
-                      actor_zid=c,
-                      kind="negative",
-                      evidence=b"breach",
-                  )
-                  summary = (
-                      net.reputation.summary(
-                          subject_zid=worker
-                      )
-                  )
-                  assert summary.score == 10
-                  assert (
-                      summary.positive_events == 2
-                  )
-                  assert (
-                      summary.negative_events == 1
-                  )
-                  assert (
-                      summary.last_event_at
-                      is not None
-                  )
-              finally:
-                  net.close()
-
-
-          def test_decay_over_time(
-              tmp_path: Path,
-          ) -> None:
-              net = _Net(tmp_path)
-              try:
-                  employer = net.person("employer")
-                  worker = net.person("worker")
-                  net.reputation.record_event(
-                      subject_zid=worker,
-                      actor_zid=employer,
-                      kind="positive",
-                      evidence=b"fresh",
-                  )
-                  assert (
-                      net.reputation.score(
-                          subject_zid=worker
-                      )
-                      == 10
-                  )
-                  net.clock.advance(100)
-                  assert (
-                      net.reputation.score(
-                          subject_zid=worker
-                      )
-                      == 5
-                  )
-                  net.clock.advance(100)
-                  faded = net.reputation.score(
-                      subject_zid=worker
-                  )
-                  assert faded < 6
-                  assert faded >= 2
-              finally:
-                  net.close()
+                  db.close()
           PYEOF
-          echo "=== REPUTATION TESTS READY ==="
+          echo "=== ALL TESTS READY ==="
 
       - name: Quality gates (mypy first; full regression)
         run: |
           set -euo pipefail
-          M="shared_engines/common shared_engines/storage shared_engines/events shared_engines/observability shared_engines/audit shared_engines/security shared_engines/identity shared_engines/verification shared_engines/runtime shared_engines/tokenization shared_engines/currency shared_engines/verifier shared_engines/hardening shared_engines/authority shared_engines/network shared_engines/telemetry shared_engines/logs shared_engines/consensus shared_engines/integrity shared_engines/encryption shared_engines/certification shared_engines/search shared_engines/reputation"
+          M="shared_engines/common shared_engines/storage shared_engines/events shared_engines/observability shared_engines/audit shared_engines/security shared_engines/identity shared_engines/verification shared_engines/runtime shared_engines/tokenization shared_engines/currency shared_engines/verifier shared_engines/hardening shared_engines/authority shared_engines/network shared_engines/telemetry shared_engines/logs shared_engines/consensus shared_engines/integrity shared_engines/encryption shared_engines/certification shared_engines/search shared_engines/reputation shared_engines/compression shared_engines/scalability shared_engines/supervisor"
           python -m compileall -q $M main.py scripts shared_engines/tests
           echo "compile OK"
           find $M scripts -name '__pycache__' -type d -prune -exec rm -rf {} +
@@ -962,7 +1293,7 @@ jobs:
           if git diff --cached --quiet; then
             echo "No changes."
           else
-            git commit -m "zyra: engine 6/17 reputation - evidence-backed scoring over IntegrityEngine (durable proof per event, verify_evidence), no self-rating, append-only per-subject ledger, deterministic decayed score (policy: weight * half-life), audited + outbox; float() wrap fixes mypy no-any-return on float pow; 4 proofs"
+            git commit -m "zyra: engines 7-9/17 batch - compression (bounded streaming gzip, bomb guard via decompressobj max_length + declared size + sha verify), scalability (capacity admission with common BackpressureError, release, sha256 stable partitioning), supervisor (lifecycle with restart budget -> QUARANTINED, audited failures/restarts); 9 proofs total"
             git push origin "HEAD:${{ github.ref_name }}"
           fi
-          echo "=== ENGINE REPUTATION COMPLETE ==="
+          echo "=== TRIPLE ENGINE COMPLETE ==="

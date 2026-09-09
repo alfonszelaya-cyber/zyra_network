@@ -1,4 +1,4 @@
-name: zyra-w17-final-five-engines
+name: zyra-w18-cleanup-capabilities
 
 "on":
   workflow_dispatch:
@@ -9,7 +9,7 @@ permissions:
   contents: write
 
 concurrency:
-  group: zyra-w17-${{ github.ref }}
+  group: zyra-w18-${{ github.ref }}
   cancel-in-progress: false
 
 jobs:
@@ -31,2288 +31,566 @@ jobs:
           python -m pip install --upgrade pip
           python -m pip install "cryptography>=42,<45" "flake8>=7,<8" "mypy>=1.10,<2" "pytest>=8,<9"
 
-      - name: Clean engine inits (W391)
+      - name: Structural cleanup (26 orphan dirs + 2 empty namespaces)
         run: |
           set -euo pipefail
-          for f in compliance integrations export interoperability ai; do
-            p="shared_engines/$f/__init__.py"
-            [ -f "$p" ] && printf '"""ZYRA Network engine package."""\n' > "$p"
+          for d in \
+            shared_engines/identity/authentication \
+            shared_engines/identity/authorization \
+            shared_engines/identity/biometrics \
+            shared_engines/identity/credentials \
+            shared_engines/identity/profiles \
+            shared_engines/orchestration/dispatcher \
+            shared_engines/orchestration/lifecycle \
+            shared_engines/orchestration/scheduler \
+            shared_engines/orchestration/tasks \
+            shared_engines/radar/core \
+            shared_engines/radar/detectors \
+            shared_engines/radar/events \
+            shared_engines/radar/registry \
+            shared_engines/radar/rules \
+            shared_engines/radar/scoring \
+            shared_engines/tokenization/assets \
+            shared_engines/tokenization/exchange \
+            shared_engines/tokenization/registry \
+            shared_engines/tokenization/transactions \
+            shared_engines/tokenization/valuation \
+            shared_engines/verification/ai_detection \
+            shared_engines/verification/audio \
+            shared_engines/verification/documents \
+            shared_engines/verification/images \
+            shared_engines/verification/integrity \
+            shared_engines/verification/video; do
+            rm -rf "$d"
           done
-          echo "inits cleaned"
+          rm -rf shared_engines/radar shared_engines/orchestration
+          remaining=$(find . -path ./.git -prune -o \
+            -name '__init__py' -print | wc -l)
+          echo "orphan __init__py remaining: $remaining"
+          test "$remaining" -eq 0
+          echo "=== CLEANUP COMPLETE: 0 malformed, 0 empty namespaces ==="
 
-      - name: Engine compliance
+      - name: Build capabilities composition layer
         run: |
           set -euo pipefail
-          cat > shared_engines/compliance/engine.py <<'PYEOF'
-          """Compliance engine: jurisdiction policies and
-          audited decisions (multi-jurisdiction by design)."""
+          cat > shared_engines/runtime/capabilities.py <<'PYEOF'
+          """ZyraCapabilities: the trust-services composition
+          layer.
+
+          Composes the 17 transverse engines into the
+          consumer-facing services of the Network, over one
+          durable database:
+
+              profiles      portable trust profile (W5)
+              trust         onboarding to ACTIVE (W6)
+              history       lifelong civic timeline (W7)
+              integrity     content proofs (engine 2)
+              exchange      digital notary (W10)
+              credentials   durable credential registry
+              certification accredited certificates (engine 4)
+              search        authorized global queries (engine 5)
+              reputation    evidence-backed scoring (engine 6)
+              encryption    durable sealed storage (engine 3)
+              export        signed portable bundles (engine 14)
+              interop       schema negotiation (engine 15)
+              compliance    jurisdiction decisions (engine 13)
+              ai            analysis provenance (engine 17)
+
+          Deliberately does NOT replace ZyraKernel (which owns
+          identity/verification/tokens/currency): capabilities
+          layers the trust services on top, sharing the same
+          database. Engines whose wiring is a per-node decision
+          (consensus member_id, integrations handlers,
+          system_loader contract version) stay direct-use.
+          """
           from __future__ import annotations
 
-          import hashlib
-          import sqlite3
-          from dataclasses import dataclass
-
+          from shared_engines.ai.engine import AIEngine
           from shared_engines.audit.chain import AuditTrail
+          from shared_engines.certification.engine import (
+              CertificationEngine,
+          )
+          from shared_engines.certification.registry import (
+              IssuerRegistry,
+          )
           from shared_engines.common.clocks import Clock
-          from shared_engines.common.errors import (
-              NotFoundError,
+          from shared_engines.compliance.engine import (
+              ComplianceEngine,
           )
-          from shared_engines.common.identifiers import (
-              new_id,
-          )
-          from shared_engines.common.serialization import (
-              canonical_json_dumps,
-          )
-          from shared_engines.common.validation import (
-              require_int_range,
-              require_non_empty_str,
-          )
-          from shared_engines.events.outbox import Outbox
-          from shared_engines.storage.database import (
-              Database,
-          )
-          from shared_engines.storage.migrations import (
-              Migration,
-              MigrationRunner,
-          )
-
-          EVENT_DECISION = (
-              "compliance.decision.recorded"
-          )
-
-          _MIGRATIONS = (
-              Migration(
-                  1,
-                  "compliance",
-                  (
-                      "CREATE TABLE"
-                      " compliance_policies ("
-                      " policy_id TEXT PRIMARY KEY,"
-                      " jurisdiction TEXT NOT NULL,"
-                      " requirement TEXT NOT NULL,"
-                      " mandatory INTEGER NOT NULL,"
-                      " version INTEGER NOT NULL,"
-                      " active INTEGER NOT NULL,"
-                      " created_at REAL NOT NULL)",
-                      "CREATE INDEX comp_lookup"
-                      " ON compliance_policies"
-                      " (jurisdiction,"
-                      " requirement, active)",
-                      "CREATE TABLE"
-                      " compliance_decisions ("
-                      " decision_id TEXT PRIMARY"
-                      " KEY,"
-                      " subject_zid TEXT NOT NULL,"
-                      " policy_id TEXT NOT NULL,"
-                      " compliant INTEGER NOT NULL,"
-                      " reason TEXT NOT NULL,"
-                      " decided_at REAL NOT NULL)",
-                  ),
-              ),
-          )
-
-
-          class PolicyNotFoundError(NotFoundError):
-              """No active policy for that jurisdiction
-              and requirement."""
-
-
-          @dataclass(frozen=True)
-          class PolicyRecord:
-              policy_id: str
-              jurisdiction: str
-              requirement: str
-              mandatory: bool
-              version: int
-              active: bool
-
-
-          @dataclass(frozen=True)
-          class ComplianceDecision:
-              decision_id: str
-              subject_zid: str
-              jurisdiction: str
-              requirement: str
-              compliant: bool
-              policy_id: str
-              reason: str
-
-
-          class ComplianceEngine:
-              """Jurisdiction policies -> audited
-              decisions."""
-
-              def __init__(
-                  self,
-                  db: Database,
-                  clock: Clock,
-                  *,
-                  audit: AuditTrail,
-                  outbox: Outbox,
-              ) -> None:
-                  self._db = db
-                  self._clock = clock
-                  self._audit = audit
-                  self._outbox = outbox
-                  MigrationRunner(
-                      db, "compliance", _MIGRATIONS
-                  ).run(clock)
-
-              def _emit(
-                  self,
-                  cursor: sqlite3.Cursor,
-                  *,
-                  aggregate: str,
-                  payload: dict[str, object],
-              ) -> None:
-                  uid = hashlib.sha256(
-                      canonical_json_dumps(
-                          {
-                              "a": aggregate,
-                              "u": new_id(),
-                          }
-                      ).encode("utf-8")
-                  ).hexdigest()[:32]
-                  fp = hashlib.sha256(
-                      canonical_json_dumps(
-                          {
-                              "id": uid,
-                              "ty": EVENT_DECISION,
-                          }
-                      ).encode("utf-8")
-                  ).hexdigest()
-                  cursor.execute(
-                      "INSERT INTO events_outbox"
-                      " (event_id, event_type,"
-                      " aggregate_id, schema_version,"
-                      " envelope_version, created_at,"
-                      " payload, fingerprint,"
-                      " published_at)"
-                      " VALUES (?, ?, ?, 1, 1, ?, ?,"
-                      " ?, NULL)",
-                      (
-                          uid,
-                          EVENT_DECISION,
-                          aggregate,
-                          self._clock.now(),
-                          canonical_json_dumps(
-                              payload
-                          ),
-                          fp,
-                      ),
-                  )
-
-              def register_policy(
-                  self,
-                  *,
-                  jurisdiction: str,
-                  requirement: str,
-                  mandatory: bool,
-                  version: int = 1,
-              ) -> PolicyRecord:
-                  require_non_empty_str(
-                      jurisdiction, "jurisdiction"
-                  )
-                  require_non_empty_str(
-                      requirement, "requirement"
-                  )
-                  require_int_range(
-                      version, "version", 1, 10**6
-                  )
-                  policy_id = (
-                      f"POL-{new_id()[:12]}"
-                  )
-                  now = self._clock.now()
-                  with (
-                      self._db.transaction()
-                      as cursor
-                  ):
-                      cursor.execute(
-                          "INSERT INTO"
-                          " compliance_policies"
-                          " (policy_id, jurisdiction,"
-                          "  requirement, mandatory,"
-                          "  version, active,"
-                          "  created_at)"
-                          " VALUES (?, ?, ?, ?, ?, 1,"
-                          " ?)",
-                          (
-                              policy_id,
-                              jurisdiction,
-                              requirement,
-                              int(mandatory),
-                              version,
-                              now,
-                          ),
-                      )
-                  return PolicyRecord(
-                      policy_id=policy_id,
-                      jurisdiction=jurisdiction,
-                      requirement=requirement,
-                      mandatory=mandatory,
-                      version=version,
-                      active=True,
-                  )
-
-              def _active_policy(
-                  self,
-                  jurisdiction: str,
-                  requirement: str,
-              ) -> PolicyRecord:
-                  row = self._db.query_one(
-                      "SELECT * FROM"
-                      " compliance_policies"
-                      " WHERE jurisdiction = ?"
-                      " AND requirement = ?"
-                      " AND active = 1"
-                      " ORDER BY version DESC"
-                      " LIMIT 1",
-                      (jurisdiction, requirement),
-                  )
-                  if row is None:
-                      raise PolicyNotFoundError(
-                          "no active policy for"
-                          f" '{jurisdiction}' /"
-                          f" '{requirement}'"
-                      )
-                  return PolicyRecord(
-                      policy_id=str(
-                          row["policy_id"]
-                      ),
-                      jurisdiction=str(
-                          row["jurisdiction"]
-                      ),
-                      requirement=str(
-                          row["requirement"]
-                      ),
-                      mandatory=bool(
-                          int(row["mandatory"])
-                      ),
-                      version=int(row["version"]),
-                      active=True,
-                  )
-
-              def evaluate(
-                  self,
-                  *,
-                  subject_zid: str,
-                  jurisdiction: str,
-                  requirement: str,
-                  satisfied: bool,
-              ) -> ComplianceDecision:
-                  require_non_empty_str(
-                      subject_zid, "subject_zid"
-                  )
-                  policy = self._active_policy(
-                      jurisdiction, requirement
-                  )
-                  compliant = (
-                      satisfied
-                      or not policy.mandatory
-                  )
-                  if satisfied:
-                      reason = (
-                          "requirement satisfied"
-                      )
-                  elif compliant:
-                      reason = (
-                          "optional requirement"
-                      )
-                  else:
-                      reason = (
-                          "mandatory"
-                          " requirement unmet"
-                      )
-                  decision_id = (
-                      f"DEC-{new_id()[:12]}"
-                  )
-                  now = self._clock.now()
-                  with (
-                      self._db.transaction()
-                      as cursor
-                  ):
-                      cursor.execute(
-                          "INSERT INTO"
-                          " compliance_decisions"
-                          " (decision_id,"
-                          " subject_zid, policy_id,"
-                          " compliant, reason,"
-                          " decided_at)"
-                          " VALUES (?, ?, ?, ?, ?, ?)",
-                          (
-                              decision_id,
-                              subject_zid,
-                              policy.policy_id,
-                              int(compliant),
-                              reason,
-                              now,
-                          ),
-                      )
-                      self._emit(
-                          cursor,
-                          aggregate=decision_id,
-                          payload={
-                              "jurisdiction": (
-                                  jurisdiction
-                              ),
-                              "requirement": (
-                                  requirement
-                              ),
-                              "compliant": (
-                                  compliant
-                              ),
-                          },
-                      )
-                  self._audit.append(
-                      event_type=EVENT_DECISION,
-                      actor="compliance-engine",
-                      subject=decision_id,
-                      payload={
-                          "compliant": compliant
-                      },
-                  )
-                  return ComplianceDecision(
-                      decision_id=decision_id,
-                      subject_zid=subject_zid,
-                      jurisdiction=jurisdiction,
-                      requirement=requirement,
-                      compliant=compliant,
-                      policy_id=policy.policy_id,
-                      reason=reason,
-                  )
-
-              def list_policies(
-                  self, *, jurisdiction: str
-              ) -> tuple[PolicyRecord, ...]:
-                  rows = self._db.query_all(
-                      "SELECT * FROM"
-                      " compliance_policies"
-                      " WHERE jurisdiction = ?"
-                      " AND active = 1"
-                      " ORDER BY requirement,"
-                      " version DESC",
-                      (jurisdiction,),
-                  )
-                  return tuple(
-                      PolicyRecord(
-                          policy_id=str(
-                              r["policy_id"]
-                          ),
-                          jurisdiction=str(
-                              r["jurisdiction"]
-                          ),
-                          requirement=str(
-                              r["requirement"]
-                          ),
-                          mandatory=bool(
-                              int(r["mandatory"])
-                          ),
-                          version=int(
-                              r["version"]
-                          ),
-                          active=True,
-                      )
-                      for r in rows
-                  )
-          PYEOF
-          echo "=== COMPLIANCE READY ==="
-
-      - name: Engine integrations
-        run: |
-          set -euo pipefail
-          cat > shared_engines/integrations/engine.py <<'PYEOF'
-          """Integrations engine: external adapters with
-          retry, health and durable stats. Real providers
-          are wired as handler callables at the composition
-          root; the engine governs invocation: bounded
-          retries on transient failures, durable counters,
-          health. No fake providers live here."""
-          from __future__ import annotations
-
-          import hashlib
-          from collections.abc import Callable
-          from dataclasses import dataclass
-
-          from shared_engines.common.clocks import Clock
-          from shared_engines.common.errors import (
-              ConfigurationError,
-              IntegrityError,
-              NotFoundError,
-              ProviderPermanentError,
-              ProviderTransientError,
-          )
-          from shared_engines.common.validation import (
-              require_int_range,
-              require_non_empty_str,
-          )
-          from shared_engines.storage.database import (
-              Database,
-          )
-          from shared_engines.storage.migrations import (
-              Migration,
-              MigrationRunner,
-          )
-
-          _MIGRATIONS = (
-              Migration(
-                  1,
-                  "integrations",
-                  (
-                      "CREATE TABLE"
-                      " integration_adapters ("
-                      " adapter_id TEXT PRIMARY"
-                      " KEY,"
-                      " kind TEXT NOT NULL,"
-                      " endpoint TEXT NOT NULL,"
-                      " max_retries INTEGER NOT"
-                      " NULL,"
-                      " calls INTEGER NOT NULL"
-                      " DEFAULT 0,"
-                      " failures INTEGER NOT NULL"
-                      " DEFAULT 0,"
-                      " created_at REAL NOT NULL)",
-                  ),
-              ),
-          )
-
-
-          class UnknownAdapterError(NotFoundError):
-              """Adapter not registered."""
-
-
-          @dataclass(frozen=True)
-          class AdapterRecord:
-              adapter_id: str
-              kind: str
-              endpoint: str
-              max_retries: int
-              calls: int
-              failures: int
-
-
-          @dataclass(frozen=True)
-          class InvokeResult:
-              adapter_id: str
-              attempts: int
-              response_sha256: str
-
-
-          class IntegrationsEngine:
-              """Governed invocation of external
-              adapters."""
-
-              def __init__(
-                  self, db: Database, clock: Clock
-              ) -> None:
-                  self._db = db
-                  self._clock = clock
-                  self._handlers: dict[
-                      str,
-                      Callable[[bytes], bytes],
-                  ] = {}
-                  MigrationRunner(
-                      db,
-                      "integrations",
-                      _MIGRATIONS,
-                  ).run(clock)
-
-              def register_adapter(
-                  self,
-                  *,
-                  adapter_id: str,
-                  kind: str,
-                  endpoint: str,
-                  max_retries: int = 3,
-              ) -> AdapterRecord:
-                  require_non_empty_str(
-                      adapter_id, "adapter_id"
-                  )
-                  require_non_empty_str(
-                      kind, "kind"
-                  )
-                  require_non_empty_str(
-                      endpoint, "endpoint"
-                  )
-                  require_int_range(
-                      max_retries,
-                      "max_retries",
-                      1,
-                      10,
-                  )
-                  with (
-                      self._db.transaction()
-                      as cursor
-                  ):
-                      cursor.execute(
-                          "INSERT INTO"
-                          " integration_adapters"
-                          " (adapter_id, kind,"
-                          "  endpoint, max_retries,"
-                          "  calls, failures,"
-                          "  created_at)"
-                          " VALUES (?, ?, ?, ?, 0, 0,"
-                          " ?)"
-                          " ON CONFLICT(adapter_id)"
-                          " DO UPDATE SET kind ="
-                          " excluded.kind, endpoint"
-                          " = excluded.endpoint,"
-                          " max_retries ="
-                          " excluded.max_retries",
-                          (
-                              adapter_id,
-                              kind,
-                              endpoint,
-                              max_retries,
-                              self._clock.now(),
-                          ),
-                      )
-                  return self.health(
-                      adapter_id=adapter_id
-                  )
-
-              def register_handler(
-                  self,
-                  *,
-                  adapter_id: str,
-                  handler: Callable[[bytes], bytes],
-              ) -> None:
-                  require_non_empty_str(
-                      adapter_id, "adapter_id"
-                  )
-                  self._row(adapter_id)
-                  self._handlers[adapter_id] = (
-                      handler
-                  )
-
-              def _row(
-                  self, adapter_id: str
-              ) -> AdapterRecord:
-                  row = self._db.query_one(
-                      "SELECT * FROM"
-                      " integration_adapters"
-                      " WHERE adapter_id = ?",
-                      (adapter_id,),
-                  )
-                  if row is None:
-                      raise UnknownAdapterError(
-                          "unknown adapter:"
-                          f" {adapter_id}"
-                      )
-                  return AdapterRecord(
-                      adapter_id=str(
-                          row["adapter_id"]
-                      ),
-                      kind=str(row["kind"]),
-                      endpoint=str(
-                          row["endpoint"]
-                      ),
-                      max_retries=int(
-                          row["max_retries"]
-                      ),
-                      calls=int(row["calls"]),
-                      failures=int(
-                          row["failures"]
-                      ),
-                  )
-
-              def invoke(
-                  self,
-                  *,
-                  adapter_id: str,
-                  payload: bytes,
-              ) -> InvokeResult:
-                  require_non_empty_str(
-                      adapter_id, "adapter_id"
-                  )
-                  if not payload:
-                      raise IntegrityError(
-                          "payload required"
-                      )
-                  record = self._row(adapter_id)
-                  handler = self._handlers.get(
-                      adapter_id
-                  )
-                  if handler is None:
-                      raise ConfigurationError(
-                          "no handler wired for"
-                          f" '{adapter_id}'"
-                      )
-                  attempts = 0
-                  last_exc: Exception | None = (
-                      None
-                  )
-                  while attempts < (
-                      record.max_retries
-                  ):
-                      attempts += 1
-                      try:
-                          response = handler(
-                              payload
-                          )
-                          self._bump(
-                              adapter_id,
-                              failure=False,
-                          )
-                          return InvokeResult(
-                              adapter_id=(
-                                  adapter_id
-                              ),
-                              attempts=attempts,
-                              response_sha256=hashlib.sha256(
-                                  response
-                              ).hexdigest(),
-                          )
-                      except (
-                          ProviderTransientError
-                      ) as exc:
-                          last_exc = exc
-                      except (
-                          ProviderPermanentError
-                      ):
-                          self._bump(
-                              adapter_id,
-                              failure=True,
-                          )
-                          raise
-                  self._bump(
-                      adapter_id, failure=True
-                  )
-                  raise ProviderPermanentError(
-                      "adapter"
-                      f" '{adapter_id}' failed"
-                      f" after {attempts}"
-                      f" attempts: {last_exc}"
-                  ) from last_exc
-
-              def _bump(
-                  self,
-                  adapter_id: str,
-                  *,
-                  failure: bool,
-              ) -> None:
-                  delta_fail = 1 if failure else 0
-                  with (
-                      self._db.transaction()
-                      as cursor
-                  ):
-                      cursor.execute(
-                          "UPDATE"
-                          " integration_adapters"
-                          " SET calls = calls + 1,"
-                          " failures = failures"
-                          " + ?"
-                          " WHERE adapter_id = ?",
-                          (delta_fail, adapter_id),
-                      )
-
-              def health(
-                  self, *, adapter_id: str
-              ) -> AdapterRecord:
-                  return self._row(adapter_id)
-          PYEOF
-          echo "=== INTEGRATIONS READY ==="
-
-      - name: Engine export
-        run: |
-          set -euo pipefail
-          cat > shared_engines/export/engine.py <<'PYEOF'
-          """Export engine: portable, signed evidence
-          bundles. Third parties verify offline with the
-          bundle + public key - no database, no trust.
-          Domain-separated payload
-          "EXPORT:<bundle_id>:<manifest_sha>"."""
-          from __future__ import annotations
-
-          import hashlib
-          from dataclasses import dataclass
-
-          from shared_engines.audit.chain import AuditTrail
-          from shared_engines.common.clocks import Clock
-          from shared_engines.common.errors import (
-              EngineError,
-              NotFoundError,
-          )
-          from shared_engines.common.identifiers import (
-              new_id,
-          )
-          from shared_engines.common.serialization import (
-              canonical_json_dumps,
-          )
-          from shared_engines.common.validation import (
-              require_non_empty_str,
-          )
-          from shared_engines.storage.database import (
-              Database,
-          )
-          from shared_engines.storage.migrations import (
-              Migration,
-              MigrationRunner,
-          )
-          from shared_engines.verification.signatures import (
-              Ed25519Signer,
-              Ed25519Verifier,
-          )
-
-          EVENT_EXPORTED = "export.bundle.created"
-
-          _MIGRATIONS = (
-              Migration(
-                  1,
-                  "export",
-                  (
-                      "CREATE TABLE"
-                      " export_bundles ("
-                      " bundle_id TEXT PRIMARY KEY,"
-                      " subject_zid TEXT NOT NULL,"
-                      " entries_json BLOB NOT NULL,"
-                      " manifest_sha256 TEXT NOT"
-                      " NULL,"
-                      " signature BLOB NOT NULL,"
-                      " public_pem BLOB NOT NULL,"
-                      " created_at REAL NOT NULL)",
-                  ),
-              ),
-          )
-
-
-          class EmptyExportError(EngineError):
-              """An export needs at least one entry."""
-
-
-          @dataclass(frozen=True)
-          class ExportBundle:
-              bundle_id: str
-              subject_zid: str
-              entries_json: bytes
-              manifest_sha256: str
-              signature: bytes
-              public_pem: bytes
-              created_at: float
-
-
-          def _manifest_sha(
-              entries_json: bytes,
-          ) -> str:
-              return hashlib.sha256(
-                  entries_json
-              ).hexdigest()
-
-
-          def _payload(
-              bundle_id: str,
-              manifest_sha: str,
-          ) -> bytes:
-              return (
-                  f"EXPORT:{bundle_id}:"
-                  f"{manifest_sha}"
-              ).encode("utf-8")
-
-
-          class ExportEngine:
-              """Signed portable bundles."""
-
-              def __init__(
-                  self,
-                  db: Database,
-                  clock: Clock,
-                  *,
-                  signer: Ed25519Signer,
-                  audit: AuditTrail,
-              ) -> None:
-                  self._db = db
-                  self._clock = clock
-                  self._signer = signer
-                  self._audit = audit
-                  self._public_pem = (
-                      signer.public_pem
-                  )
-                  MigrationRunner(
-                      db, "export", _MIGRATIONS
-                  ).run(clock)
-
-              def export_bundle(
-                  self,
-                  *,
-                  subject_zid: str,
-                  entries: tuple[
-                      tuple[str, str, str], ...
-                  ],
-                  actor_app: str,
-              ) -> ExportBundle:
-                  require_non_empty_str(
-                      subject_zid, "subject_zid"
-                  )
-                  require_non_empty_str(
-                      actor_app, "actor_app"
-                  )
-                  row = self._db.query_one(
-                      "SELECT 1 FROM app_registry"
-                      " WHERE app_id = ?",
-                      (actor_app,),
-                  )
-                  if row is None:
-                      raise PermissionError(
-                          "app not registered:"
-                          f" {actor_app}"
-                      )
-                  if not entries:
-                      raise EmptyExportError(
-                          "at least one entry"
-                          " required"
-                      )
-                  entry_docs = [
-                      {
-                          "kind": str(kind),
-                          "ref_id": str(ref),
-                          "content": str(
-                              content
-                          ),
-                      }
-                      for kind, ref, content in (
-                          entries
-                      )
-                  ]
-                  entries_json = canonical_json_dumps(
-                      entry_docs
-                  ).encode("utf-8")
-                  manifest = _manifest_sha(
-                      entries_json
-                  )
-                  bundle_id = (
-                      f"EXP-{new_id()[:12]}"
-                  )
-                  signature = self._signer.sign(
-                      _payload(bundle_id, manifest)
-                  )
-                  now = self._clock.now()
-                  with (
-                      self._db.transaction()
-                      as cursor
-                  ):
-                      cursor.execute(
-                          "INSERT INTO"
-                          " export_bundles"
-                          " (bundle_id, subject_zid,"
-                          "  entries_json,"
-                          "  manifest_sha256,"
-                          "  signature, public_pem,"
-                          "  created_at)"
-                          " VALUES (?, ?, ?, ?, ?, ?,"
-                          "  ?)",
-                          (
-                              bundle_id,
-                              subject_zid,
-                              entries_json,
-                              manifest,
-                              signature,
-                              self._public_pem,
-                              now,
-                          ),
-                      )
-                  self._audit.append(
-                      event_type=EVENT_EXPORTED,
-                      actor=actor_app,
-                      subject=bundle_id,
-                      payload={
-                          "subject": subject_zid,
-                          "entries": len(
-                              entry_docs
-                          ),
-                      },
-                  )
-                  return ExportBundle(
-                      bundle_id=bundle_id,
-                      subject_zid=subject_zid,
-                      entries_json=entries_json,
-                      manifest_sha256=manifest,
-                      signature=signature,
-                      public_pem=(
-                          self._public_pem
-                      ),
-                      created_at=now,
-                  )
-
-              def get_bundle(
-                  self, *, bundle_id: str
-              ) -> ExportBundle:
-                  row = self._db.query_one(
-                      "SELECT * FROM"
-                      " export_bundles"
-                      " WHERE bundle_id = ?",
-                      (bundle_id,),
-                  )
-                  if row is None:
-                      raise NotFoundError(
-                          f"unknown bundle:"
-                          f" {bundle_id}"
-                      )
-                  return ExportBundle(
-                      bundle_id=str(
-                          row["bundle_id"]
-                      ),
-                      subject_zid=str(
-                          row["subject_zid"]
-                      ),
-                      entries_json=bytes(
-                          row["entries_json"]
-                      ),
-                      manifest_sha256=str(
-                          row["manifest_sha256"]
-                      ),
-                      signature=bytes(
-                          row["signature"]
-                      ),
-                      public_pem=bytes(
-                          row["public_pem"]
-                      ),
-                      created_at=float(
-                          row["created_at"]
-                      ),
-                  )
-
-              def verify_stored(
-                  self, *, bundle_id: str
-              ) -> bool:
-                  bundle = self.get_bundle(
-                      bundle_id=bundle_id
-                  )
-                  recomputed = _manifest_sha(
-                      bundle.entries_json
-                  )
-                  if (
-                      recomputed
-                      != bundle.manifest_sha256
-                  ):
-                      return False
-                  verifier = Ed25519Verifier(
-                      bundle.public_pem
-                  )
-                  return verifier.verify(
-                      _payload(
-                          bundle_id,
-                          bundle.manifest_sha256,
-                      ),
-                      bundle.signature,
-                  )
-
-              @staticmethod
-              def verify_offline(
-                  *,
-                  bundle_id: str,
-                  entries_json: bytes,
-                  signature: bytes,
-                  public_pem: bytes,
-              ) -> bool:
-                  manifest = _manifest_sha(
-                      entries_json
-                  )
-                  verifier = Ed25519Verifier(
-                      public_pem
-                  )
-                  return verifier.verify(
-                      _payload(
-                          bundle_id, manifest
-                      ),
-                      signature,
-                  )
-          PYEOF
-          echo "=== EXPORT READY ==="
-
-      - name: Engine interoperability
-        run: |
-          set -euo pipefail
-          cat > shared_engines/interoperability/engine.py <<'PYEOF'
-          """Interoperability engine: versioned schemas and
-          mutual-version negotiation."""
-          from __future__ import annotations
-
-          from dataclasses import dataclass
-
-          from shared_engines.common.clocks import Clock
-          from shared_engines.common.errors import (
-              NotFoundError,
-              UnsupportedVersionError,
-          )
-          from shared_engines.common.validation import (
-              require_int_range,
-              require_non_empty_str,
-          )
-          from shared_engines.storage.database import (
-              Database,
-          )
-          from shared_engines.storage.migrations import (
-              Migration,
-              MigrationRunner,
-          )
-
-          _MIGRATIONS = (
-              Migration(
-                  1,
-                  "interoperability",
-                  (
-                      "CREATE TABLE interop_schemas ("
-                      " schema_id TEXT NOT NULL,"
-                      " version INTEGER NOT NULL,"
-                      " definition TEXT NOT NULL,"
-                      " registered_at REAL NOT"
-                      " NULL,"
-                      " PRIMARY KEY (schema_id,"
-                      " version))",
-                  ),
-              ),
-          )
-
-
-          class SchemaNotFoundError(NotFoundError):
-              """Schema not registered."""
-
-
-          @dataclass(frozen=True)
-          class SchemaVersion:
-              schema_id: str
-              version: int
-              definition: str
-              registered_at: float
-
-
-          @dataclass(frozen=True)
-          class NegotiationResult:
-              schema_id: str
-              agreed_version: int
-
-
-          class InteroperabilityEngine:
-              """Versioned schemas with negotiation."""
-
-              def __init__(
-                  self, db: Database, clock: Clock
-              ) -> None:
-                  self._db = db
-                  self._clock = clock
-                  MigrationRunner(
-                      db,
-                      "interoperability",
-                      _MIGRATIONS,
-                  ).run(clock)
-
-              def register_schema(
-                  self,
-                  *,
-                  schema_id: str,
-                  version: int,
-                  definition: str,
-              ) -> SchemaVersion:
-                  require_non_empty_str(
-                      schema_id, "schema_id"
-                  )
-                  require_int_range(
-                      version, "version", 1, 10**6
-                  )
-                  require_non_empty_str(
-                      definition, "definition"
-                  )
-                  now = self._clock.now()
-                  with (
-                      self._db.transaction()
-                      as cursor
-                  ):
-                      cursor.execute(
-                          "INSERT INTO interop_schemas"
-                          " (schema_id, version,"
-                          "  definition,"
-                          "  registered_at)"
-                          " VALUES (?, ?, ?, ?)"
-                          " ON CONFLICT(schema_id,"
-                          " version) DO UPDATE SET"
-                          " definition ="
-                          " excluded.definition",
-                          (
-                              schema_id,
-                              version,
-                              definition,
-                              now,
-                          ),
-                      )
-                  return SchemaVersion(
-                      schema_id=schema_id,
-                      version=version,
-                      definition=definition,
-                      registered_at=now,
-                  )
-
-              def get_schema(
-                  self,
-                  *,
-                  schema_id: str,
-                  version: int,
-              ) -> SchemaVersion:
-                  require_non_empty_str(
-                      schema_id, "schema_id"
-                  )
-                  row = self._db.query_one(
-                      "SELECT * FROM interop_schemas"
-                      " WHERE schema_id = ?"
-                      " AND version = ?",
-                      (schema_id, version),
-                  )
-                  if row is None:
-                      raise SchemaNotFoundError(
-                          "unknown schema version:"
-                          f" {schema_id} v{version}"
-                      )
-                  return SchemaVersion(
-                      schema_id=str(
-                          row["schema_id"]
-                      ),
-                      version=int(row["version"]),
-                      definition=str(
-                          row["definition"]
-                      ),
-                      registered_at=float(
-                          row["registered_at"]
-                      ),
-                  )
-
-              def list_versions(
-                  self, *, schema_id: str
-              ) -> tuple[int, ...]:
-                  require_non_empty_str(
-                      schema_id, "schema_id"
-                  )
-                  rows = self._db.query_all(
-                      "SELECT version FROM"
-                      " interop_schemas"
-                      " WHERE schema_id = ?"
-                      " ORDER BY version",
-                      (schema_id,),
-                  )
-                  return tuple(
-                      int(r["version"])
-                      for r in rows
-                  )
-
-              def negotiate(
-                  self,
-                  *,
-                  schema_id: str,
-                  client_versions: tuple[int, ...],
-              ) -> NegotiationResult:
-                  require_non_empty_str(
-                      schema_id, "schema_id"
-                  )
-                  if not client_versions:
-                      raise UnsupportedVersionError(
-                          "client offered no"
-                          " versions"
-                      )
-                  ours = set(
-                      self.list_versions(
-                          schema_id=schema_id
-                      )
-                  )
-                  if not ours:
-                      raise SchemaNotFoundError(
-                          "unknown schema:"
-                          f" {schema_id}"
-                      )
-                  common = ours & set(
-                      client_versions
-                  )
-                  if not common:
-                      ours_sorted = sorted(ours)
-                      client_sorted = sorted(
-                          set(client_versions)
-                      )
-                      raise (
-                          UnsupportedVersionError(
-                              "no mutual version:"
-                              f" ours"
-                              f" {ours_sorted} vs"
-                              " client"
-                              f" {client_sorted}"
-                          )
-                      )
-                  return NegotiationResult(
-                      schema_id=schema_id,
-                      agreed_version=max(common),
-                  )
-          PYEOF
-          echo "=== INTEROPERABILITY READY ==="
-
-      - name: Engine ai
-        run: |
-          set -euo pipefail
-          cat > shared_engines/ai/engine.py <<'PYEOF'
-          """AI engine: model registry + analysis
-          provenance. Honest by design: real models are
-          registered at the composition root; the engine
-          durably records WHAT model (id, version)
-          analyzed WHAT content (sha256) with WHAT result
-          (verdict + confidence). No fake detection."""
-          from __future__ import annotations
-
-          import hashlib
-          import sqlite3
-          from dataclasses import dataclass
-
-          from shared_engines.audit.chain import AuditTrail
-          from shared_engines.common.clocks import Clock
-          from shared_engines.common.errors import (
-              NotFoundError,
-          )
-          from shared_engines.common.identifiers import (
-              new_id,
-          )
-          from shared_engines.common.serialization import (
-              canonical_json_dumps,
-          )
-          from shared_engines.common.validation import (
-              require_non_empty_str,
-          )
-          from shared_engines.events.outbox import Outbox
-          from shared_engines.storage.database import (
-              Database,
-          )
-          from shared_engines.storage.migrations import (
-              Migration,
-              MigrationRunner,
-          )
-
-          EVENT_ANALYSIS = "ai.analysis.recorded"
-
-          _MIGRATIONS = (
-              Migration(
-                  1,
-                  "ai",
-                  (
-                      "CREATE TABLE ai_models ("
-                      " model_id TEXT PRIMARY KEY,"
-                      " provider TEXT NOT NULL,"
-                      " model_version TEXT NOT"
-                      " NULL,"
-                      " capabilities TEXT NOT"
-                      " NULL,"
-                      " active INTEGER NOT NULL,"
-                      " registered_at REAL NOT"
-                      " NULL)",
-                      "CREATE TABLE ai_analyses ("
-                      " analysis_id TEXT PRIMARY"
-                      " KEY,"
-                      " model_id TEXT NOT NULL,"
-                      " model_version TEXT NOT"
-                      " NULL,"
-                      " content_sha256 TEXT NOT"
-                      " NULL,"
-                      " verdict TEXT NOT NULL,"
-                      " confidence REAL NOT NULL,"
-                      " analyzed_at REAL NOT"
-                      " NULL)",
-                      "CREATE INDEX ai_content"
-                      " ON ai_analyses"
-                      " (content_sha256)",
-                  ),
-              ),
-          )
-
-
-          class UnknownModelError(NotFoundError):
-              """Model not registered or inactive."""
-
-
-          @dataclass(frozen=True)
-          class ModelRecord:
-              model_id: str
-              provider: str
-              model_version: str
-              capabilities: tuple[str, ...]
-              active: bool
-
-
-          @dataclass(frozen=True)
-          class AnalysisRecord:
-              analysis_id: str
-              model_id: str
-              model_version: str
-              content_sha256: str
-              verdict: str
-              confidence: float
-              analyzed_at: float
-
-
-          class AIEngine:
-              """Traceable AI provenance."""
-
-              def __init__(
-                  self,
-                  db: Database,
-                  clock: Clock,
-                  *,
-                  audit: AuditTrail,
-                  outbox: Outbox,
-              ) -> None:
-                  self._db = db
-                  self._clock = clock
-                  self._audit = audit
-                  self._outbox = outbox
-                  MigrationRunner(
-                      db, "ai", _MIGRATIONS
-                  ).run(clock)
-
-              def _emit(
-                  self,
-                  cursor: sqlite3.Cursor,
-                  *,
-                  aggregate: str,
-                  payload: dict[str, object],
-              ) -> None:
-                  uid = hashlib.sha256(
-                      canonical_json_dumps(
-                          {
-                              "a": aggregate,
-                              "u": new_id(),
-                          }
-                      ).encode("utf-8")
-                  ).hexdigest()[:32]
-                  fp = hashlib.sha256(
-                      canonical_json_dumps(
-                          {
-                              "id": uid,
-                              "ty": EVENT_ANALYSIS,
-                          }
-                      ).encode("utf-8")
-                  ).hexdigest()
-                  cursor.execute(
-                      "INSERT INTO events_outbox"
-                      " (event_id, event_type,"
-                      " aggregate_id, schema_version,"
-                      " envelope_version, created_at,"
-                      " payload, fingerprint,"
-                      " published_at)"
-                      " VALUES (?, ?, ?, 1, 1, ?, ?,"
-                      " ?, NULL)",
-                      (
-                          uid,
-                          EVENT_ANALYSIS,
-                          aggregate,
-                          self._clock.now(),
-                          canonical_json_dumps(
-                              payload
-                          ),
-                          fp,
-                      ),
-                  )
-
-              def register_model(
-                  self,
-                  *,
-                  model_id: str,
-                  provider: str,
-                  model_version: str,
-                  capabilities: tuple[str, ...],
-              ) -> ModelRecord:
-                  require_non_empty_str(
-                      model_id, "model_id"
-                  )
-                  require_non_empty_str(
-                      provider, "provider"
-                  )
-                  require_non_empty_str(
-                      model_version,
-                      "model_version",
-                  )
-                  clean: list[str] = []
-                  for cap in capabilities:
-                      require_non_empty_str(
-                          cap, "capability"
-                      )
-                      if cap not in clean:
-                          clean.append(cap)
-                  with (
-                      self._db.transaction()
-                      as cursor
-                  ):
-                      cursor.execute(
-                          "INSERT INTO ai_models"
-                          " (model_id, provider,"
-                          "  model_version,"
-                          "  capabilities,"
-                          "  active, registered_at)"
-                          " VALUES (?, ?, ?, ?, 1, ?)"
-                          " ON CONFLICT(model_id)"
-                          " DO UPDATE SET provider"
-                          " = excluded.provider,"
-                          " model_version ="
-                          " excluded"
-                          ".model_version,"
-                          " capabilities ="
-                          " excluded.capabilities,"
-                          " active = 1",
-                          (
-                              model_id,
-                              provider,
-                              model_version,
-                              ",".join(clean),
-                              self._clock.now(),
-                          ),
-                      )
-                  return ModelRecord(
-                      model_id=model_id,
-                      provider=provider,
-                      model_version=(
-                          model_version
-                      ),
-                      capabilities=tuple(clean),
-                      active=True,
-                  )
-
-              def _model_version(
-                  self, model_id: str
-              ) -> str:
-                  row = self._db.query_one(
-                      "SELECT model_version,"
-                      " active FROM ai_models"
-                      " WHERE model_id = ?",
-                      (model_id,),
-                  )
-                  if row is None:
-                      raise UnknownModelError(
-                          "unknown model:"
-                          f" {model_id}"
-                      )
-                  if int(row["active"]) != 1:
-                      raise UnknownModelError(
-                          "model deactivated:"
-                          f" {model_id}"
-                      )
-                  return str(
-                      row["model_version"]
-                  )
-
-              def record_analysis(
-                  self,
-                  *,
-                  model_id: str,
-                  content_sha256: str,
-                  verdict: str,
-                  confidence: float,
-              ) -> AnalysisRecord:
-                  model_version = (
-                      self._model_version(model_id)
-                  )
-                  require_non_empty_str(
-                      content_sha256,
-                      "content_sha256",
-                  )
-                  require_non_empty_str(
-                      verdict, "verdict"
-                  )
-                  if not (
-                      0.0 <= confidence <= 1.0
-                  ):
-                      raise ValueError(
-                          "confidence must be"
-                          " within [0, 1]"
-                      )
-                  analysis_id = (
-                      f"AI-{new_id()[:12]}"
-                  )
-                  now = self._clock.now()
-                  with (
-                      self._db.transaction()
-                      as cursor
-                  ):
-                      cursor.execute(
-                          "INSERT INTO ai_analyses"
-                          " (analysis_id, model_id,"
-                          "  model_version,"
-                          "  content_sha256, verdict,"
-                          "  confidence, analyzed_at)"
-                          " VALUES (?, ?, ?, ?, ?, ?,"
-                          "  ?)",
-                          (
-                              analysis_id,
-                              model_id,
-                              model_version,
-                              content_sha256,
-                              verdict,
-                              confidence,
-                              now,
-                          ),
-                      )
-                      self._emit(
-                          cursor,
-                          aggregate=analysis_id,
-                          payload={
-                              "model": model_id,
-                              "verdict": verdict,
-                          },
-                      )
-                  self._audit.append(
-                      event_type=EVENT_ANALYSIS,
-                      actor=model_id,
-                      subject=analysis_id,
-                      payload={
-                          "verdict": verdict
-                      },
-                  )
-                  return AnalysisRecord(
-                      analysis_id=analysis_id,
-                      model_id=model_id,
-                      model_version=(
-                          model_version
-                      ),
-                      content_sha256=(
-                          content_sha256
-                      ),
-                      verdict=verdict,
-                      confidence=confidence,
-                      analyzed_at=now,
-                  )
-
-              def analysis_history(
-                  self, *, content_sha256: str
-              ) -> tuple[AnalysisRecord, ...]:
-                  require_non_empty_str(
-                      content_sha256,
-                      "content_sha256",
-                  )
-                  rows = self._db.query_all(
-                      "SELECT * FROM ai_analyses"
-                      " WHERE content_sha256 = ?"
-                      " ORDER BY analyzed_at",
-                      (content_sha256,),
-                  )
-                  return tuple(
-                      AnalysisRecord(
-                          analysis_id=str(
-                              r["analysis_id"]
-                          ),
-                          model_id=str(
-                              r["model_id"]
-                          ),
-                          model_version=str(
-                              r["model_version"]
-                          ),
-                          content_sha256=str(
-                              r["content_sha256"]
-                          ),
-                          verdict=str(
-                              r["verdict"]
-                          ),
-                          confidence=float(
-                              r["confidence"]
-                          ),
-                          analyzed_at=float(
-                              r["analyzed_at"]
-                          ),
-                      )
-                      for r in rows
-                  )
-          PYEOF
-          echo "=== AI READY ==="
-
-      - name: Engine proofs (5 engines)
-        run: |
-          set -euo pipefail
-          mkdir -p shared_engines/compliance/tests shared_engines/integrations/tests shared_engines/export/tests shared_engines/interoperability/tests shared_engines/ai/tests
-
-          cat > shared_engines/compliance/tests/test_compliance.py <<'PYEOF'
-          """Compliance proofs: mandatory vs optional,
-          unknown policy refused, decisions audited."""
-          from __future__ import annotations
-
-          from pathlib import Path
-
-          import pytest
-
-          from shared_engines.audit.chain import AuditTrail
-          from shared_engines.common.clocks import (
-              FrozenClock,
+          from shared_engines.encryption.engine import (
+              EncryptionEngine,
           )
           from shared_engines.events.contracts import (
               EventCatalog,
           )
           from shared_engines.events.outbox import Outbox
-          from shared_engines.storage.database import (
-              SQLiteAdapter,
+          from shared_engines.export.engine import ExportEngine
+          from shared_engines.identity.engine import IdentityEngine
+          from shared_engines.integrity.engine import IntegrityEngine
+          from shared_engines.interoperability.engine import (
+              InteroperabilityEngine,
           )
-          from shared_engines.compliance.engine import (
-              ComplianceEngine,
-              PolicyNotFoundError,
+          from shared_engines.network.document_exchange import (
+              DocumentExchange,
           )
-
-
-          def _engine(
-              tmp_path: Path,
-          ) -> tuple[ComplianceEngine, AuditTrail]:
-              db = SQLiteAdapter(
-                  tmp_path / "comp.db"
-              )
-              clock = FrozenClock()
-              audit = AuditTrail(db, clock)
-              outbox = Outbox(db, clock)
-              outbox.ensure_schema()
-              catalog = EventCatalog()
-              catalog.register(
-                  "compliance.decision.recorded"
-              )
-              engine = ComplianceEngine(
-                  db,
-                  clock,
-                  audit=audit,
-                  outbox=outbox,
-              )
-              engine.register_policy(
-                  jurisdiction="SV",
-                  requirement="kyc_verified",
-                  mandatory=True,
-              )
-              return engine, audit
-
-
-          def test_mandatory_satisfied(
-              tmp_path: Path,
-          ) -> None:
-              engine, audit = _engine(tmp_path)
-              decision = engine.evaluate(
-                  subject_zid="ZID-1",
-                  jurisdiction="SV",
-                  requirement="kyc_verified",
-                  satisfied=True,
-              )
-              assert decision.compliant is True
-              assert audit.verify() >= 1
-
-
-          def test_mandatory_unmet_denied(
-              tmp_path: Path,
-          ) -> None:
-              engine, audit = _engine(tmp_path)
-              decision = engine.evaluate(
-                  subject_zid="ZID-1",
-                  jurisdiction="SV",
-                  requirement="kyc_verified",
-                  satisfied=False,
-              )
-              assert decision.compliant is False
-              assert audit.verify() >= 1
-
-
-          def test_optional_unmet_allowed(
-              tmp_path: Path,
-          ) -> None:
-              engine, audit = _engine(tmp_path)
-              engine.register_policy(
-                  jurisdiction="SV",
-                  requirement="phone_confirmed",
-                  mandatory=False,
-              )
-              decision = engine.evaluate(
-                  subject_zid="ZID-1",
-                  jurisdiction="SV",
-                  requirement="phone_confirmed",
-                  satisfied=False,
-              )
-              assert decision.compliant is True
-              assert audit.verify() >= 1
-
-
-          def test_unknown_policy(
-              tmp_path: Path,
-          ) -> None:
-              engine, audit = _engine(tmp_path)
-              with pytest.raises(
-                  PolicyNotFoundError
-              ):
-                  engine.evaluate(
-                      subject_zid="ZID-1",
-                      jurisdiction="XX",
-                      requirement="ghost",
-                      satisfied=True,
-                  )
-              assert audit.verify() >= 0
-          PYEOF
-
-          cat > shared_engines/integrations/tests/test_integrations.py <<'PYEOF'
-          """Integration proofs: transient retry succeeds,
-          permanent raises, budget exhausted (one failed
-          invocation recorded per invoke), unknown and
-          unwired refused."""
-          from __future__ import annotations
-
-          from pathlib import Path
-
-          import pytest
-
-          from shared_engines.common.clocks import (
-              FrozenClock,
-          )
-          from shared_engines.common.errors import (
-              ConfigurationError,
-              ProviderPermanentError,
-              ProviderTransientError,
-          )
-          from shared_engines.integrations.engine import (
-              IntegrationsEngine,
-              UnknownAdapterError,
-          )
-          from shared_engines.storage.database import (
-              SQLiteAdapter,
-          )
-
-
-          def _engine(
-              tmp_path: Path,
-          ) -> IntegrationsEngine:
-              db = SQLiteAdapter(
-                  tmp_path / "integ.db"
-              )
-              clock = FrozenClock()
-              engine = IntegrationsEngine(db, clock)
-              engine.register_adapter(
-                  adapter_id="kyc-provider",
-                  kind="http",
-                  endpoint="https://api.example",
-                  max_retries=3,
-              )
-              return engine
-
-
-          def test_transient_then_success(
-              tmp_path: Path,
-          ) -> None:
-              engine = _engine(tmp_path)
-              calls = {"n": 0}
-
-              def flaky(payload: bytes) -> bytes:
-                  calls["n"] += 1
-                  if calls["n"] < 2:
-                      raise ProviderTransientError(
-                          "timeout"
-                      )
-                  return b"ok:" + payload
-
-              engine.register_handler(
-                  adapter_id="kyc-provider",
-                  handler=flaky,
-              )
-              result = engine.invoke(
-                  adapter_id="kyc-provider",
-                  payload=b"doc",
-              )
-              assert result.attempts == 2
-              health = engine.health(
-                  adapter_id="kyc-provider"
-              )
-              assert health.calls == 1
-              assert health.failures == 0
-
-
-          def test_permanent_raises_and_counts(
-              tmp_path: Path,
-          ) -> None:
-              engine = _engine(tmp_path)
-
-              def broken(payload: bytes) -> bytes:
-                  raise ProviderPermanentError(
-                      "bad request"
-                  )
-
-              engine.register_handler(
-                  adapter_id="kyc-provider",
-                  handler=broken,
-              )
-              with pytest.raises(
-                  ProviderPermanentError
-              ):
-                  engine.invoke(
-                      adapter_id="kyc-provider",
-                      payload=b"x",
-                  )
-              health = engine.health(
-                  adapter_id="kyc-provider"
-              )
-              assert health.failures == 1
-
-
-          def test_retry_budget_exhausted(
-              tmp_path: Path,
-          ) -> None:
-              engine = _engine(tmp_path)
-
-              def always_transient(
-                  payload: bytes,
-              ) -> bytes:
-                  raise ProviderTransientError(
-                      "down"
-                  )
-
-              engine.register_handler(
-                  adapter_id="kyc-provider",
-                  handler=always_transient,
-              )
-              with pytest.raises(
-                  ProviderPermanentError
-              ):
-                  engine.invoke(
-                      adapter_id="kyc-provider",
-                      payload=b"x",
-                  )
-              health = engine.health(
-                  adapter_id="kyc-provider"
-              )
-              # Contract: ONE failed invocation is
-              # recorded per invoke() call, regardless
-              # of internal retry attempts.
-              assert health.calls == 1
-              assert health.failures == 1
-
-
-          def test_unknown_and_unwired(
-              tmp_path: Path,
-          ) -> None:
-              engine = _engine(tmp_path)
-              with pytest.raises(UnknownAdapterError):
-                  engine.invoke(
-                      adapter_id="ghost",
-                      payload=b"x",
-                  )
-              with pytest.raises(
-                  ConfigurationError
-              ):
-                  engine.invoke(
-                      adapter_id="kyc-provider",
-                      payload=b"x",
-                  )
-          PYEOF
-
-          cat > shared_engines/export/tests/test_export.py <<'PYEOF'
-          """Export proofs: signed bundle, offline third-
-          party verification, tamper detection."""
-          from __future__ import annotations
-
-          import json
-          from pathlib import Path
-
-          import pytest
-
-          from shared_engines.audit.chain import AuditTrail
-          from shared_engines.common.clocks import (
-              FrozenClock,
-          )
-          from shared_engines.common.serialization import (
-              canonical_json_dumps,
-          )
-          from shared_engines.events.outbox import Outbox
-          from shared_engines.export.engine import (
-              ExportEngine,
-          )
+          from shared_engines.network.life_history import LifeHistory
           from shared_engines.network.portable_profile import (
               ProfileRegistry,
           )
-          from shared_engines.storage.database import (
-              SQLiteAdapter,
+          from shared_engines.network.trust_flow import TrustFlow
+          from shared_engines.reputation.engine import ReputationEngine
+          from shared_engines.search.engine import SearchEngine
+          from shared_engines.storage.database import Database
+          from shared_engines.verification.credentials import (
+              CredentialRegistry,
           )
           from shared_engines.verification.signatures import (
               Ed25519Signer,
           )
 
+          CAPABILITY_EVENT_TYPES = (
+              "identity.registered",
+              "identity.status_changed",
+              "verification.credential.issued",
+              "verification.credential.revoked",
+              "network.profile.updated",
+              "network.profile.accessed",
+              "network.history.appended",
+              "network.document.sealed",
+              "network.signature.requested",
+              "network.document.signed",
+              "network.document.rejected",
+              "network.search.performed",
+              "reputation.event.recorded",
+              "certification.certificate.issued",
+              "certification.certificate.revoked",
+              "compliance.decision.recorded",
+              "export.bundle.created",
+              "ai.analysis.recorded",
+          )
 
-          def _engine(
+
+          class ZyraCapabilities:
+              """Trust services over one database."""
+
+              def __init__(
+                  self,
+                  db: Database,
+                  clock: Clock,
+                  *,
+                  identity: IdentityEngine,
+                  signer: Ed25519Signer,
+              ) -> None:
+                  self._db = db
+                  self._clock = clock
+                  self.audit = AuditTrail(db, clock)
+                  self.outbox = Outbox(db, clock)
+                  self.outbox.ensure_schema()
+                  self.catalog = EventCatalog()
+                  for event_type in (
+                      CAPABILITY_EVENT_TYPES
+                  ):
+                      self.catalog.register(event_type)
+                  self.profiles = ProfileRegistry(
+                      db,
+                      clock,
+                      audit=self.audit,
+                      outbox=self.outbox,
+                  )
+                  self.integrity = IntegrityEngine(
+                      db, clock
+                  )
+                  self.trust = TrustFlow(
+                      identity=identity,
+                      profiles=self.profiles,
+                  )
+                  self.history = LifeHistory(
+                      db,
+                      clock,
+                      audit=self.audit,
+                      outbox=self.outbox,
+                  )
+                  self.exchange = DocumentExchange(
+                      db,
+                      clock,
+                      signer=signer,
+                      integrity=self.integrity,
+                      audit=self.audit,
+                      outbox=self.outbox,
+                  )
+                  self.credentials = CredentialRegistry(
+                      db,
+                      clock,
+                      self.audit,
+                      self.outbox,
+                      self.catalog,
+                  )
+                  self.issuers = IssuerRegistry(db, clock)
+                  self.certification = CertificationEngine(
+                      db,
+                      clock,
+                      issuers=self.issuers,
+                      identity=identity,
+                      credentials=self.credentials,
+                      signer=signer,
+                      audit=self.audit,
+                      outbox=self.outbox,
+                  )
+                  self.search = SearchEngine(
+                      db,
+                      clock,
+                      audit=self.audit,
+                      outbox=self.outbox,
+                  )
+                  self.reputation = ReputationEngine(
+                      db,
+                      clock,
+                      identity=identity,
+                      integrity=self.integrity,
+                      audit=self.audit,
+                      outbox=self.outbox,
+                  )
+                  self.export = ExportEngine(
+                      db,
+                      clock,
+                      signer=signer,
+                      audit=self.audit,
+                  )
+                  self.interop = InteroperabilityEngine(
+                      db, clock
+                  )
+                  self.compliance = ComplianceEngine(
+                      db,
+                      clock,
+                      audit=self.audit,
+                      outbox=self.outbox,
+                  )
+                  self.ai = AIEngine(
+                      db,
+                      clock,
+                      audit=self.audit,
+                      outbox=self.outbox,
+                  )
+                  self.encryption = EncryptionEngine(
+                      db,
+                      clock,
+                      namespace="capabilities",
+                  )
+          PYEOF
+          echo "=== CAPABILITIES READY ==="
+
+      - name: End-to-end capabilities proofs (3)
+        run: |
+          set -euo pipefail
+          mkdir -p shared_engines/runtime/tests
+          cat > shared_engines/runtime/tests/test_capabilities.py <<'PYEOF'
+          """Capabilities proofs: the family-demo end to end
+          over the trust stack."""
+          from __future__ import annotations
+
+          from pathlib import Path
+
+          from shared_engines.audit.chain import AuditTrail
+          from shared_engines.common.clocks import FrozenClock
+          from shared_engines.events.contracts import EventCatalog
+          from shared_engines.events.outbox import Outbox
+          from shared_engines.identity.contracts import (
+              IdentityKind,
+              IdentityStatus,
+          )
+          from shared_engines.identity.engine import IdentityEngine
+          from shared_engines.network.document_exchange import (
+              DocumentExchange,
+          )
+          from shared_engines.runtime.capabilities import (
+              ZyraCapabilities,
+          )
+          from shared_engines.storage.database import SQLiteAdapter
+          from shared_engines.verification.signatures import (
+              Ed25519Signer,
+          )
+
+
+          def _caps(
               tmp_path: Path,
-          ) -> tuple[SQLiteAdapter, ExportEngine]:
-              db = SQLiteAdapter(
-                  tmp_path / "export.db"
-              )
+          ) -> tuple[SQLiteAdapter, ZyraCapabilities, IdentityEngine]:
+              db = SQLiteAdapter(tmp_path / "caps.db")
               clock = FrozenClock()
               audit = AuditTrail(db, clock)
               outbox = Outbox(db, clock)
               outbox.ensure_schema()
-              profiles = ProfileRegistry(
-                  db,
-                  clock,
+              catalog = EventCatalog()
+              for et in (
+                  "identity.registered",
+                  "identity.status_changed",
+              ):
+                  catalog.register(et)
+              identity = IdentityEngine(
+                  db=db,
+                  clock=clock,
                   audit=audit,
                   outbox=outbox,
-              )
-              profiles.register_app(
-                  app_id="portal",
-                  display_name="Portal",
-                  scopes=("display_name",),
+                  catalog=catalog,
               )
               signer, _ = Ed25519Signer.generate()
-              engine = ExportEngine(
+              caps = ZyraCapabilities(
                   db,
                   clock,
+                  identity=identity,
                   signer=signer,
-                  audit=audit,
               )
-              return db, engine
+              return db, caps, identity
 
 
-          def test_export_and_offline_verify(
+          def test_trust_services_end_to_end(
               tmp_path: Path,
           ) -> None:
-              db, engine = _engine(tmp_path)
+              db, caps, identity = _caps(tmp_path)
               try:
-                  bundle = engine.export_bundle(
+                  caps.profiles.register_app(
+                      app_id="familia",
+                      display_name="Familia",
+                      scopes=(
+                          "display_name",
+                          "contact",
+                      ),
+                  )
+                  user = identity.register_identity(
+                      kind=IdentityKind.PERSON,
+                      display_name="maria",
+                      actor="familia",
+                  )
+                  caps.profiles.set_field(
+                      zid=user.zid,
+                      field="display_name",
+                      value="Maria Lopez",
+                  )
+                  caps.profiles.set_field(
+                      zid=user.zid,
+                      field="contact",
+                      value="maria@zyra.sv",
+                  )
+                  final = caps.trust.onboarding_complete(
+                      zid=user.zid,
+                      actor="verifier",
+                  )
+                  assert final.status is (
+                      IdentityStatus.ACTIVE
+                  )
+                  assert (
+                      caps.trust.is_trusted(
+                          zid=user.zid
+                      )
+                      is True
+                  )
+                  view = caps.profiles.view_for_app(
+                      app_id="familia",
+                      zid=user.zid,
+                  )
+                  assert (
+                      view.fields["display_name"]
+                      == "Maria Lopez"
+                  )
+                  first = caps.history.append(
+                      zid=user.zid,
+                      entry_type=(
+                          "birth_registration"
+                      ),
+                      actor_app="familia",
+                      payload={
+                          "hospital": "San Salvador"
+                      },
+                  )
+                  assert first.entry_seq == 1
+                  assert (
+                      caps.history.verify_chain(
+                          zid=user.zid
+                      )
+                      is True
+                  )
+                  sealed = caps.exchange.seal_document(
+                      owner_zid=user.zid,
+                      title="Acta",
+                      content=b"acta de nacimiento",
+                      actor_app="familia",
+                  )
+                  assert (
+                      DocumentExchange.offline_verify(
+                          document_id=(
+                              sealed.document_id
+                          ),
+                          content=(
+                              b"acta de nacimiento"
+                          ),
+                          signature=(
+                              sealed.network_signature
+                          ),
+                          public_pem=(
+                              sealed.public_pem
+                          ),
+                      )
+                      is True
+                  )
+              finally:
+                  db.close()
+
+
+          def test_certification_search_reputation(
+              tmp_path: Path,
+          ) -> None:
+              db, caps, identity = _caps(tmp_path)
+              try:
+                  uni = identity.register_identity(
+                      kind=IdentityKind.INSTITUTION,
+                      display_name="Uni SV",
+                      actor="familia",
+                  )
+                  user = identity.register_identity(
+                      kind=IdentityKind.PERSON,
+                      display_name="maria lopez",
+                      actor="familia",
+                  )
+                  caps.issuers.register_issuer(
+                      issuer_id=uni.zid,
+                      display_name="Uni SV",
+                      scopes=("education",),
+                  )
+                  cert = (
+                      caps.certification.issue_certificate(
+                          subject_zid=user.zid,
+                          issuer_id=uni.zid,
+                          scope="education",
+                          title=(
+                              "Ingenieria"
+                              " Informatica"
+                          ),
+                          detail="titulo",
+                      )
+                  )
+                  verdict = (
+                      caps.certification
+                      .verify_certificate(
+                          certificate_id=(
+                              cert.certificate_id
+                          )
+                      )
+                  )
+                  assert verdict.valid is True
+                  result = caps.search.search(
+                      app_id="familia",
+                      query="ingenieria",
+                  )
+                  sources = {
+                      h.source
+                      for h in result.items
+                  }
+                  assert (
+                      "certificate" in sources
+                  )
+                  event = caps.reputation.record_event(
+                      subject_zid=user.zid,
+                      actor_zid=uni.zid,
+                      kind="positive",
+                      evidence=b"titulo verificado",
+                  )
+                  summary = caps.reputation.summary(
+                      subject_zid=user.zid
+                  )
+                  assert summary.score == 10
+                  assert (
+                      caps.reputation.verify_evidence(
+                          event_id=event.event_id,
+                          evidence=(
+                              b"titulo verificado"
+                          ),
+                      )
+                      is True
+                  )
+              finally:
+                  db.close()
+
+
+          def test_export_interop_compliance_ai_encryption(
+              tmp_path: Path,
+          ) -> None:
+              db, caps, identity = _caps(tmp_path)
+              try:
+                  caps.profiles.register_app(
+                      app_id="familia",
+                      display_name="Familia",
+                      scopes=("display_name",),
+                  )
+                  _ = identity
+                  bundle = caps.export.export_bundle(
                       subject_zid="ZID-1",
                       entries=(
                           (
-                              "credential",
-                              "CRD-1",
-                              "titulo",
-                          ),
-                          (
-                              "history",
-                              "H-1",
-                              "nacimiento",
+                              "doc",
+                              "D-1",
+                              "acta",
                           ),
                       ),
-                      actor_app="portal",
+                      actor_app="familia",
                   )
                   assert (
-                      engine.verify_stored(
+                      caps.export.verify_stored(
                           bundle_id=(
                               bundle.bundle_id
                           )
                       )
                       is True
                   )
-                  assert (
-                      ExportEngine.verify_offline(
-                          bundle_id=(
-                              bundle.bundle_id
-                          ),
-                          entries_json=(
-                              bundle.entries_json
-                          ),
-                          signature=(
-                              bundle.signature
-                          ),
-                          public_pem=(
-                              bundle.public_pem
-                          ),
-                      )
-                      is True
-                  )
-              finally:
-                  db.close()
-
-
-          def test_tampered_entries_detected(
-              tmp_path: Path,
-          ) -> None:
-              db, engine = _engine(tmp_path)
-              try:
-                  bundle = engine.export_bundle(
-                      subject_zid="ZID-1",
-                      entries=(
-                          ("doc", "D-1", "original"),
-                      ),
-                      actor_app="portal",
-                  )
-                  doc = json.loads(
-                      bundle.entries_json.decode(
-                          "utf-8"
-                      )
-                  )
-                  doc[0]["content"] = "FALSIFICADO"
-                  fake = canonical_json_dumps(
-                      doc
-                  ).encode("utf-8")
-                  assert (
-                      ExportEngine.verify_offline(
-                          bundle_id=(
-                              bundle.bundle_id
-                          ),
-                          entries_json=fake,
-                          signature=(
-                              bundle.signature
-                          ),
-                          public_pem=(
-                              bundle.public_pem
-                          ),
-                      )
-                      is False
-                  )
-              finally:
-                  db.close()
-
-
-          def test_unregistered_app_and_empty(
-              tmp_path: Path,
-          ) -> None:
-              db, engine = _engine(tmp_path)
-              try:
-                  with pytest.raises(
-                      PermissionError
-                  ):
-                      engine.export_bundle(
-                          subject_zid="ZID-1",
-                          entries=(
-                              ("doc", "D", "c"),
-                          ),
-                          actor_app="malware",
-                      )
-                  with pytest.raises(Exception):
-                      engine.export_bundle(
-                          subject_zid="ZID-1",
-                          entries=(),
-                          actor_app="portal",
-                      )
-              finally:
-                  db.close()
-          PYEOF
-
-          cat > shared_engines/interoperability/tests/test_interoperability.py <<'PYEOF'
-          """Interoperability proofs: mutual version
-          negotiation, refusal, schema retrieval."""
-          from __future__ import annotations
-
-          from pathlib import Path
-
-          import pytest
-
-          from shared_engines.common.clocks import (
-              FrozenClock,
-          )
-          from shared_engines.common.errors import (
-              UnsupportedVersionError,
-          )
-          from shared_engines.interoperability.engine import (
-              InteroperabilityEngine,
-              SchemaNotFoundError,
-          )
-          from shared_engines.storage.database import (
-              SQLiteAdapter,
-          )
-
-
-          def _engine(
-              tmp_path: Path,
-          ) -> InteroperabilityEngine:
-              db = SQLiteAdapter(
-                  tmp_path / "interop.db"
-              )
-              clock = FrozenClock()
-              engine = InteroperabilityEngine(
-                  db, clock
-              )
-              engine.register_schema(
-                  schema_id="zyra.identity.v1",
-                  version=1,
-                  definition="identity schema v1",
-              )
-              engine.register_schema(
-                  schema_id="zyra.identity.v1",
-                  version=2,
-                  definition="identity schema v2",
-              )
-              engine.register_schema(
-                  schema_id="zyra.identity.v1",
-                  version=3,
-                  definition="identity schema v3",
-              )
-              return engine
-
-
-          def test_negotiation_picks_highest_mutual(
-              tmp_path: Path,
-          ) -> None:
-              engine = _engine(tmp_path)
-              result = engine.negotiate(
-                  schema_id="zyra.identity.v1",
-                  client_versions=(1, 2),
-              )
-              assert result.agreed_version == 2
-              result = engine.negotiate(
-                  schema_id="zyra.identity.v1",
-                  client_versions=(3, 4),
-              )
-              assert result.agreed_version == 3
-
-
-          def test_no_mutual_version_refused(
-              tmp_path: Path,
-          ) -> None:
-              engine = _engine(tmp_path)
-              with pytest.raises(
-                  UnsupportedVersionError
-              ):
-                  engine.negotiate(
-                      schema_id="zyra.identity.v1",
-                      client_versions=(7, 8),
-                  )
-              with pytest.raises(
-                  UnsupportedVersionError
-              ):
-                  engine.negotiate(
-                      schema_id="zyra.identity.v1",
-                      client_versions=(),
-                  )
-
-
-          def test_get_and_unknown(
-              tmp_path: Path,
-          ) -> None:
-              engine = _engine(tmp_path)
-              schema = engine.get_schema(
-                  schema_id="zyra.identity.v1",
-                  version=2,
-              )
-              assert (
-                  schema.definition
-                  == "identity schema v2"
-              )
-              with pytest.raises(
-                  SchemaNotFoundError
-              ):
-                  engine.get_schema(
-                      schema_id="ghost",
+                  caps.interop.register_schema(
+                      schema_id="zyra.demo",
                       version=1,
+                      definition="demo",
                   )
-              with pytest.raises(
-                  SchemaNotFoundError
-              ):
-                  engine.negotiate(
-                      schema_id="ghost",
-                      client_versions=(1,),
+                  agreed = caps.interop.negotiate(
+                      schema_id="zyra.demo",
+                      client_versions=(1, 2),
                   )
+                  assert agreed.agreed_version == 1
+                  caps.compliance.register_policy(
+                      jurisdiction="SV",
+                      requirement="kyc_verified",
+                      mandatory=True,
+                  )
+                  decision = caps.compliance.evaluate(
+                      subject_zid="ZID-1",
+                      jurisdiction="SV",
+                      requirement="kyc_verified",
+                      satisfied=True,
+                  )
+                  assert (
+                      decision.compliant is True
+                  )
+                  caps.ai.register_model(
+                      model_id="classifier",
+                      provider="lab",
+                      model_version="1.0",
+                      capabilities=("document",),
+                  )
+                  record = caps.ai.record_analysis(
+                      model_id="classifier",
+                      content_sha256="a" * 64,
+                      verdict="authentic",
+                      confidence=0.9,
+                  )
+                  assert (
+                      record.model_version
+                      == "1.0"
+                  )
+                  sealed = caps.encryption.seal(
+                      b"secreto de la familia"
+                  )
+                  assert (
+                      caps.encryption.open(sealed)
+                      == b"secreto de la familia"
+                  )
+              finally:
+                  db.close()
           PYEOF
-
-          cat > shared_engines/ai/tests/test_ai.py <<'PYEOF'
-          """AI proofs: model registry, traceable analysis
-          provenance, unknown model and bad confidence
-          refused."""
-          from __future__ import annotations
-
-          from pathlib import Path
-
-          import pytest
-
-          from shared_engines.audit.chain import AuditTrail
-          from shared_engines.common.clocks import (
-              FrozenClock,
-          )
-          from shared_engines.events.contracts import (
-              EventCatalog,
-          )
-          from shared_engines.events.outbox import Outbox
-          from shared_engines.storage.database import (
-              SQLiteAdapter,
-          )
-          from shared_engines.ai.engine import AIEngine
-          from shared_engines.ai.engine import (
-              UnknownModelError,
-          )
-
-
-          def _engine(tmp_path: Path) -> AIEngine:
-              db = SQLiteAdapter(tmp_path / "ai.db")
-              clock = FrozenClock()
-              audit = AuditTrail(db, clock)
-              outbox = Outbox(db, clock)
-              outbox.ensure_schema()
-              catalog = EventCatalog()
-              catalog.register("ai.analysis.recorded")
-              engine = AIEngine(
-                  db, clock, audit=audit, outbox=outbox
-              )
-              engine.register_model(
-                  model_id="doc-classifier",
-                  provider="external-lab",
-                  model_version="2.1.0",
-                  capabilities=(
-                      "document",
-                      "signature",
-                  ),
-              )
-              return engine
-
-
-          def test_analysis_provenance(
-              tmp_path: Path,
-          ) -> None:
-              engine = _engine(tmp_path)
-              sha = "a" * 64
-              record = engine.record_analysis(
-                  model_id="doc-classifier",
-                  content_sha256=sha,
-                  verdict="authentic",
-                  confidence=0.93,
-              )
-              assert (
-                  record.model_version == "2.1.0"
-              )
-              history = engine.analysis_history(
-                  content_sha256=sha
-              )
-              assert len(history) == 1
-              assert history[0].verdict == (
-                  "authentic"
-              )
-
-
-          def test_unknown_and_bad_confidence(
-              tmp_path: Path,
-          ) -> None:
-              engine = _engine(tmp_path)
-              with pytest.raises(UnknownModelError):
-                  engine.record_analysis(
-                      model_id="ghost",
-                      content_sha256="b" * 64,
-                      verdict="x",
-                      confidence=0.5,
-                  )
-              with pytest.raises(ValueError):
-                  engine.record_analysis(
-                      model_id="doc-classifier",
-                      content_sha256="b" * 64,
-                      verdict="x",
-                      confidence=1.5,
-                  )
-              with pytest.raises(ValueError):
-                  engine.record_analysis(
-                      model_id="doc-classifier",
-                      content_sha256="b" * 64,
-                      verdict="x",
-                      confidence=-0.1,
-                  )
-
-
-          def test_history_per_content_isolated(
-              tmp_path: Path,
-          ) -> None:
-              engine = _engine(tmp_path)
-              engine.record_analysis(
-                  model_id="doc-classifier",
-                  content_sha256="c" * 64,
-                  verdict="authentic",
-                  confidence=0.9,
-              )
-              engine.record_analysis(
-                  model_id="doc-classifier",
-                  content_sha256="d" * 64,
-                  verdict="suspicious",
-                  confidence=0.4,
-              )
-              assert (
-                  len(
-                      engine.analysis_history(
-                          content_sha256="c"
-                          * 64
-                      )
-                  )
-                  == 1
-              )
-              assert (
-                  engine.analysis_history(
-                      content_sha256="d" * 64
-                  )[0].verdict
-                  == "suspicious"
-              )
-          PYEOF
-          echo "=== ALL FINAL TESTS READY ==="
+          echo "=== CAPABILITY TESTS READY ==="
 
       - name: Quality gates (mypy first; full regression)
         run: |
@@ -2340,7 +618,7 @@ jobs:
           if git diff --cached --quiet; then
             echo "No changes."
           else
-            git commit -m "zyra: engines 13-17/17 FINAL - compliance, integrations, export, interoperability, ai; broken f-string fixed, retry-budget test aligned; 17/17 engines complete"
+            git commit -m "zyra: W18 structural cleanup + capabilities - 26 orphan __init__py dirs removed, empty radar/orchestration namespaces removed (zero importers confirmed), runtime/capabilities.py composes 14 trust services (profiles/trust/history/exchange/certification/search/reputation/export/interop/compliance/ai/encryption) over one DB; 3 end-to-end family-demo proofs"
             git push origin "HEAD:${{ github.ref_name }}"
           fi
-          echo "=== ALL 17 ENGINES COMPLETE ==="
+          echo "=== W18 COMPLETE ==="

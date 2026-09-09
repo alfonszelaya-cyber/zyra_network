@@ -1,4 +1,4 @@
-name: zyra-w16-triple-engine-2
+name: zyra-w17-final-five-engines
 
 "on":
   workflow_dispatch:
@@ -9,7 +9,7 @@ permissions:
   contents: write
 
 concurrency:
-  group: zyra-w16-${{ github.ref }}
+  group: zyra-w17-${{ github.ref }}
   cancel-in-progress: false
 
 jobs:
@@ -34,92 +34,38 @@ jobs:
       - name: Clean engine inits (W391)
         run: |
           set -euo pipefail
-          for f in workflow routing system_loader; do
+          for f in compliance integrations export interoperability ai; do
             p="shared_engines/$f/__init__.py"
             [ -f "$p" ] && printf '"""ZYRA Network engine package."""\n' > "$p"
           done
           echo "inits cleaned"
 
-      - name: Engine workflow
+      - name: Engine compliance
         run: |
           set -euo pipefail
-          cat > shared_engines/workflow/errors.py <<'PYEOF'
-          """Typed workflow errors."""
-          from __future__ import annotations
+          cat > shared_engines/compliance/engine.py <<'PYEOF'
+          """Compliance engine: jurisdiction policies and
+          audited decisions.
 
-          from shared_engines.common.errors import (
-              EngineError,
-          )
-
-
-          class UnknownWorkflowError(EngineError):
-              """Workflow definition not registered."""
-
-
-          class UnknownRunError(EngineError):
-              """Workflow run does not exist."""
-
-
-          class InvalidStateError(EngineError):
-              """Operation not valid in current run
-              state."""
-          PYEOF
-
-          cat > shared_engines/workflow/contracts.py <<'PYEOF'
-          """Workflow contracts."""
-          from __future__ import annotations
-
-          from dataclasses import dataclass
-
-          STATE_RUNNING = "RUNNING"
-          STATE_COMPLETED = "COMPLETED"
-          STATE_COMPENSATING = "COMPENSATING"
-          STATE_COMPENSATED = "COMPENSATED"
-
-
-          @dataclass(frozen=True)
-          class WorkflowRun:
-              """Durable run snapshot."""
-
-              run_id: str
-              workflow_id: str
-              state: str
-              steps: tuple[str, ...]
-              completed_count: int
-              pending_compensations: int
-              reason: str | None
-          PYEOF
-
-          cat > shared_engines/workflow/engine.py <<'PYEOF'
-          """Workflow engine: durable multi-step runs with
-          compensation.
-
-          A workflow is an ordered list of named steps. A
-          run persists its position; each completed step is
-          durable. On failure, completed steps are
-          compensated in REVERSE order (saga pattern):
-
-              RUNNING -> step -> step -> COMPLETED
-                  |
-                  v (failure)
-              COMPENSATING (undo last-first)
-                  |
-                  v
-              COMPENSATED
-
-          Every state change is durable (SQLite), emitted
-          to the Outbox, and lifecycle milestones are
-          audited. Reuses existing patterns only - no
-          parallel event system.
+          Policies are versioned per jurisdiction and
+          requirement (multi-jurisdiction by design, not
+          tied to one country). evaluate() records a
+          durable, audited decision: compliant when the
+          requirement is satisfied OR the policy is not
+          mandatory; denied otherwise.
           """
           from __future__ import annotations
 
           import hashlib
-          import json
           import sqlite3
+          from dataclasses import dataclass
 
           from shared_engines.audit.chain import AuditTrail
           from shared_engines.common.clocks import Clock
+          from shared_engines.common.errors import (
+              EngineError,
+              NotFoundError,
+          )
           from shared_engines.common.identifiers import (
               new_id,
           )
@@ -127,6 +73,7 @@ jobs:
               canonical_json_dumps,
           )
           from shared_engines.common.validation import (
+              require_int_range,
               require_non_empty_str,
           )
           from shared_engines.events.outbox import Outbox
@@ -137,53 +84,41 @@ jobs:
               Migration,
               MigrationRunner,
           )
-          from shared_engines.workflow.contracts import (
-              STATE_COMPENSATED,
-              STATE_COMPENSATING,
-              STATE_COMPLETED,
-              STATE_RUNNING,
-              WorkflowRun,
-          )
-          from shared_engines.workflow.errors import (
-              InvalidStateError,
-              UnknownRunError,
-              UnknownWorkflowError,
-          )
 
-          EVENT_STARTED = "workflow.run.started"
-          EVENT_STEP = "workflow.run.step_completed"
-          EVENT_COMPLETED = "workflow.run.completed"
-          EVENT_FAILED = "workflow.run.failed"
-          EVENT_COMPENSATED = (
-              "workflow.run.compensated"
-          )
-
-          _MIGRATIONS = (
-              Migration(
-                  1,
-                  "workflow",
-                  (
-                      "CREATE TABLE workflow_defs ("
-                      " workflow_id TEXT PRIMARY KEY,"
-                      " steps_json TEXT NOT NULL,"
-                      " created_at REAL NOT NULL)",
-                      "CREATE TABLE workflow_runs ("
-                      " run_id TEXT PRIMARY KEY,"
-                      " workflow_id TEXT NOT NULL,"
-                      " state TEXT NOT NULL,"
-                      " current_step INTEGER NOT"
-                      " NULL DEFAULT 0,"
-                      " compensating_at INTEGER,"
-                      " reason TEXT,"
-                      " created_at REAL NOT NULL,"
-                      " updated_at REAL NOT NULL)",
-                  ),
-              ),
+          EVENT_DECISION = (
+              "compliance.decision.recorded"
           )
 
 
-          class WorkflowEngine:
-              """Durable saga-style workflow runs."""
+          class PolicyNotFoundError(NotFoundError):
+              """No active policy for that jurisdiction
+              and requirement."""
+
+
+          @dataclass(frozen=True)
+          class PolicyRecord:
+              policy_id: str
+              jurisdiction: str
+              requirement: str
+              mandatory: bool
+              version: int
+              active: bool
+
+
+          @dataclass(frozen=True)
+          class ComplianceDecision:
+              decision_id: str
+              subject_zid: str
+              jurisdiction: str
+              requirement: str
+              compliant: bool
+              policy_id: str
+              reason: str
+
+
+          class ComplianceEngine:
+              """Jurisdiction policies -> audited
+              decisions."""
 
               def __init__(
                   self,
@@ -198,22 +133,21 @@ jobs:
                   self._audit = audit
                   self._outbox = outbox
                   MigrationRunner(
-                      db, "workflow", _MIGRATIONS
+                      db, "compliance", _MIGRATIONS
                   ).run(clock)
 
               def _emit(
                   self,
                   cursor: sqlite3.Cursor,
                   *,
-                  event_type: str,
                   aggregate: str,
                   payload: dict[str, object],
               ) -> None:
                   uid = hashlib.sha256(
                       canonical_json_dumps(
                           {
-                              "t": event_type,
                               "a": aggregate,
+                              "p": payload,
                               "u": new_id(),
                           }
                       ).encode("utf-8")
@@ -222,7 +156,7 @@ jobs:
                       canonical_json_dumps(
                           {
                               "id": uid,
-                              "ty": event_type,
+                              "ty": EVENT_DECISION,
                           }
                       ).encode("utf-8")
                   ).hexdigest()
@@ -237,7 +171,7 @@ jobs:
                       " ?, NULL)",
                       (
                           uid,
-                          event_type,
+                          EVENT_DECISION,
                           aggregate,
                           self._clock.now(),
                           canonical_json_dumps(
@@ -247,264 +181,126 @@ jobs:
                       ),
                   )
 
-              def _steps_of(
-                  self, workflow_id: str
-              ) -> tuple[str, ...]:
-                  row = self._db.query_one(
-                      "SELECT steps_json FROM"
-                      " workflow_defs WHERE"
-                      " workflow_id = ?",
-                      (workflow_id,),
-                  )
-                  if row is None:
-                      raise UnknownWorkflowError(
-                          "unknown workflow:"
-                          f" {workflow_id}"
-                      )
-                  parsed = json.loads(
-                      str(row["steps_json"])
-                  )
-                  if not isinstance(parsed, list):
-                      return tuple()
-                  return tuple(
-                      str(s)
-                      for s in parsed
-                      if isinstance(s, str)
-                  )
-
-              def _run_row(
-                  self, run_id: str
-              ) -> sqlite3.Row:
-                  row = self._db.query_one(
-                      "SELECT * FROM workflow_runs"
-                      " WHERE run_id = ?",
-                      (run_id,),
-                  )
-                  if row is None:
-                      raise UnknownRunError(
-                          f"unknown run: {run_id}"
-                      )
-                  return row
-
-              def _record(
-                  self, run_id: str
-              ) -> WorkflowRun:
-                  row = self._run_row(run_id)
-                  steps = self._steps_of(
-                      str(row["workflow_id"])
-                  )
-                  comp = row["compensating_at"]
-                  state = str(row["state"])
-                  return WorkflowRun(
-                      run_id=str(row["run_id"]),
-                      workflow_id=str(
-                          row["workflow_id"]
-                      ),
-                      state=state,
-                      steps=steps,
-                      completed_count=int(
-                          row["current_step"]
-                      ),
-                      pending_compensations=(
-                          int(comp)
-                          if comp is not None
-                          and state
-                          == STATE_COMPENSATING
-                          else 0
-                      ),
-                      reason=(
-                          str(row["reason"])
-                          if row["reason"]
-                          is not None
-                          else None
-                      ),
-                  )
-
-              def define_workflow(
+              def register_policy(
                   self,
                   *,
-                  workflow_id: str,
-                  steps: tuple[str, ...],
-              ) -> None:
+                  jurisdiction: str,
+                  requirement: str,
+                  mandatory: bool,
+                  version: int = 1,
+              ) -> PolicyRecord:
                   require_non_empty_str(
-                      workflow_id, "workflow_id"
+                      jurisdiction, "jurisdiction"
                   )
-                  if not steps:
-                      raise ValueError(
-                          "at least one step"
-                          " required"
-                      )
-                  if any(
-                      not s.strip()
-                      for s in steps
-                  ):
-                      raise ValueError(
-                          "steps must be non-empty"
-                      )
+                  require_non_empty_str(
+                      requirement, "requirement"
+                  )
+                  require_int_range(
+                      version, "version", 1, 10**6
+                  )
+                  policy_id = (
+                      f"POL-{new_id()[:12]}"
+                  )
+                  now = self._clock.now()
                   with (
                       self._db.transaction()
                       as cursor
                   ):
                       cursor.execute(
-                          "INSERT INTO workflow_defs"
-                          " (workflow_id, steps_json,"
+                          "INSERT INTO"
+                          " compliance_policies"
+                          " (policy_id, jurisdiction,"
+                          "  requirement, mandatory,"
+                          "  version, active,"
                           "  created_at)"
-                          " VALUES (?, ?, ?)"
-                          " ON CONFLICT(workflow_id)"
-                          " DO UPDATE SET steps_json"
-                          " = excluded.steps_json",
+                          " VALUES (?, ?, ?, ?, ?, 1,"
+                          " ?)",
                           (
-                              workflow_id,
-                              canonical_json_dumps(
-                                  list(steps)
-                              ),
-                              self._clock.now(),
-                          ),
-                      )
-
-              def start_run(
-                  self, *, workflow_id: str
-              ) -> WorkflowRun:
-                  steps = self._steps_of(
-                      workflow_id
-                  )
-                  run_id = f"RUN-{new_id()}"
-                  now = self._clock.now()
-                  with (
-                      self._db.transaction()
-                      as cursor
-                  ):
-                      cursor.execute(
-                          "INSERT INTO workflow_runs"
-                          " (run_id, workflow_id,"
-                          "  state, current_step,"
-                          "  created_at, updated_at)"
-                          " VALUES (?, ?, ?, 0, ?, ?)",
-                          (
-                              run_id,
-                              workflow_id,
-                              STATE_RUNNING,
-                              now,
+                              policy_id,
+                              jurisdiction,
+                              requirement,
+                              int(mandatory),
+                              version,
                               now,
                           ),
                       )
-                      self._emit(
-                          cursor,
-                          event_type=EVENT_STARTED,
-                          aggregate=run_id,
-                          payload={
-                              "workflow": (
-                                  workflow_id
-                              ),
-                              "steps": len(steps),
-                          },
-                      )
-                  self._audit.append(
-                      event_type=EVENT_STARTED,
-                      actor="workflow-engine",
-                      subject=run_id,
-                      payload={
-                          "workflow": workflow_id
-                      },
+                  return PolicyRecord(
+                      policy_id=policy_id,
+                      jurisdiction=jurisdiction,
+                      requirement=requirement,
+                      mandatory=mandatory,
+                      version=version,
+                      active=True,
                   )
-                  return self._record(run_id)
 
-              def complete_step(
-                  self, *, run_id: str
-              ) -> WorkflowRun:
-                  row = self._run_row(run_id)
-                  if str(row["state"]) != (
-                      STATE_RUNNING
-                  ):
-                      raise InvalidStateError(
-                          "run is not RUNNING:"
-                          f" {run_id}"
-                      )
-                  workflow_id = str(
-                      row["workflow_id"]
+              def _active_policy(
+                  self,
+                  jurisdiction: str,
+                  requirement: str,
+              ) -> PolicyRecord:
+                  row = self._db.query_one(
+                      "SELECT * FROM"
+                      " compliance_policies"
+                      " WHERE jurisdiction = ?"
+                      " AND requirement = ?"
+                      " AND active = 1"
+                      " ORDER BY version DESC"
+                      " LIMIT 1",
+                      (jurisdiction, requirement),
                   )
-                  steps = self._steps_of(
-                      workflow_id
+                  if row is None:
+                      raise PolicyNotFoundError(
+                          "no active policy for"
+                          f" '{jurisdiction}' /"
+                          f" '{requirement}'"
+                      )
+                  return PolicyRecord(
+                      policy_id=str(
+                          row["policy_id"]
+                      ),
+                      jurisdiction=str(
+                          row["jurisdiction"]
+                      ),
+                      requirement=str(
+                          row["requirement"]
+                      ),
+                      mandatory=bool(
+                          int(row["mandatory"])
+                      ),
+                      version=int(row["version"]),
+                      active=True,
                   )
-                  current = int(
-                      row["current_step"]
-                  )
-                  if current >= len(steps):
-                      raise InvalidStateError(
-                          "no pending steps"
-                      )
-                  new_step = current + 1
-                  done = (
-                      new_step == len(steps)
-                  )
-                  now = self._clock.now()
-                  with (
-                      self._db.transaction()
-                      as cursor
-                  ):
-                      cursor.execute(
-                          "UPDATE workflow_runs SET"
-                          " current_step = ?,"
-                          " state = ?,"
-                          " updated_at = ?"
-                          " WHERE run_id = ?",
-                          (
-                              new_step,
-                              STATE_COMPLETED
-                              if done
-                              else STATE_RUNNING,
-                              now,
-                              run_id,
-                          ),
-                      )
-                      self._emit(
-                          cursor,
-                          event_type=(
-                              EVENT_COMPLETED
-                              if done
-                              else EVENT_STEP
-                          ),
-                          aggregate=run_id,
-                          payload={
-                              "step": steps[current],
-                              "position": new_step,
-                          },
-                      )
-                  if done:
-                      self._audit.append(
-                          event_type=(
-                              EVENT_COMPLETED
-                          ),
-                          actor="workflow-engine",
-                          subject=run_id,
-                          payload={},
-                      )
-                  return self._record(run_id)
 
-              def fail_run(
+              def evaluate(
                   self,
                   *,
-                  run_id: str,
-                  reason: str,
-              ) -> WorkflowRun:
+                  subject_zid: str,
+                  jurisdiction: str,
+                  requirement: str,
+                  satisfied: bool,
+              ) -> ComplianceDecision:
                   require_non_empty_str(
-                      reason, "reason"
+                      subject_zid, "subject_zid"
                   )
-                  row = self._run_row(run_id)
-                  if str(row["state"]) != (
-                      STATE_RUNNING
-                  ):
-                      raise InvalidStateError(
-                          "run is not RUNNING:"
-                          f" {run_id}"
+                  policy = self._active_policy(
+                      jurisdiction, requirement
+                  )
+                  compliant = (
+                      satisfied
+                      or not policy.mandatory
+                  )
+                  reason = (
+                      "requirement satisfied"
+                      if satisfied
+                      else (
+                          "optional requirement"
+                          if compliant
+                          else "mandatory"
+                          " requirement unmet"
                       )
-                  completed = int(
-                      row["current_step"]
                   )
-                  terminal = (
-                      STATE_COMPENSATING
-                      if completed > 0
-                      else STATE_COMPENSATED
+                  decision_id = (
+                      f"DEC-{new_id()[:12]}"
                   )
                   now = self._clock.now()
                   with (
@@ -512,165 +308,155 @@ jobs:
                       as cursor
                   ):
                       cursor.execute(
-                          "UPDATE workflow_runs SET"
-                          " state = ?,"
-                          " compensating_at = ?,"
-                          " reason = ?,"
-                          " updated_at = ?"
-                          " WHERE run_id = ?",
+                          "INSERT INTO"
+                          " compliance_decisions"
+                          " (decision_id,"
+                          " subject_zid, policy_id,"
+                          " compliant, reason,"
+                          " decided_at)"
+                          " VALUES (?, ?, ?, ?, ?, ?)",
                           (
-                              terminal,
-                              completed
-                              if terminal
-                              == (
-                                  STATE_COMPENSATING
-                              )
-                              else None,
+                              decision_id,
+                              subject_zid,
+                              policy.policy_id,
+                              int(compliant),
                               reason,
                               now,
-                              run_id,
                           ),
                       )
                       self._emit(
                           cursor,
-                          event_type=EVENT_FAILED,
-                          aggregate=run_id,
+                          aggregate=decision_id,
                           payload={
-                              "reason": reason
+                              "jurisdiction": (
+                                  jurisdiction
+                              ),
+                              "requirement": (
+                                  requirement
+                              ),
+                              "compliant": (
+                                  compliant
+                              ),
                           },
                       )
                   self._audit.append(
-                      event_type=EVENT_FAILED,
-                      actor="workflow-engine",
-                      subject=run_id,
-                      payload={"reason": reason},
+                      event_type=EVENT_DECISION,
+                      actor="compliance-engine",
+                      subject=decision_id,
+                      payload={
+                          "compliant": compliant
+                      },
                   )
-                  return self._record(run_id)
-
-              def compensate_step(
-                  self, *, run_id: str
-              ) -> WorkflowRun:
-                  row = self._run_row(run_id)
-                  if str(row["state"]) != (
-                      STATE_COMPENSATING
-                  ):
-                      raise InvalidStateError(
-                          "run is not"
-                          " COMPENSATING:"
-                          f" {run_id}"
-                      )
-                  comp = int(
-                      row["compensating_at"]
-                      or 0
+                  return ComplianceDecision(
+                      decision_id=decision_id,
+                      subject_zid=subject_zid,
+                      jurisdiction=jurisdiction,
+                      requirement=requirement,
+                      compliant=compliant,
+                      policy_id=policy.policy_id,
+                      reason=reason,
                   )
-                  if comp <= 0:
-                      raise InvalidStateError(
-                          "nothing to compensate"
-                      )
-                  remaining = comp - 1
-                  done = remaining == 0
-                  now = self._clock.now()
-                  with (
-                      self._db.transaction()
-                      as cursor
-                  ):
-                      cursor.execute(
-                          "UPDATE workflow_runs SET"
-                          " compensating_at = ?,"
-                          " state = ?,"
-                          " updated_at = ?"
-                          " WHERE run_id = ?",
-                          (
-                              remaining
-                              if not done
-                              else None,
-                              STATE_COMPENSATED
-                              if done
-                              else (
-                                  STATE_COMPENSATING
-                              ),
-                              now,
-                              run_id,
-                          ),
-                      )
-                      self._emit(
-                          cursor,
-                          event_type=(
-                              EVENT_COMPENSATED
-                              if done
-                              else EVENT_STEP
-                          ),
-                          aggregate=run_id,
-                          payload={
-                              "undo_position": comp
-                          },
-                      )
-                  if done:
-                      self._audit.append(
-                          event_type=(
-                              EVENT_COMPENSATED
-                          ),
-                          actor="workflow-engine",
-                          subject=run_id,
-                          payload={},
-                      )
-                  return self._record(run_id)
 
-              def get_run(
-                  self, *, run_id: str
-              ) -> WorkflowRun:
-                  return self._record(run_id)
+              def list_policies(
+                  self, *, jurisdiction: str
+              ) -> tuple[PolicyRecord, ...]:
+                  rows = self._db.query_all(
+                      "SELECT * FROM"
+                      " compliance_policies"
+                      " WHERE jurisdiction = ?"
+                      " AND active = 1"
+                      " ORDER BY requirement,"
+                      " version DESC",
+                      (jurisdiction,),
+                  )
+                  return tuple(
+                      PolicyRecord(
+                          policy_id=str(
+                              r["policy_id"]
+                          ),
+                          jurisdiction=str(
+                              r["jurisdiction"]
+                          ),
+                          requirement=str(
+                              r["requirement"]
+                          ),
+                          mandatory=bool(
+                              int(r["mandatory"])
+                          ),
+                          version=int(
+                              r["version"]
+                          ),
+                          active=True,
+                      )
+                      for r in rows
+                  )
+
+          _MIGRATIONS = (
+              Migration(
+                  1,
+                  "compliance",
+                  (
+                      "CREATE TABLE"
+                      " compliance_policies ("
+                      " policy_id TEXT PRIMARY KEY,"
+                      " jurisdiction TEXT NOT NULL,"
+                      " requirement TEXT NOT NULL,"
+                      " mandatory INTEGER NOT NULL,"
+                      " version INTEGER NOT NULL,"
+                      " active INTEGER NOT NULL,"
+                      " created_at REAL NOT NULL)",
+                      "CREATE INDEX comp_lookup"
+                      " ON compliance_policies"
+                      " (jurisdiction,"
+                      " requirement, active)",
+                      "CREATE TABLE"
+                      " compliance_decisions ("
+                      " decision_id TEXT PRIMARY"
+                      " KEY,"
+                      " subject_zid TEXT NOT NULL,"
+                      " policy_id TEXT NOT NULL,"
+                      " compliant INTEGER NOT NULL,"
+                      " reason TEXT NOT NULL,"
+                      " decided_at REAL NOT NULL)",
+                  ),
+              ),
+          )
           PYEOF
-          echo "=== WORKFLOW READY ==="
+          echo "=== COMPLIANCE READY ==="
 
-      - name: Engine routing
+      - name: Engine integrations
         run: |
           set -euo pipefail
-          cat > shared_engines/routing/errors.py <<'PYEOF'
-          """Typed routing errors."""
-          from __future__ import annotations
+          cat > shared_engines/integrations/engine.py <<'PYEOF'
+          """Integrations engine: external adapters with
+          retry, health and durable stats.
 
-          from shared_engines.common.errors import (
-              NotFoundError,
-          )
-
-
-          class NoRouteError(NotFoundError):
-              """No active route for the key."""
-          PYEOF
-
-          cat > shared_engines/routing/engine.py <<'PYEOF'
-          """Routing engine: the transversal route table.
-
-          Canonical layer mapping route keys to targets with
-          explicit priorities. Deliberately independent of
-          network/ (node-level routing) and currency (bridge
-          routing): this is the Network-wide registry for
-          "which target serves this key, in which order".
-
-          Resolution is deterministic: lowest priority
-          number wins, ties broken by route_id. Deactivating
-          a route falls resolution to the next one. Pure
-          utility layer.
+          Real providers are wired at the composition root
+          as handler callables (bytes -> bytes); the engine
+          governs invocation: bounded retries on transient
+          failures (reusing ProviderTransientError /
+          ProviderPermanentError from the common error
+          hierarchy), durable call counters and health.
+          No fake providers live here.
           """
           from __future__ import annotations
 
-          import sqlite3
+          import hashlib
+          from collections.abc import Callable
           from dataclasses import dataclass
 
           from shared_engines.common.clocks import Clock
           from shared_engines.common.errors import (
+              ConfigurationError,
+              EngineError,
+              IntegrityError,
               NotFoundError,
-          )
-          from shared_engines.common.identifiers import (
-              new_id,
+              ProviderPermanentError,
+              ProviderTransientError,
           )
           from shared_engines.common.validation import (
               require_int_range,
               require_non_empty_str,
-          )
-          from shared_engines.routing.errors import (
-              NoRouteError,
           )
           from shared_engines.storage.database import (
               Database,
@@ -680,245 +466,289 @@ jobs:
               MigrationRunner,
           )
 
-          _MIGRATIONS = (
-              Migration(
-                  1,
-                  "routing_routes",
-                  (
-                      "CREATE TABLE routing_routes ("
-                      " route_id TEXT PRIMARY KEY,"
-                      " route_key TEXT NOT NULL,"
-                      " target TEXT NOT NULL,"
-                      " priority INTEGER NOT NULL,"
-                      " active INTEGER NOT NULL"
-                      " DEFAULT 1,"
-                      " created_at REAL NOT NULL)",
-                      "CREATE INDEX routing_lookup"
-                      " ON routing_routes"
-                      " (route_key, priority,"
-                      " route_id)",
-                  ),
-              ),
-          )
+
+          class UnknownAdapterError(NotFoundError):
+              """Adapter not registered."""
 
 
           @dataclass(frozen=True)
-          class RouteRecord:
-              route_id: str
-              route_key: str
-              target: str
-              priority: int
-              active: bool
+          class AdapterRecord:
+              adapter_id: str
+              kind: str
+              endpoint: str
+              max_retries: int
+              calls: int
+              failures: int
 
 
-          class RoutingEngine:
-              """Durable prioritized route table."""
+          @dataclass(frozen=True)
+          class InvokeResult:
+              adapter_id: str
+              attempts: int
+              response_sha256: str
+
+
+          class IntegrationsEngine:
+              """Governed invocation of external
+              adapters."""
 
               def __init__(
                   self, db: Database, clock: Clock
               ) -> None:
                   self._db = db
                   self._clock = clock
+                  self._handlers: dict[
+                      str,
+                      Callable[[bytes], bytes],
+                  ] = {}
                   MigrationRunner(
-                      db, "routing", _MIGRATIONS
+                      db,
+                      "integrations",
+                      _MIGRATIONS,
                   ).run(clock)
 
-              def _record(
-                  self, row: sqlite3.Row
-              ) -> RouteRecord:
-                  return RouteRecord(
-                      route_id=str(
-                          row["route_id"]
-                      ),
-                      route_key=str(
-                          row["route_key"]
-                      ),
-                      target=str(row["target"]),
-                      priority=int(
-                          row["priority"]
-                      ),
-                      active=bool(
-                          int(row["active"])
-                      ),
-                  )
-
-              def _by_id(
-                  self, route_id: str
-              ) -> RouteRecord:
-                  row = self._db.query_one(
-                      "SELECT * FROM routing_routes"
-                      " WHERE route_id = ?",
-                      (route_id,),
-                  )
-                  if row is None:
-                      raise NotFoundError(
-                          "unknown route:"
-                          f" {route_id}"
-                      )
-                  return self._record(row)
-
-              def register_route(
+              def register_adapter(
                   self,
                   *,
-                  route_key: str,
-                  target: str,
-                  priority: int = 100,
-              ) -> RouteRecord:
+                  adapter_id: str,
+                  kind: str,
+                  endpoint: str,
+                  max_retries: int = 3,
+              ) -> AdapterRecord:
                   require_non_empty_str(
-                      route_key, "route_key"
+                      adapter_id, "adapter_id"
                   )
                   require_non_empty_str(
-                      target, "target"
+                      kind, "kind"
+                  )
+                  require_non_empty_str(
+                      endpoint, "endpoint"
                   )
                   require_int_range(
-                      priority,
-                      "priority",
+                      max_retries,
+                      "max_retries",
                       1,
-                      10**6,
+                      10,
                   )
-                  route_id = f"RTE-{new_id()}"
                   with (
                       self._db.transaction()
                       as cursor
                   ):
                       cursor.execute(
-                          "INSERT INTO routing_routes"
-                          " (route_id, route_key,"
-                          "  target, priority,"
-                          "  active, created_at)"
-                          " VALUES (?, ?, ?, ?, 1, ?)",
+                          "INSERT INTO"
+                          " integration_adapters"
+                          " (adapter_id, kind,"
+                          "  endpoint, max_retries,"
+                          "  calls, failures,"
+                          "  created_at)"
+                          " VALUES (?, ?, ?, ?, 0, 0,"
+                          " ?)"
+                          " ON CONFLICT(adapter_id)"
+                          " DO UPDATE SET kind ="
+                          " excluded.kind, endpoint"
+                          " = excluded.endpoint,"
+                          " max_retries ="
+                          " excluded.max_retries",
                           (
-                              route_id,
-                              route_key,
-                              target,
-                              priority,
+                              adapter_id,
+                              kind,
+                              endpoint,
+                              max_retries,
                               self._clock.now(),
                           ),
                       )
-                  return self._by_id(route_id)
-
-              def deactivate_route(
-                  self, *, route_id: str
-              ) -> RouteRecord:
-                  require_non_empty_str(
-                      route_id, "route_id"
+                  return self.health(
+                      adapter_id=adapter_id
                   )
-                  self._by_id(route_id)
+
+              def register_handler(
+                  self,
+                  *,
+                  adapter_id: str,
+                  handler: Callable[[bytes], bytes],
+              ) -> None:
+                  require_non_empty_str(
+                      adapter_id, "adapter_id"
+                  )
+                  self._row(adapter_id)
+                  self._handlers[adapter_id] = (
+                      handler
+                  )
+
+              def _row(
+                  self, adapter_id: str
+              ) -> AdapterRecord:
+                  row = self._db.query_one(
+                      "SELECT * FROM"
+                      " integration_adapters"
+                      " WHERE adapter_id = ?",
+                      (adapter_id,),
+                  )
+                  if row is None:
+                      raise UnknownAdapterError(
+                          "unknown adapter:"
+                          f" {adapter_id}"
+                      )
+                  return AdapterRecord(
+                      adapter_id=str(
+                          row["adapter_id"]
+                      ),
+                      kind=str(row["kind"]),
+                      endpoint=str(
+                          row["endpoint"]
+                      ),
+                      max_retries=int(
+                          row["max_retries"]
+                      ),
+                      calls=int(row["calls"]),
+                      failures=int(
+                          row["failures"]
+                      ),
+                  )
+
+              def invoke(
+                  self,
+                  *,
+                  adapter_id: str,
+                  payload: bytes,
+              ) -> InvokeResult:
+                  require_non_empty_str(
+                      adapter_id, "adapter_id"
+                  )
+                  if not payload:
+                      raise IntegrityError(
+                          "payload required"
+                      )
+                  record = self._row(adapter_id)
+                  handler = (
+                      self._handlers.get(
+                          adapter_id
+                      )
+                  )
+                  if handler is None:
+                      raise ConfigurationError(
+                          "no handler wired for"
+                          f" '{adapter_id}'"
+                      )
+                  attempts = 0
+                  last_exc: Exception | None = (
+                      None
+                  )
+                  while (
+                      attempts
+                      < record.max_retries
+                  ):
+                      attempts += 1
+                      try:
+                          response = handler(
+                              payload
+                          )
+                          self._bump(
+                              adapter_id,
+                              failure=False,
+                          )
+                          return InvokeResult(
+                              adapter_id=(
+                                  adapter_id
+                              ),
+                              attempts=attempts,
+                              response_sha256=(
+                                  hashlib.sha256(
+                                      response
+                                  ).hexdigest()
+                              ),
+                          )
+                      except (
+                          ProviderTransientError
+                      ) as exc:
+                          last_exc = exc
+                      except (
+                          ProviderPermanentError
+                      ) as exc:
+                          self._bump(
+                              adapter_id,
+                              failure=True,
+                          )
+                          raise
+                  self._bump(
+                      adapter_id, failure=True
+                  )
+                  raise ProviderPermanentError(
+                      "adapter"
+                      f" '{adapter_id}' failed"
+                      f" after {attempts}"
+                      " attempts:"
+                      f" {last_exc}"
+                  ) from last_exc
+
+              def _bump(
+                  self,
+                  adapter_id: str,
+                  *,
+                  failure: bool,
+              ) -> None:
+                  delta_fail = 1 if failure else 0
                   with (
                       self._db.transaction()
                       as cursor
                   ):
                       cursor.execute(
-                          "UPDATE routing_routes"
-                          " SET active = 0"
-                          " WHERE route_id = ?",
-                          (route_id,),
+                          "UPDATE"
+                          " integration_adapters"
+                          " SET calls = calls + 1,"
+                          " failures = failures"
+                          " + ?"
+                          " WHERE adapter_id = ?",
+                          (delta_fail, adapter_id),
                       )
-                  return self._by_id(route_id)
 
-              def resolve(
-                  self, *, route_key: str
-              ) -> RouteRecord:
-                  """Best active route: lowest priority
-                  number, tie by route_id."""
-                  require_non_empty_str(
-                      route_key, "route_key"
-                  )
-                  row = self._db.query_one(
-                      "SELECT * FROM routing_routes"
-                      " WHERE route_key = ?"
-                      " AND active = 1"
-                      " ORDER BY priority ASC,"
-                      " route_id ASC LIMIT 1",
-                      (route_key,),
-                  )
-                  if row is None:
-                      raise NoRouteError(
-                          "no active route for"
-                          f" '{route_key}'"
-                      )
-                  return self._record(row)
+              def health(
+                  self, *, adapter_id: str
+              ) -> AdapterRecord:
+                  return self._row(adapter_id)
 
-              def list_routes(
-                  self, *, route_key: str
-              ) -> tuple[RouteRecord, ...]:
-                  require_non_empty_str(
-                      route_key, "route_key"
-                  )
-                  rows = self._db.query_all(
-                      "SELECT * FROM routing_routes"
-                      " WHERE route_key = ?"
-                      " ORDER BY priority ASC,"
-                      " route_id ASC",
-                      (route_key,),
-                  )
-                  return tuple(
-                      self._record(row)
-                      for row in rows
-                  )
+          _MIGRATIONS = (
+              Migration(
+                  1,
+                  "integrations",
+                  (
+                      "CREATE TABLE"
+                      " integration_adapters ("
+                      " adapter_id TEXT PRIMARY"
+                      " KEY,"
+                      " kind TEXT NOT NULL,"
+                      " endpoint TEXT NOT NULL,"
+                      " max_retries INTEGER NOT"
+                      " NULL,"
+                      " calls INTEGER NOT NULL"
+                      " DEFAULT 0,"
+                      " failures INTEGER NOT NULL"
+                      " DEFAULT 0,"
+                      " created_at REAL NOT NULL)",
+                  ),
+              ),
+          )
           PYEOF
-          echo "=== ROUTING READY ==="
+          echo "=== INTEGRATIONS READY ==="
 
-      - name: Engine system_loader
+      - name: Engine export
         run: |
           set -euo pipefail
-          cat > shared_engines/system_loader/errors.py <<'PYEOF'
-          """Typed system-loader errors."""
-          from __future__ import annotations
+          cat > shared_engines/export/engine.py <<'PYEOF'
+          """Export engine: portable, signed evidence
+          bundles.
 
-          from shared_engines.common.errors import (
-              EngineError,
-              NotFoundError,
-          )
+          An export bundles entries (kind, ref_id,
+          content) about one subject into a canonical
+          manifest, signed with the network Ed25519 key.
+          ANY third party verifies offline with the
+          bundle + public key - no database, no trust:
 
+              verify_offline(bundle_id, entries_json,
+                             signature, public_pem)
 
-          class IncompatibleVersionError(EngineError):
-              """Manifest version range does not cover
-              this Network contract version."""
-
-
-          class ComponentAlreadyLoadedError(
-              EngineError
-          ):
-              """Component is already loaded."""
-
-
-          class ManifestNotRegisteredError(
-              NotFoundError
-          ):
-              """No manifest for the requested
-              component/version."""
-
-
-          class UnknownLoadedComponentError(
-              NotFoundError
-          ):
-              """Component is not currently loaded."""
-          PYEOF
-
-          cat > shared_engines/system_loader/engine.py <<'PYEOF'
-          """System loader: manifest-governed component
-          loading.
-
-          The GOVERNANCE layer above execution (foundation
-          ModuleLoader/ComponentLoader do the actual import;
-          LifecycleManager runs states). This engine decides
-          WHAT MAY LOAD and records it durably:
-
-              manifest declared (component, version,
-                                 compatible contract range)
-                    |
-                    v
-              load_component(): policy check
-              (contract version within range, not loaded)
-                    |
-                    v
-              durable loaded-registry + outbox event
-
-          Policy is compatibility-based and explicit: an
-          out-of-range component can never load, and a
-          component cannot load twice. This is the
-          anti-arbitrary-loading guard the audit demanded.
+          Domain-separated payload
+          "EXPORT:<bundle_id>:<manifest_sha>".
           """
           from __future__ import annotations
 
@@ -926,7 +756,13 @@ jobs:
           import sqlite3
           from dataclasses import dataclass
 
+          from shared_engines.audit.chain import AuditTrail
           from shared_engines.common.clocks import Clock
+          from shared_engines.common.errors import (
+              EngineError,
+              IntegrityError,
+              NotFoundError,
+          )
           from shared_engines.common.identifiers import (
               new_id,
           )
@@ -934,7 +770,551 @@ jobs:
               canonical_json_dumps,
           )
           from shared_engines.common.validation import (
+              require_non_empty_str,
+          )
+          from shared_engines.storage.database import (
+              Database,
+          )
+          from shared_engines.storage.migrations import (
+              Migration,
+              MigrationRunner,
+          )
+          from shared_engines.verification.signatures import (
+              Ed25519Signer,
+              Ed25519Verifier,
+          )
+
+          EVENT_EXPORTED = "export.bundle.created"
+
+
+          class EmptyExportError(EngineError):
+              """An export needs at least one entry."""
+
+
+          @dataclass(frozen=True)
+          class ExportBundle:
+              bundle_id: str
+              subject_zid: str
+              entries_json: bytes
+              manifest_sha256: str
+              signature: bytes
+              public_pem: bytes
+              created_at: float
+
+
+          def _manifest_sha(entries_json: bytes) -> str:
+              return hashlib.sha256(
+                  entries_json
+              ).hexdigest()
+
+
+          def _payload(
+              bundle_id: str, manifest_sha: str
+          ) -> bytes:
+              return (
+                  f"EXPORT:{bundle_id}:"
+                  f"{manifest_sha}"
+              ).encode("utf-8")
+
+
+          class ExportEngine:
+              """Signed portable bundles."""
+
+              def __init__(
+                  self,
+                  db: Database,
+                  clock: Clock,
+                  *,
+                  signer: Ed25519Signer,
+                  audit: AuditTrail,
+              ) -> None:
+                  self._db = db
+                  self._clock = clock
+                  self._signer = signer
+                  self._audit = audit
+                  self._public_pem = (
+                      signer.public_pem
+                  )
+                  MigrationRunner(
+                      db, "export", _MIGRATIONS
+                  ).run(clock)
+
+              def export_bundle(
+                  self,
+                  *,
+                  subject_zid: str,
+                  entries: tuple[
+                      tuple[str, str, str], ...
+                  ],
+                  actor_app: str,
+              ) -> ExportBundle:
+                  """entries: (kind, ref_id,
+                  content) triples."""
+                  require_non_empty_str(
+                      subject_zid, "subject_zid"
+                  )
+                  require_non_empty_str(
+                      actor_app, "actor_app"
+                  )
+                  row = self._db.query_one(
+                      "SELECT 1 FROM app_registry"
+                      " WHERE app_id = ?",
+                      (actor_app,),
+                  )
+                  if row is None:
+                      raise PermissionError(
+                          "app not registered:"
+                          f" {actor_app}"
+                      )
+                  if not entries:
+                      raise EmptyExportError(
+                          "at least one entry"
+                          " required"
+                      )
+                  entry_docs = [
+                      {
+                          "kind": str(kind),
+                          "ref_id": str(ref),
+                          "content": str(
+                              content
+                          ),
+                      }
+                      for kind, ref, content in (
+                          entries
+                      )
+                  ]
+                  entries_json = (
+                      canonical_json_dumps(
+                          entry_docs
+                      ).encode("utf-8")
+                  )
+                  manifest = _manifest_sha(
+                      entries_json
+                  )
+                  bundle_id = (
+                      f"EXP-{new_id()[:12]}"
+                  )
+                  signature = self._signer.sign(
+                      _payload(
+                          bundle_id, manifest
+                      )
+                  )
+                  now = self._clock.now()
+                  with (
+                      self._db.transaction()
+                      as cursor
+                  ):
+                      cursor.execute(
+                          "INSERT INTO"
+                          " export_bundles"
+                          " (bundle_id, subject_zid,"
+                          "  entries_json,"
+                          "  manifest_sha256,"
+                          "  signature, public_pem,"
+                          "  created_at)"
+                          " VALUES (?, ?, ?, ?, ?, ?,"
+                          "  ?)",
+                          (
+                              bundle_id,
+                              subject_zid,
+                              entries_json,
+                              manifest,
+                              signature,
+                              self._public_pem,
+                              now,
+                          ),
+                      )
+                  self._audit.append(
+                      event_type=EVENT_EXPORTED,
+                      actor=actor_app,
+                      subject=bundle_id,
+                      payload={
+                          "subject": subject_zid,
+                          "entries": len(
+                              entry_docs
+                          ),
+                      },
+                  )
+                  return ExportBundle(
+                      bundle_id=bundle_id,
+                      subject_zid=subject_zid,
+                      entries_json=entries_json,
+                      manifest_sha256=manifest,
+                      signature=signature,
+                      public_pem=(
+                          self._public_pem
+                      ),
+                      created_at=now,
+                  )
+
+              def get_bundle(
+                  self, *, bundle_id: str
+              ) -> ExportBundle:
+                  row = self._db.query_one(
+                      "SELECT * FROM"
+                      " export_bundles"
+                      " WHERE bundle_id = ?",
+                      (bundle_id,),
+                  )
+                  if row is None:
+                      raise NotFoundError(
+                          "unknown bundle:"
+                          f" {bundle_id}"
+                      )
+                  return ExportBundle(
+                      bundle_id=str(
+                          row["bundle_id"]
+                      ),
+                      subject_zid=str(
+                          row["subject_zid"]
+                      ),
+                      entries_json=bytes(
+                          row["entries_json"]
+                      ),
+                      manifest_sha256=str(
+                          row["manifest_sha256"]
+                      ),
+                      signature=bytes(
+                          row["signature"]
+                      ),
+                      public_pem=bytes(
+                          row["public_pem"]
+                      ),
+                      created_at=float(
+                          row["created_at"]
+                      ),
+                  )
+
+              def verify_stored(
+                  self, *, bundle_id: str
+              ) -> bool:
+                  bundle = self.get_bundle(
+                      bundle_id=bundle_id
+                  )
+                  recomputed = _manifest_sha(
+                      bundle.entries_json
+                  )
+                  if (
+                      recomputed
+                      != bundle.manifest_sha256
+                  ):
+                      return False
+                  verifier = Ed25519Verifier(
+                      bundle.public_pem
+                  )
+                  return verifier.verify(
+                      _payload(
+                          bundle_id,
+                          bundle.manifest_sha256,
+                      ),
+                      bundle.signature,
+                  )
+
+              @staticmethod
+              def verify_offline(
+                  *,
+                  bundle_id: str,
+                  entries_json: bytes,
+                  signature: bytes,
+                  public_pem: bytes,
+              ) -> bool:
+                  manifest = _manifest_sha(
+                      entries_json
+                  )
+                  verifier = Ed25519Verifier(
+                      public_pem
+                  )
+                  return verifier.verify(
+                      _payload(
+                          bundle_id, manifest
+                      ),
+                      signature,
+                  )
+
+          _MIGRATIONS = (
+              Migration(
+                  1,
+                  "export",
+                  (
+                      "CREATE TABLE"
+                      " export_bundles ("
+                      " bundle_id TEXT PRIMARY KEY,"
+                      " subject_zid TEXT NOT NULL,"
+                      " entries_json BLOB NOT NULL,"
+                      " manifest_sha256 TEXT NOT"
+                      " NULL,"
+                      " signature BLOB NOT NULL,"
+                      " public_pem BLOB NOT NULL,"
+                      " created_at REAL NOT NULL)",
+                  ),
+              ),
+          )
+          PYEOF
+          echo "=== EXPORT READY ==="
+
+      - name: Engine interoperability
+        run: |
+          set -euo pipefail
+          cat > shared_engines/interoperability/engine.py <<'PYEOF'
+          """Interoperability engine: schemas, versions and
+          negotiation.
+
+          External parties declare the schema versions they
+          support; negotiate() picks the highest MUTUAL
+          version or refuses with the common
+          UnsupportedVersionError. Schemas are durable and
+          versioned; unknown schemas are refused. Pure
+          contract layer - no protocol duplication.
+          """
+          from __future__ import annotations
+
+          from dataclasses import dataclass
+
+          from shared_engines.common.clocks import Clock
+          from shared_engines.common.errors import (
+              NotFoundError,
+              UnsupportedVersionError,
+          )
+          from shared_engines.common.validation import (
               require_int_range,
+              require_non_empty_str,
+          )
+          from shared_engines.storage.database import (
+              Database,
+          )
+          from shared_engines.storage.migrations import (
+              Migration,
+              MigrationRunner,
+          )
+
+
+          class SchemaNotFoundError(NotFoundError):
+              """Schema not registered."""
+
+
+          @dataclass(frozen=True)
+          class SchemaVersion:
+              schema_id: str
+              version: int
+              definition: str
+              registered_at: float
+
+
+          @dataclass(frozen=True)
+          class NegotiationResult:
+              schema_id: str
+              agreed_version: int
+
+
+          class InteroperabilityEngine:
+              """Versioned schemas with negotiation."""
+
+              def __init__(
+                  self, db: Database, clock: Clock
+              ) -> None:
+                  self._db = db
+                  self._clock = clock
+                  MigrationRunner(
+                      db,
+                      "interoperability",
+                      _MIGRATIONS,
+                  ).run(clock)
+
+              def register_schema(
+                  self,
+                  *,
+                  schema_id: str,
+                  version: int,
+                  definition: str,
+              ) -> SchemaVersion:
+                  require_non_empty_str(
+                      schema_id, "schema_id"
+                  )
+                  require_int_range(
+                      version, "version", 1, 10**6
+                  )
+                  require_non_empty_str(
+                      definition, "definition"
+                  )
+                  now = self._clock.now()
+                  with (
+                      self._db.transaction()
+                      as cursor
+                  ):
+                      cursor.execute(
+                          "INSERT INTO interop_schemas"
+                          " (schema_id, version,"
+                          "  definition,"
+                          "  registered_at)"
+                          " VALUES (?, ?, ?, ?)"
+                          " ON CONFLICT(schema_id,"
+                          " version) DO UPDATE SET"
+                          " definition ="
+                          " excluded.definition",
+                          (
+                              schema_id,
+                              version,
+                              definition,
+                              now,
+                          ),
+                      )
+                  return SchemaVersion(
+                      schema_id=schema_id,
+                      version=version,
+                      definition=definition,
+                      registered_at=now,
+                  )
+
+              def get_schema(
+                  self,
+                  *,
+                  schema_id: str,
+                  version: int,
+              ) -> SchemaVersion:
+                  require_non_empty_str(
+                      schema_id, "schema_id"
+                  )
+                  row = self._db.query_one(
+                      "SELECT * FROM interop_schemas"
+                      " WHERE schema_id = ?"
+                      " AND version = ?",
+                      (schema_id, version),
+                  )
+                  if row is None:
+                      raise SchemaNotFoundError(
+                          "unknown schema version:"
+                          f" {schema_id} v{version}"
+                      )
+                  return SchemaVersion(
+                      schema_id=str(
+                          row["schema_id"]
+                      ),
+                      version=int(row["version"]),
+                      definition=str(
+                          row["definition"]
+                      ),
+                      registered_at=float(
+                          row["registered_at"]
+                      ),
+                  )
+
+              def list_versions(
+                  self, *, schema_id: str
+              ) -> tuple[int, ...]:
+                  require_non_empty_str(
+                      schema_id, "schema_id"
+                  )
+                  rows = self._db.query_all(
+                      "SELECT version FROM"
+                      " interop_schemas"
+                      " WHERE schema_id = ?"
+                      " ORDER BY version",
+                      (schema_id,),
+                  )
+                  return tuple(
+                      int(r["version"])
+                      for r in rows
+                  )
+
+              def negotiate(
+                  self,
+                  *,
+                  schema_id: str,
+                  client_versions: tuple[int, ...],
+              ) -> NegotiationResult:
+                  """Highest version supported by BOTH
+                  sides, else UnsupportedVersionError."""
+                  require_non_empty_str(
+                      schema_id, "schema_id"
+                  )
+                  if not client_versions:
+                      raise UnsupportedVersionError(
+                          "client offered no"
+                          " versions"
+                      )
+                  ours = set(
+                      self.list_versions(
+                          schema_id=schema_id
+                      )
+                  )
+                  if not ours:
+                      raise SchemaNotFoundError(
+                          "unknown schema:"
+                          f" {schema_id}"
+                      )
+                  common = ours & set(
+                      client_versions
+                  )
+                  if not common:
+                      raise (
+                          UnsupportedVersionError(
+                              "no mutual version:"
+                              f" ours"
+                              f" {sorted(ours)}"
+                              " vs client"
+                              f" {sorted(set(client_versions))}"
+                          )
+                      )
+                  return NegotiationResult(
+                      schema_id=schema_id,
+                      agreed_version=max(common),
+                  )
+
+          _MIGRATIONS = (
+              Migration(
+                  1,
+                  "interoperability",
+                  (
+                      "CREATE TABLE interop_schemas ("
+                      " schema_id TEXT NOT NULL,"
+                      " version INTEGER NOT NULL,"
+                      " definition TEXT NOT NULL,"
+                      " registered_at REAL NOT"
+                      " NULL,"
+                      " PRIMARY KEY (schema_id,"
+                      " version))",
+                  ),
+              ),
+          )
+          PYEOF
+          echo "=== INTEROPERABILITY READY ==="
+
+      - name: Engine ai
+        run: |
+          set -euo pipefail
+          cat > shared_engines/ai/engine.py <<'PYEOF'
+          """AI engine: model registry + analysis
+          provenance.
+
+          Honest by design: this engine does NOT fake AI
+          detection. Real models/providers are registered
+          at the composition root; the engine durably
+          records WHAT model (id, provider, version)
+          analyzed WHAT content (sha256) with WHAT result
+          (verdict + confidence), so every AI-related
+          claim in the Network is traceable to a specific
+          model version and content hash. Analyses are
+          audited and emitted to the Outbox.
+          """
+          from __future__ import annotations
+
+          import hashlib
+          import sqlite3
+          from dataclasses import dataclass
+
+          from shared_engines.audit.chain import AuditTrail
+          from shared_engines.common.clocks import Clock
+          from shared_engines.common.errors import (
+              EngineError,
+              NotFoundError,
+            )
+          from shared_engines.common.identifiers import (
+              new_id,
+          )
+          from shared_engines.common.serialization import (
+              canonical_json_dumps,
+          )
+          from shared_engines.common.validation import (
               require_non_empty_str,
           )
           from shared_engines.events.outbox import Outbox
@@ -945,104 +1325,63 @@ jobs:
               Migration,
               MigrationRunner,
           )
-          from shared_engines.system_loader.errors import (
-              ComponentAlreadyLoadedError,
-              IncompatibleVersionError,
-              ManifestNotRegisteredError,
-              UnknownLoadedComponentError,
-          )
 
-          EVENT_LOADED = "system.component.loaded"
-          EVENT_UNLOADED = (
-              "system.component.unloaded"
-          )
+          EVENT_ANALYSIS = "ai.analysis.recorded"
 
-          _MIGRATIONS = (
-              Migration(
-                  1,
-                  "system_loader",
-                  (
-                      "CREATE TABLE"
-                      " system_manifests ("
-                      " component_id TEXT NOT NULL,"
-                      " version INTEGER NOT NULL,"
-                      " min_contract INTEGER NOT"
-                      " NULL,"
-                      " max_contract INTEGER NOT"
-                      " NULL,"
-                      " registered_at REAL NOT"
-                      " NULL,"
-                      " PRIMARY KEY (component_id,"
-                      " version))",
-                      "CREATE TABLE system_loaded ("
-                      " component_id TEXT PRIMARY"
-                      " KEY,"
-                      " version INTEGER NOT NULL,"
-                      " loaded_at REAL NOT NULL)",
-                  ),
-              ),
-          )
+
+          class UnknownModelError(NotFoundError):
+              """Model not registered."""
 
 
           @dataclass(frozen=True)
-          class ManifestRecord:
-              component_id: str
-              version: int
-              min_contract: int
-              max_contract: int
-              registered_at: float
+          class ModelRecord:
+              model_id: str
+              provider: str
+              model_version: str
+              capabilities: tuple[str, ...]
+              active: bool
 
 
           @dataclass(frozen=True)
-          class LoadedRecord:
-              component_id: str
-              version: int
-              loaded_at: float
+          class AnalysisRecord:
+              analysis_id: str
+              model_id: str
+              model_version: str
+              content_sha256: str
+              verdict: str
+              confidence: float
+              analyzed_at: float
 
 
-          class SystemLoaderEngine:
-              """Manifest policy over durable load
-              registry."""
+          class AIEngine:
+              """Traceable AI analysis provenance."""
 
               def __init__(
                   self,
                   db: Database,
                   clock: Clock,
                   *,
+                  audit: AuditTrail,
                   outbox: Outbox,
-                  network_contract_version: int = 1,
               ) -> None:
-                  require_int_range(
-                      network_contract_version,
-                      "network_contract_version",
-                      1,
-                      10**6,
-                      config=True,
-                  )
                   self._db = db
                   self._clock = clock
+                  self._audit = audit
                   self._outbox = outbox
-                  self._contract = (
-                      network_contract_version
-                  )
                   MigrationRunner(
-                      db,
-                      "system_loader",
-                      _MIGRATIONS,
+                      db, "ai", _MIGRATIONS
                   ).run(clock)
 
               def _emit(
                   self,
                   cursor: sqlite3.Cursor,
                   *,
-                  event_type: str,
                   aggregate: str,
                   payload: dict[str, object],
               ) -> None:
                   uid = hashlib.sha256(
                       canonical_json_dumps(
                           {
-                              "t": event_type,
                               "a": aggregate,
                               "u": new_id(),
                           }
@@ -1052,7 +1391,7 @@ jobs:
                       canonical_json_dumps(
                           {
                               "id": uid,
-                              "ty": event_type,
+                              "ty": EVENT_ANALYSIS,
                           }
                       ).encode("utf-8")
                   ).hexdigest()
@@ -1067,7 +1406,7 @@ jobs:
                       " ?, NULL)",
                       (
                           uid,
-                          event_type,
+                          EVENT_ANALYSIS,
                           aggregate,
                           self._clock.now(),
                           canonical_json_dumps(
@@ -1077,282 +1416,805 @@ jobs:
                       ),
                   )
 
-              def register_manifest(
+              def register_model(
                   self,
                   *,
-                  component_id: str,
-                  version: int,
-                  min_contract: int,
-                  max_contract: int,
-              ) -> ManifestRecord:
+                  model_id: str,
+                  provider: str,
+                  model_version: str,
+                  capabilities: tuple[str, ...],
+              ) -> ModelRecord:
                   require_non_empty_str(
-                      component_id,
-                      "component_id",
+                      model_id, "model_id"
                   )
-                  require_int_range(
-                      version, "version", 1, 10**6
+                  require_non_empty_str(
+                      provider, "provider"
                   )
-                  require_int_range(
-                      min_contract,
-                      "min_contract",
-                      1,
-                      10**6,
+                  require_non_empty_str(
+                      model_version,
+                      "model_version",
                   )
-                  require_int_range(
-                      max_contract,
-                      "max_contract",
-                      1,
-                      10**6,
-                  )
-                  if min_contract > max_contract:
-                      raise ValueError(
-                          "min_contract exceeds"
-                          " max_contract"
+                  clean: list[str] = []
+                  for cap in capabilities:
+                      require_non_empty_str(
+                          cap, "capability"
                       )
-                  now = self._clock.now()
+                      if cap not in clean:
+                          clean.append(cap)
                   with (
                       self._db.transaction()
                       as cursor
                   ):
                       cursor.execute(
-                          "INSERT INTO"
-                          " system_manifests"
-                          " (component_id, version,"
-                          "  min_contract,"
-                          "  max_contract,"
-                          "  registered_at)"
-                          " VALUES (?, ?, ?, ?, ?)"
-                          " ON CONFLICT("
-                          " component_id, version)"
-                          " DO UPDATE SET"
-                          " min_contract ="
-                          " excluded.min_contract,"
-                          " max_contract ="
-                          " excluded.max_contract",
+                          "INSERT INTO ai_models"
+                          " (model_id, provider,"
+                          "  model_version,"
+                          "  capabilities,"
+                          "  active, registered_at)"
+                          " VALUES (?, ?, ?, ?, 1, ?)"
+                          " ON CONFLICT(model_id)"
+                          " DO UPDATE SET provider"
+                          " = excluded.provider,"
+                          " model_version ="
+                          " excluded"
+                          ".model_version,"
+                          " capabilities ="
+                          " excluded.capabilities,"
+                          " active = 1",
                           (
-                              component_id,
-                              version,
-                              min_contract,
-                              max_contract,
-                              now,
+                              model_id,
+                              provider,
+                              model_version,
+                              ",".join(clean),
+                              self._clock.now(),
                           ),
                       )
-                  return ManifestRecord(
-                      component_id=component_id,
-                      version=version,
-                      min_contract=min_contract,
-                      max_contract=max_contract,
-                      registered_at=now,
+                  return ModelRecord(
+                      model_id=model_id,
+                      provider=provider,
+                      model_version=(
+                          model_version
+                      ),
+                      capabilities=tuple(clean),
+                      active=True,
                   )
 
-              def _pick_manifest(
-                  self,
-                  component_id: str,
-                  version: int | None,
-              ) -> ManifestRecord:
-                  if version is not None:
-                      row = self._db.query_one(
-                          "SELECT * FROM"
-                          " system_manifests"
-                          " WHERE component_id = ?"
-                          " AND version = ?",
-                          (component_id, version),
-                      )
-                  else:
-                      row = self._db.query_one(
-                          "SELECT * FROM"
-                          " system_manifests"
-                          " WHERE component_id = ?"
-                          " ORDER BY version DESC"
-                          " LIMIT 1",
-                          (component_id,),
-                      )
+              def _model_row(
+                  self, model_id: str
+              ) -> tuple[str, str, str]:
+                  row = self._db.query_one(
+                      "SELECT model_version,"
+                      " active FROM ai_models"
+                      " WHERE model_id = ?",
+                      (model_id,),
+                  )
                   if row is None:
-                      raise (
-                          ManifestNotRegisteredError(
-                              "no manifest for"
-                              f" '{component_id}'"
-                          )
+                      raise UnknownModelError(
+                          "unknown model:"
+                          f" {model_id}"
                       )
-                  return ManifestRecord(
-                      component_id=str(
-                          row["component_id"]
-                      ),
-                      version=int(
-                          row["version"]
-                      ),
-                      min_contract=int(
-                          row["min_contract"]
-                      ),
-                      max_contract=int(
-                          row["max_contract"]
-                      ),
-                      registered_at=float(
-                          row["registered_at"]
-                      ),
+                  if int(row["active"]) != 1:
+                      raise UnknownModelError(
+                          "model deactivated:"
+                          f" {model_id}"
+                      )
+                  return (
+                      model_id,
+                      str(row["model_version"]),
+                      "active",
                   )
 
-              def load_component(
+              def record_analysis(
                   self,
                   *,
-                  component_id: str,
-                  version: int | None = None,
-              ) -> LoadedRecord:
+                  model_id: str,
+                  content_sha256: str,
+                  verdict: str,
+                  confidence: float,
+              ) -> AnalysisRecord:
+                  model_version = self._model_row(
+                      model_id
+                  )[1]
                   require_non_empty_str(
-                      component_id,
-                      "component_id",
+                      content_sha256,
+                      "content_sha256",
                   )
-                  already = self._db.query_one(
-                      "SELECT 1 FROM"
-                      " system_loaded WHERE"
-                      " component_id = ?",
-                      (component_id,),
-                  )
-                  if already is not None:
-                      raise (
-                          ComponentAlreadyLoadedError(
-                              "already loaded:"
-                              f" {component_id}"
-                          )
-                      )
-                  manifest = self._pick_manifest(
-                      component_id, version
+                  require_non_empty_str(
+                      verdict, "verdict"
                   )
                   if not (
-                      manifest.min_contract
-                      <= self._contract
-                      <= manifest.max_contract
+                      0.0 <= confidence <= 1.0
                   ):
-                      raise (
-                          IncompatibleVersionError(
-                              f"'{component_id}'"
-                              f" v{manifest.version}"
-                              " needs contract"
-                              " ["
-                              f"{manifest.min_contract}"
-                              ","
-                              f"{manifest.max_contract}"
-                              "] but network is"
-                              f" {self._contract}"
-                          )
+                      raise ValueError(
+                          "confidence must be"
+                          " within [0, 1]"
                       )
+                  analysis_id = (
+                      f"AI-{new_id()[:12]}"
+                  )
                   now = self._clock.now()
                   with (
                       self._db.transaction()
                       as cursor
                   ):
                       cursor.execute(
-                          "INSERT INTO"
-                          " system_loaded"
-                          " (component_id, version,"
-                          "  loaded_at)"
-                          " VALUES (?, ?, ?)",
+                          "INSERT INTO ai_analyses"
+                          " (analysis_id, model_id,"
+                          "  model_version,"
+                          "  content_sha256, verdict,"
+                          "  confidence, analyzed_at)"
+                          " VALUES (?, ?, ?, ?, ?, ?,"
+                          "  ?)",
                           (
-                              component_id,
-                              manifest.version,
+                              analysis_id,
+                              model_id,
+                              model_version,
+                              content_sha256,
+                              verdict,
+                              confidence,
                               now,
                           ),
                       )
                       self._emit(
                           cursor,
-                          event_type=EVENT_LOADED,
-                          aggregate=component_id,
+                          aggregate=analysis_id,
                           payload={
-                              "version": (
-                                  manifest.version
-                              )
+                              "model": model_id,
+                              "verdict": verdict,
                           },
                       )
-                  return LoadedRecord(
-                      component_id=component_id,
-                      version=manifest.version,
-                      loaded_at=now,
+                  self._audit.append(
+                      event_type=EVENT_ANALYSIS,
+                      actor=model_id,
+                      subject=analysis_id,
+                      payload={
+                          "verdict": verdict
+                      },
+                  )
+                  return AnalysisRecord(
+                      analysis_id=analysis_id,
+                      model_id=model_id,
+                      model_version=(
+                          model_version
+                      ),
+                      content_sha256=(
+                          content_sha256
+                      ),
+                      verdict=verdict,
+                      confidence=confidence,
+                      analyzed_at=now,
                   )
 
-              def unload_component(
-                  self, *, component_id: str
-              ) -> LoadedRecord:
+              def analysis_history(
+                  self, *, content_sha256: str
+              ) -> tuple[AnalysisRecord, ...]:
                   require_non_empty_str(
-                      component_id,
-                      "component_id",
+                      content_sha256,
+                      "content_sha256",
                   )
-                  row = self._db.query_one(
-                      "SELECT * FROM system_loaded"
-                      " WHERE component_id = ?",
-                      (component_id,),
-                  )
-                  if row is None:
-                      raise (
-                          UnknownLoadedComponentError(
-                              "not loaded:"
-                              f" {component_id}"
-                          )
-                      )
-                  record = LoadedRecord(
-                      component_id=str(
-                          row["component_id"]
-                      ),
-                      version=int(row["version"]),
-                      loaded_at=float(
-                          row["loaded_at"]
-                      ),
-                  )
-                  with (
-                      self._db.transaction()
-                      as cursor
-                  ):
-                      cursor.execute(
-                          "DELETE FROM"
-                          " system_loaded WHERE"
-                          " component_id = ?",
-                          (component_id,),
-                      )
-                      self._emit(
-                          cursor,
-                          event_type=(
-                              EVENT_UNLOADED
-                          ),
-                          aggregate=component_id,
-                          payload={
-                              "version": (
-                                  record.version
-                              )
-                          },
-                      )
-                  return record
-
-              def loaded_components(
-                  self,
-              ) -> tuple[LoadedRecord, ...]:
                   rows = self._db.query_all(
-                      "SELECT * FROM system_loaded"
-                      " ORDER BY component_id"
+                      "SELECT * FROM ai_analyses"
+                      " WHERE content_sha256 = ?"
+                      " ORDER BY analyzed_at",
+                      (content_sha256,),
                   )
                   return tuple(
-                      LoadedRecord(
-                          component_id=str(
-                              r["component_id"]
+                      AnalysisRecord(
+                          analysis_id=str(
+                              r["analysis_id"]
                           ),
-                          version=int(
-                              r["version"]
+                          model_id=str(
+                              r["model_id"]
                           ),
-                          loaded_at=float(
-                              r["loaded_at"]
+                          model_version=str(
+                              r["model_version"]
+                          ),
+                          content_sha256=str(
+                              r["content_sha256"]
+                          ),
+                          verdict=str(
+                              r["verdict"]
+                          ),
+                          confidence=float(
+                              r["confidence"]
+                          ),
+                          analyzed_at=float(
+                              r["analyzed_at"]
                           ),
                       )
                       for r in rows
                   )
-          PYEOF
-          echo "=== SYSTEM LOADER READY ==="
 
-      - name: Engine proofs (workflow x3, routing x3, system_loader x3)
+          _MIGRATIONS = (
+              Migration(
+                  1,
+                  "ai",
+                  (
+                      "CREATE TABLE ai_models ("
+                      " model_id TEXT PRIMARY KEY,"
+                      " provider TEXT NOT NULL,"
+                      " model_version TEXT NOT"
+                      " NULL,"
+                      " capabilities TEXT NOT"
+                      " NULL,"
+                      " active INTEGER NOT NULL,"
+                      " registered_at REAL NOT"
+                      " NULL)",
+                      "CREATE TABLE ai_analyses ("
+                      " analysis_id TEXT PRIMARY"
+                      " KEY,"
+                      " model_id TEXT NOT NULL,"
+                      " model_version TEXT NOT"
+                      " NULL,"
+                      " content_sha256 TEXT NOT"
+                      " NULL,"
+                      " verdict TEXT NOT NULL,"
+                      " confidence REAL NOT NULL,"
+                      " analyzed_at REAL NOT"
+                      " NULL)",
+                      "CREATE INDEX ai_content"
+                      " ON ai_analyses"
+                      " (content_sha256)",
+                  ),
+              ),
+          )
+          PYEOF
+          echo "=== AI READY ==="
+
+      - name: Engine proofs (5 engines)
         run: |
           set -euo pipefail
-          mkdir -p shared_engines/workflow/tests shared_engines/routing/tests shared_engines/system_loader/tests
+          mkdir -p shared_engines/compliance/tests shared_engines/integrations/tests shared_engines/export/tests shared_engines/interoperability/tests shared_engines/ai/tests
 
-          cat > shared_engines/workflow/tests/test_workflow.py <<'PYEOF'
-          """Workflow proofs: durable run to completion,
-          failure with reverse compensation, invalid ops
+          cat > shared_engines/compliance/tests/test_compliance.py <<'PYEOF'
+          """Compliance proofs: mandatory vs optional,
+          unknown policy refused, decisions audited."""
+          from __future__ import annotations
+
+          from pathlib import Path
+
+          import pytest
+
+          from shared_engines.audit.chain import AuditTrail
+          from shared_engines.common.clocks import (
+              FrozenClock,
+          )
+          from shared_engines.events.contracts import (
+              EventCatalog,
+          )
+          from shared_engines.events.outbox import Outbox
+          from shared_engines.storage.database import (
+              SQLiteAdapter,
+          )
+          from shared_engines.compliance.engine import (
+              ComplianceEngine,
+              PolicyNotFoundError,
+          )
+
+
+          def _engine(tmp_path: Path) -> ComplianceEngine:
+              db = SQLiteAdapter(
+                  tmp_path / "comp.db"
+              )
+              clock = FrozenClock()
+              audit = AuditTrail(db, clock)
+              outbox = Outbox(db, clock)
+              outbox.ensure_schema()
+              catalog = EventCatalog()
+              catalog.register(
+                  "compliance.decision.recorded"
+              )
+              engine = ComplianceEngine(
+                  db, clock, audit=audit, outbox=outbox
+              )
+              engine.register_policy(
+                  jurisdiction="SV",
+                  requirement="kyc_verified",
+                  mandatory=True,
+              )
+              return engine
+
+
+          def test_mandatory_satisfied(tmp_path: Path) -> None:
+              engine = _engine(tmp_path)
+              decision = engine.evaluate(
+                  subject_zid="ZID-1",
+                  jurisdiction="SV",
+                  requirement="kyc_verified",
+                  satisfied=True,
+              )
+              assert decision.compliant is True
+              assert (
+                  decision.reason
+                  == "requirement satisfied"
+              )
+
+
+          def test_mandatory_unmet_denied(
+              tmp_path: Path,
+          ) -> None:
+              engine = _engine(tmp_path)
+              decision = engine.evaluate(
+                  subject_zid="ZID-1",
+                  jurisdiction="SV",
+                  requirement="kyc_verified",
+                  satisfied=False,
+              )
+              assert decision.compliant is False
+
+
+          def test_optional_unmet_allowed(
+              tmp_path: Path,
+          ) -> None:
+              engine = _engine(tmp_path)
+              engine.register_policy(
+                  jurisdiction="SV",
+                  requirement="phone_confirmed",
+                  mandatory=False,
+              )
+              decision = engine.evaluate(
+                  subject_zid="ZID-1",
+                  jurisdiction="SV",
+                  requirement="phone_confirmed",
+                  satisfied=False,
+              )
+              assert decision.compliant is True
+
+
+          def test_unknown_policy_and_audit(
+              tmp_path: Path,
+          ) -> None:
+              engine = _engine(tmp_path)
+              with pytest.raises(
+                  PolicyNotFoundError
+              ):
+                  engine.evaluate(
+                      subject_zid="ZID-1",
+                      jurisdiction="XX",
+                      requirement="ghost",
+                      satisfied=True,
+                  )
+              engine.evaluate(
+                  subject_zid="ZID-1",
+                  jurisdiction="SV",
+                  requirement="kyc_verified",
+                  satisfied=True,
+              )
+              assert engine.audit.verify() >= 1
+          PYEOF
+
+          cat > shared_engines/integrations/tests/test_integrations.py <<'PYEOF'
+          """Integration proofs: transient retry succeeds,
+          permanent raises, retry budget exhausted, unknown
+          adapter and unwired handler refused."""
+          from __future__ import annotations
+
+          from pathlib import Path
+
+          import pytest
+
+          from shared_engines.common.clocks import (
+              FrozenClock,
+          )
+          from shared_engines.common.errors import (
+              ConfigurationError,
+              ProviderPermanentError,
+              ProviderTransientError,
+          )
+          from shared_engines.integrations.engine import (
+              IntegrationsEngine,
+          )
+          from shared_engines.integrations.engine import (
+              UnknownAdapterError,
+          )
+          from shared_engines.storage.database import (
+              SQLiteAdapter,
+          )
+
+
+          def _engine(tmp_path: Path) -> IntegrationsEngine:
+              db = SQLiteAdapter(
+                  tmp_path / "integ.db"
+              )
+              clock = FrozenClock()
+              engine = IntegrationsEngine(db, clock)
+              engine.register_adapter(
+                  adapter_id="kyc-provider",
+                  kind="http",
+                  endpoint="https://api.example",
+                  max_retries=3,
+              )
+              return engine
+
+
+          def test_transient_then_success(
+              tmp_path: Path,
+          ) -> None:
+              engine = _engine(tmp_path)
+              calls = {"n": 0}
+
+              def flaky(payload: bytes) -> bytes:
+                  calls["n"] += 1
+                  if calls["n"] < 2:
+                      raise ProviderTransientError(
+                          "timeout"
+                      )
+                  return b"ok:" + payload
+
+              engine.register_handler(
+                  adapter_id="kyc-provider",
+                  handler=flaky,
+              )
+              result = engine.invoke(
+                  adapter_id="kyc-provider",
+                  payload=b"doc",
+              )
+              assert result.attempts == 2
+              health = engine.health(
+                  adapter_id="kyc-provider"
+              )
+              assert health.calls == 1
+              assert health.failures == 0
+
+
+          def test_permanent_raises_and_counts(
+              tmp_path: Path,
+          ) -> None:
+              engine = _engine(tmp_path)
+
+              def broken(payload: bytes) -> bytes:
+                  raise ProviderPermanentError(
+                      "bad request"
+                  )
+
+              engine.register_handler(
+                  adapter_id="kyc-provider",
+                  handler=broken,
+              )
+              with pytest.raises(
+                  ProviderPermanentError
+              ):
+                  engine.invoke(
+                      adapter_id="kyc-provider",
+                      payload=b"x",
+                  )
+              health = engine.health(
+                  adapter_id="kyc-provider"
+              )
+              assert health.failures == 1
+
+
+          def test_retry_budget_exhausted(
+              tmp_path: Path,
+          ) -> None:
+              engine = _engine(tmp_path)
+
+              def always_transient(
+                  payload: bytes,
+              ) -> bytes:
+                  raise ProviderTransientError(
+                      "down"
+                  )
+
+              engine.register_handler(
+                  adapter_id="kyc-provider",
+                  handler=always_transient,
+              )
+              with pytest.raises(
+                  ProviderPermanentError
+              ):
+                  engine.invoke(
+                      adapter_id="kyc-provider",
+                      payload=b"x",
+                  )
+              health = engine.health(
+                  adapter_id="kyc-provider"
+              )
+              assert health.calls == 3
+
+
+          def test_unknown_and_unwired(
+              tmp_path: Path,
+          ) -> None:
+              engine = _engine(tmp_path)
+              with pytest.raises(UnknownAdapterError):
+                  engine.invoke(
+                      adapter_id="ghost",
+                      payload=b"x",
+                  )
+              with pytest.raises(
+                  ConfigurationError
+              ):
+                  engine.invoke(
+                      adapter_id="kyc-provider",
+                      payload=b"x",
+                  )
+          PYEOF
+
+          cat > shared_engines/export/tests/test_export.py <<'PYEOF'
+          """Export proofs: signed bundle, offline third-
+          party verification, tamper detection."""
+          from __future__ import annotations
+
+          from pathlib import Path
+
+          from shared_engines.audit.chain import AuditTrail
+          from shared_engines.common.clocks import (
+              FrozenClock,
+          )
+          from shared_engines.export.engine import (
+              ExportEngine,
+          )
+          from shared_engines.network.portable_profile import (
+              ProfileRegistry,
+          )
+          from shared_engines.storage.database import (
+              SQLiteAdapter,
+          )
+          from shared_engines.verification.signatures import (
+              Ed25519Signer,
+          )
+
+
+          def _engine(
+              tmp_path: Path,
+          ) -> tuple[SQLiteAdapter, ExportEngine]:
+              db = SQLiteAdapter(
+                  tmp_path / "export.db"
+              )
+              clock = FrozenClock()
+              audit = AuditTrail(db, clock)
+              outbox = Outbox(db, clock)
+              outbox.ensure_schema()
+              profiles = ProfileRegistry(
+                  db, clock, audit=audit, outbox=outbox
+              )
+              profiles.register_app(
+                  app_id="portal",
+                  display_name="Portal",
+                  scopes=("display_name",),
+              )
+              signer, _ = Ed25519Signer.generate()
+              engine = ExportEngine(
+                  db, clock, signer=signer, audit=audit
+              )
+              return db, engine
+
+
+          def test_export_and_offline_verify(
+              tmp_path: Path,
+          ) -> None:
+              db, engine = _engine(tmp_path)
+              try:
+                  bundle = engine.export_bundle(
+                      subject_zid="ZID-1",
+                      entries=(
+                          (
+                              "credential",
+                              "CRD-1",
+                              "titulo universitario",
+                          ),
+                          (
+                              "history",
+                              "H-1",
+                              "registro de nacimiento",
+                          ),
+                      ),
+                      actor_app="portal",
+                  )
+                  assert (
+                      engine.verify_stored(
+                          bundle_id=bundle.bundle_id
+                      )
+                      is True
+                  )
+                  assert (
+                      ExportEngine.verify_offline(
+                          bundle_id=bundle.bundle_id,
+                          entries_json=(
+                              bundle.entries_json
+                          ),
+                          signature=bundle.signature,
+                          public_pem=(
+                              bundle.public_pem
+                          ),
+                      )
+                      is True
+                  )
+              finally:
+                  db.close()
+
+
+          def test_tampered_entries_detected(
+              tmp_path: Path,
+          ) -> None:
+              db, engine = _engine(tmp_path)
+              try:
+                  bundle = engine.export_bundle(
+                      subject_zid="ZID-1",
+                      entries=(
+                          ("doc", "D-1", "original"),
+                      ),
+                      actor_app="portal",
+                  )
+                  fake_entries = (
+                      canonical_tamper(
+                          bundle.entries_json
+                      )
+                  )
+                  assert (
+                      ExportEngine.verify_offline(
+                          bundle_id=bundle.bundle_id,
+                          entries_json=fake_entries,
+                          signature=bundle.signature,
+                          public_pem=(
+                              bundle.public_pem
+                          ),
+                      )
+                      is False
+                  )
+              finally:
+                  db.close()
+
+
+          def test_unregistered_app_and_empty(
+              tmp_path: Path,
+          ) -> None:
+              db, engine = _engine(tmp_path)
+              try:
+                  import pytest
+
+                  with pytest.raises(
+                      PermissionError
+                  ):
+                      engine.export_bundle(
+                          subject_zid="ZID-1",
+                          entries=(
+                              ("doc", "D", "c"),
+                          ),
+                          actor_app="malware",
+                      )
+                  with pytest.raises(Exception):
+                      engine.export_bundle(
+                          subject_zid="ZID-1",
+                          entries=(),
+                          actor_app="portal",
+                      )
+              finally:
+                  db.close()
+
+
+          def canonical_tamper(raw: bytes) -> bytes:
+              import json
+
+              doc = json.loads(raw.decode("utf-8"))
+              doc[0]["content"] = "FALSIFICADO"
+              from shared_engines.common.serialization import (
+                  canonical_json_dumps,
+              )
+
+              return canonical_json_dumps(doc).encode(
+                  "utf-8"
+              )
+          PYEOF
+
+          cat > shared_engines/interoperability/tests/test_interoperability.py <<'PYEOF'
+          """Interoperability proofs: mutual version
+          negotiation, refusal, schema retrieval."""
+          from __future__ import annotations
+
+          from pathlib import Path
+
+          import pytest
+
+          from shared_engines.common.clocks import (
+              FrozenClock,
+          )
+          from shared_engines.common.errors import (
+              UnsupportedVersionError,
+          )
+          from shared_engines.interoperability.engine import (
+              InteroperabilityEngine,
+              SchemaNotFoundError,
+          )
+          from shared_engines.storage.database import (
+              SQLiteAdapter,
+          )
+
+
+          def _engine(
+              tmp_path: Path,
+          ) -> InteroperabilityEngine:
+              db = SQLiteAdapter(
+                  tmp_path / "interop.db"
+              )
+              clock = FrozenClock()
+              engine = InteroperabilityEngine(
+                  db, clock
+              )
+              engine.register_schema(
+                  schema_id="zyra.identity.v1",
+                  version=1,
+                  definition="identity schema v1",
+              )
+              engine.register_schema(
+                  schema_id="zyra.identity.v1",
+                  version=2,
+                  definition="identity schema v2",
+              )
+              engine.register_schema(
+                  schema_id="zyra.identity.v1",
+                  version=3,
+                  definition="identity schema v3",
+              )
+              return engine
+
+
+          def test_negotiation_picks_highest_mutual(
+              tmp_path: Path,
+          ) -> None:
+              engine = _engine(tmp_path)
+              result = engine.negotiate(
+                  schema_id="zyra.identity.v1",
+                  client_versions=(1, 2),
+              )
+              assert result.agreed_version == 2
+              result = engine.negotiate(
+                  schema_id="zyra.identity.v1",
+                  client_versions=(3, 4),
+              )
+              assert result.agreed_version == 3
+
+
+          def test_no_mutual_version_refused(
+              tmp_path: Path,
+          ) -> None:
+              engine = _engine(tmp_path)
+              with pytest.raises(
+                  UnsupportedVersionError
+              ):
+                  engine.negotiate(
+                      schema_id="zyra.identity.v1",
+                      client_versions=(7, 8),
+                  )
+              with pytest.raises(
+                  UnsupportedVersionError
+              ):
+                  engine.negotiate(
+                      schema_id="zyra.identity.v1",
+                      client_versions=(),
+                  )
+
+
+          def test_get_and_unknown(tmp_path: Path) -> None:
+              engine = _engine(tmp_path)
+              schema = engine.get_schema(
+                  schema_id="zyra.identity.v1",
+                  version=2,
+              )
+              assert (
+                  schema.definition
+                  == "identity schema v2"
+              )
+              with pytest.raises(
+                  SchemaNotFoundError
+              ):
+                  engine.get_schema(
+                      schema_id="ghost",
+                      version=1,
+                  )
+              with pytest.raises(
+                  SchemaNotFoundError
+              ):
+                  engine.negotiate(
+                      schema_id="ghost",
+                      client_versions=(1,),
+                  )
+          PYEOF
+
+          cat > shared_engines/ai/tests/test_ai.py <<'PYEOF'
+          """AI proofs: model registry, traceable analysis
+          provenance, unknown model and bad confidence
           refused."""
           from __future__ import annotations
 
@@ -1371,443 +2233,122 @@ jobs:
           from shared_engines.storage.database import (
               SQLiteAdapter,
           )
-          from shared_engines.workflow.engine import (
-              WorkflowEngine,
-          )
-          from shared_engines.workflow.errors import (
-              InvalidStateError,
-              UnknownRunError,
+          from shared_engines.ai.engine import AIEngine
+          from shared_engines.ai.engine import (
+              UnknownModelError,
           )
 
 
-          def _engine(
-              tmp_path: Path,
-          ) -> tuple[SQLiteAdapter, WorkflowEngine]:
-              db = SQLiteAdapter(
-                  tmp_path / "wf.db"
-              )
+          def _engine(tmp_path: Path) -> AIEngine:
+              db = SQLiteAdapter(tmp_path / "ai.db")
               clock = FrozenClock()
               audit = AuditTrail(db, clock)
               outbox = Outbox(db, clock)
               outbox.ensure_schema()
               catalog = EventCatalog()
-              for et in (
-                  "workflow.run.started",
-                  "workflow.run.step_completed",
-                  "workflow.run.completed",
-                  "workflow.run.failed",
-                  "workflow.run.compensated",
-              ):
-                  catalog.register(et)
-              engine = WorkflowEngine(
-                  db,
-                  clock,
-                  audit=audit,
-                  outbox=outbox,
+              catalog.register("ai.analysis.recorded")
+              engine = AIEngine(
+                  db, clock, audit=audit, outbox=outbox
               )
-              return db, engine
-
-
-          def test_run_to_completion(
-              tmp_path: Path,
-          ) -> None:
-              db, engine = _engine(tmp_path)
-              try:
-                  engine.define_workflow(
-                      workflow_id="onboarding",
-                      steps=(
-                          "verify-email",
-                          "kyc",
-                          "activate",
-                      ),
-                  )
-                  run = engine.start_run(
-                      workflow_id="onboarding"
-                  )
-                  assert run.state == "RUNNING"
-                  assert (
-                      run.completed_count == 0
-                  )
-                  r1 = engine.complete_step(
-                      run_id=run.run_id
-                  )
-                  assert (
-                      r1.completed_count == 1
-                  )
-                  assert r1.state == "RUNNING"
-                  engine.complete_step(
-                      run_id=run.run_id
-                  )
-                  final = engine.complete_step(
-                      run_id=run.run_id
-                  )
-                  assert (
-                      final.state == "COMPLETED"
-                  )
-                  assert (
-                      final.completed_count == 3
-                  )
-                  with pytest.raises(
-                      InvalidStateError
-                  ):
-                      engine.complete_step(
-                          run_id=run.run_id
-                      )
-              finally:
-                  db.close()
-
-
-          def test_failure_compensates_reverse(
-              tmp_path: Path,
-          ) -> None:
-              db, engine = _engine(tmp_path)
-              try:
-                  engine.define_workflow(
-                      workflow_id="transfer",
-                      steps=(
-                          "debit",
-                          "transfer",
-                          "credit",
-                      ),
-                  )
-                  run = engine.start_run(
-                      workflow_id="transfer"
-                  )
-                  engine.complete_step(
-                      run_id=run.run_id
-                  )
-                  engine.complete_step(
-                      run_id=run.run_id
-                  )
-                  failed = engine.fail_run(
-                      run_id=run.run_id,
-                      reason="credit leg failed",
-                  )
-                  assert (
-                      failed.state
-                      == "COMPENSATING"
-                  )
-                  assert (
-                      failed.pending_compensations
-                      == 2
-                  )
-                  mid = engine.compensate_step(
-                      run_id=run.run_id
-                  )
-                  assert (
-                      mid.pending_compensations
-                      == 1
-                  )
-                  done = engine.compensate_step(
-                      run_id=run.run_id
-                  )
-                  assert (
-                      done.state
-                      == "COMPENSATED"
-                  )
-                  with pytest.raises(
-                      InvalidStateError
-                  ):
-                      engine.complete_step(
-                          run_id=run.run_id
-                      )
-              finally:
-                  db.close()
-
-
-          def test_fail_without_steps_direct_compensated(
-              tmp_path: Path,
-          ) -> None:
-              db, engine = _engine(tmp_path)
-              try:
-                  engine.define_workflow(
-                      workflow_id="single",
-                      steps=("only",),
-                  )
-                  run = engine.start_run(
-                      workflow_id="single"
-                  )
-                  failed = engine.fail_run(
-                      run_id=run.run_id,
-                      reason="early",
-                  )
-                  assert (
-                      failed.state
-                      == "COMPENSATED"
-                  )
-                  with pytest.raises(
-                      UnknownRunError
-                  ):
-                      engine.get_run(
-                          run_id="RUN-ghost"
-                      )
-                  with pytest.raises(ValueError):
-                      engine.define_workflow(
-                          workflow_id="empty",
-                          steps=(),
-                      )
-              finally:
-                  db.close()
-          PYEOF
-
-          cat > shared_engines/routing/tests/test_routing.py <<'PYEOF'
-          """Routing proofs: priority resolution, failover
-          by deactivation, unknown key refused."""
-          from __future__ import annotations
-
-          from pathlib import Path
-
-          import pytest
-
-          from shared_engines.common.clocks import (
-              FrozenClock,
-          )
-          from shared_engines.routing.engine import (
-              RoutingEngine,
-          )
-          from shared_engines.routing.errors import (
-              NoRouteError,
-          )
-          from shared_engines.storage.database import (
-              SQLiteAdapter,
-          )
-
-
-          def _engine(tmp_path: Path) -> RoutingEngine:
-              db = SQLiteAdapter(
-                  tmp_path / "routes.db"
+              engine.register_model(
+                  model_id="doc-classifier",
+                  provider="external-lab",
+                  model_version="2.1.0",
+                  capabilities=(
+                      "document",
+                      "signature",
+                  ),
               )
-              clock = FrozenClock()
-              return RoutingEngine(db, clock)
+              return engine
 
 
-          def test_priority_resolution(
+          def test_analysis_provenance(
               tmp_path: Path,
           ) -> None:
               engine = _engine(tmp_path)
-              engine.register_route(
-                  route_key="verify.docs",
-                  target="node-a",
-                  priority=10,
-              )
-              engine.register_route(
-                  route_key="verify.docs",
-                  target="node-b",
-                  priority=5,
-              )
-              engine.register_route(
-                  route_key="verify.docs",
-                  target="node-c",
-                  priority=1,
-              )
-              best = engine.resolve(
-                  route_key="verify.docs"
-              )
-              assert best.target == "node-c"
-              assert best.priority == 1
-              all_routes = engine.list_routes(
-                  route_key="verify.docs"
-              )
-              assert len(all_routes) == 3
-
-
-          def test_deactivation_falls_to_next(
-              tmp_path: Path,
-          ) -> None:
-              engine = _engine(tmp_path)
-              primary = engine.register_route(
-                  route_key="pay.settle",
-                  target="primary",
-                  priority=1,
-              )
-              engine.register_route(
-                  route_key="pay.settle",
-                  target="backup",
-                  priority=2,
+              sha = "a" * 64
+              record = engine.record_analysis(
+                  model_id="doc-classifier",
+                  content_sha256=sha,
+                  verdict="authentic",
+                  confidence=0.93,
               )
               assert (
-                  engine.resolve(
-                      route_key="pay.settle"
-                  ).target
-                  == "primary"
+                  record.model_version == "2.1.0"
               )
-              engine.deactivate_route(
-                  route_id=primary.route_id
+              history = engine.analysis_history(
+                  content_sha256=sha
               )
-              fell = engine.resolve(
-                  route_key="pay.settle"
+              assert len(history) == 1
+              assert history[0].verdict == (
+                  "authentic"
               )
-              assert fell.target == "backup"
-              assert fell.active is True
+
+
+          def test_unknown_and_bad_confidence(
+              tmp_path: Path,
+          ) -> None:
+              engine = _engine(tmp_path)
+              with pytest.raises(UnknownModelError):
+                  engine.record_analysis(
+                      model_id="ghost",
+                      content_sha256="b" * 64,
+                      verdict="x",
+                      confidence=0.5,
+                  )
+              with pytest.raises(ValueError):
+                  engine.record_analysis(
+                      model_id="doc-classifier",
+                      content_sha256="b" * 64,
+                      verdict="x",
+                      confidence=1.5,
+                  )
+              with pytest.raises(ValueError):
+                  engine.record_analysis(
+                      model_id="doc-classifier",
+                      content_sha256="b" * 64,
+                      verdict="x",
+                      confidence=-0.1,
+                  )
+
+
+          def test_history_per_content_isolated(
+              tmp_path: Path,
+          ) -> None:
+              engine = _engine(tmp_path)
+              engine.record_analysis(
+                  model_id="doc-classifier",
+                  content_sha256="c" * 64,
+                  verdict="authentic",
+                  confidence=0.9,
+              )
+              engine.record_analysis(
+                  model_id="doc-classifier",
+                  content_sha256="d" * 64,
+                  verdict="suspicious",
+                  confidence=0.4,
+              )
               assert (
-                  engine.resolve(
-                      route_key="pay.settle"
-                  ).priority
-                  == 2
-              )
-
-
-          def test_unknown_key_refused(
-              tmp_path: Path,
-          ) -> None:
-              engine = _engine(tmp_path)
-              with pytest.raises(NoRouteError):
-                  engine.resolve(
-                      route_key="ghost.key"
+                  len(
+                      engine.analysis_history(
+                          content_sha256="c" * 64
+                      )
                   )
-          PYEOF
-
-          cat > shared_engines/system_loader/tests/test_system_loader.py <<'PYEOF'
-          """System loader proofs: manifest-governed loading,
-          compatibility policy enforced, duplicate and
-          unknown refused, unload and reload."""
-          from __future__ import annotations
-
-          from pathlib import Path
-
-          import pytest
-
-          from shared_engines.common.clocks import (
-              FrozenClock,
-          )
-          from shared_engines.events.contracts import (
-              EventCatalog,
-          )
-          from shared_engines.events.outbox import Outbox
-          from shared_engines.storage.database import (
-              SQLiteAdapter,
-          )
-          from shared_engines.system_loader.engine import (
-              SystemLoaderEngine,
-          )
-          from shared_engines.system_loader.errors import (
-              ComponentAlreadyLoadedError,
-              IncompatibleVersionError,
-              ManifestNotRegisteredError,
-              UnknownLoadedComponentError,
-          )
-
-
-          def _engine(
-              tmp_path: Path,
-              *,
-              contract: int = 1,
-          ) -> SystemLoaderEngine:
-              db = SQLiteAdapter(
-                  tmp_path
-                  / f"loader{contract}.db"
+                  == 1
               )
-              clock = FrozenClock()
-              outbox = Outbox(db, clock)
-              outbox.ensure_schema()
-              catalog = EventCatalog()
-              catalog.register(
-                  "system.component.loaded"
-              )
-              catalog.register(
-                  "system.component.unloaded"
-              )
-              return SystemLoaderEngine(
-                  db,
-                  clock,
-                  outbox=outbox,
-                  network_contract_version=contract,
-              )
-
-
-          def test_compatible_load(tmp_path: Path) -> None:
-              engine = _engine(tmp_path)
-              engine.register_manifest(
-                  component_id="engine-search",
-                  version=2,
-                  min_contract=1,
-                  max_contract=2,
-              )
-              loaded = engine.load_component(
-                  component_id="engine-search"
-              )
-              assert loaded.version == 2
-              names = {
-                  c.component_id
-                  for c in (
-                      engine.loaded_components()
-                  )
-              }
-              assert "engine-search" in names
-
-
-          def test_incompatible_and_unknown_refused(
-              tmp_path: Path,
-          ) -> None:
-              engine = _engine(
-                  tmp_path, contract=1
-              )
-              engine.register_manifest(
-                  component_id="future-engine",
-                  version=1,
-                  min_contract=3,
-                  max_contract=5,
-              )
-              with pytest.raises(
-                  IncompatibleVersionError
-              ):
-                  engine.load_component(
-                      component_id="future-engine"
-                  )
-              with pytest.raises(
-                  ManifestNotRegisteredError
-              ):
-                  engine.load_component(
-                      component_id="ghost"
-                  )
-
-
-          def test_duplicate_unload_reload(
-              tmp_path: Path,
-          ) -> None:
-              engine = _engine(tmp_path)
-              engine.register_manifest(
-                  component_id="engine-x",
-                  version=1,
-                  min_contract=1,
-                  max_contract=1,
-              )
-              engine.load_component(
-                  component_id="engine-x"
-              )
-              with pytest.raises(
-                  ComponentAlreadyLoadedError
-              ):
-                  engine.load_component(
-                      component_id="engine-x"
-                  )
-              unloaded = (
-                  engine.unload_component(
-                      component_id="engine-x"
-                  )
-              )
-              assert unloaded.version == 1
               assert (
-                  engine.loaded_components()
-                  == ()
+                  engine.analysis_history(
+                      content_sha256="d" * 64
+                  )[0].verdict
+                  == "suspicious"
               )
-              with pytest.raises(
-                  UnknownLoadedComponentError
-              ):
-                  engine.unload_component(
-                      component_id="engine-x"
-                  )
-              reloaded = engine.load_component(
-                  component_id="engine-x"
-              )
-              assert reloaded.version == 1
           PYEOF
-          echo "=== ALL TESTS READY ==="
+          echo "=== ALL FINAL TESTS READY ==="
 
       - name: Quality gates (mypy first; full regression)
         run: |
           set -euo pipefail
-          M="shared_engines/common shared_engines/storage shared_engines/events shared_engines/observability shared_engines/audit shared_engines/security shared_engines/identity shared_engines/verification shared_engines/runtime shared_engines/tokenization shared_engines/currency shared_engines/verifier shared_engines/hardening shared_engines/authority shared_engines/network shared_engines/telemetry shared_engines/logs shared_engines/consensus shared_engines/integrity shared_engines/encryption shared_engines/certification shared_engines/search shared_engines/reputation shared_engines/compression shared_engines/scalability shared_engines/supervisor shared_engines/workflow shared_engines/routing shared_engines/system_loader"
+          M="shared_engines/common shared_engines/storage shared_engines/events shared_engines/observability shared_engines/audit shared_engines/security shared_engines/identity shared_engines/verification shared_engines/runtime shared_engines/tokenization shared_engines/currency shared_engines/verifier shared_engines/hardening shared_engines/authority shared_engines/network shared_engines/telemetry shared_engines/logs shared_engines/consensus shared_engines/integrity shared_engines/encryption shared_engines/certification shared_engines/search shared_engines/reputation shared_engines/compression shared_engines/scalability shared_engines/supervisor shared_engines/workflow shared_engines/routing shared_engines/system_loader shared_engines/compliance shared_engines/integrations shared_engines/export shared_engines/interoperability shared_engines/ai"
           python -m compileall -q $M main.py scripts shared_engines/tests
           echo "compile OK"
           find $M scripts -name '__pycache__' -type d -prune -exec rm -rf {} +
@@ -1830,7 +2371,7 @@ jobs:
           if git diff --cached --quiet; then
             echo "No changes."
           else
-            git commit -m "zyra: engines 10-12/17 batch - workflow (durable saga runs, reverse compensation), routing (transversal route table, deterministic resolve, failover), system_loader (manifest governance, contract-range compatibility); routing errors import cleaned (F401); 9 proofs"
+            git commit -m "zyra: engines 13-17/17 FINAL batch - compliance (multi-jurisdiction versioned policies, audited decisions), integrations (adapter registry with handler wiring, transient retry/permanent fail using common error hierarchy, durable health), export (Ed25519-signed portable bundles, offline third-party verification), interoperability (versioned schemas, mutual-version negotiation via UnsupportedVersionError), ai (honest model registry + analysis provenance, no fake detection); 17/17 engines complete"
             git push origin "HEAD:${{ github.ref_name }}"
           fi
-          echo "=== TRIPLE ENGINE 2 COMPLETE ==="
+          echo "=== ALL 17 ENGINES COMPLETE ==="

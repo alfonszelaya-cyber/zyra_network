@@ -1,4 +1,4 @@
-name: zyra-w18-cleanup-capabilities
+name: zyra-w19-capabilities-api
 
 "on":
   workflow_dispatch:
@@ -9,7 +9,7 @@ permissions:
   contents: write
 
 concurrency:
-  group: zyra-w18-${{ github.ref }}
+  group: zyra-w19-${{ github.ref }}
   cancel-in-progress: false
 
 jobs:
@@ -31,248 +31,744 @@ jobs:
           python -m pip install --upgrade pip
           python -m pip install "cryptography>=42,<45" "flake8>=7,<8" "mypy>=1.10,<2" "pytest>=8,<9"
 
-      - name: Structural cleanup (26 orphan dirs + 2 empty namespaces)
+      - name: Build capabilities HTTP surface
         run: |
           set -euo pipefail
-          for d in \
-            shared_engines/identity/authentication \
-            shared_engines/identity/authorization \
-            shared_engines/identity/biometrics \
-            shared_engines/identity/credentials \
-            shared_engines/identity/profiles \
-            shared_engines/orchestration/dispatcher \
-            shared_engines/orchestration/lifecycle \
-            shared_engines/orchestration/scheduler \
-            shared_engines/orchestration/tasks \
-            shared_engines/radar/core \
-            shared_engines/radar/detectors \
-            shared_engines/radar/events \
-            shared_engines/radar/registry \
-            shared_engines/radar/rules \
-            shared_engines/radar/scoring \
-            shared_engines/tokenization/assets \
-            shared_engines/tokenization/exchange \
-            shared_engines/tokenization/registry \
-            shared_engines/tokenization/transactions \
-            shared_engines/tokenization/valuation \
-            shared_engines/verification/ai_detection \
-            shared_engines/verification/audio \
-            shared_engines/verification/documents \
-            shared_engines/verification/images \
-            shared_engines/verification/integrity \
-            shared_engines/verification/video; do
-            rm -rf "$d"
-          done
-          rm -rf shared_engines/radar shared_engines/orchestration
-          remaining=$(find . -path ./.git -prune -o \
-            -name '__init__py' -print | wc -l)
-          echo "orphan __init__py remaining: $remaining"
-          test "$remaining" -eq 0
-          echo "=== CLEANUP COMPLETE ==="
+          cat > shared_engines/runtime/capabilities_api.py <<'PYEOF'
+          """HTTP surface for the trust services.
 
-      - name: Build capabilities composition layer
-        run: |
-          set -euo pipefail
-          cat > shared_engines/runtime/capabilities.py <<'PYEOF'
-          """ZyraCapabilities: the trust-services composition
-          layer.
+          Companion to runtime/api.py: same envelope style
+          ({"ok": true, "data": ...}) and optional bearer
+          token, but bound to ZyraCapabilities so consumers
+          (family demo, apps) reach the trust services over
+          HTTP. The engines themselves enforce registered-
+          apps authorization; the token guards everything
+          past /health when configured.
 
-          Composes the transverse engines into the
-          consumer-facing services of the Network, over one
-          durable database. Deliberately does NOT replace
-          ZyraKernel (which owns identity/verification/
-          tokens/currency): capabilities layers the trust
-          services on top, sharing the same database.
-          Engines whose wiring is a per-node decision
-          (consensus member_id, integrations handlers,
-          system_loader contract version) stay direct-use.
+          Served by CapabilitiesServer, the counterpart of
+          ZyraServer (daemon threads, reusable address,
+          bound_port for ephemeral binds).
           """
           from __future__ import annotations
 
-          from shared_engines.ai.engine import AIEngine
-          from shared_engines.audit.chain import AuditTrail
-          from shared_engines.certification.engine import (
-              CertificationEngine,
+          import base64
+          import hmac
+          import json
+          from dataclasses import dataclass
+          from http.server import (
+              BaseHTTPRequestHandler,
+              ThreadingHTTPServer,
           )
-          from shared_engines.certification.registry import (
-              IssuerRegistry,
-          )
-          from shared_engines.common.clocks import Clock
-          from shared_engines.compliance.engine import (
-              ComplianceEngine,
-          )
-          from shared_engines.encryption.engine import (
-              EncryptionEngine,
-          )
-          from shared_engines.events.contracts import (
-              EventCatalog,
-          )
-          from shared_engines.events.outbox import Outbox
-          from shared_engines.export.engine import ExportEngine
-          from shared_engines.identity.engine import IdentityEngine
-          from shared_engines.integrity.engine import IntegrityEngine
-          from shared_engines.interoperability.engine import (
-              InteroperabilityEngine,
-          )
-          from shared_engines.network.document_exchange import (
-              DocumentExchange,
-          )
-          from shared_engines.network.life_history import LifeHistory
-          from shared_engines.network.portable_profile import (
-              ProfileRegistry,
-          )
-          from shared_engines.network.trust_flow import TrustFlow
-          from shared_engines.reputation.engine import ReputationEngine
-          from shared_engines.search.engine import SearchEngine
-          from shared_engines.storage.database import Database
-          from shared_engines.verification.credentials import (
-              CredentialRegistry,
-          )
-          from shared_engines.verification.signatures import (
-              Ed25519Signer,
-          )
+          from typing import Any, ClassVar
+          from urllib.parse import parse_qs, urlparse
 
-          CAPABILITY_EVENT_TYPES = (
-              "identity.registered",
-              "identity.status_changed",
-              "verification.credential.issued",
-              "verification.credential.revoked",
-              "network.profile.updated",
-              "network.profile.accessed",
-              "network.history.appended",
-              "network.document.sealed",
-              "network.signature.requested",
-              "network.document.signed",
-              "network.document.rejected",
-              "network.search.performed",
-              "reputation.event.recorded",
-              "certification.certificate.issued",
-              "certification.certificate.revoked",
-              "compliance.decision.recorded",
-              "export.bundle.created",
-              "ai.analysis.recorded",
+          from shared_engines.common.errors import (
+              EngineError,
+          )
+          from shared_engines.runtime.capabilities import (
+              ZyraCapabilities,
           )
 
 
-          class ZyraCapabilities:
-              """Trust services over one database."""
+          @dataclass(frozen=True)
+          class _ApiError(Exception):
+              status: int
+              code: str
+              message: str
+
+
+          class CapabilitiesApiHandler(
+              BaseHTTPRequestHandler
+          ):
+              caps: ClassVar[ZyraCapabilities]
+              token: ClassVar[str | None] = None
+
+              def log_message(
+                  self,
+                  format: str,
+                  *args: object,
+              ) -> None:
+                  return None
+
+              def do_GET(self) -> None:
+                  self._dispatch("GET")
+
+              def do_POST(self) -> None:
+                  self._dispatch("POST")
+
+              def _dispatch(
+                  self, method: str
+              ) -> None:
+                  try:
+                      self._route(method)
+                  except _ApiError as exc:
+                      self._error(
+                          exc.status,
+                          exc.code,
+                          exc.message,
+                      )
+                  except PermissionError as exc:
+                      self._error(
+                          403,
+                          "forbidden",
+                          str(exc),
+                      )
+                  except (EngineError, ValueError) as exc:
+                      self._error(
+                          400,
+                          "invalid_request",
+                          str(exc),
+                      )
+                  except Exception:
+                      self._error(
+                          500,
+                          "internal_error",
+                          "internal error",
+                      )
+
+              def _authorized(self) -> None:
+                  token = type(self).token
+                  if token is None:
+                      return
+                  header = self.headers.get(
+                      "Authorization"
+                  )
+                  if header is None or not hmac.compare_digest(
+                      header,
+                      f"Bearer {token}",
+                  ):
+                      raise _ApiError(
+                          401,
+                          "unauthorized",
+                          "valid bearer token"
+                          " required",
+                      )
+
+              def _route(
+                  self, method: str
+              ) -> None:
+                  parsed = urlparse(self.path)
+                  segments = [
+                      s
+                      for s in parsed.path.split("/")
+                      if s
+                  ]
+                  if segments == ["health"]:
+                      if method != "GET":
+                          raise _ApiError(
+                              405,
+                              "method_not_allowed",
+                              "use GET",
+                          )
+                      self._send(
+                          200,
+                          {
+                              "ok": True,
+                              "data": {
+                                  "service":
+                                  "zyra-capabilities",
+                                  "status": "up",
+                              },
+                          },
+                      )
+                      return
+                  self._authorized()
+                  query = parse_qs(parsed.query)
+                  if method == "GET":
+                      self._route_get(
+                          segments, query
+                      )
+                  else:
+                      self._route_post(segments)
+
+              def _route_get(
+                  self,
+                  s: list[str],
+                  query: dict[str, list[str]],
+              ) -> None:
+                  caps = type(self).caps
+                  if (
+                      len(s) == 2
+                      and s[0] == "trust"
+                  ):
+                      trusted = caps.trust.is_trusted(
+                          zid=s[1]
+                      )
+                      self._ok(
+                          {
+                              "zid": s[1],
+                              "trusted": trusted,
+                          }
+                      )
+                      return
+                  if (
+                      len(s) == 2
+                      and s[0] == "profile"
+                  ):
+                      app = query.get("app", [""])[0]
+                      if not app:
+                          raise ValueError(
+                              "missing app query"
+                              " parameter"
+                          )
+                      view = (
+                          caps.profiles.view_for_app(
+                              app_id=app,
+                              zid=s[1],
+                          )
+                      )
+                      self._ok(
+                          {
+                              "zid": view.zid,
+                              "fields": view.fields,
+                              "levels": view.levels,
+                          }
+                      )
+                      return
+                  if (
+                      len(s) == 2
+                      and s[0] == "history"
+                  ):
+                      timeline = caps.history.timeline(
+                          zid=s[1]
+                      )
+                      self._ok(
+                          [
+                              {
+                                  "seq": e.entry_seq,
+                                  "type": (
+                                      e.entry_type
+                                  ),
+                                  "actor": (
+                                      e.actor_app
+                                  ),
+                                  "payload": (
+                                      e.payload
+                                  ),
+                                  "content_hash": (
+                                      e.content_hash
+                                  ),
+                              }
+                              for e in timeline
+                          ]
+                      )
+                      return
+                  if (
+                      len(s) == 2
+                      and s[0] == "reputation"
+                  ):
+                      summary = (
+                          caps.reputation.summary(
+                              subject_zid=s[1]
+                          )
+                      )
+                      self._ok(
+                          {
+                              "zid": (
+                                  summary.subject_zid
+                              ),
+                              "score": summary.score,
+                              "positive": (
+                                  summary.positive_events
+                              ),
+                              "negative": (
+                                  summary.negative_events
+                              ),
+                          }
+                      )
+                      return
+                  if (
+                      len(s) == 2
+                      and s[0] == "certificates"
+                  ):
+                      records = (
+                          caps.certification
+                          .list_by_subject(
+                              subject_zid=s[1]
+                          )
+                      )
+                      self._ok(
+                          [
+                              {
+                                  "certificate_id": r.certificate_id,
+                                  "scope": r.scope,
+                                  "title": r.title,
+                                  "revoked": r.revoked,
+                              }
+                              for r in records
+                          ]
+                      )
+                      return
+                  raise _ApiError(
+                      404,
+                      "not_found",
+                      "unknown route",
+                  )
+
+              def _route_post(
+                  self, s: list[str]
+              ) -> None:
+                  caps = type(self).caps
+                  doc = self._read_json()
+                  if s == ["apps", "register"]:
+                      scopes_raw = doc.get("scopes")
+                      if not isinstance(
+                          scopes_raw, list
+                      ):
+                          raise ValueError(
+                              "scopes must be a"
+                              " list"
+                          )
+                      record = (
+                          caps.profiles.register_app(
+                              app_id=self._req(
+                                  doc, "app_id"
+                              ),
+                              display_name=self._req(
+                                  doc,
+                                  "display_name",
+                              ),
+                              scopes=tuple(
+                                  str(x)
+                                  for x in scopes_raw
+                              ),
+                          )
+                      )
+                      self._send(
+                          201,
+                          {
+                              "ok": True,
+                              "data": {
+                                  "app_id": (
+                                      record.app_id
+                                  ),
+                                  "scopes": list(
+                                      record.scopes
+                                  ),
+                              },
+                          },
+                      )
+                      return
+                  if s == ["profile", "field"]:
+                      caps.profiles.set_field(
+                          zid=self._req(doc, "zid"),
+                          field=self._req(
+                              doc, "field"
+                          ),
+                          value=self._req(
+                              doc, "value"
+                          ),
+                          verified=bool(
+                              doc.get(
+                                  "verified", False
+                              )
+                          ),
+                      )
+                      self._ok({"saved": True})
+                      return
+                  if s == ["trust", "complete"]:
+                      final = (
+                          caps.trust.onboarding_complete(
+                              zid=self._req(
+                                  doc, "zid"
+                              ),
+                              actor=self._req(
+                                  doc, "actor"
+                              ),
+                          )
+                      )
+                      self._ok(
+                          {
+                              "zid": final.zid,
+                              "status": (
+                                  final.status.value
+                              ),
+                          }
+                      )
+                      return
+                  if s == ["history", "append"]:
+                      payload = doc.get("payload")
+                      if not isinstance(
+                          payload, dict
+                      ):
+                          raise ValueError(
+                              "payload must be an"
+                              " object"
+                          )
+                      typed_payload: dict[
+                          str, object
+                      ] = {
+                          str(k): v
+                          for k, v in payload.items()
+                      }
+                      entry = caps.history.append(
+                          zid=self._req(doc, "zid"),
+                          entry_type=self._req(
+                              doc, "entry_type"
+                          ),
+                          actor_app=self._req(
+                              doc, "actor_app"
+                          ),
+                          payload=typed_payload,
+                      )
+                      self._send(
+                          201,
+                          {
+                              "ok": True,
+                              "data": {
+                                  "seq": (
+                                      entry.entry_seq
+                                  ),
+                                  "content_hash": entry.content_hash,
+                              },
+                          },
+                      )
+                      return
+                  if s == ["documents", "seal"]:
+                      sealed = (
+                          caps.exchange.seal_document(
+                              owner_zid=self._req(
+                                  doc, "owner_zid"
+                              ),
+                              title=self._req(
+                                  doc, "title"
+                              ),
+                              content=self._b64(
+                                  self._req(
+                                      doc,
+                                      "content_b64",
+                                  )
+                              ),
+                              actor_app=self._req(
+                                  doc, "actor_app"
+                              ),
+                          )
+                      )
+                      self._send(
+                          201,
+                          {
+                              "ok": True,
+                              "data": {
+                                  "document_id": sealed.document_id,
+                                  "sha256": sealed.sha256,
+                                  "signature_b64": base64.b64encode(
+                                      sealed.network_signature
+                                  ).decode("ascii"),
+                                  "public_pem": sealed.public_pem.decode(
+                                      "utf-8"
+                                  ),
+                              },
+                          },
+                      )
+                      return
+                  if s == ["documents", "verify"]:
+                      verdict = (
+                          caps.exchange.verify_document(
+                              document_id=self._req(
+                                  doc,
+                                  "document_id",
+                              ),
+                              content=self._b64(
+                                  self._req(
+                                      doc,
+                                      "content_b64",
+                                  )
+                              ),
+                          )
+                      )
+                      self._ok(
+                          {
+                              "authentic": verdict.authentic,
+                              "hash_matches": verdict.hash_matches,
+                              "signature_valid": verdict.signature_valid,
+                          }
+                      )
+                      return
+                  if s == ["search"]:
+                      result = caps.search.search(
+                          app_id=self._req(
+                              doc, "app_id"
+                          ),
+                          query=self._req(
+                              doc, "query"
+                          ),
+                      )
+                      self._ok(
+                          {
+                              "total": result.total,
+                              "items": [
+                                  {
+                                      "source": h.source,
+                                      "ref_id": h.ref_id,
+                                      "title": h.title,
+                                      "score": h.score,
+                                  }
+                                  for h in result.items
+                              ],
+                          }
+                      )
+                      return
+                  if s == ["reputation", "record"]:
+                      event = (
+                          caps.reputation.record_event(
+                              subject_zid=self._req(
+                                  doc,
+                                  "subject_zid",
+                              ),
+                              actor_zid=self._req(
+                                  doc, "actor_zid"
+                              ),
+                              kind=self._req(
+                                  doc, "kind"
+                              ),
+                              evidence=self._b64(
+                                  self._req(
+                                      doc,
+                                      "evidence_b64",
+                                  )
+                              ),
+                          )
+                      )
+                      self._send(
+                          201,
+                          {
+                              "ok": True,
+                              "data": {
+                                  "event_id": event.event_id,
+                                  "seq": event.seq,
+                              },
+                          },
+                      )
+                      return
+                  if s == ["export"]:
+                      entries_raw = doc.get("entries")
+                      if not isinstance(
+                          entries_raw, list
+                      ):
+                          raise ValueError(
+                              "entries must be a"
+                              " list"
+                          )
+                      entries: tuple[
+                          tuple[str, str, str], ...
+                      ] = tuple(
+                          (
+                              str(e[0]),
+                              str(e[1]),
+                              str(e[2]),
+                          )
+                          for e in entries_raw
+                          if isinstance(e, list)
+                          and len(e) == 3
+                      )
+                      bundle = (
+                          caps.export.export_bundle(
+                              subject_zid=self._req(
+                                  doc,
+                                  "subject_zid",
+                              ),
+                              entries=entries,
+                              actor_app=self._req(
+                                  doc, "actor_app"
+                              ),
+                          )
+                      )
+                      self._send(
+                          201,
+                          {
+                              "ok": True,
+                              "data": {
+                                  "bundle_id": bundle.bundle_id,
+                                  "manifest_sha256": bundle.manifest_sha256,
+                              },
+                          },
+                      )
+                      return
+                  raise _ApiError(
+                      404,
+                      "not_found",
+                      "unknown route",
+                  )
+
+              def _read_json(
+                  self,
+              ) -> dict[str, Any]:
+                  length_header = self.headers.get(
+                      "Content-Length"
+                  )
+                  if length_header is None:
+                      raise _ApiError(
+                          411,
+                          "length_required",
+                          "Content-Length required",
+                      )
+                  try:
+                      length = int(length_header)
+                  except ValueError as exc:
+                      raise _ApiError(
+                          400,
+                          "invalid_request",
+                          "bad Content-Length",
+                      ) from exc
+                  if length > 10_000_000:
+                      raise _ApiError(
+                          413,
+                          "payload_too_large",
+                          "body exceeds limit",
+                      )
+                  raw = self.rfile.read(length)
+                  try:
+                      parsed: Any = json.loads(
+                          raw.decode("utf-8")
+                      )
+                  except (
+                      UnicodeDecodeError,
+                      ValueError,
+                  ) as exc:
+                      raise _ApiError(
+                          400,
+                          "invalid_json",
+                          "body is not valid JSON",
+                      ) from exc
+                  if not isinstance(parsed, dict):
+                      raise _ApiError(
+                          400,
+                          "invalid_request",
+                          "body must be a JSON"
+                          " object",
+                      )
+                  return {
+                      str(k): v
+                      for k, v in parsed.items()
+                  }
+
+              @staticmethod
+              def _req(
+                  doc: dict[str, Any], key: str
+              ) -> str:
+                  value: Any = doc.get(key)
+                  if isinstance(value, int) and not isinstance(
+                      value, bool
+                  ):
+                      value = str(value)
+                  if not isinstance(value, str):
+                      raise ValueError(
+                          f"missing field: {key}"
+                      )
+                  if not value.strip():
+                      raise ValueError(
+                          f"missing field: {key}"
+                      )
+                  return value
+
+              @staticmethod
+              def _b64(value: str) -> bytes:
+                  try:
+                      return base64.b64decode(
+                          value, validate=True
+                      )
+                  except ValueError as exc:
+                      raise ValueError(
+                          "invalid base64 payload"
+                      ) from exc
+
+              def _ok(self, data: Any) -> None:
+                  self._send(
+                      200,
+                      {"ok": True, "data": data},
+                  )
+
+              def _error(
+                  self,
+                  status: int,
+                  code: str,
+                  message: str,
+              ) -> None:
+                  self._send(
+                      status,
+                      {
+                          "ok": False,
+                          "error": {
+                              "type": code,
+                              "message": message,
+                          },
+                      },
+                  )
+
+              def _send(
+                  self,
+                  status: int,
+                  payload: dict[str, Any],
+              ) -> None:
+                  body = json.dumps(payload).encode(
+                      "utf-8"
+                  )
+                  self.send_response(status)
+                  self.send_header(
+                      "Content-Type",
+                      "application/json",
+                  )
+                  self.send_header(
+                      "Content-Length",
+                      str(len(body)),
+                  )
+                  self.end_headers()
+                  self.wfile.write(body)
+
+
+          class CapabilitiesServer(ThreadingHTTPServer):
+              """Counterpart of ZyraServer for the
+              capabilities surface."""
+
+              daemon_threads = True
+              allow_reuse_address = True
 
               def __init__(
                   self,
-                  db: Database,
-                  clock: Clock,
-                  *,
-                  identity: IdentityEngine,
-                  signer: Ed25519Signer,
+                  address: tuple[str, int],
               ) -> None:
-                  self._db = db
-                  self._clock = clock
-                  self.audit = AuditTrail(db, clock)
-                  self.outbox = Outbox(db, clock)
-                  self.outbox.ensure_schema()
-                  self.catalog = EventCatalog()
-                  for event_type in (
-                      CAPABILITY_EVENT_TYPES
-                  ):
-                      self.catalog.register(event_type)
-                  self.profiles = ProfileRegistry(
-                      db,
-                      clock,
-                      audit=self.audit,
-                      outbox=self.outbox,
+                  super().__init__(
+                      address, CapabilitiesApiHandler
                   )
-                  self.integrity = IntegrityEngine(
-                      db, clock
-                  )
-                  self.trust = TrustFlow(
-                      identity=identity,
-                      profiles=self.profiles,
-                  )
-                  self.history = LifeHistory(
-                      db,
-                      clock,
-                      audit=self.audit,
-                      outbox=self.outbox,
-                  )
-                  self.exchange = DocumentExchange(
-                      db,
-                      clock,
-                      signer=signer,
-                      integrity=self.integrity,
-                      audit=self.audit,
-                      outbox=self.outbox,
-                  )
-                  self.credentials = CredentialRegistry(
-                      db,
-                      clock,
-                      self.audit,
-                      self.outbox,
-                      self.catalog,
-                  )
-                  self.issuers = IssuerRegistry(db, clock)
-                  self.certification = CertificationEngine(
-                      db,
-                      clock,
-                      issuers=self.issuers,
-                      identity=identity,
-                      credentials=self.credentials,
-                      signer=signer,
-                      audit=self.audit,
-                      outbox=self.outbox,
-                  )
-                  self.search = SearchEngine(
-                      db,
-                      clock,
-                      audit=self.audit,
-                      outbox=self.outbox,
-                  )
-                  self.reputation = ReputationEngine(
-                      db,
-                      clock,
-                      identity=identity,
-                      integrity=self.integrity,
-                      audit=self.audit,
-                      outbox=self.outbox,
-                  )
-                  self.export = ExportEngine(
-                      db,
-                      clock,
-                      signer=signer,
-                      audit=self.audit,
-                  )
-                  self.interop = InteroperabilityEngine(
-                      db, clock
-                  )
-                  self.compliance = ComplianceEngine(
-                      db,
-                      clock,
-                      audit=self.audit,
-                      outbox=self.outbox,
-                  )
-                  self.ai = AIEngine(
-                      db,
-                      clock,
-                      audit=self.audit,
-                      outbox=self.outbox,
-                  )
-                  self.encryption = EncryptionEngine(
-                      db,
-                      clock,
-                      namespace="capabilities",
-                  )
-          PYEOF
-          echo "=== CAPABILITIES READY ==="
 
-      - name: End-to-end capabilities proofs (3)
+              @property
+              def bound_port(self) -> int:
+                  return int(self.server_address[1])
+
+
+          def serve_capabilities(
+              caps: ZyraCapabilities,
+              *,
+              host: str = "127.0.0.1",
+              port: int = 0,
+              token: str | None = None,
+          ) -> CapabilitiesServer:
+              """Bind caps and start serving."""
+              CapabilitiesApiHandler.caps = caps
+              CapabilitiesApiHandler.token = token
+              return CapabilitiesServer((host, port))
+          PYEOF
+          echo "=== CAPABILITIES API READY ==="
+
+      - name: HTTP journey proofs (3)
         run: |
           set -euo pipefail
           mkdir -p shared_engines/runtime/tests
-          cat > shared_engines/runtime/tests/test_capabilities.py <<'PYEOF'
-          """Capabilities proofs: the family-demo end to end
-          over the trust stack."""
+          cat > shared_engines/runtime/tests/test_capabilities_api.py <<'PYEOF'
+          """Capabilities HTTP proofs: the family-consumer
+          journey over real HTTP, following the existing
+          ZyraServer test pattern (real server on a thread,
+          urllib, explicit shutdown)."""
           from __future__ import annotations
 
+          import base64
+          import json
+          import threading
           from pathlib import Path
+          from urllib.error import HTTPError
+          from urllib.request import Request, urlopen
+
+          import pytest
 
           from shared_engines.audit.chain import AuditTrail
           from shared_engines.common.clocks import FrozenClock
@@ -280,14 +776,14 @@ jobs:
           from shared_engines.events.outbox import Outbox
           from shared_engines.identity.contracts import (
               IdentityKind,
-              IdentityStatus,
           )
           from shared_engines.identity.engine import IdentityEngine
-          from shared_engines.network.document_exchange import (
-              DocumentExchange,
-          )
           from shared_engines.runtime.capabilities import (
               ZyraCapabilities,
+          )
+          from shared_engines.runtime.capabilities_api import (
+              CapabilitiesApiHandler,
+              CapabilitiesServer,
           )
           from shared_engines.storage.database import SQLiteAdapter
           from shared_engines.verification.signatures import (
@@ -295,296 +791,308 @@ jobs:
           )
 
 
-          def _caps(
-              tmp_path: Path,
-          ) -> tuple[
-              SQLiteAdapter,
-              ZyraCapabilities,
-              IdentityEngine,
-          ]:
-              db = SQLiteAdapter(tmp_path / "caps.db")
-              clock = FrozenClock()
-              audit = AuditTrail(db, clock)
-              outbox = Outbox(db, clock)
-              outbox.ensure_schema()
-              catalog = EventCatalog()
-              for et in (
-                  "identity.registered",
-                  "identity.status_changed",
-              ):
-                  catalog.register(et)
-              identity = IdentityEngine(
-                  db=db,
-                  clock=clock,
-                  audit=audit,
-                  outbox=outbox,
-                  catalog=catalog,
-              )
-              signer, _ = Ed25519Signer.generate()
-              caps = ZyraCapabilities(
-                  db,
-                  clock,
-                  identity=identity,
-                  signer=signer,
-              )
-              return db, caps, identity
+          class _Http:
+              """Real server harness, existing-pattern."""
+
+              def __init__(self, tmp_path: Path) -> None:
+                  self.db = SQLiteAdapter(
+                      tmp_path / "api.db"
+                  )
+                  self.clock = FrozenClock()
+                  audit = AuditTrail(self.db, self.clock)
+                  outbox = Outbox(self.db, self.clock)
+                  outbox.ensure_schema()
+                  catalog = EventCatalog()
+                  for et in (
+                      "identity.registered",
+                      "identity.status_changed",
+                  ):
+                      catalog.register(et)
+                  self.identity = IdentityEngine(
+                      db=self.db,
+                      clock=self.clock,
+                      audit=audit,
+                      outbox=outbox,
+                      catalog=catalog,
+                  )
+                  signer, _ = Ed25519Signer.generate()
+                  self.caps = ZyraCapabilities(
+                      self.db,
+                      self.clock,
+                      identity=self.identity,
+                      signer=signer,
+                  )
+                  CapabilitiesApiHandler.caps = self.caps
+                  self.server = CapabilitiesServer(
+                      ("127.0.0.1", 0)
+                  )
+                  self.thread = threading.Thread(
+                      target=self.server.serve_forever,
+                      daemon=True,
+                  )
+                  self.thread.start()
+                  self.base = (
+                      "http://127.0.0.1:"
+                      f"{self.server.bound_port}"
+                  )
+
+              def close(self) -> None:
+                  self.server.shutdown()
+                  self.server.server_close()
+                  self.thread.join(timeout=5)
+                  self.db.close()
 
 
-          def test_trust_services_end_to_end(
+          def _get(url: str) -> dict[str, object]:
+              with urlopen(url, timeout=10) as response:
+                  body = json.loads(
+                      response.read().decode("utf-8")
+                  )
+              assert isinstance(body, dict)
+              return body
+
+
+          def _post(
+              url: str, doc: dict[str, object]
+          ) -> dict[str, object]:
+              request = Request(
+                  url,
+                  data=json.dumps(doc).encode("utf-8"),
+                  headers={
+                      "Content-Type":
+                      "application/json"
+                  },
+                  method="POST",
+              )
+              with urlopen(request, timeout=10) as response:
+                  body = json.loads(
+                      response.read().decode("utf-8")
+                  )
+              assert isinstance(body, dict)
+              return body
+
+
+          def test_health_profile_trust_journey(
               tmp_path: Path,
           ) -> None:
-              db, caps, identity = _caps(tmp_path)
+              http = _Http(tmp_path)
               try:
-                  caps.profiles.register_app(
-                      app_id="familia",
-                      display_name="Familia",
-                      scopes=(
-                          "display_name",
-                          "contact",
-                      ),
+                  health = _get(f"{http.base}/health")
+                  assert health["ok"] is True
+                  _post(
+                      f"{http.base}/apps/register",
+                      {
+                          "app_id": "familia",
+                          "display_name": "Familia",
+                          "scopes": [
+                              "display_name",
+                              "contact",
+                          ],
+                      },
                   )
-                  user = identity.register_identity(
+                  user = http.identity.register_identity(
                       kind=IdentityKind.PERSON,
                       display_name="maria",
                       actor="familia",
                   )
-                  caps.profiles.set_field(
-                      zid=user.zid,
-                      field="display_name",
-                      value="Maria Lopez",
-                  )
-                  caps.profiles.set_field(
-                      zid=user.zid,
-                      field="contact",
-                      value="maria@zyra.sv",
-                  )
-                  final = caps.trust.onboarding_complete(
-                      zid=user.zid,
-                      actor="verifier",
-                  )
-                  assert final.status is (
-                      IdentityStatus.ACTIVE
-                  )
-                  assert (
-                      caps.trust.is_trusted(
-                          zid=user.zid
-                      )
-                      is True
-                  )
-                  view = caps.profiles.view_for_app(
-                      app_id="familia",
-                      zid=user.zid,
-                  )
-                  assert (
-                      view.fields["display_name"]
-                      == "Maria Lopez"
-                  )
-                  first = caps.history.append(
-                      zid=user.zid,
-                      entry_type=(
-                          "birth_registration"
-                      ),
-                      actor_app="familia",
-                      payload={
-                          "hospital": "San Salvador"
+                  _post(
+                      f"{http.base}/profile/field",
+                      {
+                          "zid": user.zid,
+                          "field": "display_name",
+                          "value": "Maria Lopez",
                       },
                   )
-                  assert first.entry_seq == 1
+                  _post(
+                      f"{http.base}/profile/field",
+                      {
+                          "zid": user.zid,
+                          "field": "contact",
+                          "value": "maria@zyra.sv",
+                      },
+                  )
+                  view = _get(
+                      f"{http.base}/profile/"
+                      f"{user.zid}?app=familia"
+                  )
+                  data = view["data"]
+                  assert isinstance(data, dict)
+                  fields = data["fields"]
+                  assert isinstance(fields, dict)
                   assert (
-                      caps.history.verify_chain(
-                          zid=user.zid
-                      )
-                      is True
+                      fields["display_name"]
+                      == "Maria Lopez"
                   )
-                  sealed = caps.exchange.seal_document(
-                      owner_zid=user.zid,
-                      title="Acta",
-                      content=b"acta de nacimiento",
-                      actor_app="familia",
+                  complete = _post(
+                      f"{http.base}/trust/complete",
+                      {
+                          "zid": user.zid,
+                          "actor": "verifier",
+                      },
                   )
-                  assert (
-                      DocumentExchange.offline_verify(
-                          document_id=(
-                              sealed.document_id
-                          ),
-                          content=(
-                              b"acta de nacimiento"
-                          ),
-                          signature=(
-                              sealed.network_signature
-                          ),
-                          public_pem=(
-                              sealed.public_pem
-                          ),
-                      )
-                      is True
+                  cdata = complete["data"]
+                  assert isinstance(cdata, dict)
+                  assert cdata["status"] == "ACTIVE"
+                  trust = _get(
+                      f"{http.base}/trust/{user.zid}"
                   )
+                  tdata = trust["data"]
+                  assert isinstance(tdata, dict)
+                  assert tdata["trusted"] is True
               finally:
-                  db.close()
+                  http.close()
 
 
-          def test_certification_search_reputation(
+          def test_history_documents_journey(
               tmp_path: Path,
           ) -> None:
-              db, caps, identity = _caps(tmp_path)
+              http = _Http(tmp_path)
               try:
-                  caps.profiles.register_app(
+                  caps_profs = http.caps.profiles
+                  caps_profs.register_app(
                       app_id="familia",
                       display_name="Familia",
                       scopes=("display_name",),
                   )
-                  uni = identity.register_identity(
-                      kind=IdentityKind.INSTITUTION,
-                      display_name="Uni SV",
-                      actor="familia",
-                  )
-                  user = identity.register_identity(
+                  user = http.identity.register_identity(
                       kind=IdentityKind.PERSON,
-                      display_name="maria lopez",
+                      display_name="bebe",
                       actor="familia",
                   )
-                  caps.issuers.register_issuer(
-                      issuer_id=uni.zid,
-                      display_name="Uni SV",
-                      scopes=("education",),
-                  )
-                  cert = (
-                      caps.certification
-                      .issue_certificate(
-                          subject_zid=user.zid,
-                          issuer_id=uni.zid,
-                          scope="education",
-                          title=(
-                              "Ingenieria"
-                              " Informatica"
+                  appended = _post(
+                      f"{http.base}/history/append",
+                      {
+                          "zid": user.zid,
+                          "entry_type": (
+                              "birth_registration"
                           ),
-                          detail="titulo",
-                      )
+                          "actor_app": "familia",
+                          "payload": {
+                              "hospital":
+                              "San Salvador"
+                          },
+                      },
                   )
-                  verdict = (
-                      caps.certification
-                      .verify_certificate(
-                          certificate_id=(
-                              cert.certificate_id
-                          )
-                      )
+                  adata = appended["data"]
+                  assert isinstance(adata, dict)
+                  assert adata["seq"] == 1
+                  timeline = _get(
+                      f"{http.base}/history/"
+                      f"{user.zid}"
                   )
-                  assert verdict.valid is True
-                  result = caps.search.search(
-                      app_id="familia",
-                      query="ingenieria",
+                  hdata = timeline["data"]
+                  assert isinstance(hdata, list)
+                  assert len(hdata) == 1
+                  sealed = _post(
+                      f"{http.base}/documents/seal",
+                      {
+                          "owner_zid": user.zid,
+                          "title": "Acta",
+                          "content_b64": base64.b64encode(
+                              b"acta original"
+                          ).decode("ascii"),
+                          "actor_app": "familia",
+                      },
                   )
-                  sources = {
-                      h.source
-                      for h in result.items
-                  }
-                  assert (
-                      "certificate" in sources
+                  sdata = sealed["data"]
+                  assert isinstance(sdata, dict)
+                  document_id = sdata["document_id"]
+                  good = _post(
+                      f"{http.base}/documents/verify",
+                      {
+                          "document_id": document_id,
+                          "content_b64": base64.b64encode(
+                              b"acta original"
+                          ).decode("ascii"),
+                      },
                   )
-                  event = caps.reputation.record_event(
-                      subject_zid=user.zid,
-                      actor_zid=uni.zid,
-                      kind="positive",
-                      evidence=b"titulo verificado",
+                  gdata = good["data"]
+                  assert isinstance(gdata, dict)
+                  assert gdata["authentic"] is True
+                  bad = _post(
+                      f"{http.base}/documents/verify",
+                      {
+                          "document_id": document_id,
+                          "content_b64": base64.b64encode(
+                              b"acta falsificada"
+                          ).decode("ascii"),
+                      },
                   )
-                  summary = caps.reputation.summary(
-                      subject_zid=user.zid
-                  )
-                  assert summary.score == 10
-                  assert (
-                      caps.reputation.verify_evidence(
-                          event_id=event.event_id,
-                          evidence=(
-                              b"titulo verificado"
-                          ),
-                      )
-                      is True
-                  )
+                  bdata = bad["data"]
+                  assert isinstance(bdata, dict)
+                  assert bdata["authentic"] is False
               finally:
-                  db.close()
+                  http.close()
 
 
-          def test_export_interop_compliance_ai_encryption(
+          def test_search_reputation_and_guard(
               tmp_path: Path,
           ) -> None:
-              db, caps, identity = _caps(tmp_path)
+              http = _Http(tmp_path)
               try:
-                  caps.profiles.register_app(
+                  http.caps.profiles.register_app(
                       app_id="familia",
                       display_name="Familia",
                       scopes=("display_name",),
                   )
-                  _ = identity
-                  bundle = caps.export.export_bundle(
-                      subject_zid="ZID-1",
-                      entries=(
-                          (
-                              "doc",
-                              "D-1",
-                              "acta",
-                          ),
-                      ),
-                      actor_app="familia",
-                  )
-                  assert (
-                      caps.export.verify_stored(
-                          bundle_id=(
-                              bundle.bundle_id
-                          )
+                  worker = (
+                      http.identity.register_identity(
+                          kind=IdentityKind.PERSON,
+                          display_name="carlos ruiz",
+                          actor="familia",
                       )
-                      is True
                   )
-                  caps.interop.register_schema(
-                      schema_id="zyra.demo",
-                      version=1,
-                      definition="demo",
+                  employer = (
+                      http.identity.register_identity(
+                          kind=IdentityKind.PERSON,
+                          display_name="empleador",
+                          actor="familia",
+                      )
                   )
-                  agreed = caps.interop.negotiate(
-                      schema_id="zyra.demo",
-                      client_versions=(1, 2),
+                  recorded = _post(
+                      f"{http.base}/reputation/record",
+                      {
+                          "subject_zid": worker.zid,
+                          "actor_zid": employer.zid,
+                          "kind": "positive",
+                          "evidence_b64": base64.b64encode(
+                              b"contrato firmado"
+                          ).decode("ascii"),
+                      },
                   )
-                  assert agreed.agreed_version == 1
-                  caps.compliance.register_policy(
-                      jurisdiction="SV",
-                      requirement="kyc_verified",
-                      mandatory=True,
+                  rdata = recorded["data"]
+                  assert isinstance(rdata, dict)
+                  assert rdata["seq"] == 1
+                  summary = _get(
+                      f"{http.base}/reputation/"
+                      f"{worker.zid}"
                   )
-                  decision = caps.compliance.evaluate(
-                      subject_zid="ZID-1",
-                      jurisdiction="SV",
-                      requirement="kyc_verified",
-                      satisfied=True,
+                  sdata = summary["data"]
+                  assert isinstance(sdata, dict)
+                  assert sdata["score"] == 10
+                  result = _post(
+                      f"{http.base}/search",
+                      {
+                          "app_id": "familia",
+                          "query": "carlos ruiz",
+                      },
                   )
-                  assert (
-                      decision.compliant is True
-                  )
-                  caps.ai.register_model(
-                      model_id="classifier",
-                      provider="lab",
-                      model_version="1.0",
-                      capabilities=("document",),
-                  )
-                  record = caps.ai.record_analysis(
-                      model_id="classifier",
-                      content_sha256="a" * 64,
-                      verdict="authentic",
-                      confidence=0.9,
-                  )
-                  assert (
-                      record.model_version
-                      == "1.0"
-                  )
-                  sealed = caps.encryption.seal(
-                      b"secreto de la familia"
-                  )
-                  assert (
-                      caps.encryption.open(sealed)
-                      == b"secreto de la familia"
-                  )
+                  data = result["data"]
+                  assert isinstance(data, dict)
+                  assert data["total"] >= 1
+                  with pytest.raises(HTTPError) as exc:
+                      _post(
+                          f"{http.base}/search",
+                          {
+                              "app_id": "malware",
+                              "query": "x",
+                          },
+                      )
+                  assert exc.value.code == 400
               finally:
-                  db.close()
+                  http.close()
           PYEOF
-          echo "=== CAPABILITY TESTS READY ==="
+          echo "=== API TESTS READY ==="
 
       - name: Quality gates (mypy first; full regression)
         run: |
@@ -612,7 +1120,7 @@ jobs:
           if git diff --cached --quiet; then
             echo "No changes."
           else
-            git commit -m "zyra: W18 structural cleanup + capabilities - 26 orphan dirs removed, empty namespaces removed, runtime/capabilities.py composes 14 trust services over one DB; test 2 registers app before search; 3 end-to-end proofs"
+            git commit -m "zyra: W19 capabilities HTTP surface - CapabilitiesApiHandler + CapabilitiesServer (ZyraServer-pattern: daemon threads, reusable address, bound_port), 14 trust routes over ZyraCapabilities, optional bearer token, engines enforce registered-apps; tests follow existing real-server pattern with explicit shutdown; 3 HTTP journey proofs"
             git push origin "HEAD:${{ github.ref_name }}"
           fi
-          echo "=== W18 COMPLETE ==="
+          echo "=== W19 COMPLETE ==="

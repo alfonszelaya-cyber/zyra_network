@@ -31,6 +31,147 @@ jobs:
           python -m pip install --upgrade pip
           python -m pip install "cryptography>=42,<45" "pytest>=8,<9"
 
+      - name: Combined HTTP surface (core + capabilities, one port)
+        run: |
+          set -euo pipefail
+          cat > shared_engines/runtime/combined_api.py <<'PYEOF'
+          """Combined HTTP surface: core API + capabilities
+          on ONE port.
+
+          Routes by first path segment: core prefixes (health,
+          verify, identity, verification, tokens, currency)
+          go to ZyraApiHandler routing; everything else goes
+          to CapabilitiesApiHandler. Both keep their tested
+          internals; this module only dispatches and unifies
+          error mapping. One bearer token guards both.
+          """
+          from __future__ import annotations
+
+          from http.server import ThreadingHTTPServer
+          from typing import ClassVar
+          from urllib.parse import urlparse
+
+          from shared_engines.common.errors import (
+              EngineError,
+          )
+          from shared_engines.runtime.api import (
+              ZyraApiHandler,
+          )
+          from shared_engines.runtime.capabilities import (
+              ZyraCapabilities,
+          )
+          from shared_engines.runtime.capabilities_api import (
+              CapabilitiesApiHandler,
+          )
+          from shared_engines.runtime.capabilities_api import (
+              _ApiError,
+          )
+          from shared_engines.runtime.kernel import ZyraKernel
+          from shared_engines.runtime.responses import (
+              ApiError,
+              map_engine_error,
+          )
+
+          CORE_PREFIXES = frozenset(
+              {
+                  "health",
+                  "verify",
+                  "identity",
+                  "verification",
+                  "tokens",
+                  "currency",
+              }
+          )
+
+
+          class CombinedHandler(
+              ZyraApiHandler, CapabilitiesApiHandler
+          ):
+              """One port, two surfaces, shared database."""
+
+              caps: ClassVar[ZyraCapabilities]
+              kernel: ClassVar[ZyraKernel]
+
+              def _route(self, method: str) -> None:
+                  path = urlparse(self.path).path
+                  segments = [
+                      s
+                      for s in path.split("/")
+                      if s
+                  ]
+                  if segments and (
+                      segments[0] in CORE_PREFIXES
+                  ):
+                      ZyraApiHandler._route(
+                          self, method
+                      )
+                      return
+                  CapabilitiesApiHandler._route(
+                      self, method
+                  )
+
+              def _dispatch(
+                  self, method: str
+              ) -> None:
+                  try:
+                      self._route(method)
+                  except ApiError as exc:
+                      self._send_json(
+                          exc.status,
+                          self._error_body(exc),
+                      )
+                  except _ApiError as exc:
+                      CapabilitiesApiHandler._error(
+                          self,
+                          exc.status,
+                          exc.code,
+                          exc.message,
+                      )
+                  except PermissionError as exc:
+                      CapabilitiesApiHandler._error(
+                          self,
+                          403,
+                          "forbidden",
+                          str(exc),
+                      )
+                  except EngineError as exc:
+                      mapped = map_engine_error(exc)
+                      self._send_json(
+                          mapped.status,
+                          self._error_body(mapped),
+                      )
+                  except ValueError as exc:
+                      CapabilitiesApiHandler._error(
+                          self,
+                          400,
+                          "invalid_request",
+                          str(exc),
+                      )
+                  except Exception:
+                      CapabilitiesApiHandler._error(
+                          self,
+                          500,
+                          "internal_error",
+                          "internal error",
+                      )
+
+
+          def serve_combined(
+              kernel: ZyraKernel,
+              caps: ZyraCapabilities,
+              *,
+              host: str,
+              port: int,
+          ) -> ThreadingHTTPServer:
+              """Bind both surfaces to one server."""
+              CombinedHandler.kernel = kernel
+              CombinedHandler.caps = caps
+              return ThreadingHTTPServer(
+                  (host, port), CombinedHandler
+              )
+          PYEOF
+          echo "=== COMBINED API READY ==="
+
       - name: Extend NetworkClient (real HTTP, legacy kept)
         run: |
           set -euo pipefail
@@ -1073,7 +1214,6 @@ jobs:
               ZyraCapabilities,
           )
           from shared_engines.runtime.combined_api import (
-              CombinedHandler,
               serve_combined,
           )
           from shared_engines.runtime.config import RuntimeConfig
@@ -1382,8 +1522,8 @@ jobs:
           set -euo pipefail
           PYTHONPATH="$PWD" python -m pytest -q -p no:cacheprovider apps/agro/tests/test_agro_n1.py
           echo "N1 tests OK"
-          python -m compileall -q apps/agro
-          echo "agro compile OK"
+          python -m compileall -q apps/agro shared_engines/runtime/combined_api.py
+          echo "compile OK"
           find apps/agro -name '__pycache__' -type d -prune \
             -exec rm -rf {} +
 
@@ -1398,7 +1538,7 @@ jobs:
           if git diff --cached --quiet; then
             echo "No changes."
           else
-            git commit -m "zyra: N1 AGRO - test harness now boots the COMBINED surface (core+capabilities, production shape) so /identity/register exists; ZyraLink gets ZID for producers; 2 prior fixes kept; 3 e2e proofs"
+            git commit -m "zyra: N1 AGRO - combined_api.py created (was pending from W21), test harness boots COMBINED surface so /identity/register exists; NetworkClient+ZyraLink+AgroStore+AgroServer; 3 e2e proofs"
             git push origin "HEAD:${{ github.ref_name }}"
           fi
           echo "=== N1 AGRO COMPLETE ==="

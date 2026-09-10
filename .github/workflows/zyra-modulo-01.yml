@@ -1,4 +1,4 @@
-name: zyra-n4a-nexo-files
+name: zyra-n4b-nexo-tests
 
 "on":
   workflow_dispatch:
@@ -9,7 +9,7 @@ permissions:
   contents: write
 
 concurrency:
-  group: zyra-n4a-${{ github.ref }}
+  group: zyra-n4b-${{ github.ref }}
   cancel-in-progress: false
 
 jobs:
@@ -25,1291 +25,329 @@ jobs:
         with:
           python-version: "3.12"
 
-      - name: NEXO NetworkClient
+      - name: Install toolchain
         run: |
           set -euo pipefail
-          mkdir -p apps/nexo/infrastructure/network
-          cat > apps/nexo/infrastructure/network/network_client.py <<'PYEOF'
-          """NEXO HTTP client to ZYRA Network."""
+          python -m pip install --upgrade pip
+          python -m pip install "cryptography>=42,<45" "pytest>=8,<9"
+
+      - name: NEXO proofs
+        run: |
+          set -euo pipefail
+          mkdir -p apps/nexo/tests
+          cat > apps/nexo/tests/test_nexo_core.py <<'PYEOF'
+          """NEXO proofs: operation -> hash-chained ledger ->
+          invoice sealed on the network -> contador verifies;
+          tamper detected; resilience offline."""
           from __future__ import annotations
 
           import json
-          import os
-          import urllib.request
+          import threading
+          from pathlib import Path
+          from urllib.request import Request, urlopen
 
-
-          class NetworkClient:
-              def __init__(
-                  self,
-                  base_url: str | None = None,
-                  *,
-                  timeout_seconds: float = 5.0,
-                  max_retries: int = 2,
-              ) -> None:
-                  self._base = (
-                      base_url
-                      or os.environ.get("ZYRA_URL", "")
-                  ).rstrip("/")
-                  self._timeout = timeout_seconds
-                  self._retries = max(0, max_retries)
-
-              def get(self, path: str) -> tuple[
-                  bool, dict | None, str | None
-              ]:
-                  return self._call("GET", path)
-
-              def post(
-                  self, path: str, payload: dict
-              ) -> tuple[bool, dict | None, str | None]:
-                  return self._call("POST", path, payload)
-
-              def _call(
-                  self,
-                  method: str,
-                  path: str,
-                  payload: dict | None = None,
-              ) -> tuple[bool, dict | None, str | None]:
-                  if not self._base:
-                      return (
-                          False,
-                          None,
-                          "ZYRA_URL not configured",
-                      )
-                  url = self._base + path
-                  data = None
-                  if payload is not None:
-                      data = json.dumps(
-                          payload
-                      ).encode("utf-8")
-                  last_error = "unknown"
-                  for attempt in range(
-                      self._retries + 1
-                  ):
-                      try:
-                          request = urllib.request.Request(
-                              url,
-                              data=data,
-                              method=method,
-                              headers={
-                                  "Content-Type":
-                                  "application/json"
-                              },
-                          )
-                          with urllib.request.urlopen(
-                              request,
-                              timeout=self._timeout,
-                          ) as response:
-                              body = json.loads(
-                                  response.read()
-                                  .decode("utf-8")
-                              )
-                          if body.get("ok") is True:
-                              return (
-                                  True,
-                                  body.get("data"),
-                                  None,
-                              )
-                          error = body.get("error", {})
-                          return (
-                              False,
-                              None,
-                              str(
-                                  error.get(
-                                      "message",
-                                      "rejected",
-                                  )
-                              ),
-                          )
-                      except Exception as exc:
-                          last_error = str(exc)
-                  return False, None, last_error
-          PYEOF
-
-      - name: NexoLink
-        run: |
-          set -euo pipefail
-          mkdir -p apps/nexo/services
-          cat > apps/nexo/services/nexo_link.py <<'PYEOF'
-          """NexoLink: NEXO ops on the Network."""
-          from __future__ import annotations
-
-          import base64
+          from shared_engines.common.clocks import FrozenClock
+          from shared_engines.runtime.capabilities import (
+              ZyraCapabilities,
+          )
+          from shared_engines.runtime.combined_api import (
+              serve_combined,
+          )
+          from shared_engines.runtime.config import RuntimeConfig
+          from shared_engines.runtime.kernel import ZyraKernel
+          from shared_engines.storage.database import SQLiteAdapter
+          from shared_engines.verification.signatures import (
+              Ed25519Signer,
+          )
 
           from apps.nexo.infrastructure.network.network_client import (
               NetworkClient,
           )
-
-
-          class NexoLink:
-              def __init__(
-                  self, client: NetworkClient
-              ) -> None:
-                  self._client = client
-
-              def register_app(self) -> tuple[
-                  bool, dict | None, str | None
-              ]:
-                  return self._client.post(
-                      "/apps/register",
-                      {
-                          "app_id": "nexo",
-                          "display_name": "NEXO",
-                          "scopes": [
-                              "display_name",
-                              "contact",
-                          ],
-                      },
-                  )
-
-              def register_company(
-                  self, display_name: str
-              ) -> tuple[bool, dict | None, str | None]:
-                  return self._client.post(
-                      "/identity/register",
-                      {
-                          "kind": "organization",
-                          "display_name": display_name,
-                          "actor": "nexo",
-                      },
-                  )
-
-              def record_fiscal_event(
-                  self,
-                  zid: str,
-                  event: str,
-                  detail: str,
-              ) -> tuple[bool, dict | None, str | None]:
-                  return self._client.post(
-                      "/history/append",
-                      {
-                          "zid": zid,
-                          "entry_type": "other",
-                          "actor_app": "nexo",
-                          "payload": {
-                              "event": event,
-                              "detail": detail,
-                          },
-                      },
-                  )
-
-              def seal_invoice(
-                  self,
-                  *,
-                  owner_zid: str,
-                  invoice_id: str,
-                  content: bytes,
-              ) -> tuple[
-                  bool, dict | None, str | None
-              ]:
-                  encoded = base64.b64encode(
-                      content
-                  ).decode("ascii")
-                  return self._client.post(
-                      "/documents/seal",
-                      {
-                          "owner_zid": owner_zid,
-                          "title": "Factura "
-                          + invoice_id,
-                          "content_b64": encoded,
-                          "actor_app": "nexo",
-                      },
-                  )
-          PYEOF
-
-      - name: NexoStore (hash-chained ledger, fiscal kinds only)
-        run: |
-          set -euo pipefail
-          mkdir -p apps/nexo/infrastructure/persistence
-          cat > apps/nexo/infrastructure/persistence/nexo_store.py <<'PYEOF'
-          """NexoCore durable ledger: hash-chained
-          accounting between ZIDs. Fiscal kinds only -
-          import/export live in MERCADO."""
-          from __future__ import annotations
-
-          import hashlib
-
-          from shared_engines.storage.database import (
-              Database,
-          )
-          from shared_engines.storage.migrations import (
-              Migration,
-              MigrationRunner,
-          )
-
-          KINDS = (
-              "venta",
-              "compra",
-              "pago",
-              "cobro",
-              "ajuste",
-          )
-
-          _MIGRATIONS = (
-              Migration(
-                  1,
-                  "nexo",
-                  (
-                      "CREATE TABLE nexo_companies ("
-                      " company_id TEXT PRIMARY KEY,"
-                      " zid TEXT,"
-                      " name TEXT NOT NULL,"
-                      " synced INTEGER NOT NULL"
-                      " DEFAULT 0,"
-                      " created_at REAL NOT NULL)",
-                      "CREATE TABLE nexo_operations ("
-                      " seq INTEGER PRIMARY KEY"
-                      " AUTOINCREMENT,"
-                      " operation_id TEXT NOT NULL,"
-                      " kind TEXT NOT NULL,"
-                      " seller_zid TEXT NOT NULL,"
-                      " buyer_zid TEXT NOT NULL,"
-                      " amount REAL NOT NULL,"
-                      " description TEXT NOT NULL,"
-                      " invoice_id TEXT,"
-                      " entry_hash TEXT NOT NULL,"
-                      " prev_hash TEXT NOT NULL,"
-                      " synced INTEGER NOT NULL"
-                      " DEFAULT 0,"
-                      " created_at REAL NOT NULL)",
-                      "CREATE INDEX nexo_seq"
-                      " ON nexo_operations (seq)",
-                  ),
-              ),
-          )
-
-
-          def _entry_hash(
-              *,
-              seq: int,
-              kind: str,
-              seller_zid: str,
-              buyer_zid: str,
-              amount: float,
-              description: str,
-              prev_hash: str,
-              created_at: float,
-          ) -> str:
-              raw = (
-                  str(seq)
-                  + "|"
-                  + kind
-                  + "|"
-                  + seller_zid
-                  + "|"
-                  + buyer_zid
-                  + "|"
-                  + str(amount)
-                  + "|"
-                  + description
-                  + "|"
-                  + str(created_at)
-                  + "|"
-                  + prev_hash
-              )
-              return hashlib.sha256(
-                  raw.encode("utf-8")
-              ).hexdigest()
-
-
-          class NexoStore:
-              """Hash-chained durable ledger."""
-
-              def __init__(
-                  self, db: Database, clock
-              ) -> None:
-                  self._db = db
-                  self._clock = clock
-                  MigrationRunner(
-                      db, "nexo", _MIGRATIONS
-                  ).run(clock)
-
-              def add_company(
-                  self,
-                  *,
-                  company_id: str,
-                  zid: str | None,
-                  name: str,
-                  synced: bool,
-              ) -> dict[str, object]:
-                  now = self._clock.now()
-                  with self._db.transaction() as cursor:
-                      cursor.execute(
-                          "INSERT INTO nexo_companies"
-                          " (company_id, zid, name,"
-                          "  synced, created_at)"
-                          " VALUES (?, ?, ?, ?, ?)",
-                          (
-                              company_id,
-                              zid,
-                              name,
-                              int(synced),
-                              now,
-                          ),
-                      )
-                  return self.get_company(company_id)
-
-              def get_company(
-                  self, company_id: str
-              ) -> dict[str, object]:
-                  row = self._db.query_one(
-                      "SELECT * FROM nexo_companies"
-                      " WHERE company_id = ?",
-                      (company_id,),
-                  )
-                  if row is None:
-                      raise LookupError(
-                          "unknown company:"
-                          f" {company_id}"
-                      )
-                  zid = row["zid"]
-                  return {
-                      "company_id": str(
-                          row["company_id"]
-                      ),
-                      "zid": (
-                          str(zid)
-                          if zid is not None
-                          else None
-                      ),
-                      "name": str(row["name"]),
-                      "synced": bool(
-                          int(row["synced"])
-                      ),
-                  }
-
-              def record_operation(
-                  self,
-                  *,
-                  operation_id: str,
-                  kind: str,
-                  seller_zid: str,
-                  buyer_zid: str,
-                  amount: float,
-                  description: str,
-                  invoice_id: str | None,
-                  synced: bool,
-              ) -> dict[str, object]:
-                  if kind not in KINDS:
-                      raise ValueError(
-                          f"unknown kind: {kind}"
-                      )
-                  if amount <= 0:
-                      raise ValueError(
-                          "amount must be positive"
-                      )
-                  now = self._clock.now()
-                  with self._db.transaction() as cursor:
-                      last = cursor.execute(
-                          "SELECT seq, entry_hash"
-                          " FROM nexo_operations"
-                          " ORDER BY seq DESC"
-                          " LIMIT 1"
-                      ).fetchone()
-                      if last is None:
-                          seq = 1
-                          prev_hash = "GENESIS"
-                      else:
-                          seq = int(
-                              last["seq"]
-                          ) + 1
-                          prev_hash = str(
-                              last["entry_hash"]
-                          )
-                      entry_hash = _entry_hash(
-                          seq=seq,
-                          kind=kind,
-                          seller_zid=seller_zid,
-                          buyer_zid=buyer_zid,
-                          amount=amount,
-                          description=description,
-                          prev_hash=prev_hash,
-                          created_at=now,
-                      )
-                      cursor.execute(
-                          "INSERT INTO nexo_operations"
-                          " (operation_id, kind,"
-                          "  seller_zid, buyer_zid,"
-                          "  amount, description,"
-                          "  invoice_id, entry_hash,"
-                          "  prev_hash, synced,"
-                          "  created_at)"
-                          " VALUES (?, ?, ?, ?, ?,"
-                          "  ?, ?, ?, ?, ?, ?, ?)",
-                          (
-                              operation_id,
-                              kind,
-                              seller_zid,
-                              buyer_zid,
-                              amount,
-                              description,
-                              invoice_id,
-                              entry_hash,
-                              prev_hash,
-                              int(synced),
-                              now,
-                          ),
-                      )
-                  return {
-                      "operation_id": (
-                          operation_id
-                      ),
-                      "seq": seq,
-                      "kind": kind,
-                      "amount": amount,
-                      "entry_hash": entry_hash,
-                      "prev_hash": prev_hash,
-                      "invoice_id": invoice_id,
-                      "synced": synced,
-                  }
-
-              def verify_chain(self) -> bool:
-                  rows = self._db.query_all(
-                      "SELECT * FROM nexo_operations"
-                      " ORDER BY seq"
-                  )
-                  prev = "GENESIS"
-                  for r in rows:
-                      expected = _entry_hash(
-                          seq=int(r["seq"]),
-                          kind=str(r["kind"]),
-                          seller_zid=str(
-                              r["seller_zid"]
-                          ),
-                          buyer_zid=str(
-                              r["buyer_zid"]
-                          ),
-                          amount=float(
-                              r["amount"]
-                          ),
-                          description=str(
-                              r["description"]
-                          ),
-                          prev_hash=prev,
-                          created_at=float(
-                              r["created_at"]
-                          ),
-                      )
-                      if (
-                          str(r["entry_hash"])
-                          != expected
-                          or str(r["prev_hash"])
-                          != prev
-                      ):
-                          return False
-                      prev = str(r["entry_hash"])
-                  return True
-
-              def list_operations(
-                  self,
-              ) -> tuple[dict[str, object], ...]:
-                  rows = self._db.query_all(
-                      "SELECT * FROM nexo_operations"
-                      " ORDER BY seq"
-                  )
-                  return tuple(
-                      {
-                          "seq": int(r["seq"]),
-                          "kind": str(r["kind"]),
-                          "seller_zid": str(
-                              r["seller_zid"]
-                          ),
-                          "buyer_zid": str(
-                              r["buyer_zid"]
-                          ),
-                          "amount": float(
-                              r["amount"]
-                          ),
-                          "invoice_id": (
-                              str(r["invoice_id"])
-                              if r["invoice_id"]
-                              is not None
-                              else None
-                          ),
-                          "entry_hash": str(
-                              r["entry_hash"]
-                          ),
-                      }
-                      for r in rows
-                  )
-
-              def summary(self) -> dict[str, object]:
-                  totals = self._db.query_all(
-                      "SELECT kind, COUNT(*) AS n,"
-                      " SUM(amount) AS total FROM"
-                      " nexo_operations"
-                      " GROUP BY kind"
-                      " ORDER BY kind"
-                  )
-                  by_kind = {
-                      str(r["kind"]): {
-                          "count": int(r["n"]),
-                          "total": float(
-                              r["total"]
-                          ),
-                      }
-                      for r in totals
-                  }
-                  row = self._db.query_one(
-                      "SELECT COUNT(*) AS n FROM"
-                      " nexo_operations"
-                  )
-                  return {
-                      "operations_total": int(
-                          row["n"]
-                      )
-                      if row is not None
-                      else 0,
-                      "by_kind": by_kind,
-                      "chain_intact": (
-                          self.verify_chain()
-                      ),
-                  }
-          PYEOF
-
-      - name: NEXO HTTP surface (empresario + contador)
-        run: |
-          set -euo pipefail
-          cat > apps/nexo/server.py <<'PYEOF'
-          """NEXO HTTP surface: empresario + contador."""
-          from __future__ import annotations
-
-          import json
-          import uuid
-          from http.server import (
-              BaseHTTPRequestHandler,
-              ThreadingHTTPServer,
-          )
-          from typing import Any, ClassVar
-          from urllib.parse import urlparse
-
           from apps.nexo.infrastructure.persistence.nexo_store import (
-              KINDS,
               NexoStore,
           )
-          from apps.nexo.infrastructure.network.network_client import (
-              NetworkClient,
-          )
+          from apps.nexo.server import serve_nexo
           from apps.nexo.services.nexo_link import NexoLink
 
-          _CSS = (
-              "body{font-family:system-ui,sans-serif;"
-              "background:#0d1117;color:#e6edf3;"
-              "display:flex;justify-content:center;"
-              "padding:20px;margin:0}"
-              ".wrap{max-width:680px;width:100%}"
-              "h1{font-size:1.3rem}"
-              "h2{font-size:1rem;margin-top:20px;"
-              "color:#58a6ff}"
-              ".card{background:#161b22;border:1px solid"
-              " #30363d;border-radius:10px;padding:14px;"
-              "margin-top:10px}"
-              "button{background:#238636;color:#fff;"
-              "border:none;padding:12px 18px;border-radius:8px;"
-              "font-size:1rem;cursor:pointer;margin:6px 4px"
-              " 0 0;width:100%;text-align:left}"
-              "button.gray{background:#30363d}"
-              "input,select{width:100%;box-sizing:border-box;"
-              "background:#0d1117;color:#e6edf3;"
-              "border:1px solid #30363d;border-radius:6px;"
-              "padding:8px;margin:4px 0;font-size:0.95rem}"
-              ".big{font-size:1.6rem;font-weight:bold;"
-              "color:#58a6ff}"
-              ".ok{background:#0f2417;border:1px solid"
-              " #238636;border-radius:8px;padding:10px;"
-              "margin:8px 0}"
-              ".bad{background:#2d1216;border:1px solid"
-              " #da3633;border-radius:8px;padding:10px;"
-              "margin:8px 0}"
-              "small{color:#8b949e}"
-          )
+
+          class _Ecosystem:
+              def __init__(self, tmp_path: Path) -> None:
+                  self.net_db = SQLiteAdapter(
+                      tmp_path / "network.db"
+                  )
+                  net_clock = FrozenClock()
+                  signer, _ = Ed25519Signer.generate()
+                  config = RuntimeConfig(
+                      host="127.0.0.1",
+                      port=0,
+                      api_token=None,
+                  )
+                  self.kernel = ZyraKernel(
+                      db=self.net_db,
+                      clock=net_clock,
+                      signer=signer,
+                      config=config,
+                  )
+                  self.kernel.bootstrap_root()
+                  self.caps = ZyraCapabilities(
+                      self.net_db,
+                      net_clock,
+                      identity=self.kernel.identity,
+                      signer=signer,
+                  )
+                  self.net_server = serve_combined(
+                      self.kernel,
+                      self.caps,
+                      host="127.0.0.1",
+                      port=0,
+                  )
+                  self.net_thread = threading.Thread(
+                      target=(
+                          self.net_server
+                          .serve_forever
+                      ),
+                      daemon=True,
+                  )
+                  self.net_thread.start()
+                  self.net_base = (
+                      "http://127.0.0.1:"
+                      f"{self.net_server.server_address[1]}"
+                  )
+                  self.net_url = self.net_base
+
+                  self.nexo_db = SQLiteAdapter(
+                      tmp_path / "nexo.db"
+                  )
+                  nexo_clock = FrozenClock()
+                  self.store = NexoStore(
+                      self.nexo_db, nexo_clock
+                  )
+                  self.client = NetworkClient(
+                      self.net_url, max_retries=1
+                  )
+                  self.link = NexoLink(self.client)
+                  self.nexo_server = serve_nexo(
+                      self.store, self.client
+                  )
+                  self.nexo_thread = threading.Thread(
+                      target=(
+                          self.nexo_server
+                          .serve_forever
+                      ),
+                      daemon=True,
+                  )
+                  self.nexo_thread.start()
+                  self.nexo_base = (
+                      "http://127.0.0.1:"
+                      f"{self.nexo_server.bound_port}"
+                  )
+
+              def close(self) -> None:
+                  self.nexo_server.shutdown()
+                  self.nexo_server.server_close()
+                  self.nexo_thread.join(timeout=5)
+                  self.net_server.shutdown()
+                  self.net_server.server_close()
+                  self.net_thread.join(timeout=5)
+                  self.nexo_db.close()
+                  self.net_db.close()
 
 
-          def _page(title: str, body: str) -> str:
-              return (
-                  "<!DOCTYPE html><html lang='es'><head>"
-                  "<meta charset='utf-8'>"
-                  "<meta name='viewport' content='width="
-                  "device-width, initial-scale=1'>"
-                  f"<title>{title}</title>"
-                  f"<style>{_CSS}</style></head><body>"
-                  f"<div class='wrap'>{body}</div></body>"
-                  "</html>"
+          def _get(url: str) -> dict[str, object]:
+              with urlopen(url, timeout=10) as response:
+                  body = json.loads(
+                      response.read().decode("utf-8")
+                  )
+              assert isinstance(body, dict)
+              return body
+
+
+          def _post(
+              url: str, doc: dict[str, object]
+          ) -> dict[str, object]:
+              request = Request(
+                  url,
+                  data=json.dumps(doc).encode("utf-8"),
+                  headers={
+                      "Content-Type":
+                      "application/json"
+                  },
+                  method="POST",
               )
-
-
-          class NexoApiHandler(
-              BaseHTTPRequestHandler
-          ):
-              store: ClassVar[NexoStore]
-              link: ClassVar[NexoLink]
-
-              def log_message(
-                  self, format: str, *args: object
-              ) -> None:
-                  return None
-
-              def do_GET(self) -> None:
-                  self._safe("GET")
-
-              def do_POST(self) -> None:
-                  self._safe("POST")
-
-              def _safe(self, method: str) -> None:
-                  try:
-                      self._route(method)
-                  except LookupError as exc:
-                      self._html(
-                          404,
-                          _page(
-                              "No encontrado",
-                              "<h1>404</h1>"
-                              f"<p>{exc}</p>",
-                          ),
-                      )
-                  except ValueError as exc:
-                      self._html(
-                          400,
-                          _page(
-                              "Error",
-                              "<h1>Dato invalido"
-                              f"</h1><p>{exc}</p>",
-                          ),
-                      )
-                  except Exception as exc:
-                      self._html(
-                          500,
-                          _page(
-                              "Error",
-                              "<h1>Error interno"
-                              f"</h1><p>{exc}</p>",
-                          ),
-                      )
-
-              def _route(self, method: str) -> None:
-                  path = urlparse(self.path).path
-                  segments = [
-                      s
-                      for s in path.split("/")
-                      if s
-                  ]
-                  if segments[:1] != ["nexo"]:
-                      self._html(
-                          404,
-                          _page(
-                              "404",
-                              "<h1>Fuera de NEXO"
-                              "</h1>",
-                          ),
-                      )
-                      return
-                  tail = segments[1:]
-                  if method == "GET":
-                      self._get(tail)
-                  else:
-                      self._post(tail)
-
-              def _get(self, s: list[str]) -> None:
-                  if s[:1] == ["api"]:
-                      self._api_get(s[1:])
-                      return
-                  store = type(self).store
-                  if not s or s == ["home"]:
-                      self._home()
-                      return
-                  if s[0] == "contador":
-                      summary = store.summary()
-                      if summary["chain_intact"]:
-                          chain = (
-                              "<div class='ok'>✅"
-                              " Cadena contable"
-                              " INTACTA - nada fue"
-                              " alterado</div>"
-                          )
-                      else:
-                          chain = (
-                              "<div class='bad'>❌"
-                              " CADENA ALTERADA"
-                              " - hay registros"
-                              " modificados</div>"
-                          )
-                      by_kind = summary["by_kind"]
-                      rows = ""
-                      for k, v in by_kind.items():
-                          rows = (
-                              rows
-                              + "<li>• "
-                              + k
-                              + ": "
-                              + str(v["count"])
-                              + " ops / $"
-                              + str(v["total"])
-                              + "</li>"
-                          )
-                      if not rows:
-                          rows = (
-                              "<li>Sin operaciones"
-                              "</li>"
-                          )
-                      body = (
-                          "<h1>📊 Panel Contador"
-                          "</h1>"
-                          "<p>Verificacion con"
-                          " evidencia criptografica"
-                          " de la Red.</p>"
-                          + chain
-                          + "<h2>Resumen</h2><ul>"
-                          + rows
-                          + "</ul>"
-                          "<a href='/nexo'>"
-                          "<button class='gray'>"
-                          "Inicio</button></a>"
-                      )
-                      self._html(
-                          200,
-                          _page(
-                              "NEXO - Contador", body
-                          ),
-                      )
-                      return
-                  if s == ["ledger"]:
-                      ops = store.list_operations()
-                      items = ""
-                      for o in ops:
-                          items = (
-                              items
-                              + "<li>• #"
-                              + str(o["seq"])
-                              + " ["
-                              + o["kind"]
-                              + "] $"
-                              + str(o["amount"])
-                              + " hash: "
-                              + o["entry_hash"][:12]
-                              + "...</li>"
-                          )
-                      if not items:
-                          items = (
-                              "<li>Libro vacio</li>"
-                          )
-                      self._html(
-                          200,
-                          _page(
-                              "NEXO - Libro",
-                              "<h1>Libro diario"
-                              " (encadenado)</h1><ul>"
-                              + items
-                              + "</ul>"
-                              "<a href='/nexo'>"
-                              "<button class='gray'>"
-                              "Inicio</button></a>",
-                          ),
-                      )
-                      return
-                  self._html(
-                      404,
-                      _page("404", "<h1>No"
-                      " encontrado</h1>"),
+              with urlopen(request, timeout=10) as response:
+                  body = json.loads(
+                      response.read().decode("utf-8")
                   )
+              assert isinstance(body, dict)
+              return body
 
-              def _post(self, s: list[str]) -> None:
-                  if s[:1] == ["api"]:
-                      self._api_post(s[1:])
-                      return
-                  store = type(self).store
-                  link = type(self).link
-                  doc = self._read_form()
-                  if s == ["register"]:
-                      name = self._req(doc, "name")
-                      company_id = (
-                          "EMP-"
-                          + uuid.uuid4().hex[:12]
-                      )
-                      zid: str | None = None
-                      ok, data, _error = (
-                          link.register_company(
-                              name
-                          )
-                      )
-                      if ok and data is not None:
-                          zid = str(data.get("zid"))
-                      store.add_company(
-                          company_id=company_id,
-                          zid=zid,
-                          name=name,
-                          synced=(
-                              zid is not None
-                          ),
-                      )
-                      zid_text = (
-                          zid
-                          if zid is not None
-                          else "pendiente de conexion"
-                      )
-                      self._html(
-                          200,
-                          _page(
-                              "Empresa registrada",
-                              "<h1>Empresa en la"
-                              " Red</h1>"
-                              "<p>Tu ID: <b>"
-                              + company_id
-                              + "</b></p>"
-                              "<p>Tu ZID: <b>"
-                              + zid_text
-                              + "</b></p>"
-                              "<a href='/nexo'>"
-                              "<button>Inicio"
-                              "</button></a>",
-                          ),
-                      )
-                      return
-                  if s == ["operation"]:
-                      seller = self._req(
-                          doc, "seller_zid"
-                      )
-                      buyer = self._req(
-                          doc, "buyer_zid"
-                      )
-                      kind = self._req(doc, "kind")
-                      amount = float(
-                          doc.get("amount", 0)
-                      )
-                      if amount <= 0:
-                          raise ValueError(
-                              "monto invalido"
-                          )
-                      description = self._req(
-                          doc, "description"
-                      )
-                      operation_id = (
-                          "OP-"
-                          + uuid.uuid4().hex[:12]
-                      )
-                      invoice_id: str | None = None
-                      synced = False
-                      ok, data, _error = (
-                          link.seal_invoice(
-                              owner_zid=seller,
-                              invoice_id=(
-                                  operation_id
-                              ),
-                              content=(
-                                  kind
-                                  + "|"
-                                  + seller
-                                  + "|"
-                                  + buyer
-                                  + "|"
-                                  + str(amount)
-                                  + "|"
-                                  + description
-                              ).encode("utf-8"),
-                          )
-                      )
-                      if ok and data is not None:
-                          invoice_id = str(
-                              data.get(
-                                  "document_id"
-                              )
-                          )
-                          synced = True
-                      link.record_fiscal_event(
-                          seller,
-                          kind,
-                          operation_id
-                          + ": $"
-                          + str(amount),
-                      )
-                      row = store.record_operation(
-                          operation_id=(
-                              operation_id
-                          ),
-                          kind=kind,
-                          seller_zid=seller,
-                          buyer_zid=buyer,
-                          amount=amount,
-                          description=description,
-                          invoice_id=invoice_id,
-                          synced=synced,
-                      )
-                      if synced:
-                          sello = (
-                              "SELLADA en la Red"
-                              " (verificable"
-                              " offline)"
-                          )
-                      else:
-                          sello = (
-                              "pendiente de sello"
-                              " (Red no disponible,"
-                              " quedara registrada)"
-                          )
-                      self._html(
-                          200,
-                          _page(
-                              "Operacion registrada",
-                              "<h1>Operacion #"
-                              + str(row["seq"])
-                              + "</h1>"
-                              "<p>"
-                              + kind
-                              + ": $"
-                              + str(amount)
-                              + " - "
-                              + sello
-                              + "</p><p>Factura: <b>"
-                              + (invoice_id
-                                 or "pendiente")
-                              + "</b></p>"
-                              "<a href='/nexo/contador'>"
-                              "<button>Verificar como"
-                              " contador</button></a>"
-                              "<a href='/nexo'>"
-                              "<button class='gray'>"
-                              "Inicio</button></a>",
-                          ),
-                      )
-                      return
-                  self._html(
-                      404,
-                      _page("404", "<h1>Ruta"
-                      " desconocida</h1>"),
-                  )
 
-              def _read_form(
-                  self,
-              ) -> dict[str, Any]:
-                  length_header = self.headers.get(
-                      "Content-Length"
+          def test_company_operation_chain_invoice(
+              tmp_path: Path,
+          ) -> None:
+              eco = _Ecosystem(tmp_path)
+              try:
+                  reg = eco.link.register_app()
+                  assert reg[0] is True
+                  created = _post(
+                      f"{eco.nexo_base}/nexo/api/"
+                      "companies",
+                      {"name": "Mi Negocio SV"},
                   )
-                  if length_header is None:
-                      raise ValueError(
-                          "Content-Length required"
-                      )
-                  raw = self.rfile.read(
-                      int(length_header)
-                  ).decode("utf-8")
-                  doc: dict[str, Any] = {}
-                  for pair in raw.split("&"):
-                      if "=" in pair:
-                          key, value = pair.split(
-                              "=", 1
-                          )
-                          doc[key] = value.replace(
-                              "+", " "
-                          )
-                  return doc
-
-              def _read_json(
-                  self,
-              ) -> dict[str, Any]:
-                  length_header = self.headers.get(
-                      "Content-Length"
+                  row = created["data"]
+                  assert isinstance(row, dict)
+                  assert (
+                      row["company_id"]
+                      .startswith("EMP-")
                   )
-                  if length_header is None:
-                      raise ValueError(
-                          "Content-Length required"
-                      )
-                  raw = self.rfile.read(
-                      int(length_header)
-                  )
-                  parsed: Any = json.loads(
-                      raw.decode("utf-8")
-                  )
-                  if not isinstance(parsed, dict):
-                      raise ValueError(
-                          "body must be a JSON"
-                          " object"
-                      )
-                  return {
-                      str(k): v
-                      for k, v in parsed.items()
-                  }
-
-              @staticmethod
-              def _req(
-                  doc: dict[str, Any], key: str
-              ) -> str:
-                  value: Any = doc.get(key)
-                  if isinstance(value, int) and not isinstance(
-                      value, bool
-                  ):
-                      value = str(value)
-                  if not isinstance(value, str):
-                      raise ValueError(
-                          f"missing field: {key}"
-                      )
-                  if not value.strip():
-                      raise ValueError(
-                          f"missing field: {key}"
-                      )
-                  return value
-
-              def _api_get(self, s: list[str]) -> None:
-                  store = type(self).store
-                  if s == ["health"]:
-                      self._send(
-                          200,
-                          {
-                              "ok": True,
-                              "data": {
-                                  "app": "nexo",
-                                  "status":
-                                  "operational",
-                              },
-                          },
-                      )
-                      return
-                  if s == ["ledger"]:
-                      self._send(
-                          200,
-                          {
-                              "ok": True,
-                              "data": list(
-                                  store
-                                  .list_operations()
-                              ),
-                          },
-                      )
-                      return
-                  if s == ["ledger", "verify"]:
-                      self._send(
-                          200,
-                          {
-                              "ok": True,
-                              "data": {
-                                  "chain_intact": (
-                                      store
-                                      .verify_chain()
-                                  ),
-                              },
-                          },
-                      )
-                      return
-                  if s == ["summary"]:
-                      self._send(
-                          200,
-                          {
-                              "ok": True,
-                              "data": store.summary(),
-                          },
-                      )
-                      return
-                  self._send(
-                      404,
+                  op = _post(
+                      f"{eco.nexo_base}/nexo/api/"
+                      "operations",
                       {
-                          "ok": False,
-                          "error": {
-                              "type": "not_found",
-                              "message":
-                              "unknown api route",
-                          },
+                          "kind": "venta",
+                          "seller_zid": "ZID-seller",
+                          "buyer_zid": "ZID-buyer",
+                          "amount": 250.0,
+                          "description": (
+                              "venta de mercaderia"
+                          ),
                       },
                   )
+                  odata = op["data"]
+                  assert isinstance(odata, dict)
+                  assert odata["seq"] == 1
+                  assert odata["synced"] is False
+                  verify = _get(
+                      f"{eco.nexo_base}/nexo/api/"
+                      "ledger/verify"
+                  )
+                  vdata = verify["data"]
+                  assert isinstance(vdata, dict)
+                  assert (
+                      vdata["chain_intact"]
+                      is True
+                  )
+                  summary = _get(
+                      f"{eco.nexo_base}/nexo/api/"
+                      "summary"
+                  )
+                  gdata = summary["data"]
+                  assert isinstance(gdata, dict)
+                  assert (
+                      gdata["operations_total"]
+                      == 1
+                  )
+                  assert (
+                      gdata["chain_intact"] is True
+                  )
+              finally:
+                  eco.close()
 
-              def _api_post(
-                  self, s: list[str]
-              ) -> None:
-                  store = type(self).store
-                  doc = self._read_json()
-                  if s == ["companies"]:
-                      company_id = (
-                          "EMP-"
-                          + uuid.uuid4().hex[:12]
-                      )
-                      row = store.add_company(
-                          company_id=company_id,
-                          zid=doc.get("zid"),
-                          name=self._req(doc, "name"),
-                          synced=False,
-                      )
-                      self._send(
-                          201,
-                          {
-                              "ok": True,
-                              "data": row,
-                          },
-                      )
-                      return
-                  if s == ["operations"]:
-                      row = store.record_operation(
-                          operation_id=(
-                              "OP-"
-                              + uuid.uuid4().hex[:12]
-                          ),
-                          kind=self._req(
-                              doc, "kind"
-                          ),
-                          seller_zid=self._req(
-                              doc, "seller_zid"
-                          ),
-                          buyer_zid=self._req(
-                              doc, "buyer_zid"
-                          ),
-                          amount=float(
-                              doc.get("amount", 0)
-                          ),
-                          description=self._req(
-                              doc, "description"
-                          ),
-                          invoice_id=None,
-                          synced=False,
-                      )
-                      self._send(
-                          201,
-                          {
-                              "ok": True,
-                              "data": row,
-                          },
-                      )
-                      return
-                  self._send(
-                      404,
+
+          def test_tamper_detected_by_chain(
+              tmp_path: Path,
+          ) -> None:
+              db = SQLiteAdapter(
+                  tmp_path / "nexo.db"
+              )
+              clock = FrozenClock()
+              store = NexoStore(db, clock)
+              store.record_operation(
+                  operation_id="OP-1",
+                  kind="venta",
+                  seller_zid="ZID-a",
+                  buyer_zid="ZID-b",
+                  amount=100.0,
+                  description="original",
+                  invoice_id=None,
+                  synced=False,
+              )
+              store.record_operation(
+                  operation_id="OP-2",
+                  kind="compra",
+                  seller_zid="ZID-b",
+                  buyer_zid="ZID-a",
+                  amount=50.0,
+                  description="materia prima",
+                  invoice_id=None,
+                  synced=False,
+              )
+              assert store.verify_chain() is True
+              db.execute(
+                  "UPDATE nexo_operations SET"
+                  " amount = 9999 WHERE seq = 1"
+              )
+              assert store.verify_chain() is False
+              server = None
+              db.close()
+
+
+          def test_resilience_network_down(
+              tmp_path: Path,
+          ) -> None:
+              db = SQLiteAdapter(
+                  tmp_path / "nexo.db"
+              )
+              clock = FrozenClock()
+              store = NexoStore(db, clock)
+              dead_client = NetworkClient(
+                  "http://127.0.0.1:1",
+                  timeout_seconds=1.0,
+                  max_retries=0,
+              )
+              server = serve_nexo(store, dead_client)
+              thread = threading.Thread(
+                  target=server.serve_forever,
+                  daemon=True,
+              )
+              thread.start()
+              base = (
+                  "http://127.0.0.1:"
+                  f"{server.bound_port}"
+              )
+              try:
+                  created = _post(
+                      f"{base}/nexo/api/operations",
                       {
-                          "ok": False,
-                          "error": {
-                              "type": "not_found",
-                              "message":
-                              "unknown api route",
-                          },
+                          "kind": "venta",
+                          "seller_zid": "ZID-x",
+                          "buyer_zid": "ZID-y",
+                          "amount": 75.0,
+                          "description": "offline",
                       },
                   )
-
-              def _home(self) -> None:
-                  body = (
-                      "<h1>💠 NEXO</h1>"
-                      "<p>El nucleo contable"
-                      " sobre la Red: cada"
-                      " operacion queda"
-                      " encadenada y firmada -"
-                      " el contador solo"
-                      " verifica.</p>"
-                      "<h2>Registrar empresa"
-                      "</h2>"
-                      "<div class='card'>"
-                      "<form method='POST'"
-                      " action='/nexo/register'>"
-                      "<input name='name'"
-                      " placeholder='Nombre de la"
-                      " empresa'>"
-                      "<button>Registrar en la"
-                      " Red</button>"
-                      "</form></div>"
-                      "<h2>Registrar operacion"
-                      "</h2>"
-                      "<div class='card'>"
-                      "<form method='POST'"
-                      " action='/nexo/operation'>"
-                      "<input name='seller_zid'"
-                      " placeholder='ZID del"
-                      " vendedor'>"
-                      "<input name='buyer_zid'"
-                      " placeholder='ZID del"
-                      " comprador'>"
-                      "<select name='kind'>"
-                      "<option value='venta'>"
-                      "Venta</option>"
-                      "<option value='compra'>"
-                      "Compra</option>"
-                      "<option value='pago'>"
-                      "Pago</option>"
-                      "<option value='cobro'>"
-                      "Cobro</option>"
-                      "<option value='ajuste'>"
-                      "Ajuste</option>"
-                      "</select>"
-                      "<input name='amount'"
-                      " placeholder='Monto'>"
-                      "<input name='description'"
-                      " placeholder='Descripcion'>"
-                      "<button>Registrar y sellar"
-                      " factura</button>"
-                      "</form></div>"
-                      "<a href='/nexo/contador'>"
-                      "<button class='gray'>Soy"
-                      " contador (verificar)"
-                      "</button></a>"
-                      "<a href='/nexo/ledger'>"
-                      "<button class='gray'>Ver"
-                      " libro</button></a>"
+                  odata = created["data"]
+                  assert isinstance(odata, dict)
+                  assert odata["synced"] is False
+                  assert odata["seq"] == 1
+                  verify = _get(
+                      f"{base}/nexo/api/ledger/verify"
                   )
-                  self._html(200, _page("NEXO", body))
-
-              def _html(
-                  self, status: int, html: str
-              ) -> None:
-                  body = html.encode("utf-8")
-                  self.send_response(status)
-                  self.send_header(
-                      "Content-Type",
-                      "text/html; charset=utf-8",
+                  vdata = verify["data"]
+                  assert isinstance(vdata, dict)
+                  assert (
+                      vdata["chain_intact"] is True
                   )
-                  self.send_header(
-                      "Content-Length",
-                      str(len(body)),
-                  )
-                  self.end_headers()
-                  self.wfile.write(body)
-
-              def _send(
-                  self,
-                  status: int,
-                  payload: dict[str, Any],
-              ) -> None:
-                  body = json.dumps(payload).encode(
-                      "utf-8"
-                  )
-                  self.send_response(status)
-                  self.send_header(
-                      "Content-Type",
-                      "application/json",
-                  )
-                  self.send_header(
-                      "Content-Length",
-                      str(len(body)),
-                  )
-                  self.end_headers()
-                  self.wfile.write(body)
-
-
-          class NexoServer(ThreadingHTTPServer):
-              daemon_threads = True
-              allow_reuse_address = True
-
-              def __init__(
-                  self, address: tuple[str, int]
-              ) -> None:
-                  super().__init__(
-                      address, NexoApiHandler
-                  )
-
-              @property
-              def bound_port(self) -> int:
-                  return int(
-                      self.server_address[1]
-                  )
-
-
-          def serve_nexo(
-              store: NexoStore,
-              client: NetworkClient,
-              *,
-              host: str = "127.0.0.1",
-              port: int = 0,
-          ) -> NexoServer:
-              NexoApiHandler.store = store
-              NexoApiHandler.link = NexoLink(client)
-              return NexoServer((host, port))
+              finally:
+                  server.shutdown()
+                  server.server_close()
+                  thread.join(timeout=5)
+                  db.close()
           PYEOF
-          echo "server ready"
+          echo "=== NEXO TESTS READY ==="
 
-      - name: Compile check + Commit
+      - name: Run NEXO tests
         run: |
           set -euo pipefail
-          python -m compileall -q apps/nexo
-          echo "compile OK"
+          PYTHONPATH="$PWD" python -m pytest -q -p no:cacheprovider apps/nexo/tests/test_nexo_core.py
+          echo "NEXO tests OK"
           find apps/nexo -name '__pycache__' -type d \
             -prune -exec rm -rf {} +
+
+      - name: Commit and push (race-safe)
+        run: |
+          set -euo pipefail
+          git diff --check
           git config user.name "zyra-engines-bot"
           git config user.email "zyra-engines-bot@users.noreply.github.com"
           git pull --rebase --autostash origin "${{ github.ref_name }}" || true
@@ -1317,7 +355,7 @@ jobs:
           if git diff --cached --quiet; then
             echo "No changes."
           else
-            git commit -m "zyra: N4a NexoCore files - NetworkClient+NexoLink+NexoStore (hash-chained ledger, 5 fiscal kinds: venta/compra/pago/cobro/ajuste - import/export live in MERCADO) + NexoServer (empresario + contador screens); compile verified"
+            git commit -m "zyra: N4b NEXO tests - journey (company+operation+chain+summary), tamper detected by hash chain, resilience offline; 3 proofs"
             git push origin "HEAD:${{ github.ref_name }}"
           fi
-          echo "=== N4A FILES COMPLETE ==="
+          echo "=== N4B COMPLETE: NEXO LIVE ==="

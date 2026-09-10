@@ -31,19 +31,19 @@ jobs:
           python -m pip install --upgrade pip
           python -m pip install "cryptography>=42,<45" "pytest>=8,<9"
 
-      - name: Combined HTTP surface (core + capabilities, one port)
+      - name: Combined HTTP surface (prefix-dispatch fix)
         run: |
           set -euo pipefail
           cat > shared_engines/runtime/combined_api.py <<'PYEOF'
           """Combined HTTP surface: core API + capabilities
           on ONE port.
 
-          Routes by first path segment: core prefixes (health,
-          verify, identity, verification, tokens, currency)
-          go to ZyraApiHandler routing; everything else goes
-          to CapabilitiesApiHandler. Both keep their tested
-          internals; this module only dispatches and unifies
-          error mapping. One bearer token guards both.
+          MRO note: both parents define _route_get/_route_post,
+          so Python would always resolve them to the CORE
+          versions and every capabilities route would 404.
+          CombinedHandler therefore overrides both with a
+          first-segment dispatcher that sends each group to
+          its correct parent implementation.
           """
           from __future__ import annotations
 
@@ -83,6 +83,29 @@ jobs:
               }
           )
 
+          CAPS_GET_PREFIXES = frozenset(
+              {
+                  "trust",
+                  "profile",
+                  "history",
+                  "reputation",
+                  "certificates",
+              }
+          )
+
+          CAPS_POST_PREFIXES = frozenset(
+              {
+                  "apps",
+                  "profile",
+                  "trust",
+                  "history",
+                  "documents",
+                  "search",
+                  "reputation",
+                  "export",
+              }
+          )
+
 
           class CombinedHandler(
               ZyraApiHandler, CapabilitiesApiHandler
@@ -108,6 +131,30 @@ jobs:
                       return
                   CapabilitiesApiHandler._route(
                       self, method
+                  )
+
+              def _route_get(
+                  self, s: list[str]
+              ) -> None:
+                  if s and s[0] in CAPS_GET_PREFIXES:
+                      CapabilitiesApiHandler._route_get(
+                          self, s
+                      )
+                      return
+                  ZyraApiHandler._route_get(self, s)
+
+              def _route_post(
+                  self, s: list[str]
+              ) -> None:
+                  if s and (
+                      s[0] in CAPS_POST_PREFIXES
+                  ):
+                      CapabilitiesApiHandler._route_post(
+                          self, s
+                      )
+                      return
+                  ZyraApiHandler._route_post(
+                      self, s
                   )
 
               def _dispatch(
@@ -170,17 +217,13 @@ jobs:
                   (host, port), CombinedHandler
               )
           PYEOF
-          echo "=== COMBINED API READY ==="
+          echo "=== COMBINED API READY (prefix dispatch) ==="
 
       - name: Extend NetworkClient (real HTTP, legacy kept)
         run: |
           set -euo pipefail
           cat > apps/agro/infrastructure/network/network_client.py <<'PYEOF'
           """Real HTTP client to ZYRA Network.
-
-          Extends the original stub (request() kept for
-          backwards compatibility). Base URL comes from the
-          ZYRA_URL environment variable or constructor.
 
           Resilience contract: failures are returned as
           (ok=False, data=None, error=...), never raised -
@@ -313,12 +356,7 @@ jobs:
           set -euo pipefail
           cat > apps/agro/services/zyra_link.py <<'PYEOF'
           """ZyraLink: high-level AGRO operations on the
-          Network (identity, trust, life history).
-
-          Every method returns (ok, data, error) and never
-          raises - the resilience rule: AGRO keeps working
-          when the Network is unreachable.
-          """
+          Network. Never raises - resilience rule."""
           from __future__ import annotations
 
           from apps.agro.infrastructure.network.network_client import (
@@ -404,13 +442,7 @@ jobs:
         run: |
           set -euo pipefail
           cat > apps/agro/infrastructure/persistence/agro_store.py <<'PYEOF'
-          """AGRO local durable store (SQLite).
-
-          AGRO's own domain data lives here: producers
-          (linked to network ZIDs) and productions. If the
-          Network is unreachable, records are kept with
-          synced=0 and linked later.
-          """
+          """AGRO local durable store (SQLite)."""
           from __future__ import annotations
 
           from shared_engines.storage.database import (
@@ -725,13 +757,7 @@ jobs:
         run: |
           set -euo pipefail
           cat > apps/agro/server.py <<'PYEOF'
-          """AGRO HTTP surface.
-
-          Serves the app's menus (Silicon Valley rule: 1
-          screen, max 2 actions) and its operations, backed
-          by the local store and the Network. Pattern follows
-          ZyraServer/CapabilitiesServer.
-          """
+          """AGRO HTTP surface (menus + operations)."""
           from __future__ import annotations
 
           import json
@@ -1195,10 +1221,8 @@ jobs:
           set -euo pipefail
           mkdir -p apps/agro/tests
           cat > apps/agro/tests/test_agro_n1.py <<'PYEOF'
-          """AGRO N1 proofs: the farmer journey over real
-          HTTP - AGRO app talking to the COMBINED network
-          surface (core + capabilities on one port, the
-          production entrypoint shape), plus resilience."""
+          """AGRO N1 proofs: farmer journey over real HTTP
+          against the COMBINED network surface + resilience."""
           from __future__ import annotations
 
           import json
@@ -1206,10 +1230,6 @@ jobs:
           from pathlib import Path
           from urllib.request import Request, urlopen
 
-          from shared_engines.audit.chain import AuditTrail
-          from shared_engines.common.clocks import FrozenClock
-          from shared_engines.events.contracts import EventCatalog
-          from shared_engines.events.outbox import Outbox
           from shared_engines.runtime.capabilities import (
               ZyraCapabilities,
           )
@@ -1234,10 +1254,6 @@ jobs:
 
 
           class _Ecosystem:
-              """Real ZYRA network (COMBINED surface: core +
-              capabilities, like production main.py) + real
-              AGRO app, both over HTTP."""
-
               def __init__(self, tmp_path: Path) -> None:
                   self.net_db = SQLiteAdapter(
                       tmp_path / "network.db"
@@ -1354,7 +1370,8 @@ jobs:
           ) -> None:
               eco = _Ecosystem(tmp_path)
               try:
-                  eco.link.register_app()
+                  reg = eco.link.register_app()
+                  assert reg[0] is True
                   health = _get(
                       f"{eco.agro_base}/agro/health"
                   )
@@ -1538,7 +1555,7 @@ jobs:
           if git diff --cached --quiet; then
             echo "No changes."
           else
-            git commit -m "zyra: N1 AGRO - combined_api.py created (was pending from W21), test harness boots COMBINED surface so /identity/register exists; NetworkClient+ZyraLink+AgroStore+AgroServer; 3 e2e proofs"
+            git commit -m "zyra: N1 AGRO - combined_api MRO fix: CombinedHandler overrides _route_get/_route_post with first-segment dispatch to the correct parent (capabilities routes no longer fall through to core router -> 404); register_app asserted in journey; 3 e2e proofs"
             git push origin "HEAD:${{ github.ref_name }}"
           fi
           echo "=== N1 AGRO COMPLETE ==="

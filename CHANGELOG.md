@@ -50,3 +50,10 @@ Each entry landed as a green CI run with tested code.
 - W20a Audit-gap closure: pytest normal collection fixed
   (all test basenames unique), README/CHANGELOG written,
   root authority rotation runbook, telemetry root facade.
+
+## [1.0.1] - Operations Complete
+
+### Added
+- W20b operational scripts: install (idempotent bootstrap), deploy (pre-deploy gate + snapshot), repair (integrity check + verified snapshot restore), update (idempotent migrations + post-update snapshot).
+- ADRs recorded: node_runtime intentionally not created; root facades are re-exports; single operational script pattern.
+- Audit status: all 29 original audit points closed; ZYRA Network reaches the 99% closure target.

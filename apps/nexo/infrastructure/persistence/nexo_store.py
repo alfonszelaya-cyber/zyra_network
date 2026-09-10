@@ -1,6 +1,5 @@
 """NexoCore durable ledger: hash-chained
-accounting between ZIDs. Fiscal kinds only -
-import/export live in MERCADO."""
+accounting between ZIDs (fiscal kinds only)."""
 from __future__ import annotations
 
 import hashlib
@@ -48,8 +47,6 @@ _MIGRATIONS = (
             " synced INTEGER NOT NULL"
             " DEFAULT 0,"
             " created_at REAL NOT NULL)",
-            "CREATE INDEX nexo_seq"
-            " ON nexo_operations (seq)",
         ),
     ),
 )
@@ -211,7 +208,7 @@ class NexoStore:
                 "  prev_hash, synced,"
                 "  created_at)"
                 " VALUES (?, ?, ?, ?, ?,"
-                "  ?, ?, ?, ?, ?, ?, ?)",
+                "  ?, ?, ?, ?, ?, ?)",
                 (
                     operation_id,
                     kind,
@@ -286,6 +283,9 @@ class NexoStore:
         return tuple(
             {
                 "seq": int(r["seq"]),
+                "operation_id": str(
+                    r["operation_id"]
+                ),
                 "kind": str(r["kind"]),
                 "seller_zid": str(
                     r["seller_zid"]

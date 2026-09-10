@@ -1,0 +1,297 @@
+"""NEXO proofs: operation -> hash-chained ledger ->
+invoice sealed on the network -> contador verifies;
+tamper detected; resilience offline."""
+from __future__ import annotations
+
+import json
+import threading
+from pathlib import Path
+from urllib.request import Request, urlopen
+
+from shared_engines.common.clocks import FrozenClock
+from shared_engines.runtime.capabilities import (
+    ZyraCapabilities,
+)
+from shared_engines.runtime.combined_api import (
+    serve_combined,
+)
+from shared_engines.runtime.config import RuntimeConfig
+from shared_engines.runtime.kernel import ZyraKernel
+from shared_engines.storage.database import SQLiteAdapter
+from shared_engines.verification.signatures import (
+    Ed25519Signer,
+)
+
+from apps.nexo.infrastructure.network.network_client import (
+    NetworkClient,
+)
+from apps.nexo.infrastructure.persistence.nexo_store import (
+    NexoStore,
+)
+from apps.nexo.server import serve_nexo
+from apps.nexo.services.nexo_link import NexoLink
+
+
+class _Ecosystem:
+    def __init__(self, tmp_path: Path) -> None:
+        self.net_db = SQLiteAdapter(
+            tmp_path / "network.db"
+        )
+        net_clock = FrozenClock()
+        signer, _ = Ed25519Signer.generate()
+        config = RuntimeConfig(
+            host="127.0.0.1",
+            port=0,
+            api_token=None,
+        )
+        self.kernel = ZyraKernel(
+            db=self.net_db,
+            clock=net_clock,
+            signer=signer,
+            config=config,
+        )
+        self.kernel.bootstrap_root()
+        self.caps = ZyraCapabilities(
+            self.net_db,
+            net_clock,
+            identity=self.kernel.identity,
+            signer=signer,
+        )
+        self.net_server = serve_combined(
+            self.kernel,
+            self.caps,
+            host="127.0.0.1",
+            port=0,
+        )
+        self.net_thread = threading.Thread(
+            target=(
+                self.net_server
+                .serve_forever
+            ),
+            daemon=True,
+        )
+        self.net_thread.start()
+        self.net_base = (
+            "http://127.0.0.1:"
+            f"{self.net_server.server_address[1]}"
+        )
+        self.net_url = self.net_base
+
+        self.nexo_db = SQLiteAdapter(
+            tmp_path / "nexo.db"
+        )
+        nexo_clock = FrozenClock()
+        self.store = NexoStore(
+            self.nexo_db, nexo_clock
+        )
+        self.client = NetworkClient(
+            self.net_url, max_retries=1
+        )
+        self.link = NexoLink(self.client)
+        self.nexo_server = serve_nexo(
+            self.store, self.client
+        )
+        self.nexo_thread = threading.Thread(
+            target=(
+                self.nexo_server
+                .serve_forever
+            ),
+            daemon=True,
+        )
+        self.nexo_thread.start()
+        self.nexo_base = (
+            "http://127.0.0.1:"
+            f"{self.nexo_server.bound_port}"
+        )
+
+    def close(self) -> None:
+        self.nexo_server.shutdown()
+        self.nexo_server.server_close()
+        self.nexo_thread.join(timeout=5)
+        self.net_server.shutdown()
+        self.net_server.server_close()
+        self.net_thread.join(timeout=5)
+        self.nexo_db.close()
+        self.net_db.close()
+
+
+def _get(url: str) -> dict[str, object]:
+    with urlopen(url, timeout=10) as response:
+        body = json.loads(
+            response.read().decode("utf-8")
+        )
+    assert isinstance(body, dict)
+    return body
+
+
+def _post(
+    url: str, doc: dict[str, object]
+) -> dict[str, object]:
+    request = Request(
+        url,
+        data=json.dumps(doc).encode("utf-8"),
+        headers={
+            "Content-Type":
+            "application/json"
+        },
+        method="POST",
+    )
+    with urlopen(request, timeout=10) as response:
+        body = json.loads(
+            response.read().decode("utf-8")
+        )
+    assert isinstance(body, dict)
+    return body
+
+
+def test_company_operation_chain_invoice(
+    tmp_path: Path,
+) -> None:
+    eco = _Ecosystem(tmp_path)
+    try:
+        reg = eco.link.register_app()
+        assert reg[0] is True
+        created = _post(
+            f"{eco.nexo_base}/nexo/api/"
+            "companies",
+            {"name": "Mi Negocio SV"},
+        )
+        row = created["data"]
+        assert isinstance(row, dict)
+        assert (
+            row["company_id"]
+            .startswith("EMP-")
+        )
+        op = _post(
+            f"{eco.nexo_base}/nexo/api/"
+            "operations",
+            {
+                "kind": "venta",
+                "seller_zid": "ZID-seller",
+                "buyer_zid": "ZID-buyer",
+                "amount": 250.0,
+                "description": (
+                    "venta de mercaderia"
+                ),
+            },
+        )
+        odata = op["data"]
+        assert isinstance(odata, dict)
+        assert odata["seq"] == 1
+        assert odata["synced"] is False
+        verify = _get(
+            f"{eco.nexo_base}/nexo/api/"
+            "ledger/verify"
+        )
+        vdata = verify["data"]
+        assert isinstance(vdata, dict)
+        assert (
+            vdata["chain_intact"]
+            is True
+        )
+        summary = _get(
+            f"{eco.nexo_base}/nexo/api/"
+            "summary"
+        )
+        gdata = summary["data"]
+        assert isinstance(gdata, dict)
+        assert (
+            gdata["operations_total"]
+            == 1
+        )
+        assert (
+            gdata["chain_intact"] is True
+        )
+    finally:
+        eco.close()
+
+
+def test_tamper_detected_by_chain(
+    tmp_path: Path,
+) -> None:
+    db = SQLiteAdapter(
+        tmp_path / "nexo.db"
+    )
+    clock = FrozenClock()
+    store = NexoStore(db, clock)
+    store.record_operation(
+        operation_id="OP-1",
+        kind="venta",
+        seller_zid="ZID-a",
+        buyer_zid="ZID-b",
+        amount=100.0,
+        description="original",
+        invoice_id=None,
+        synced=False,
+    )
+    store.record_operation(
+        operation_id="OP-2",
+        kind="compra",
+        seller_zid="ZID-b",
+        buyer_zid="ZID-a",
+        amount=50.0,
+        description="materia prima",
+        invoice_id=None,
+        synced=False,
+    )
+    assert store.verify_chain() is True
+    db.execute(
+        "UPDATE nexo_operations SET"
+        " amount = 9999 WHERE seq = 1"
+    )
+    assert store.verify_chain() is False
+    server = None
+    db.close()
+
+
+def test_resilience_network_down(
+    tmp_path: Path,
+) -> None:
+    db = SQLiteAdapter(
+        tmp_path / "nexo.db"
+    )
+    clock = FrozenClock()
+    store = NexoStore(db, clock)
+    dead_client = NetworkClient(
+        "http://127.0.0.1:1",
+        timeout_seconds=1.0,
+        max_retries=0,
+    )
+    server = serve_nexo(store, dead_client)
+    thread = threading.Thread(
+        target=server.serve_forever,
+        daemon=True,
+    )
+    thread.start()
+    base = (
+        "http://127.0.0.1:"
+        f"{server.bound_port}"
+    )
+    try:
+        created = _post(
+            f"{base}/nexo/api/operations",
+            {
+                "kind": "venta",
+                "seller_zid": "ZID-x",
+                "buyer_zid": "ZID-y",
+                "amount": 75.0,
+                "description": "offline",
+            },
+        )
+        odata = created["data"]
+        assert isinstance(odata, dict)
+        assert odata["synced"] is False
+        assert odata["seq"] == 1
+        verify = _get(
+            f"{base}/nexo/api/ledger/verify"
+        )
+        vdata = verify["data"]
+        assert isinstance(vdata, dict)
+        assert (
+            vdata["chain_intact"] is True
+        )
+    finally:
+        server.shutdown()
+        server.server_close()
+        thread.join(timeout=5)
+        db.close()

@@ -1,4 +1,4 @@
-"""AGRO HTTP surface (menus + operations)."""
+"""AGRO HTTP surface v2: role-based screens."""
 from __future__ import annotations
 
 import json
@@ -11,6 +11,7 @@ from typing import Any, ClassVar
 from urllib.parse import urlparse
 
 from apps.agro.infrastructure.persistence.agro_store import (
+    ROLES,
     AgroStore,
 )
 from apps.agro.infrastructure.network.network_client import (
@@ -20,6 +21,45 @@ from apps.agro.modules.comercializacion.alertas_de_mercado.market_alert_service 
     MarketAlertService,
 )
 from apps.agro.services.zyra_link import ZyraLink
+
+_CSS = (
+    "body{font-family:system-ui,sans-serif;"
+    "background:#0d1117;color:#e6edf3;"
+    "display:flex;justify-content:center;"
+    "padding:20px;margin:0}"
+    ".wrap{max-width:680px;width:100%}"
+    "h1{font-size:1.3rem}"
+    "h2{font-size:1rem;margin-top:20px;"
+    "color:#58a6ff}"
+    ".card{background:#161b22;border:1px solid"
+    " #30363d;border-radius:10px;padding:14px;"
+    "margin-top:10px}"
+    "button{background:#238636;color:#fff;"
+    "border:none;padding:12px 18px;border-radius:8px;"
+    "font-size:1rem;cursor:pointer;margin:6px 4px 0 0;"
+    "width:100%;text-align:left}"
+    "button.gray{background:#30363d}"
+    "input,select{width:100%;box-sizing:border-box;"
+    "background:#0d1117;color:#e6edf3;"
+    "border:1px solid #30363d;border-radius:6px;"
+    "padding:8px;margin:4px 0;font-size:0.95rem}"
+    ".big{font-size:1.6rem;font-weight:bold;"
+    "color:#58a6ff}"
+    "small{color:#8b949e}"
+)
+
+
+def _page(title: str, body: str) -> str:
+    return (
+        "<!DOCTYPE html><html lang='es'><head>"
+        "<meta charset='utf-8'>"
+        "<meta name='viewport' content='width="
+        "device-width, initial-scale=1'>"
+        f"<title>{title}</title>"
+        f"<style>{_CSS}</style></head><body>"
+        f"<div class='wrap'>{body}</div></body>"
+        "</html>"
+    )
 
 
 class AgroApiHandler(
@@ -47,46 +87,31 @@ class AgroApiHandler(
         try:
             self._route(method)
         except LookupError as exc:
-            self._send(
+            self._html(
                 404,
-                {
-                    "ok": False,
-                    "error": {
-                        "type":
-                        "not_found",
-                        "message": str(
-                            exc
-                        ),
-                    },
-                },
+                _page(
+                    "No encontrado",
+                    "<h1>404</h1>"
+                    f"<p>{exc}</p>",
+                ),
             )
         except ValueError as exc:
-            self._send(
+            self._html(
                 400,
-                {
-                    "ok": False,
-                    "error": {
-                        "type":
-                        "invalid_request",
-                        "message": str(
-                            exc
-                        ),
-                    },
-                },
+                _page(
+                    "Error",
+                    "<h1>Dato invalido"
+                    f"</h1><p>{exc}</p>",
+                ),
             )
         except Exception as exc:
-            self._send(
+            self._html(
                 500,
-                {
-                    "ok": False,
-                    "error": {
-                        "type":
-                        "internal_error",
-                        "message": str(
-                            exc
-                        ),
-                    },
-                },
+                _page(
+                    "Error",
+                    "<h1>Error interno"
+                    f"</h1><p>{exc}</p>",
+                ),
             )
 
     def _route(self, method: str) -> None:
@@ -97,17 +122,13 @@ class AgroApiHandler(
             if s
         ]
         if segments[:1] != ["agro"]:
-            self._send(
+            self._html(
                 404,
-                {
-                    "ok": False,
-                    "error": {
-                        "type":
-                        "not_found",
-                        "message":
-                        "outside /agro",
-                    },
-                },
+                _page(
+                    "404",
+                    "<h1>Fuera de AGRO"
+                    "</h1>",
+                ),
             )
             return
         tail = segments[1:]
@@ -117,80 +138,61 @@ class AgroApiHandler(
             self._post(tail)
 
     def _get(self, s: list[str]) -> None:
+        if s[:1] == ["api"]:
+            self._api_get(s[1:])
+            return
         store = type(self).store
-        if s == ["health"]:
-            self._send(
-                200,
-                {
-                    "ok": True,
-                    "data": {
-                        "app": "agro",
-                        "status":
-                        "operational",
-                    },
-                },
-            )
+        if not s or s == ["home"]:
+            self._home()
             return
-        if s == ["menu"]:
-            self._send(
-                200,
-                {
-                    "ok": True,
-                    "data": {
-                        "title": "AGRO",
-                        "subtitle": (
-                            "Tu cosecha,"
-                            " tus precios,"
-                            " tu ayuda"
-                            " del gobierno"
-                        ),
-                        "actions": [
-                            {
-                                "label":
-                                "Vender mi"
-                                " cosecha",
-                                "route":
-                                "/agro/production",
-                            },
-                            {
-                                "label":
-                                "Mi historial",
-                                "route":
-                                "/agro/government/summary",
-                            },
-                        ],
-                    },
-                },
-            )
+        if s[0] == "productor":
+            self._screen_producer(s)
             return
-        if s == ["producers"]:
-            self._ok(
-                list(store.list_producers())
-            )
+        if s[0] == "gobierno":
+            self._screen_government()
             return
-        if s == ["productions"]:
-            self._ok(
-                list(
-                    store.list_productions()
-                )
-            )
+        if s[0] == "banco":
+            self._screen_bank()
             return
         if s == ["government", "summary"]:
-            self._ok(store.summary())
+            self._send(
+                200,
+                {
+                    "ok": True,
+                    "data": store.summary(),
+                },
+            )
             return
-        self._not_found()
+        self._html(
+            404,
+            _page(
+                "404",
+                "<h1>Pagina no"
+                " encontrada</h1>"
+                "<a href='/agro'>Volver"
+                " a AGRO</a>",
+            ),
+        )
 
     def _post(self, s: list[str]) -> None:
+        if s[:1] == ["api"]:
+            self._api_post(s[1:])
+            return
         store = type(self).store
         link = type(self).link
-        doc = self._read_json()
-        if s == ["producers"]:
-            name = self._req(
-                doc, "name"
-            )
+        doc = self._read_form()
+        if s == ["register"]:
+            name = self._req(doc, "name")
             producer_type = self._req(
                 doc, "producer_type"
             )
+            role = str(
+                doc.get("role", "agricultor")
+            )
+            if role not in ROLES:
+                raise ValueError(
+                    f"unknown role: {role}"
+                )
             location = doc.get("location")
             location = (
                 str(location)
@@ -202,7 +204,6 @@ class AgroApiHandler(
                 + uuid.uuid4().hex[:12]
             )
             zid: str | None = None
-            synced = False
             ok, data, _error = (
                 link.register_producer_zid(
                     name
@@ -210,54 +211,42 @@ class AgroApiHandler(
             )
             if ok and data is not None:
                 zid = str(data.get("zid"))
-                synced = True
-            row = store.add_producer(
+            store.add_producer(
                 producer_id=producer_id,
                 zid=zid,
                 name=name,
                 producer_type=(
                     producer_type
                 ),
+                role=role,
                 location=location,
-                synced=synced,
+                synced=(zid is not None),
             )
-            self._send(
-                201,
-                {
-                    "ok": True,
-                    "data": row,
-                },
+            zid_text = (
+                zid
+                if zid is not None
+                else "pendiente de conexion"
             )
-            return
-        if s == ["producers", "verify"]:
-            producer_id = self._req(
-                doc, "producer_id"
+            self._html(
+                200,
+                _page(
+                    "Bienvenido a AGRO",
+                    "<h1>Registro listo"
+                    "</h1>"
+                    "<p>Tu ID de confianza:"
+                    f" <b>{producer_id}"
+                    "</b></p>"
+                    "<p>Tu ZID de red: "
+                    f"<b>{zid_text}</b></p>"
+                    "<a href='/agro/productor/"
+                    f"{producer_id}'>"
+                    "<button>Ir a mi panel"
+                    "</button></a>"
+                    "<a href='/agro'>"
+                    "<button class='gray'>"
+                    "Inicio</button></a>",
+                ),
             )
-            row = store.get_producer(
-                producer_id
-            )
-            zid = row.get("zid")
-            if zid is None:
-                raise ValueError(
-                    "producer has no"
-                    " network ZID yet"
-                )
-            ok, data, _error = (
-                link.complete_trust(
-                    str(zid)
-                )
-            )
-            if not ok:
-                raise ValueError(
-                    "network trust failed"
-                )
-            store.mark_verified(
-                producer_id=producer_id
-            )
-            updated = store.get_producer(
-                producer_id
-            )
-            self._ok(updated)
             return
         if s == ["production"]:
             producer_id = self._req(
@@ -274,12 +263,9 @@ class AgroApiHandler(
             )
             if quantity <= 0:
                 raise ValueError(
-                    "quantity must be"
-                    " positive"
+                    "cantidad invalida"
                 )
-            unit = self._req(
-                doc, "unit"
-            )
+            unit = self._req(doc, "unit")
             network_seq: int | None = None
             zid = producer.get("zid")
             if zid is not None:
@@ -297,15 +283,12 @@ class AgroApiHandler(
                     and data is not None
                 ):
                     network_seq = int(
-                        data.get(
-                            "seq", 0
-                        )
+                        data.get("seq", 0)
                     )
-            row = store.add_production(
+            store.add_production(
                 production_id=(
                     "PRO-"
-                    + uuid.uuid4()
-                    .hex[:12]
+                    + uuid.uuid4().hex[:12]
                 ),
                 producer_id=producer_id,
                 product=product,
@@ -313,32 +296,95 @@ class AgroApiHandler(
                 unit=unit,
                 network_seq=network_seq,
             )
-            self._send(
-                201,
-                {
-                    "ok": True,
-                    "data": row,
-                },
+            self._html(
+                200,
+                _page(
+                    "Cosecha registrada",
+                    "<h1>Guardado en la"
+                    " Red</h1>"
+                    f"<p>{product}:"
+                    f" {quantity} {unit}"
+                    "</p>"
+                    "<a href='/agro/productor/"
+                    f"{producer_id}'>"
+                    "<button>Volver a mi"
+                    " panel</button></a>",
+                ),
             )
             return
-        if s == ["alerts", "evaluate"]:
-            previous = float(
-                doc.get(
-                    "previous_price", 0
+        if s == ["verify"]:
+            producer_id = self._req(
+                doc, "producer_id"
+            )
+            row = store.get_producer(
+                producer_id
+            )
+            zid = row.get("zid")
+            if zid is None:
+                raise ValueError(
+                    "sin ZID de red"
+                )
+            ok, _data, _error = (
+                link.complete_trust(
+                    str(zid)
                 )
             )
-            current = float(
-                doc.get("current_price", 0)
-            )
-            result = (
-                type(self).alerts.evaluate(
-                    previous,
-                    current,
+            if not ok:
+                raise ValueError(
+                    "la red rechazo la"
+                    " verificacion"
                 )
+            store.mark_verified(
+                producer_id=producer_id
             )
-            self._ok(result)
+            self._html(
+                200,
+                _page(
+                    "Verificado",
+                    "<h1>Productor"
+                    " VERIFICADO</h1>"
+                    "<p>Ya puede recibir"
+                    " bonos y beneficios"
+                    " del gobierno.</p>"
+                    "<a href='/agro/productor/"
+                    f"{producer_id}'>"
+                    "<button>Ir a mi panel"
+                    "</button></a>",
+                ),
+            )
             return
-        self._not_found()
+        self._html(
+            404,
+            _page(
+                "404",
+                "<h1>Ruta desconocida"
+                "</h1>",
+            ),
+        )
+
+    def _read_form(
+        self,
+    ) -> dict[str, Any]:
+        length_header = self.headers.get(
+            "Content-Length"
+        )
+        if length_header is None:
+            raise ValueError(
+                "Content-Length required"
+            )
+        raw = self.rfile.read(
+            int(length_header)
+        ).decode("utf-8")
+        doc: dict[str, Any] = {}
+        for pair in raw.split("&"):
+            if "=" in pair:
+                key, value = pair.split(
+                    "=", 1
+                )
+                doc[key] = value.replace(
+                    "+", " "
+                )
+        return doc
 
     def _read_json(
         self,
@@ -385,13 +431,52 @@ class AgroApiHandler(
             )
         return value
 
-    def _ok(self, data: Any) -> None:
-        self._send(
-            200,
-            {"ok": True, "data": data},
-        )
-
-    def _not_found(self) -> None:
+    def _api_get(self, s: list[str]) -> None:
+        store = type(self).store
+        if s == ["health"]:
+            self._send(
+                200,
+                {
+                    "ok": True,
+                    "data": {
+                        "app": "agro",
+                        "status":
+                        "operational",
+                    },
+                },
+            )
+            return
+        if s == ["producers"]:
+            self._send(
+                200,
+                {
+                    "ok": True,
+                    "data": list(
+                        store.list_producers()
+                    ),
+                },
+            )
+            return
+        if s == ["productions"]:
+            self._send(
+                200,
+                {
+                    "ok": True,
+                    "data": list(
+                        store.list_productions()
+                    ),
+                },
+            )
+            return
+        if s == ["government", "summary"]:
+            self._send(
+                200,
+                {
+                    "ok": True,
+                    "data": store.summary(),
+                },
+            )
+            return
         self._send(
             404,
             {
@@ -399,10 +484,361 @@ class AgroApiHandler(
                 "error": {
                     "type": "not_found",
                     "message":
-                    "unknown route",
+                    "unknown api route",
                 },
             },
         )
+
+    def _api_post(
+        self, s: list[str]
+    ) -> None:
+        store = type(self).store
+        doc = self._read_json()
+        if s == ["producers"]:
+            producer_id = (
+                "PRD-"
+                + uuid.uuid4().hex[:12]
+            )
+            row = store.add_producer(
+                producer_id=producer_id,
+                zid=doc.get("zid"),
+                name=self._req(doc, "name"),
+                producer_type=self._req(
+                    doc, "producer_type"
+                ),
+                role=str(
+                    doc.get(
+                        "role",
+                        "agricultor",
+                    )
+                ),
+                location=None,
+                synced=False,
+            )
+            self._send(
+                201,
+                {
+                    "ok": True,
+                    "data": row,
+                },
+            )
+            return
+        if s == ["production"]:
+            row = store.add_production(
+                production_id=(
+                    "PRO-"
+                    + uuid.uuid4().hex[:12]
+                ),
+                producer_id=self._req(
+                    doc, "producer_id"
+                ),
+                product=self._req(
+                    doc, "product"
+                ),
+                quantity=float(
+                    doc.get("quantity", 0)
+                ),
+                unit=self._req(doc, "unit"),
+                network_seq=None,
+            )
+            self._send(
+                201,
+                {
+                    "ok": True,
+                    "data": row,
+                },
+            )
+            return
+        self._send(
+            404,
+            {
+                "ok": False,
+                "error": {
+                    "type": "not_found",
+                    "message":
+                    "unknown api route",
+                },
+            },
+        )
+
+    def _home(self) -> None:
+        body = (
+            "<h1>🛡️ AGRO</h1>"
+            "<p>La Red de confianza"
+            " para agricultores y"
+            " ganaderos.</p>"
+            "<h2>Soy productor</h2>"
+            "<div class='card'>"
+            "<form method='POST'"
+            " action='/agro/register'>"
+            "<input name='name'"
+            " placeholder='Mi nombre'>"
+            "<select name='role'>"
+            "<option value='agricultor'>"
+            "Agricultor</option>"
+            "<option value='ganadero'>"
+            "Ganadero</option>"
+            "</select>"
+            "<input name='producer_type'"
+            " placeholder='Que produzco"
+            " (maiz, ganado...)'>"
+            "<input name='location'"
+            " placeholder='Mi zona'>"
+            "<button>Registrarme en la"
+            " Red</button>"
+            "</form></div>"
+            "<h2>Soy Gobierno / Banco"
+            "</h2>"
+            "<div class='card'>"
+            "<a href='/agro/gobierno'>"
+            "<button>Vista Gobierno"
+            "</button></a>"
+            "<a href='/agro/banco'>"
+            "<button class='gray'>Vista"
+            " Banco</button></a>"
+            "</div>"
+        )
+        self._html(200, _page("AGRO", body))
+
+    def _screen_producer(
+        self, s: list[str]
+    ) -> None:
+        store = type(self).store
+        producer_id = (
+            s[1] if len(s) > 1 else ""
+        )
+        row = store.get_producer(
+            producer_id
+        )
+        zid = row.get("zid")
+        verified = row.get("verified")
+        if verified:
+            badge = "✅ VERIFICADO"
+            extra = ""
+        else:
+            badge = (
+                "⚠️ Sin verificar"
+                " (sin bonos)"
+            )
+            extra = (
+                "<form method='POST'"
+                " action='/agro/verify'>"
+                "<input type='hidden'"
+                " name='producer_id'"
+                f" value='{producer_id}'>"
+                "<button>Verificarme para"
+                " recibir bonos</button>"
+                "</form>"
+            )
+        mine = [
+            p
+            for p in (
+                store.list_productions()
+            )
+            if p["producer_id"]
+            == producer_id
+        ]
+        history = "".join(
+            "<li>• "
+            + p["product"]
+            + ": "
+            + str(p["quantity"])
+            + " "
+            + p["unit"]
+            + "</li>"
+            for p in mine
+        )
+        if not history:
+            history = (
+                "<li>Sin registros</li>"
+            )
+        body = (
+            "<h1>Mi Panel — "
+            + str(row.get("name"))
+            + "</h1>"
+            "<p>"
+            + badge
+            + " · Rol: "
+            + str(row.get("role"))
+            + "</p>"
+            "<p><small>ZID de red: "
+            + str(zid or "pendiente")
+            + "</small></p>"
+            "<h2>Registrar mi cosecha"
+            "</h2>"
+            "<div class='card'>"
+            "<form method='POST'"
+            " action='/agro/production'>"
+            "<input type='hidden'"
+            " name='producer_id'"
+            f" value='{producer_id}'>"
+            "<input name='product'"
+            " placeholder='Producto"
+            " (maiz, frijol...)'>"
+            "<input name='quantity'"
+            " placeholder='Cantidad'>"
+            "<select name='unit'>"
+            "<option value='quintal'>"
+            "quintal</option>"
+            "<option value='libra'>"
+            "libra</option>"
+            "<option value='cabeza'>"
+            "cabeza de ganado"
+            "</option>"
+            "</select>"
+            "<button>Guardar en la"
+            " Red</button>"
+            "</form></div>"
+            "<h2>Mi historial</h2>"
+            "<ul>"
+            + history
+            + "</ul>"
+            + extra
+            + "<a href='/agro'><button"
+            " class='gray'>Inicio"
+            "</button></a>"
+        )
+        self._html(
+            200,
+            _page("AGRO - Mi panel", body),
+        )
+
+    def _screen_government(self) -> None:
+        summary = type(
+            self
+        ).store.summary()
+        total = summary["producers_total"]
+        verified = summary[
+            "producers_verified"
+        ]
+        by_role = summary[
+            "producers_by_role"
+        ]
+        by_product = summary[
+            "productions_by_product"
+        ]
+        roles_html = "".join(
+            "<li>• "
+            + k
+            + ": "
+            + str(v)
+            + "</li>"
+            for k, v in by_role.items()
+        )
+        if not roles_html:
+            roles_html = (
+                "<li>Sin datos</li>"
+            )
+        products_html = "".join(
+            "<li>• "
+            + k
+            + ": "
+            + str(v)
+            + " quintales</li>"
+            for k, v in (
+                by_product.items()
+            )
+        )
+        if not products_html:
+            products_html = (
+                "<li>Sin cosechas"
+                " registradas</li>"
+            )
+        body = (
+            "<h1>🏛️ AGRO — Vista"
+            " Gobierno</h1>"
+            "<h2>Soberania alimentaria"
+            " nacional</h2>"
+            "<div class='card'>"
+            "<span class='big'>"
+            + str(total)
+            + "</span> productores<br>"
+            "<span class='big'>"
+            + str(verified)
+            + "</span> verificados"
+            "</div>"
+            "<h2>Por rol</h2><ul>"
+            + roles_html
+            + "</ul>"
+            "<h2>Produccion nacional"
+            "</h2><ul>"
+            + products_html
+            + "</ul>"
+            "<a href='/agro'><button"
+            " class='gray'>Inicio"
+            "</button></a>"
+        )
+        self._html(
+            200,
+            _page(
+                "AGRO - Gobierno", body
+            ),
+        )
+
+    def _screen_bank(self) -> None:
+        producers = type(
+            self
+        ).store.list_producers()
+        rows = ""
+        for p in producers:
+            if p["verified"]:
+                estado = (
+                    "✅ verificado"
+                    " (elegible para"
+                    " credito)"
+                )
+            else:
+                estado = (
+                    "⚠️ sin verificar"
+                )
+            rows = (
+                rows
+                + "<li>• "
+                + str(p["name"])
+                + " - "
+                + str(p["role"])
+                + " - "
+                + estado
+                + "</li>"
+            )
+        if not rows:
+            rows = (
+                "<li>Sin productores</li>"
+            )
+        body = (
+            "<h1>🏦 AGRO — Vista Banco"
+            "</h1>"
+            "<p>Elegibilidad de credito:"
+            " basada en verificacion de"
+            " la Red (evidencia"
+            " inmutable).</p>"
+            "<ul>"
+            + rows
+            + "</ul>"
+            "<a href='/agro'><button"
+            " class='gray'>Inicio"
+            "</button></a>"
+        )
+        self._html(
+            200,
+            _page("AGRO - Banco", body),
+        )
+
+    def _html(
+        self, status: int, html: str
+    ) -> None:
+        body = html.encode("utf-8")
+        self.send_response(status)
+        self.send_header(
+            "Content-Type",
+            "text/html; charset=utf-8",
+        )
+        self.send_header(
+            "Content-Length",
+            str(len(body)),
+        )
+        self.end_headers()
+        self.wfile.write(body)
 
     def _send(
         self,

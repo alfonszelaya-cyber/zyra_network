@@ -1,4 +1,4 @@
-"""AGRO local durable store (SQLite)."""
+"""AGRO local durable store v2 (role-aware)."""
 from __future__ import annotations
 
 from shared_engines.storage.database import (
@@ -9,16 +9,26 @@ from shared_engines.storage.migrations import (
     MigrationRunner,
 )
 
+ROLES = (
+    "agricultor",
+    "ganadero",
+    "gobierno",
+    "banco",
+)
+
 _MIGRATIONS = (
     Migration(
-        1,
+        2,
         "agro",
         (
-            "CREATE TABLE agro_producers ("
+            "CREATE TABLE IF NOT EXISTS"
+            " agro_producers_v2 ("
             " producer_id TEXT PRIMARY KEY,"
             " zid TEXT,"
             " name TEXT NOT NULL,"
             " producer_type TEXT NOT NULL,"
+            " role TEXT NOT NULL"
+            " DEFAULT 'agricultor',"
             " location TEXT,"
             " verified INTEGER NOT NULL"
             " DEFAULT 0,"
@@ -42,7 +52,7 @@ _MIGRATIONS = (
 
 
 class AgroStore:
-    """Durable local state for AGRO."""
+    """Durable local state for AGRO (v2, roles)."""
 
     def __init__(
         self, db: Database, clock
@@ -60,24 +70,30 @@ class AgroStore:
         zid: str | None,
         name: str,
         producer_type: str,
+        role: str,
         location: str | None,
         synced: bool,
     ) -> dict[str, object]:
+        if role not in ROLES:
+            raise ValueError(
+                f"unknown role: {role}"
+            )
         now = self._clock.now()
         with self._db.transaction() as cursor:
             cursor.execute(
-                "INSERT INTO agro_producers"
+                "INSERT INTO agro_producers_v2"
                 " (producer_id, zid, name,"
-                "  producer_type, location,"
-                "  verified, synced,"
+                "  producer_type, role,"
+                "  location, verified, synced,"
                 "  created_at)"
-                " VALUES (?, ?, ?, ?, ?, 0, ?,"
-                " ?)",
+                " VALUES (?, ?, ?, ?, ?, ?, 0,"
+                "  ?, ?)",
                 (
                     producer_id,
                     zid,
                     name,
                     producer_type,
+                    role,
                     location,
                     int(synced),
                     now,
@@ -92,7 +108,7 @@ class AgroStore:
     ) -> None:
         with self._db.transaction() as cursor:
             cursor.execute(
-                "UPDATE agro_producers SET"
+                "UPDATE agro_producers_v2 SET"
                 " zid = ?, synced = 1"
                 " WHERE producer_id = ?",
                 (zid, producer_id),
@@ -103,7 +119,7 @@ class AgroStore:
     ) -> None:
         with self._db.transaction() as cursor:
             cursor.execute(
-                "UPDATE agro_producers SET"
+                "UPDATE agro_producers_v2 SET"
                 " verified = 1"
                 " WHERE producer_id = ?",
                 (producer_id,),
@@ -113,7 +129,8 @@ class AgroStore:
         self, producer_id: str
     ) -> dict[str, object]:
         row = self._db.query_one(
-            "SELECT * FROM agro_producers"
+            "SELECT * FROM"
+            " agro_producers_v2"
             " WHERE producer_id = ?",
             (producer_id,),
         )
@@ -125,12 +142,27 @@ class AgroStore:
         return self._producer_row(row)
 
     def list_producers(
-        self,
+        self, *, role: str | None = None
     ) -> tuple[dict[str, object], ...]:
-        rows = self._db.query_all(
-            "SELECT * FROM agro_producers"
-            " ORDER BY created_at"
-        )
+        if role is not None:
+            if role not in ROLES:
+                raise ValueError(
+                    f"unknown role:"
+                    f" {role}"
+                )
+            rows = self._db.query_all(
+                "SELECT * FROM"
+                " agro_producers_v2"
+                " WHERE role = ?"
+                " ORDER BY created_at",
+                (role,),
+            )
+        else:
+            rows = self._db.query_all(
+                "SELECT * FROM"
+                " agro_producers_v2"
+                " ORDER BY created_at"
+            )
         return tuple(
             self._producer_row(r)
             for r in rows
@@ -237,7 +269,12 @@ class AgroStore:
         producers = self._db.query_one(
             "SELECT COUNT(*) AS total,"
             " SUM(verified) AS verified"
-            " FROM agro_producers"
+            " FROM agro_producers_v2"
+        )
+        by_role_rows = self._db.query_all(
+            "SELECT role, COUNT(*) AS n"
+            " FROM agro_producers_v2"
+            " GROUP BY role"
         )
         productions = self._db.query_all(
             "SELECT product, SUM(quantity)"
@@ -246,6 +283,10 @@ class AgroStore:
             " GROUP BY product"
             " ORDER BY product"
         )
+        by_role = {
+            str(r["role"]): int(r["n"])
+            for r in by_role_rows
+        }
         by_product = {
             str(r["product"]): float(
                 r["total"]
@@ -270,6 +311,7 @@ class AgroStore:
             "producers_verified": (
                 verified
             ),
+            "producers_by_role": by_role,
             "productions_by_product": (
                 by_product
             ),
@@ -290,6 +332,7 @@ class AgroStore:
             "producer_type": str(
                 row["producer_type"]
             ),
+            "role": str(row["role"]),
             "location": (
                 str(row["location"])
                 if row["location"]

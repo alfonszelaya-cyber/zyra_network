@@ -1,4 +1,4 @@
-name: zyra-n1b-fix-server
+name: zyra-n1b-agro-roles
 
 "on":
   workflow_dispatch:
@@ -9,13 +9,13 @@ permissions:
   contents: write
 
 concurrency:
-  group: zyra-n1b-fix-${{ github.ref }}
+  group: zyra-n1b-${{ github.ref }}
   cancel-in-progress: false
 
 jobs:
   build:
     runs-on: ubuntu-latest
-    timeout-minutes: 15
+    timeout-minutes: 30
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -31,64 +31,1534 @@ jobs:
           python -m pip install --upgrade pip
           python -m pip install "cryptography>=42,<45" "pytest>=8,<9"
 
-      - name: Patch broken multi-line f-strings in server.py
+      - name: AgroStore v2 (role-aware)
         run: |
           set -euo pipefail
-          python3 - <<'PYEOF'
-          import re
-          from pathlib import Path
+          cat > apps/agro/infrastructure/persistence/agro_store.py <<'PYEOF'
+          """AGRO local durable store v2 (role-aware)."""
+          from __future__ import annotations
 
-          path = Path("apps/agro/server.py")
-          text = path.read_text(encoding="utf-8")
-
-          # Fix 1: f-string with raw newline inside the
-          # expression ('pendiente
-          #   de conexion}')
-          fixed = re.sub(
-              r"'pendiente\s*\n\s*de conexion\}'",
-              "'pendiente de conexion}'",
-              text,
+          from shared_engines.storage.database import (
+              Database,
           )
-          if fixed != text:
-              print(
-                  "fixed: pendiente-de-conexion"
-                  " f-string"
-              )
-          text = fixed
-
-          # Fix 2 (defensive): bank-screen implicit
-          # concatenation split across lines inside
-          # braces -> joined into one literal.
-          text = re.sub(
-              r"f\{'✅ verificado \(elegible'"
-              r"\s*\n\s*' para credito\}'"
-              r"\s*\n\s*if p\['verified'\]"
-              r"\s*\n\s*else '⚠️ sin verificar'\}",
-              "f\"{('✅ verificado"
-              " (elegible para credito)')"
-              " if p['verified']"
-              " else '⚠️ sin verificar'}\"",
-              text,
+          from shared_engines.storage.migrations import (
+              Migration,
+              MigrationRunner,
           )
-          path.write_text(text, encoding="utf-8")
-          print("server.py patched")
+
+          ROLES = (
+              "agricultor",
+              "ganadero",
+              "gobierno",
+              "banco",
+          )
+
+          _MIGRATIONS = (
+              Migration(
+                  2,
+                  "agro",
+                  (
+                      "CREATE TABLE IF NOT EXISTS"
+                      " agro_producers_v2 ("
+                      " producer_id TEXT PRIMARY KEY,"
+                      " zid TEXT,"
+                      " name TEXT NOT NULL,"
+                      " producer_type TEXT NOT NULL,"
+                      " role TEXT NOT NULL"
+                      " DEFAULT 'agricultor',"
+                      " location TEXT,"
+                      " verified INTEGER NOT NULL"
+                      " DEFAULT 0,"
+                      " synced INTEGER NOT NULL"
+                      " DEFAULT 0,"
+                      " created_at REAL NOT NULL)",
+                      "CREATE TABLE"
+                      " agro_productions ("
+                      " production_id TEXT PRIMARY"
+                      " KEY,"
+                      " producer_id TEXT NOT NULL,"
+                      " product TEXT NOT NULL,"
+                      " quantity REAL NOT NULL,"
+                      " unit TEXT NOT NULL,"
+                      " status TEXT NOT NULL,"
+                      " network_seq INTEGER,"
+                      " created_at REAL NOT NULL)",
+                  ),
+              ),
+          )
+
+
+          class AgroStore:
+              """Durable local state for AGRO (v2, roles)."""
+
+              def __init__(
+                  self, db: Database, clock
+              ) -> None:
+                  self._db = db
+                  self._clock = clock
+                  MigrationRunner(
+                      db, "agro.store", _MIGRATIONS
+                  ).run(clock)
+
+              def add_producer(
+                  self,
+                  *,
+                  producer_id: str,
+                  zid: str | None,
+                  name: str,
+                  producer_type: str,
+                  role: str,
+                  location: str | None,
+                  synced: bool,
+              ) -> dict[str, object]:
+                  if role not in ROLES:
+                      raise ValueError(
+                          f"unknown role: {role}"
+                      )
+                  now = self._clock.now()
+                  with self._db.transaction() as cursor:
+                      cursor.execute(
+                          "INSERT INTO agro_producers_v2"
+                          " (producer_id, zid, name,"
+                          "  producer_type, role,"
+                          "  location, verified, synced,"
+                          "  created_at)"
+                          " VALUES (?, ?, ?, ?, ?, ?, 0,"
+                          "  ?, ?)",
+                          (
+                              producer_id,
+                              zid,
+                              name,
+                              producer_type,
+                              role,
+                              location,
+                              int(synced),
+                              now,
+                          ),
+                      )
+                  return self.get_producer(
+                      producer_id
+                  )
+
+              def link_zid(
+                  self, *, producer_id: str, zid: str
+              ) -> None:
+                  with self._db.transaction() as cursor:
+                      cursor.execute(
+                          "UPDATE agro_producers_v2 SET"
+                          " zid = ?, synced = 1"
+                          " WHERE producer_id = ?",
+                          (zid, producer_id),
+                      )
+
+              def mark_verified(
+                  self, *, producer_id: str
+              ) -> None:
+                  with self._db.transaction() as cursor:
+                      cursor.execute(
+                          "UPDATE agro_producers_v2 SET"
+                          " verified = 1"
+                          " WHERE producer_id = ?",
+                          (producer_id,),
+                      )
+
+              def get_producer(
+                  self, producer_id: str
+              ) -> dict[str, object]:
+                  row = self._db.query_one(
+                      "SELECT * FROM"
+                      " agro_producers_v2"
+                      " WHERE producer_id = ?",
+                      (producer_id,),
+                  )
+                  if row is None:
+                      raise LookupError(
+                          "unknown producer:"
+                          f" {producer_id}"
+                      )
+                  return self._producer_row(row)
+
+              def list_producers(
+                  self, *, role: str | None = None
+              ) -> tuple[dict[str, object], ...]:
+                  if role is not None:
+                      if role not in ROLES:
+                          raise ValueError(
+                              f"unknown role:"
+                              f" {role}"
+                          )
+                      rows = self._db.query_all(
+                          "SELECT * FROM"
+                          " agro_producers_v2"
+                          " WHERE role = ?"
+                          " ORDER BY created_at",
+                          (role,),
+                      )
+                  else:
+                      rows = self._db.query_all(
+                          "SELECT * FROM"
+                          " agro_producers_v2"
+                          " ORDER BY created_at"
+                      )
+                  return tuple(
+                      self._producer_row(r)
+                      for r in rows
+                  )
+
+              def add_production(
+                  self,
+                  *,
+                  production_id: str,
+                  producer_id: str,
+                  product: str,
+                  quantity: float,
+                  unit: str,
+                  network_seq: int | None,
+              ) -> dict[str, object]:
+                  now = self._clock.now()
+                  with self._db.transaction() as cursor:
+                      cursor.execute(
+                          "INSERT INTO agro_productions"
+                          " (production_id,"
+                          "  producer_id, product,"
+                          "  quantity, unit, status,"
+                          "  network_seq, created_at)"
+                          " VALUES (?, ?, ?, ?, ?,"
+                          "  'active', ?, ?)",
+                          (
+                              production_id,
+                              producer_id,
+                              product,
+                              quantity,
+                              unit,
+                              network_seq,
+                              now,
+                          ),
+                      )
+                  row = self._db.query_one(
+                      "SELECT * FROM agro_productions"
+                      " WHERE production_id = ?",
+                      (production_id,),
+                  )
+                  assert row is not None
+                  raw_seq = row["network_seq"]
+                  return {
+                      "production_id": str(
+                          row["production_id"]
+                      ),
+                      "producer_id": str(
+                          row["producer_id"]
+                      ),
+                      "product": str(row["product"]),
+                      "quantity": float(
+                          row["quantity"]
+                      ),
+                      "unit": str(row["unit"]),
+                      "status": str(row["status"]),
+                      "network_seq": (
+                          int(raw_seq)
+                          if raw_seq is not None
+                          else None
+                      ),
+                  }
+
+              def list_productions(
+                  self,
+              ) -> tuple[dict[str, object], ...]:
+                  rows = self._db.query_all(
+                      "SELECT * FROM agro_productions"
+                      " ORDER BY created_at"
+                  )
+                  result: list[
+                      dict[str, object]
+                  ] = []
+                  for r in rows:
+                      raw_seq = r["network_seq"]
+                      result.append(
+                          {
+                              "production_id": str(
+                                  r["production_id"]
+                              ),
+                              "producer_id": str(
+                                  r["producer_id"]
+                              ),
+                              "product": str(
+                                  r["product"]
+                              ),
+                              "quantity": float(
+                                  r["quantity"]
+                              ),
+                              "unit": str(r["unit"]),
+                              "status": str(
+                                  r["status"]
+                              ),
+                              "network_seq": (
+                                  int(raw_seq)
+                                  if raw_seq
+                                  is not None
+                                  else None
+                              ),
+                          }
+                      )
+                  return tuple(result)
+
+              def summary(self) -> dict[str, object]:
+                  producers = self._db.query_one(
+                      "SELECT COUNT(*) AS total,"
+                      " SUM(verified) AS verified"
+                      " FROM agro_producers_v2"
+                  )
+                  by_role_rows = self._db.query_all(
+                      "SELECT role, COUNT(*) AS n"
+                      " FROM agro_producers_v2"
+                      " GROUP BY role"
+                  )
+                  productions = self._db.query_all(
+                      "SELECT product, SUM(quantity)"
+                      " AS total FROM"
+                      " agro_productions"
+                      " GROUP BY product"
+                      " ORDER BY product"
+                  )
+                  by_role = {
+                      str(r["role"]): int(r["n"])
+                      for r in by_role_rows
+                  }
+                  by_product = {
+                      str(r["product"]): float(
+                          r["total"]
+                      )
+                      for r in productions
+                  }
+                  total = 0
+                  verified = 0
+                  if producers is not None:
+                      total = int(
+                          producers["total"]
+                      )
+                      if (
+                          producers["verified"]
+                          is not None
+                      ):
+                          verified = int(
+                              producers["verified"]
+                          )
+                  return {
+                      "producers_total": total,
+                      "producers_verified": (
+                          verified
+                      ),
+                      "producers_by_role": by_role,
+                      "productions_by_product": (
+                          by_product
+                      ),
+                  }
+
+              @staticmethod
+              def _producer_row(row) -> dict[str, object]:
+                  return {
+                      "producer_id": str(
+                          row["producer_id"]
+                      ),
+                      "zid": (
+                          str(row["zid"])
+                          if row["zid"] is not None
+                          else None
+                      ),
+                      "name": str(row["name"]),
+                      "producer_type": str(
+                          row["producer_type"]
+                      ),
+                      "role": str(row["role"]),
+                      "location": (
+                          str(row["location"])
+                          if row["location"]
+                          is not None
+                          else None
+                      ),
+                      "verified": bool(
+                          int(row["verified"])
+                      ),
+                      "synced": bool(
+                          int(row["synced"])
+                      ),
+                      "created_at": float(
+                          row["created_at"]
+                      ),
+                  }
           PYEOF
+          echo "store v2 ready"
 
-      - name: Compile check
+      - name: AGRO HTTP surface v2 (role screens, fixed strings)
         run: |
           set -euo pipefail
-          python -m compileall -q apps/agro/server.py
-          echo "server.py compiles OK"
-          find apps/agro -name '__pycache__' -type d \
-            -prune -exec rm -rf {} +
+          cat > apps/agro/server.py <<'PYEOF'
+          """AGRO HTTP surface v2: role-based screens."""
+          from __future__ import annotations
 
-      - name: Run AGRO role tests
+          import json
+          import uuid
+          from http.server import (
+              BaseHTTPRequestHandler,
+              ThreadingHTTPServer,
+          )
+          from typing import Any, ClassVar
+          from urllib.parse import urlparse
+
+          from apps.agro.infrastructure.persistence.agro_store import (
+              ROLES,
+              AgroStore,
+          )
+          from apps.agro.infrastructure.network.network_client import (
+              NetworkClient,
+          )
+          from apps.agro.modules.comercializacion.alertas_de_mercado.market_alert_service import (
+              MarketAlertService,
+          )
+          from apps.agro.services.zyra_link import ZyraLink
+
+          _CSS = (
+              "body{font-family:system-ui,sans-serif;"
+              "background:#0d1117;color:#e6edf3;"
+              "display:flex;justify-content:center;"
+              "padding:20px;margin:0}"
+              ".wrap{max-width:680px;width:100%}"
+              "h1{font-size:1.3rem}"
+              "h2{font-size:1rem;margin-top:20px;"
+              "color:#58a6ff}"
+              ".card{background:#161b22;border:1px solid"
+              " #30363d;border-radius:10px;padding:14px;"
+              "margin-top:10px}"
+              "button{background:#238636;color:#fff;"
+              "border:none;padding:12px 18px;border-radius:8px;"
+              "font-size:1rem;cursor:pointer;margin:6px 4px 0 0;"
+              "width:100%;text-align:left}"
+              "button.gray{background:#30363d}"
+              "input,select{width:100%;box-sizing:border-box;"
+              "background:#0d1117;color:#e6edf3;"
+              "border:1px solid #30363d;border-radius:6px;"
+              "padding:8px;margin:4px 0;font-size:0.95rem}"
+              ".big{font-size:1.6rem;font-weight:bold;"
+              "color:#58a6ff}"
+              "small{color:#8b949e}"
+          )
+
+
+          def _page(title: str, body: str) -> str:
+              return (
+                  "<!DOCTYPE html><html lang='es'><head>"
+                  "<meta charset='utf-8'>"
+                  "<meta name='viewport' content='width="
+                  "device-width, initial-scale=1'>"
+                  f"<title>{title}</title>"
+                  f"<style>{_CSS}</style></head><body>"
+                  f"<div class='wrap'>{body}</div></body>"
+                  "</html>"
+              )
+
+
+          class AgroApiHandler(
+              BaseHTTPRequestHandler
+          ):
+              store: ClassVar[AgroStore]
+              link: ClassVar[ZyraLink]
+              client: ClassVar[NetworkClient]
+              alerts: ClassVar[MarketAlertService] = (
+                  MarketAlertService()
+              )
+
+              def log_message(
+                  self, format: str, *args: object
+              ) -> None:
+                  return None
+
+              def do_GET(self) -> None:
+                  self._safe("GET")
+
+              def do_POST(self) -> None:
+                  self._safe("POST")
+
+              def _safe(self, method: str) -> None:
+                  try:
+                      self._route(method)
+                  except LookupError as exc:
+                      self._html(
+                          404,
+                          _page(
+                              "No encontrado",
+                              "<h1>404</h1>"
+                              f"<p>{exc}</p>",
+                          ),
+                      )
+                  except ValueError as exc:
+                      self._html(
+                          400,
+                          _page(
+                              "Error",
+                              "<h1>Dato invalido"
+                              f"</h1><p>{exc}</p>",
+                          ),
+                      )
+                  except Exception as exc:
+                      self._html(
+                          500,
+                          _page(
+                              "Error",
+                              "<h1>Error interno"
+                              f"</h1><p>{exc}</p>",
+                          ),
+                      )
+
+              def _route(self, method: str) -> None:
+                  path = urlparse(self.path).path
+                  segments = [
+                      s
+                      for s in path.split("/")
+                      if s
+                  ]
+                  if segments[:1] != ["agro"]:
+                      self._html(
+                          404,
+                          _page(
+                              "404",
+                              "<h1>Fuera de AGRO"
+                              "</h1>",
+                          ),
+                      )
+                      return
+                  tail = segments[1:]
+                  if method == "GET":
+                      self._get(tail)
+                  else:
+                      self._post(tail)
+
+              def _get(self, s: list[str]) -> None:
+                  if s[:1] == ["api"]:
+                      self._api_get(s[1:])
+                      return
+                  store = type(self).store
+                  if not s or s == ["home"]:
+                      self._home()
+                      return
+                  if s[0] == "productor":
+                      self._screen_producer(s)
+                      return
+                  if s[0] == "gobierno":
+                      self._screen_government()
+                      return
+                  if s[0] == "banco":
+                      self._screen_bank()
+                      return
+                  if s == ["government", "summary"]:
+                      self._send(
+                          200,
+                          {
+                              "ok": True,
+                              "data": store.summary(),
+                          },
+                      )
+                      return
+                  self._html(
+                      404,
+                      _page(
+                          "404",
+                          "<h1>Pagina no"
+                          " encontrada</h1>"
+                          "<a href='/agro'>Volver"
+                          " a AGRO</a>",
+                      ),
+                  )
+
+              def _post(self, s: list[str]) -> None:
+                  if s[:1] == ["api"]:
+                      self._api_post(s[1:])
+                      return
+                  store = type(self).store
+                  link = type(self).link
+                  doc = self._read_form()
+                  if s == ["register"]:
+                      name = self._req(doc, "name")
+                      producer_type = self._req(
+                          doc, "producer_type"
+                      )
+                      role = str(
+                          doc.get("role", "agricultor")
+                      )
+                      if role not in ROLES:
+                          raise ValueError(
+                              f"unknown role: {role}"
+                          )
+                      location = doc.get("location")
+                      location = (
+                          str(location)
+                          if location is not None
+                          else None
+                      )
+                      producer_id = (
+                          "PRD-"
+                          + uuid.uuid4().hex[:12]
+                      )
+                      zid: str | None = None
+                      ok, data, _error = (
+                          link.register_producer_zid(
+                              name
+                          )
+                      )
+                      if ok and data is not None:
+                          zid = str(data.get("zid"))
+                      store.add_producer(
+                          producer_id=producer_id,
+                          zid=zid,
+                          name=name,
+                          producer_type=(
+                              producer_type
+                          ),
+                          role=role,
+                          location=location,
+                          synced=(zid is not None),
+                      )
+                      zid_text = (
+                          zid
+                          if zid is not None
+                          else "pendiente de conexion"
+                      )
+                      self._html(
+                          200,
+                          _page(
+                              "Bienvenido a AGRO",
+                              "<h1>Registro listo"
+                              "</h1>"
+                              "<p>Tu ID de confianza:"
+                              f" <b>{producer_id}"
+                              "</b></p>"
+                              "<p>Tu ZID de red: "
+                              f"<b>{zid_text}</b></p>"
+                              "<a href='/agro/productor/"
+                              f"{producer_id}'>"
+                              "<button>Ir a mi panel"
+                              "</button></a>"
+                              "<a href='/agro'>"
+                              "<button class='gray'>"
+                              "Inicio</button></a>",
+                          ),
+                      )
+                      return
+                  if s == ["production"]:
+                      producer_id = self._req(
+                          doc, "producer_id"
+                      )
+                      producer = store.get_producer(
+                          producer_id
+                      )
+                      product = self._req(
+                          doc, "product"
+                      )
+                      quantity = float(
+                          doc.get("quantity", 0)
+                      )
+                      if quantity <= 0:
+                          raise ValueError(
+                              "cantidad invalida"
+                          )
+                      unit = self._req(doc, "unit")
+                      network_seq: int | None = None
+                      zid = producer.get("zid")
+                      if zid is not None:
+                          ok, data, _error = (
+                              link.record_agro_event(
+                                  str(zid),
+                                  "production",
+                                  f"{product}:"
+                                  f" {quantity}"
+                                  f" {unit}",
+                              )
+                          )
+                          if (
+                              ok
+                              and data is not None
+                          ):
+                              network_seq = int(
+                                  data.get("seq", 0)
+                              )
+                      store.add_production(
+                          production_id=(
+                              "PRO-"
+                              + uuid.uuid4().hex[:12]
+                          ),
+                          producer_id=producer_id,
+                          product=product,
+                          quantity=quantity,
+                          unit=unit,
+                          network_seq=network_seq,
+                      )
+                      self._html(
+                          200,
+                          _page(
+                              "Cosecha registrada",
+                              "<h1>Guardado en la"
+                              " Red</h1>"
+                              f"<p>{product}:"
+                              f" {quantity} {unit}"
+                              "</p>"
+                              "<a href='/agro/productor/"
+                              f"{producer_id}'>"
+                              "<button>Volver a mi"
+                              " panel</button></a>",
+                          ),
+                      )
+                      return
+                  if s == ["verify"]:
+                      producer_id = self._req(
+                          doc, "producer_id"
+                      )
+                      row = store.get_producer(
+                          producer_id
+                      )
+                      zid = row.get("zid")
+                      if zid is None:
+                          raise ValueError(
+                              "sin ZID de red"
+                          )
+                      ok, _data, _error = (
+                          link.complete_trust(
+                              str(zid)
+                          )
+                      )
+                      if not ok:
+                          raise ValueError(
+                              "la red rechazo la"
+                              " verificacion"
+                          )
+                      store.mark_verified(
+                          producer_id=producer_id
+                      )
+                      self._html(
+                          200,
+                          _page(
+                              "Verificado",
+                              "<h1>Productor"
+                              " VERIFICADO</h1>"
+                              "<p>Ya puede recibir"
+                              " bonos y beneficios"
+                              " del gobierno.</p>"
+                              "<a href='/agro/productor/"
+                              f"{producer_id}'>"
+                              "<button>Ir a mi panel"
+                              "</button></a>",
+                          ),
+                      )
+                      return
+                  self._html(
+                      404,
+                      _page(
+                          "404",
+                          "<h1>Ruta desconocida"
+                          "</h1>",
+                      ),
+                  )
+
+              def _read_form(
+                  self,
+              ) -> dict[str, Any]:
+                  length_header = self.headers.get(
+                      "Content-Length"
+                  )
+                  if length_header is None:
+                      raise ValueError(
+                          "Content-Length required"
+                      )
+                  raw = self.rfile.read(
+                      int(length_header)
+                  ).decode("utf-8")
+                  doc: dict[str, Any] = {}
+                  for pair in raw.split("&"):
+                      if "=" in pair:
+                          key, value = pair.split(
+                              "=", 1
+                          )
+                          doc[key] = value.replace(
+                              "+", " "
+                          )
+                  return doc
+
+              def _read_json(
+                  self,
+              ) -> dict[str, Any]:
+                  length_header = self.headers.get(
+                      "Content-Length"
+                  )
+                  if length_header is None:
+                      raise ValueError(
+                          "Content-Length required"
+                      )
+                  raw = self.rfile.read(
+                      int(length_header)
+                  )
+                  parsed: Any = json.loads(
+                      raw.decode("utf-8")
+                  )
+                  if not isinstance(parsed, dict):
+                      raise ValueError(
+                          "body must be a JSON"
+                          " object"
+                      )
+                  return {
+                      str(k): v
+                      for k, v in parsed.items()
+                  }
+
+              @staticmethod
+              def _req(
+                  doc: dict[str, Any], key: str
+              ) -> str:
+                  value: Any = doc.get(key)
+                  if isinstance(value, int) and not isinstance(
+                      value, bool
+                  ):
+                      value = str(value)
+                  if not isinstance(value, str):
+                      raise ValueError(
+                          f"missing field: {key}"
+                      )
+                  if not value.strip():
+                      raise ValueError(
+                          f"missing field: {key}"
+                      )
+                  return value
+
+              def _api_get(self, s: list[str]) -> None:
+                  store = type(self).store
+                  if s == ["health"]:
+                      self._send(
+                          200,
+                          {
+                              "ok": True,
+                              "data": {
+                                  "app": "agro",
+                                  "status":
+                                  "operational",
+                              },
+                          },
+                      )
+                      return
+                  if s == ["producers"]:
+                      self._send(
+                          200,
+                          {
+                              "ok": True,
+                              "data": list(
+                                  store.list_producers()
+                              ),
+                          },
+                      )
+                      return
+                  if s == ["productions"]:
+                      self._send(
+                          200,
+                          {
+                              "ok": True,
+                              "data": list(
+                                  store.list_productions()
+                              ),
+                          },
+                      )
+                      return
+                  if s == ["government", "summary"]:
+                      self._send(
+                          200,
+                          {
+                              "ok": True,
+                              "data": store.summary(),
+                          },
+                      )
+                      return
+                  self._send(
+                      404,
+                      {
+                          "ok": False,
+                          "error": {
+                              "type": "not_found",
+                              "message":
+                              "unknown api route",
+                          },
+                      },
+                  )
+
+              def _api_post(
+                  self, s: list[str]
+              ) -> None:
+                  store = type(self).store
+                  doc = self._read_json()
+                  if s == ["producers"]:
+                      producer_id = (
+                          "PRD-"
+                          + uuid.uuid4().hex[:12]
+                      )
+                      row = store.add_producer(
+                          producer_id=producer_id,
+                          zid=doc.get("zid"),
+                          name=self._req(doc, "name"),
+                          producer_type=self._req(
+                              doc, "producer_type"
+                          ),
+                          role=str(
+                              doc.get(
+                                  "role",
+                                  "agricultor",
+                              )
+                          ),
+                          location=None,
+                          synced=False,
+                      )
+                      self._send(
+                          201,
+                          {
+                              "ok": True,
+                              "data": row,
+                          },
+                      )
+                      return
+                  if s == ["production"]:
+                      row = store.add_production(
+                          production_id=(
+                              "PRO-"
+                              + uuid.uuid4().hex[:12]
+                          ),
+                          producer_id=self._req(
+                              doc, "producer_id"
+                          ),
+                          product=self._req(
+                              doc, "product"
+                          ),
+                          quantity=float(
+                              doc.get("quantity", 0)
+                          ),
+                          unit=self._req(doc, "unit"),
+                          network_seq=None,
+                      )
+                      self._send(
+                          201,
+                          {
+                              "ok": True,
+                              "data": row,
+                          },
+                      )
+                      return
+                  self._send(
+                      404,
+                      {
+                          "ok": False,
+                          "error": {
+                              "type": "not_found",
+                              "message":
+                              "unknown api route",
+                          },
+                      },
+                  )
+
+              def _home(self) -> None:
+                  body = (
+                      "<h1>🛡️ AGRO</h1>"
+                      "<p>La Red de confianza"
+                      " para agricultores y"
+                      " ganaderos.</p>"
+                      "<h2>Soy productor</h2>"
+                      "<div class='card'>"
+                      "<form method='POST'"
+                      " action='/agro/register'>"
+                      "<input name='name'"
+                      " placeholder='Mi nombre'>"
+                      "<select name='role'>"
+                      "<option value='agricultor'>"
+                      "Agricultor</option>"
+                      "<option value='ganadero'>"
+                      "Ganadero</option>"
+                      "</select>"
+                      "<input name='producer_type'"
+                      " placeholder='Que produzco"
+                      " (maiz, ganado...)'>"
+                      "<input name='location'"
+                      " placeholder='Mi zona'>"
+                      "<button>Registrarme en la"
+                      " Red</button>"
+                      "</form></div>"
+                      "<h2>Soy Gobierno / Banco"
+                      "</h2>"
+                      "<div class='card'>"
+                      "<a href='/agro/gobierno'>"
+                      "<button>Vista Gobierno"
+                      "</button></a>"
+                      "<a href='/agro/banco'>"
+                      "<button class='gray'>Vista"
+                      " Banco</button></a>"
+                      "</div>"
+                  )
+                  self._html(200, _page("AGRO", body))
+
+              def _screen_producer(
+                  self, s: list[str]
+              ) -> None:
+                  store = type(self).store
+                  producer_id = (
+                      s[1] if len(s) > 1 else ""
+                  )
+                  row = store.get_producer(
+                      producer_id
+                  )
+                  zid = row.get("zid")
+                  verified = row.get("verified")
+                  if verified:
+                      badge = "✅ VERIFICADO"
+                      extra = ""
+                  else:
+                      badge = (
+                          "⚠️ Sin verificar"
+                          " (sin bonos)"
+                      )
+                      extra = (
+                          "<form method='POST'"
+                          " action='/agro/verify'>"
+                          "<input type='hidden'"
+                          " name='producer_id'"
+                          f" value='{producer_id}'>"
+                          "<button>Verificarme para"
+                          " recibir bonos</button>"
+                          "</form>"
+                      )
+                  mine = [
+                      p
+                      for p in (
+                          store.list_productions()
+                      )
+                      if p["producer_id"]
+                      == producer_id
+                  ]
+                  history = "".join(
+                      "<li>• "
+                      + p["product"]
+                      + ": "
+                      + str(p["quantity"])
+                      + " "
+                      + p["unit"]
+                      + "</li>"
+                      for p in mine
+                  )
+                  if not history:
+                      history = (
+                          "<li>Sin registros</li>"
+                      )
+                  body = (
+                      "<h1>Mi Panel — "
+                      + str(row.get("name"))
+                      + "</h1>"
+                      "<p>"
+                      + badge
+                      + " · Rol: "
+                      + str(row.get("role"))
+                      + "</p>"
+                      "<p><small>ZID de red: "
+                      + str(zid or "pendiente")
+                      + "</small></p>"
+                      "<h2>Registrar mi cosecha"
+                      "</h2>"
+                      "<div class='card'>"
+                      "<form method='POST'"
+                      " action='/agro/production'>"
+                      "<input type='hidden'"
+                      " name='producer_id'"
+                      f" value='{producer_id}'>"
+                      "<input name='product'"
+                      " placeholder='Producto"
+                      " (maiz, frijol...)'>"
+                      "<input name='quantity'"
+                      " placeholder='Cantidad'>"
+                      "<select name='unit'>"
+                      "<option value='quintal'>"
+                      "quintal</option>"
+                      "<option value='libra'>"
+                      "libra</option>"
+                      "<option value='cabeza'>"
+                      "cabeza de ganado"
+                      "</option>"
+                      "</select>"
+                      "<button>Guardar en la"
+                      " Red</button>"
+                      "</form></div>"
+                      "<h2>Mi historial</h2>"
+                      "<ul>"
+                      + history
+                      + "</ul>"
+                      + extra
+                      + "<a href='/agro'><button"
+                      " class='gray'>Inicio"
+                      "</button></a>"
+                  )
+                  self._html(
+                      200,
+                      _page("AGRO - Mi panel", body),
+                  )
+
+              def _screen_government(self) -> None:
+                  summary = type(
+                      self
+                  ).store.summary()
+                  total = summary["producers_total"]
+                  verified = summary[
+                      "producers_verified"
+                  ]
+                  by_role = summary[
+                      "producers_by_role"
+                  ]
+                  by_product = summary[
+                      "productions_by_product"
+                  ]
+                  roles_html = "".join(
+                      "<li>• "
+                      + k
+                      + ": "
+                      + str(v)
+                      + "</li>"
+                      for k, v in by_role.items()
+                  )
+                  if not roles_html:
+                      roles_html = (
+                          "<li>Sin datos</li>"
+                      )
+                  products_html = "".join(
+                      "<li>• "
+                      + k
+                      + ": "
+                      + str(v)
+                      + " quintales</li>"
+                      for k, v in (
+                          by_product.items()
+                      )
+                  )
+                  if not products_html:
+                      products_html = (
+                          "<li>Sin cosechas"
+                          " registradas</li>"
+                      )
+                  body = (
+                      "<h1>🏛️ AGRO — Vista"
+                      " Gobierno</h1>"
+                      "<h2>Soberania alimentaria"
+                      " nacional</h2>"
+                      "<div class='card'>"
+                      "<span class='big'>"
+                      + str(total)
+                      + "</span> productores<br>"
+                      "<span class='big'>"
+                      + str(verified)
+                      + "</span> verificados"
+                      "</div>"
+                      "<h2>Por rol</h2><ul>"
+                      + roles_html
+                      + "</ul>"
+                      "<h2>Produccion nacional"
+                      "</h2><ul>"
+                      + products_html
+                      + "</ul>"
+                      "<a href='/agro'><button"
+                      " class='gray'>Inicio"
+                      "</button></a>"
+                  )
+                  self._html(
+                      200,
+                      _page(
+                          "AGRO - Gobierno", body
+                      ),
+                  )
+
+              def _screen_bank(self) -> None:
+                  producers = type(
+                      self
+                  ).store.list_producers()
+                  rows = ""
+                  for p in producers:
+                      if p["verified"]:
+                          estado = (
+                              "✅ verificado"
+                              " (elegible para"
+                              " credito)"
+                          )
+                      else:
+                          estado = (
+                              "⚠️ sin verificar"
+                          )
+                      rows = (
+                          rows
+                          + "<li>• "
+                          + str(p["name"])
+                          + " - "
+                          + str(p["role"])
+                          + " - "
+                          + estado
+                          + "</li>"
+                      )
+                  if not rows:
+                      rows = (
+                          "<li>Sin productores</li>"
+                      )
+                  body = (
+                      "<h1>🏦 AGRO — Vista Banco"
+                      "</h1>"
+                      "<p>Elegibilidad de credito:"
+                      " basada en verificacion de"
+                      " la Red (evidencia"
+                      " inmutable).</p>"
+                      "<ul>"
+                      + rows
+                      + "</ul>"
+                      "<a href='/agro'><button"
+                      " class='gray'>Inicio"
+                      "</button></a>"
+                  )
+                  self._html(
+                      200,
+                      _page("AGRO - Banco", body),
+                  )
+
+              def _html(
+                  self, status: int, html: str
+              ) -> None:
+                  body = html.encode("utf-8")
+                  self.send_response(status)
+                  self.send_header(
+                      "Content-Type",
+                      "text/html; charset=utf-8",
+                  )
+                  self.send_header(
+                      "Content-Length",
+                      str(len(body)),
+                  )
+                  self.end_headers()
+                  self.wfile.write(body)
+
+              def _send(
+                  self,
+                  status: int,
+                  payload: dict[str, Any],
+              ) -> None:
+                  body = json.dumps(payload).encode(
+                      "utf-8"
+                  )
+                  self.send_response(status)
+                  self.send_header(
+                      "Content-Type",
+                      "application/json",
+                  )
+                  self.send_header(
+                      "Content-Length",
+                      str(len(body)),
+                  )
+                  self.end_headers()
+                  self.wfile.write(body)
+
+
+          class AgroServer(ThreadingHTTPServer):
+              daemon_threads = True
+              allow_reuse_address = True
+
+              def __init__(
+                  self, address: tuple[str, int]
+              ) -> None:
+                  super().__init__(
+                      address, AgroApiHandler
+                  )
+
+              @property
+              def bound_port(self) -> int:
+                  return int(
+                      self.server_address[1]
+                  )
+
+
+          def serve_agro(
+              store: AgroStore,
+              client: NetworkClient,
+              *,
+              host: str = "127.0.0.1",
+              port: int = 0,
+          ) -> AgroServer:
+              AgroApiHandler.store = store
+              AgroApiHandler.link = ZyraLink(client)
+              AgroApiHandler.client = client
+              return AgroServer((host, port))
+          PYEOF
+          echo "server v2 ready"
+
+      - name: Role proofs (3)
         run: |
           set -euo pipefail
+          mkdir -p apps/agro/tests
+          cat > apps/agro/tests/test_agro_roles.py <<'PYEOF'
+          """AGRO roles proofs: roles enforced, role screens
+          served, producer panel works."""
+          from __future__ import annotations
+
+          import threading
+          from pathlib import Path
+          from urllib.request import (
+              Request,
+              urlopen,
+          )
+
+          from shared_engines.common.clocks import (
+              FrozenClock,
+          )
+          from shared_engines.storage.database import (
+              SQLiteAdapter,
+          )
+
+          from apps.agro.infrastructure.network.network_client import (
+              NetworkClient,
+          )
+          from apps.agro.infrastructure.persistence.agro_store import (
+              AgroStore,
+          )
+          from apps.agro.server import serve_agro
+
+
+          def _boot(tmp_path: Path):
+              db = SQLiteAdapter(
+                  tmp_path / "agro.db"
+              )
+              clock = FrozenClock()
+              store = AgroStore(db, clock)
+              dead_client = NetworkClient(
+                  "http://127.0.0.1:1",
+                  timeout_seconds=1.0,
+                  max_retries=0,
+              )
+              server = serve_agro(store, dead_client)
+              thread = threading.Thread(
+                  target=server.serve_forever,
+                  daemon=True,
+              )
+              thread.start()
+              base = (
+                  "http://127.0.0.1:"
+                  f"{server.bound_port}"
+              )
+              return db, store, base, server, thread
+
+
+          def _post(url, doc):
+              request = Request(
+                  url,
+                  data=(
+                      "&".join(
+                          str(k)
+                          + "="
+                          + str(v)
+                          for k, v in doc.items()
+                      )
+                  ).encode("utf-8"),
+                  method="POST",
+              )
+              with urlopen(request, timeout=10) as r:
+                  return r.status
+
+
+          def test_roles_refused_and_registered(
+              tmp_path: Path,
+          ) -> None:
+              db, store, base, server, thread = _boot(
+                  tmp_path
+              )
+              try:
+                  code = _post(
+                      base + "/agro/register",
+                      {
+                          "name": "Fake",
+                          "producer_type": "x",
+                          "role": "hacker",
+                      },
+                  )
+                  assert code == 400
+                  code = _post(
+                      base + "/agro/register",
+                      {
+                          "name": "Jose Maiz",
+                          "producer_type": "maiz",
+                          "role": "agricultor",
+                          "location": "Chalatenango",
+                      },
+                  )
+                  assert code == 200
+                  code = _post(
+                      base + "/agro/register",
+                      {
+                          "name": "Ganadero Lopez",
+                          "producer_type": "ganado",
+                          "role": "ganadero",
+                          "location": "San Miguel",
+                      },
+                  )
+                  assert code == 200
+                  by_role = store.summary()[
+                      "producers_by_role"
+                  ]
+                  assert by_role.get(
+                      "agricultor"
+                  ) == 1
+                  assert by_role.get(
+                      "ganadero"
+                  ) == 1
+              finally:
+                  server.shutdown()
+                  server.server_close()
+                  thread.join(timeout=5)
+                  db.close()
+
+
+          def test_role_screens_exist(
+              tmp_path: Path,
+          ) -> None:
+              db, store, base, server, thread = _boot(
+                  tmp_path
+              )
+              try:
+                  with urlopen(
+                      base + "/agro/gobierno",
+                      timeout=10,
+                  ) as response:
+                      gov = response.read().decode(
+                          "utf-8"
+                      )
+                  assert "Gobierno" in gov
+                  assert "Soberania" in gov
+                  with urlopen(
+                      base + "/agro/banco",
+                      timeout=10,
+                  ) as response:
+                      bank = response.read().decode(
+                          "utf-8"
+                      )
+                  assert "Banco" in bank
+                  assert "credito" in bank
+                  with urlopen(
+                      base + "/agro", timeout=10
+                  ) as response:
+                      home = response.read().decode(
+                          "utf-8"
+                      )
+                  assert "Soy productor" in home
+              finally:
+                  server.shutdown()
+                  server.server_close()
+                  thread.join(timeout=5)
+                  db.close()
+
+
+          def test_producer_panel_after_register(
+              tmp_path: Path,
+          ) -> None:
+              db, store, base, server, thread = _boot(
+                  tmp_path
+              )
+              try:
+                  code = _post(
+                      base + "/agro/register",
+                      {
+                          "name": "Jose Rural",
+                          "producer_type": "maiz",
+                          "role": "agricultor",
+                      },
+                  )
+                  assert code == 200
+                  producers = (
+                      store.list_producers()
+                  )
+                  assert len(producers) == 1
+                  pid = producers[0][
+                      "producer_id"
+                  ]
+                  with urlopen(
+                      base
+                      + "/agro/productor/"
+                      + pid,
+                      timeout=10,
+                  ) as response:
+                      panel = response.read().decode(
+                          "utf-8"
+                      )
+                  assert "Mi Panel" in panel
+                  assert "Jose Rural" in panel
+              finally:
+                  server.shutdown()
+                  server.server_close()
+                  thread.join(timeout=5)
+                  db.close()
+          PYEOF
+          echo "=== ROLE TESTS READY ==="
+
+      - name: Compile + Run AGRO role tests
+        run: |
+          set -euo pipefail
+          python -m compileall -q apps/agro/server.py apps/agro/infrastructure/persistence/agro_store.py
+          echo "compile OK"
           PYTHONPATH="$PWD" python -m pytest -q -p no:cacheprovider apps/agro/tests/test_agro_roles.py
           echo "AGRO role tests OK"
-          find apps/agro -name '__pycache__' -type d \
-            -prune -exec rm -rf {} +
+          find apps/agro -name '__pycache__' -type d -prune \
+            -exec rm -rf {} +
+
+      - name: Record super-app decision
+        run: |
+          set -euo pipefail
+          mkdir -p docs
+          cat > docs/ECOSYSTEM_MAP.md <<'MDEOF'
+          # ZYRA Ecosystem - App Consolidation Map
+
+          ## ADR-004: single public entrance (super-app)
+
+          The PUBLIC sees ONE app: "ZYRA". Login by ZID, then
+          the menu is role-based (agricultor -> AGRO screens,
+          gobierno -> national dashboards, banco -> credit
+          reports, empresa -> NEXO/Subastas).
+
+          The 9 systems are the INTERNAL engines behind that
+          single entrance. Isolation rule: if one internal
+          system is down or in maintenance, the others keep
+          serving (each app consumes the Network over HTTP
+          and keeps local state).
+
+          Commercial model: verification is free forever
+          (offline cryptography); writes and scale are paid
+          per client (API keys, future workflow).
+
+          ## The 9 internal systems
+
+          1. nexo - business/fiscal core (wave 1)
+          2. agro - verified aid, planting records, prices (wave 1)
+          3. semilla - education pre-k to university (wave 1)
+          4. axis - health + justice + security (wave 1)
+          5. subastas - marketplace + Radar VIP + stocks (wave 1)
+          6. mi_primer_empleo - job matching (wave 1)
+          7. ciclo_digital - archeology + recycling (wave 2)
+          8. laboratorio - policy simulation + 3D (wave 2)
+          9. futuro_os - robots + 3D space lanes (wave 3)
+
+          ## Absorbed folders
+
+          - security_command -> axis/modules/seguridad_comando
+          - reciclaje_digital -> ciclo_digital
+          - decisiones_reales -> laboratorio
+          - controlador_espacios -> futuro_os
+          - governance_portal -> ZYRA admin surface
+          - rednew, shared_domain -> removed (empty)
+
+          ## Competitive position (to expand in the demo deck)
+
+          Not competing with go.sv or the new national
+          education system: being DIFFERENT - offline
+          cryptographic verification, immutable evidence
+          chains, portable ZID across apps, private-by-scope
+          data. Those are the barriers incumbents cannot
+          cross.
+          MDEOF
+          echo "map + ADR-004 recorded"
 
       - name: Commit and push (race-safe)
         run: |
@@ -101,7 +1571,7 @@ jobs:
           if git diff --cached --quiet; then
             echo "No changes."
           else
-            git commit -m "zyra: N1b fix - broken multi-line f-strings in server.py repaired (pendiente-de-conexion + bank-screen literal), compile verified, role tests rerun"
+            git commit -m "zyra: N1b AGRO roles - store v2 (role column), role-based HTML screens (producer panel/gobierno/banco), fixed multi-line f-strings, ADR-004 super-app single entrance recorded; 3 role proofs"
             git push origin "HEAD:${{ github.ref_name }}"
           fi
-          echo "=== N1B FIX COMPLETE ==="
+          echo "=== N1B COMPLETE: AGRO NAVIGABLE BY ROLE ==="

@@ -1,4 +1,4 @@
-name: zyra-q2-suite-termination-fix
+name: zyra-q3-mpe-hiring-e2e
 
 "on":
   workflow_dispatch:
@@ -9,13 +9,13 @@ permissions:
   contents: write
 
 concurrency:
-  group: zyra-q2-${{ github.ref }}
+  group: zyra-q3-mpe-${{ github.ref }}
   cancel-in-progress: false
 
 jobs:
   build:
     runs-on: ubuntu-latest
-    timeout-minutes: 35
+    timeout-minutes: 25
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -31,99 +31,3222 @@ jobs:
           python -m pip install --upgrade pip
           python -m pip install "cryptography>=42,<45" "pytest>=8,<9" "pytest-timeout>=2,<3"
 
-      - name: Evidence (existing conftest?)
+      - name: Evidence (current contracts before extension)
         run: |
           set -euo pipefail
-          echo "=== root conftest.py before ==="
-          if [ -f conftest.py ]; then
-            wc -c conftest.py
-            cat conftest.py
-          else
-            echo "no root conftest.py (will create)"
-          fi
+          echo "=== store methods before ==="
+          grep -n "def " apps/mi_primer_empleo/infrastructure/persistence/mpe_store.py | head -30 || true
+          echo "=== server routes before ==="
+          grep -n "\"/mpe" apps/mi_primer_empleo/server.py | head -40 || true
+          echo "=== link methods before ==="
+          grep -n "def " apps/mi_primer_empleo/services/mpe_link.py || true
 
-      - name: Write daemon-thread patch (root conftest)
+      - name: Extend MpeStore (migration 2: proposals + hires, dynamic openings)
         run: |
           set -euo pipefail
-          PATCH='
-          # ZYRA-DAEMON-PATCH
-          # Root cause fix: background threads (outbox workers,
-          # servers, supervisors) created during tests kept the
-          # interpreter alive after pytest finished, so the full
-          # suite never terminated. Every thread created during
-          # the test session is forced to daemon=True BEFORE it
-          # starts, so pytest always exits cleanly.
-          import threading as _threading
+          cat > apps/mi_primer_empleo/infrastructure/persistence/mpe_store.py <<'PYEOF'
+          """MPE durable store: accounts, jobs, applications,
+          proposals, hires with dynamic openings."""
+          from __future__ import annotations
 
-          _original_thread_init = _threading.Thread.__init__
+          from shared_engines.storage.database import (
+              Database,
+          )
+          from shared_engines.storage.migrations import (
+              Migration,
+              MigrationRunner,
+          )
 
-
-          def _zyra_daemon_thread_init(
-              self, *args, **kwargs,
-          ):
-              _original_thread_init(
-                  self, *args, **kwargs
-              )
-              try:
-                  if (
-                      self
-                      is not _threading
-                      .main_thread()
-                  ):
-                      self.daemon = True
-              except (
-                  RuntimeError,
-                  ValueError,
-              ):
-                  pass
-
-
-          _threading.Thread.__init__ = (
-              _zyra_daemon_thread_init
+          _MIGRATIONS = (
+              Migration(
+                  1,
+                  "mpe",
+                  (
+                      "CREATE TABLE mpe_accounts ("
+                      " account_id TEXT PRIMARY KEY,"
+                      " zid TEXT,"
+                      " name TEXT NOT NULL,"
+                      " role TEXT NOT NULL,"
+                      " profession TEXT,"
+                      " verified INTEGER NOT NULL"
+                      " DEFAULT 0,"
+                      " created_at REAL NOT NULL)",
+                      "CREATE TABLE mpe_jobs ("
+                      " job_id TEXT PRIMARY KEY,"
+                      " company_account TEXT NOT NULL,"
+                      " title TEXT NOT NULL,"
+                      " profession TEXT NOT NULL,"
+                      " openings INTEGER NOT NULL,"
+                      " status TEXT NOT NULL"
+                      " DEFAULT 'open',"
+                      " created_at REAL NOT NULL)",
+                      "CREATE TABLE mpe_applications ("
+                      " application_id TEXT PRIMARY"
+                      " KEY,"
+                      " job_id TEXT NOT NULL,"
+                      " worker_account TEXT NOT NULL,"
+                      " status TEXT NOT NULL"
+                      " DEFAULT 'submitted',"
+                      " created_at REAL NOT NULL)",
+                  ),
+              ),
+              Migration(
+                  2,
+                  "mpe_hiring",
+                  (
+                      "CREATE TABLE mpe_proposals ("
+                      " proposal_id TEXT PRIMARY KEY,"
+                      " job_id TEXT NOT NULL,"
+                      " company_account TEXT NOT NULL,"
+                      " worker_account TEXT NOT NULL,"
+                      " status TEXT NOT NULL"
+                      " DEFAULT 'pending',"
+                      " created_at REAL NOT NULL)",
+                      "CREATE TABLE mpe_hires ("
+                      " hire_id TEXT PRIMARY KEY,"
+                      " job_id TEXT NOT NULL,"
+                      " worker_account TEXT NOT NULL,"
+                      " status TEXT NOT NULL"
+                      " DEFAULT 'active',"
+                      " created_at REAL NOT NULL)",
+                  ),
+              ),
           )
 
 
-          def pytest_sessionfinish(
-              session, exitstatus,
-          ):
-              stray = [
-                  t.name
-                  for t in _threading.enumerate()
-                  if (
-                      t
-                      is not _threading
-                      .main_thread()
-                      and t.is_alive()
-                  )
-              ]
-              print(
-                  "ZYRA leftover threads"
-                  " (daemon, non-blocking): "
-                  + str(len(stray))
-              )
-              for name in stray:
-                  print("  - " + str(name))
-          '
-          if [ -f conftest.py ]; then
-            if ! grep -q "ZYRA-DAEMON-PATCH" conftest.py; then
-              printf '%s\n' "$PATCH" >> conftest.py
-              echo "patch appended to existing conftest.py"
-            else
-              echo "patch already present"
-            fi
-          else
-            printf '%s\n' "$PATCH" > conftest.py
-            echo "conftest.py created"
-          fi
-          python -m py_compile conftest.py
-          echo "=== final conftest.py ==="
-          cat conftest.py
+          class MpeStore:
+              def __init__(
+                  self, db: Database, clock
+              ) -> None:
+                  self._db = db
+                  self._clock = clock
+                  MigrationRunner(
+                      db, "mpe", _MIGRATIONS
+                  ).run(clock)
 
-      - name: FULL SUITE in ONE invocation (quality gate)
+              def add_account(
+                  self,
+                  *,
+                  account_id: str,
+                  zid: str | None,
+                  name: str,
+                  role: str,
+                  profession: str | None,
+              ) -> dict[str, object]:
+                  if role not in (
+                      "trabajador",
+                      "empresa",
+                  ):
+                      raise ValueError(
+                          f"unknown role: {role}"
+                      )
+                  now = self._clock.now()
+                  with self._db.transaction() as cursor:
+                      cursor.execute(
+                          "INSERT INTO mpe_accounts"
+                          " (account_id, zid, name,"
+                          "  role, profession, verified,"
+                          "  created_at)"
+                          " VALUES (?, ?, ?, ?, ?, 0, ?)",
+                          (
+                              account_id,
+                              zid,
+                              name,
+                              role,
+                              profession,
+                              now,
+                          ),
+                      )
+                  return self.get_account(account_id)
+
+              def mark_verified(
+                  self, *, account_id: str
+              ) -> None:
+                  with self._db.transaction() as cursor:
+                      cursor.execute(
+                          "UPDATE mpe_accounts SET"
+                          " verified = 1"
+                          " WHERE account_id = ?",
+                          (account_id,),
+                      )
+
+              def get_account(
+                  self, account_id: str
+              ) -> dict[str, object]:
+                  row = self._db.query_one(
+                      "SELECT * FROM mpe_accounts"
+                      " WHERE account_id = ?",
+                      (account_id,),
+                  )
+                  if row is None:
+                      raise LookupError(
+                          "unknown account:"
+                          f" {account_id}"
+                      )
+                  return self._account_row(row)
+
+              def list_workers(
+                  self, *, profession: str | None = None
+              ) -> tuple[dict[str, object], ...]:
+                  if profession is not None:
+                      rows = self._db.query_all(
+                          "SELECT * FROM mpe_accounts"
+                          " WHERE role = 'trabajador'"
+                          " AND profession = ?"
+                          " ORDER BY created_at",
+                          (profession,),
+                      )
+                  else:
+                      rows = self._db.query_all(
+                          "SELECT * FROM mpe_accounts"
+                          " WHERE role = 'trabajador'"
+                          " ORDER BY created_at"
+                      )
+                  return tuple(
+                      self._account_row(r)
+                      for r in rows
+                  )
+
+              def list_companies(
+                  self,
+              ) -> tuple[dict[str, object], ...]:
+                  rows = self._db.query_all(
+                      "SELECT * FROM mpe_accounts"
+                      " WHERE role = 'empresa'"
+                      " ORDER BY created_at"
+                  )
+                  return tuple(
+                      self._account_row(r)
+                      for r in rows
+                  )
+
+              def post_job(
+                  self,
+                  *,
+                  job_id: str,
+                  company_account: str,
+                  title: str,
+                  profession: str,
+                  openings: int,
+              ) -> dict[str, object]:
+                  company = self.get_account(
+                      company_account
+                  )
+                  if company.get("role") != "empresa":
+                      raise ValueError(
+                          "only companies can post"
+                          " jobs"
+                      )
+                  now = self._clock.now()
+                  with self._db.transaction() as cursor:
+                      cursor.execute(
+                          "INSERT INTO mpe_jobs"
+                          " (job_id, company_account,"
+                          "  title, profession,"
+                          "  openings, status,"
+                          "  created_at)"
+                          " VALUES (?, ?, ?, ?, ?,"
+                          "  'open', ?)",
+                          (
+                              job_id,
+                              company_account,
+                              title,
+                              profession,
+                              openings,
+                              now,
+                          ),
+                      )
+                  row = self._db.query_one(
+                      "SELECT * FROM mpe_jobs"
+                      " WHERE job_id = ?",
+                      (job_id,),
+                  )
+                  assert row is not None
+                  return self._job_row(row)
+
+              def list_jobs(
+                  self, *, profession: str | None = None
+              ) -> tuple[dict[str, object], ...]:
+                  if profession is not None:
+                      rows = self._db.query_all(
+                          "SELECT * FROM mpe_jobs"
+                          " WHERE status = 'open'"
+                          " AND profession = ?"
+                          " ORDER BY created_at",
+                          (profession,),
+                      )
+                  else:
+                      rows = self._db.query_all(
+                          "SELECT * FROM mpe_jobs"
+                          " WHERE status = 'open'"
+                          " ORDER BY created_at"
+                      )
+                  return tuple(
+                      self._job_row(r)
+                      for r in rows
+                  )
+
+              def list_company_jobs(
+                  self, *, company_account: str
+              ) -> tuple[dict[str, object], ...]:
+                  rows = self._db.query_all(
+                      "SELECT * FROM mpe_jobs"
+                      " WHERE company_account = ?"
+                      " ORDER BY created_at",
+                      (company_account,),
+                  )
+                  return tuple(
+                      self._job_row(r)
+                      for r in rows
+                  )
+
+              def apply(
+                  self,
+                  *,
+                  application_id: str,
+                  job_id: str,
+                  worker_account: str,
+              ) -> dict[str, object]:
+                  worker = self.get_account(
+                      worker_account
+                  )
+                  if (
+                      worker.get("role")
+                      != "trabajador"
+                  ):
+                      raise ValueError(
+                          "only workers can apply"
+                      )
+                  row = self._db.query_one(
+                      "SELECT * FROM mpe_jobs"
+                      " WHERE job_id = ?"
+                      " AND status = 'open'",
+                      (job_id,),
+                  )
+                  if row is None:
+                      raise LookupError(
+                          "job not open:"
+                          f" {job_id}"
+                      )
+                  dup = self._db.query_one(
+                      "SELECT 1 FROM"
+                      " mpe_applications WHERE"
+                      " job_id = ? AND"
+                      " worker_account = ?",
+                      (job_id, worker_account),
+                  )
+                  if dup is not None:
+                      raise ValueError(
+                          "already applied"
+                      )
+                  now = self._clock.now()
+                  with self._db.transaction() as cursor:
+                      cursor.execute(
+                          "INSERT INTO"
+                          " mpe_applications"
+                          " (application_id, job_id,"
+                          "  worker_account, status,"
+                          "  created_at)"
+                          " VALUES (?, ?, ?,"
+                          "  'submitted', ?)",
+                          (
+                              application_id,
+                              job_id,
+                              worker_account,
+                              now,
+                          ),
+                      )
+                  return {
+                      "application_id": (
+                          application_id
+                      ),
+                      "job_id": job_id,
+                      "worker": worker_account,
+                      "status": "submitted",
+                  }
+
+              def applications_for(
+                  self, *, job_id: str
+              ) -> tuple[dict[str, object], ...]:
+                  rows = self._db.query_all(
+                      "SELECT * FROM"
+                      " mpe_applications"
+                      " WHERE job_id = ?"
+                      " ORDER BY created_at",
+                      (job_id,),
+                  )
+                  return tuple(
+                      {
+                          "application_id": str(
+                              r["application_id"]
+                          ),
+                          "job_id": str(
+                              r["job_id"]
+                          ),
+                          "worker_account": str(
+                              r["worker_account"]
+                          ),
+                          "status": str(
+                              r["status"]
+                          ),
+                      }
+                      for r in rows
+                  )
+
+              # ---------- hiring (Q3) ----------
+
+              def _job_row_by_id(
+                  self, job_id: str,
+              ):
+                  return self._db.query_one(
+                      "SELECT * FROM mpe_jobs"
+                      " WHERE job_id = ?",
+                      (job_id,),
+                  )
+
+              def _active_hires_count(
+                  self, job_id: str,
+              ) -> int:
+                  row = self._db.query_one(
+                      "SELECT COUNT(*) AS n"
+                      " FROM mpe_hires"
+                      " WHERE job_id = ?"
+                      " AND status = 'active'",
+                      (job_id,),
+                  )
+                  if row is None:
+                      return 0
+                  return int(row["n"])
+
+              def job_status(
+                  self, *, job_id: str,
+              ) -> dict[str, object]:
+                  row = self._job_row_by_id(job_id)
+                  if row is None:
+                      raise LookupError(
+                          "unknown job:"
+                          f" {job_id}"
+                      )
+                  job = self._job_row(row)
+                  openings = int(job["openings"])
+                  active = (
+                      self._active_hires_count(
+                          job_id
+                      )
+                  )
+                  return {
+                      "job_id": job_id,
+                      "title": job["title"],
+                      "profession": job[
+                          "profession"
+                      ],
+                      "company_account": job[
+                          "company_account"
+                      ],
+                      "openings": openings,
+                      "hired": active,
+                      "remaining": max(
+                          openings - active, 0
+                      ),
+                      "status": job["status"],
+                  }
+
+              def create_proposal(
+                  self,
+                  *,
+                  proposal_id: str,
+                  job_id: str,
+                  company_account: str,
+                  worker_account: str,
+              ) -> dict[str, object]:
+                  company = self.get_account(
+                      company_account
+                  )
+                  if (
+                      company.get("role")
+                      != "empresa"
+                  ):
+                      raise ValueError(
+                          "only companies can"
+                          " send proposals"
+                      )
+                  worker = self.get_account(
+                      worker_account
+                  )
+                  if (
+                      worker.get("role")
+                      != "trabajador"
+                  ):
+                      raise ValueError(
+                          "only workers can"
+                          " receive proposals"
+                      )
+                  job_row = self._job_row_by_id(
+                      job_id
+                  )
+                  if job_row is None:
+                      raise LookupError(
+                          "unknown job:"
+                          f" {job_id}"
+                      )
+                  job = self._job_row(job_row)
+                  if job["status"] != "open":
+                      raise ValueError(
+                          "job not open"
+                      )
+                  if (
+                      worker.get("profession")
+                      != job["profession"]
+                  ):
+                      raise ValueError(
+                          "profession mismatch"
+                      )
+                  dup = self._db.query_one(
+                      "SELECT 1 FROM"
+                      " mpe_proposals WHERE"
+                      " job_id = ? AND"
+                      " worker_account = ? AND"
+                      " status = 'pending'",
+                      (job_id, worker_account),
+                  )
+                  if dup is not None:
+                      raise ValueError(
+                          "proposal already"
+                          " pending"
+                      )
+                  now = self._clock.now()
+                  with self._db.transaction() as cursor:
+                      cursor.execute(
+                          "INSERT INTO"
+                          " mpe_proposals"
+                          " (proposal_id, job_id,"
+                          "  company_account,"
+                          "  worker_account,"
+                          "  status, created_at)"
+                          " VALUES (?, ?, ?, ?,"
+                          "  'pending', ?)",
+                          (
+                              proposal_id,
+                              job_id,
+                              company_account,
+                              worker_account,
+                              now,
+                          ),
+                      )
+                  return {
+                      "proposal_id": proposal_id,
+                      "job_id": job_id,
+                      "worker_account": (
+                          worker_account
+                      ),
+                      "status": "pending",
+                  }
+
+              def list_proposals(
+                  self,
+                  *,
+                  worker_account: str | None = None,
+                  job_id: str | None = None,
+                  status: str | None = "pending",
+              ) -> tuple[dict[str, object], ...]:
+                  sql = (
+                      "SELECT * FROM"
+                      " mpe_proposals WHERE 1=1"
+                  )
+                  params: list[object] = []
+                  if worker_account is not None:
+                      sql += (
+                          " AND worker_account = ?"
+                      )
+                      params.append(
+                          worker_account
+                      )
+                  if job_id is not None:
+                      sql += " AND job_id = ?"
+                      params.append(job_id)
+                  if status is not None:
+                      sql += " AND status = ?"
+                      params.append(status)
+                  sql += " ORDER BY created_at"
+                  rows = self._db.query_all(
+                      sql, tuple(params)
+                  )
+                  return tuple(
+                      {
+                          "proposal_id": str(
+                              r["proposal_id"]
+                          ),
+                          "job_id": str(
+                              r["job_id"]
+                          ),
+                          "company_account": str(
+                              r[
+                                  "company_account"
+                              ]
+                          ),
+                          "worker_account": str(
+                              r[
+                                  "worker_account"
+                              ]
+                          ),
+                          "status": str(
+                              r["status"]
+                          ),
+                      }
+                      for r in rows
+                  )
+
+              def decide_proposal(
+                  self,
+                  *,
+                  proposal_id: str,
+                  accepted: bool,
+              ) -> dict[str, object]:
+                  row = self._db.query_one(
+                      "SELECT * FROM"
+                      " mpe_proposals WHERE"
+                      " proposal_id = ?",
+                      (proposal_id,),
+                  )
+                  if row is None:
+                      raise LookupError(
+                          "unknown proposal:"
+                          f" {proposal_id}"
+                      )
+                  if str(row["status"]) != "pending":
+                      raise ValueError(
+                          "proposal already"
+                          " decided"
+                      )
+                  job_id = str(row["job_id"])
+                  worker_account = str(
+                      row["worker_account"]
+                  )
+                  if accepted:
+                      job_row = (
+                          self._job_row_by_id(
+                              job_id
+                          )
+                      )
+                      if job_row is None:
+                          raise LookupError(
+                              "unknown job:"
+                              f" {job_id}"
+                          )
+                      if (
+                          str(job_row["status"])
+                          != "open"
+                      ):
+                          raise ValueError(
+                              "job not open"
+                          )
+                      if (
+                          self
+                          ._active_hires_count(
+                              job_id
+                          )
+                          >= int(
+                              job_row["openings"]
+                          )
+                      ):
+                          raise ValueError(
+                              "no openings left"
+                          )
+                      new_status = "accepted"
+                  else:
+                      new_status = "rejected"
+                  with self._db.transaction() as cursor:
+                      cursor.execute(
+                          "UPDATE mpe_proposals"
+                          " SET status = ?"
+                          " WHERE proposal_id = ?",
+                          (
+                              new_status,
+                              proposal_id,
+                          ),
+                      )
+                  result: dict[str, object] = {
+                      "proposal_id": proposal_id,
+                      "status": new_status,
+                      "job_id": job_id,
+                      "worker_account": (
+                          worker_account
+                      ),
+                  }
+                  if accepted:
+                      hire_id = (
+                          "HIR-"
+                          + proposal_id[5:]
+                      )
+                      hire = self.hire_worker(
+                          hire_id=hire_id,
+                          job_id=job_id,
+                          worker_account=(
+                              worker_account
+                          ),
+                      )
+                      result["hire"] = hire
+                  return result
+
+              def hire_worker(
+                  self,
+                  *,
+                  hire_id: str,
+                  job_id: str,
+                  worker_account: str,
+              ) -> dict[str, object]:
+                  worker = self.get_account(
+                      worker_account
+                  )
+                  if (
+                      worker.get("role")
+                      != "trabajador"
+                  ):
+                      raise ValueError(
+                          "only workers can be"
+                          " hired"
+                      )
+                  job_row = self._job_row_by_id(
+                      job_id
+                  )
+                  if job_row is None:
+                      raise LookupError(
+                          "unknown job:"
+                          f" {job_id}"
+                      )
+                  if (
+                      str(job_row["status"])
+                      != "open"
+                  ):
+                      raise ValueError(
+                          "job not open"
+                      )
+                  if (
+                      worker.get("profession")
+                      != str(
+                          job_row["profession"]
+                      )
+                  ):
+                      raise ValueError(
+                          "profession mismatch"
+                      )
+                  if (
+                      self._active_hires_count(
+                          job_id
+                      )
+                      >= int(job_row["openings"])
+                  ):
+                      raise ValueError(
+                          "no openings left"
+                      )
+                  dup = self._db.query_one(
+                      "SELECT 1 FROM mpe_hires"
+                      " WHERE job_id = ? AND"
+                      " worker_account = ? AND"
+                      " status = 'active'",
+                      (job_id, worker_account),
+                  )
+                  if dup is not None:
+                      raise ValueError(
+                          "already hired"
+                      )
+                  now = self._clock.now()
+                  with self._db.transaction() as cursor:
+                      cursor.execute(
+                          "INSERT INTO mpe_hires"
+                          " (hire_id, job_id,"
+                          "  worker_account,"
+                          "  status, created_at)"
+                          " VALUES (?, ?, ?,"
+                          "  'active', ?)",
+                          (
+                              hire_id,
+                              job_id,
+                              worker_account,
+                              now,
+                          ),
+                      )
+                  active = (
+                      self._active_hires_count(
+                          job_id
+                      )
+                  )
+                  openings = int(
+                      job_row["openings"]
+                  )
+                  filled = active >= openings
+                  if filled:
+                      with (
+                          self._db.transaction()
+                      ) as cursor:
+                          cursor.execute(
+                              "UPDATE mpe_jobs"
+                              " SET status ="
+                              " 'filled'"
+                              " WHERE job_id = ?",
+                              (job_id,),
+                          )
+                  return {
+                      "hire_id": hire_id,
+                      "job_id": job_id,
+                      "worker_account": (
+                          worker_account
+                      ),
+                      "hired": active,
+                      "remaining": max(
+                          openings - active, 0
+                      ),
+                      "job_status": (
+                          "filled"
+                          if filled
+                          else "open"
+                      ),
+                  }
+
+              def worker_leaves(
+                  self,
+                  *,
+                  job_id: str,
+                  worker_account: str,
+              ) -> dict[str, object]:
+                  row = self._db.query_one(
+                      "SELECT * FROM mpe_hires"
+                      " WHERE job_id = ? AND"
+                      " worker_account = ? AND"
+                      " status = 'active'",
+                      (job_id, worker_account),
+                  )
+                  if row is None:
+                      raise LookupError(
+                          "no active hire for"
+                          " this job/worker"
+                      )
+                  hire_id = str(row["hire_id"])
+                  with self._db.transaction() as cursor:
+                      cursor.execute(
+                          "UPDATE mpe_hires SET"
+                          " status = 'left'"
+                          " WHERE hire_id = ?",
+                          (hire_id,),
+                      )
+                  job_row = self._job_row_by_id(
+                      job_id
+                  )
+                  reopened = False
+                  if (
+                      job_row is not None
+                      and str(job_row["status"])
+                      == "filled"
+                  ):
+                      with (
+                          self._db.transaction()
+                      ) as cursor:
+                          cursor.execute(
+                              "UPDATE mpe_jobs"
+                              " SET status ="
+                              " 'open'"
+                              " WHERE job_id = ?",
+                              (job_id,),
+                          )
+                      reopened = True
+                  active = (
+                      self._active_hires_count(
+                          job_id
+                      )
+                  )
+                  openings = (
+                      int(job_row["openings"])
+                      if job_row is not None
+                      else 0
+                  )
+                  return {
+                      "job_id": job_id,
+                      "worker_account": (
+                          worker_account
+                      ),
+                      "hired": active,
+                      "remaining": max(
+                          openings - active, 0
+                      ),
+                      "status": (
+                          "open"
+                          if reopened
+                          else (
+                              str(
+                                  job_row[
+                                      "status"
+                                  ]
+                              )
+                              if job_row
+                              is not None
+                              else "open"
+                          )
+                      ),
+                      "reopened": reopened,
+                  }
+
+              def hires_for(
+                  self,
+                  *,
+                  job_id: str | None = None,
+                  worker_account: str | None = None,
+                  status: str | None = "active",
+              ) -> tuple[dict[str, object], ...]:
+                  sql = (
+                      "SELECT * FROM mpe_hires"
+                      " WHERE 1=1"
+                  )
+                  params: list[object] = []
+                  if job_id is not None:
+                      sql += " AND job_id = ?"
+                      params.append(job_id)
+                  if worker_account is not None:
+                      sql += (
+                          " AND worker_account = ?"
+                      )
+                      params.append(
+                          worker_account
+                      )
+                  if status is not None:
+                      sql += " AND status = ?"
+                      params.append(status)
+                  sql += " ORDER BY created_at"
+                  rows = self._db.query_all(
+                      sql, tuple(params)
+                  )
+                  return tuple(
+                      {
+                          "hire_id": str(
+                              r["hire_id"]
+                          ),
+                          "job_id": str(
+                              r["job_id"]
+                          ),
+                          "worker_account": str(
+                              r[
+                                  "worker_account"
+                              ]
+                          ),
+                          "status": str(
+                              r["status"]
+                          ),
+                      }
+                      for r in rows
+                  )
+
+              def summary(self) -> dict[str, object]:
+                  accounts = self._db.query_one(
+                      "SELECT COUNT(*) AS total,"
+                      " SUM(verified) AS verified"
+                      " FROM mpe_accounts"
+                  )
+                  roles = self._db.query_all(
+                      "SELECT role, COUNT(*) AS n"
+                      " FROM mpe_accounts"
+                      " GROUP BY role"
+                  )
+                  jobs = self._db.query_one(
+                      "SELECT COUNT(*) AS open_jobs"
+                      " FROM mpe_jobs"
+                      " WHERE status = 'open'"
+                  )
+                  apps = self._db.query_one(
+                      "SELECT COUNT(*) AS total"
+                      " FROM mpe_applications"
+                  )
+                  hires = self._db.query_one(
+                      "SELECT COUNT(*) AS total"
+                      " FROM mpe_hires"
+                      " WHERE status = 'active'"
+                  )
+                  props = self._db.query_one(
+                      "SELECT COUNT(*) AS total"
+                      " FROM mpe_proposals"
+                      " WHERE status = 'pending'"
+                  )
+                  by_role = {
+                      str(r["role"]): int(r["n"])
+                      for r in roles
+                  }
+                  total = 0
+                  verified = 0
+                  if accounts is not None:
+                      total = int(
+                          accounts["total"]
+                      )
+                      if (
+                          accounts["verified"]
+                          is not None
+                      ):
+                          verified = int(
+                              accounts[
+                                  "verified"
+                              ]
+                          )
+                  return {
+                      "accounts_total": total,
+                      "accounts_verified": (
+                          verified
+                      ),
+                      "by_role": by_role,
+                      "open_jobs": int(
+                          jobs["open_jobs"]
+                      )
+                      if jobs is not None
+                      else 0,
+                      "applications_total": int(
+                          apps["total"]
+                      )
+                      if apps is not None
+                      else 0,
+                      "hires_total": int(
+                          hires["total"]
+                      )
+                      if hires is not None
+                      else 0,
+                      "proposals_pending": int(
+                          props["total"]
+                      )
+                      if props is not None
+                      else 0,
+                  }
+
+              @staticmethod
+              def _account_row(row) -> dict[str, object]:
+                  return {
+                      "account_id": str(
+                          row["account_id"]
+                      ),
+                      "zid": (
+                          str(row["zid"])
+                          if row["zid"] is not None
+                          else None
+                      ),
+                      "name": str(row["name"]),
+                      "role": str(row["role"]),
+                      "profession": (
+                          str(row["profession"])
+                          if row["profession"]
+                          is not None
+                          else None
+                      ),
+                      "verified": bool(
+                          int(row["verified"])
+                      ),
+                      "created_at": float(
+                          row["created_at"]
+                      ),
+                  }
+
+              @staticmethod
+              def _job_row(row) -> dict[str, object]:
+                  return {
+                      "job_id": str(row["job_id"]),
+                      "company_account": str(
+                          row["company_account"]
+                      ),
+                      "title": str(row["title"]),
+                      "profession": str(
+                          row["profession"]
+                      ),
+                      "openings": int(
+                          row["openings"]
+                      ),
+                      "status": str(row["status"]),
+                      "created_at": float(
+                          row["created_at"]
+                      ),
+                  }
+          PYEOF
+          echo "store written"
+          wc -c apps/mi_primer_empleo/infrastructure/persistence/mpe_store.py
+
+      - name: Extend MpeLink (issue EMPLOYMENT credential)
         run: |
           set -euo pipefail
-          PYTHONPATH="$PWD" python -m pytest -q -p no:cacheprovider --timeout=180 --timeout-method=thread --durations=25
-          echo "=== FULL SUITE GREEN IN ONE RUN ==="
+          cat > apps/mi_primer_empleo/services/mpe_link.py <<'PYEOF'
+          """MpeLink: MPE operations on the Network."""
+          from __future__ import annotations
+
+          import base64
+
+          from apps.mi_primer_empleo.infrastructure.network.network_client import (
+              NetworkClient,
+          )
+
+
+          class MpeLink:
+              def __init__(
+                  self, client: NetworkClient
+              ) -> None:
+                  self._client = client
+
+              def register_app(self) -> tuple[
+                  bool, dict | None, str | None
+              ]:
+                  return self._client.post(
+                      "/apps/register",
+                      {
+                          "app_id": "mpe",
+                          "display_name": (
+                              "Mi Primer Empleo"
+                          ),
+                          "scopes": [
+                              "display_name",
+                              "contact",
+                          ],
+                      },
+                  )
+
+              def register_user(
+                  self, display_name: str
+              ) -> tuple[bool, dict | None, str | None]:
+                  return self._client.post(
+                      "/identity/register",
+                      {
+                          "kind": "person",
+                          "display_name": display_name,
+                          "actor": "mpe",
+                      },
+                  )
+
+              def register_company(
+                  self, display_name: str
+              ) -> tuple[bool, dict | None, str | None]:
+                  return self._client.post(
+                      "/identity/register",
+                      {
+                          "kind": "organization",
+                          "display_name": display_name,
+                          "actor": "mpe",
+                      },
+                  )
+
+              def complete_trust(
+                  self, zid: str
+              ) -> tuple[bool, dict | None, str | None]:
+                  return self._client.post(
+                      "/trust/complete",
+                      {"zid": zid, "actor": "mpe"},
+                  )
+
+              def is_trusted(
+                  self, zid: str
+              ) -> tuple[bool, dict | None, str | None]:
+                  return self._client.get(
+                      f"/trust/{zid}"
+                  )
+
+              def record_work_event(
+                  self,
+                  zid: str,
+                  event: str,
+                  detail: str,
+              ) -> tuple[bool, dict | None, str | None]:
+                  return self._client.post(
+                      "/history/append",
+                      {
+                          "zid": zid,
+                          "entry_type": "employment",
+                          "actor_app": "mpe",
+                          "payload": {
+                              "event": event,
+                              "detail": detail,
+                          },
+                      },
+                  )
+
+              def give_reputation(
+                  self,
+                  subject_zid: str,
+                  actor_zid: str,
+                  kind: str,
+                  evidence: str,
+              ) -> tuple[bool, dict | None, str | None]:
+                  evidence_b64 = base64.b64encode(
+                      evidence.encode("utf-8")
+                  ).decode("ascii")
+                  return self._client.post(
+                      "/reputation/record",
+                      {
+                          "subject_zid": subject_zid,
+                          "actor_zid": actor_zid,
+                          "kind": kind,
+                          "evidence_b64": (
+                              evidence_b64
+                          ),
+                      },
+                  )
+
+              def reputation_score(
+                  self, zid: str
+              ) -> tuple[bool, dict | None, str | None]:
+                  return self._client.get(
+                      f"/reputation/{zid}"
+                  )
+
+              def issue_employment_credential(
+                  self,
+                  *,
+                  subject_zid: str,
+                  issuer_zid: str,
+                  title: str,
+                  detail: str,
+              ) -> tuple[bool, dict | None, str | None]:
+                  return self._client.post(
+                      "/verification/credentials",
+                      {
+                          "subject_zid": subject_zid,
+                          "issuer_zid": issuer_zid,
+                          "credential_type":
+                          "employment",
+                          "title": title,
+                          "detail": detail,
+                      },
+                  )
+          PYEOF
+          echo "link written"
+          wc -c apps/mi_primer_empleo/services/mpe_link.py
+
+      - name: Rewrite MPE server (contracts preserved + hiring routes)
+        run: |
+          set -euo pipefail
+          cat > apps/mi_primer_empleo/server.py <<'PYEOF'
+          """MPE HTTP server: bidirectional employment."""
+          from __future__ import annotations
+
+          import json
+          import uuid
+          from http.server import (
+              BaseHTTPRequestHandler,
+              ThreadingHTTPServer,
+          )
+          from urllib.parse import parse_qs
+
+          from apps.mi_primer_empleo.infrastructure.persistence.mpe_store import (
+              MpeStore,
+          )
+          from apps.mi_primer_empleo.services.mpe_link import (
+              MpeLink,
+          )
+
+
+          def _new_account_id() -> str:
+              return "MPE-" + uuid.uuid4().hex[:12]
+
+
+          def _new_job_id() -> str:
+              return "JOB-" + uuid.uuid4().hex[:10]
+
+
+          def _new_proposal_id() -> str:
+              return "PROP-" + uuid.uuid4().hex[:10]
+
+
+          def _new_hire_id() -> str:
+              return "HIR-" + uuid.uuid4().hex[:10]
+
+
+          def _new_application_id() -> str:
+              return "APP-" + uuid.uuid4().hex[:10]
+
+
+          def _find_zid(doc):
+              if isinstance(doc, dict):
+                  for key, value in (
+                      doc.items()
+                  ):
+                      if (
+                          str(key).lower()
+                          == "zid"
+                          and isinstance(
+                              value, str
+                          )
+                          and value.startswith(
+                              "ZID-"
+                          )
+                      ):
+                          return value
+                  for value in doc.values():
+                      found = _find_zid(value)
+                      if found is not None:
+                          return found
+              elif isinstance(doc, list):
+                  for item in doc:
+                      found = _find_zid(item)
+                      if found is not None:
+                          return found
+              return None
+
+
+          class MpeApiHandler(BaseHTTPRequestHandler):
+              store: MpeStore
+              link: MpeLink
+
+              def log_message(
+                  self, format: str, *args,
+              ) -> None:
+                  pass
+
+              # ---------- helpers ----------
+
+              def _send_bytes(
+                  self,
+                  status: int,
+                  ctype: str,
+                  body: bytes,
+              ) -> None:
+                  self.send_response(status)
+                  self.send_header(
+                      "Content-Type", ctype
+                  )
+                  self.send_header(
+                      "Content-Length",
+                      str(len(body)),
+                  )
+                  self.end_headers()
+                  self.wfile.write(body)
+
+              def _send_html(
+                  self, status: int, html: str,
+              ) -> None:
+                  self._send_bytes(
+                      status,
+                      "text/html",
+                      html.encode("utf-8"),
+                  )
+
+              def _send_json(
+                  self, status: int, doc: dict,
+              ) -> None:
+                  self._send_bytes(
+                      status,
+                      "application/json",
+                      json.dumps(doc).encode(
+                          "utf-8"
+                      ),
+                  )
+
+              def _ok(self, data) -> None:
+                  self._send_json(
+                      200,
+                      {"ok": True, "data": data},
+                  )
+
+              def _api_error(
+                  self,
+                  status: int,
+                  message: str,
+              ) -> None:
+                  self._send_json(
+                      status,
+                      {
+                          "ok": False,
+                          "error": message,
+                      },
+                  )
+
+              def _html_error(
+                  self,
+                  status: int,
+                  message: str,
+              ) -> None:
+                  self._send_html(
+                      status,
+                      "<html><body><h1>MPE"
+                      "</h1><p>Error: "
+                      + message
+                      + "</p></body></html>",
+                  )
+
+              def _read_body(self) -> bytes:
+                  try:
+                      length = int(
+                          self.headers.get(
+                              "Content-Length",
+                              "0",
+                          )
+                          or "0"
+                      )
+                  except Exception:
+                      length = 0
+                  if length <= 0:
+                      return b""
+                  return self.rfile.read(
+                      length
+                  )
+
+              def _read_form(self) -> dict:
+                  raw = self._read_body()
+                  parsed = parse_qs(
+                      raw.decode("utf-8")
+                  )
+                  form: dict[str, str] = {}
+                  for key, values in (
+                      parsed.items()
+                  ):
+                      if values:
+                          form[key] = values[0]
+                  return form
+
+              def _read_json(self) -> dict | None:
+                  raw = self._read_body()
+                  if not raw:
+                      return {}
+                  try:
+                      doc = json.loads(
+                          raw.decode("utf-8")
+                      )
+                  except Exception:
+                      return None
+                  if not isinstance(doc, dict):
+                      return None
+                  return doc
+
+              @staticmethod
+              def _form_value(
+                  form: dict, key: str,
+              ) -> str:
+                  value = form.get(key, "")
+                  if value is None:
+                      return ""
+                  return str(value)
+
+              def _split_path(self) -> tuple[
+                  str, dict,
+              ]:
+                  raw = self.path
+                  if "?" in raw:
+                      path, qs = raw.split(
+                          "?", 1
+                      )
+                      query = {
+                          k: v[0]
+                          for k, v in parse_qs(
+                              qs
+                          ).items()
+                          if v
+                      }
+                  else:
+                      path = raw
+                      query = {}
+                  return path, query
+
+              # ---------- network on hire ----------
+
+              def _network_on_hire(
+                  self,
+                  job_id: str,
+                  worker_account: str,
+              ) -> dict:
+                  result: dict = {
+                      "credential": {
+                          "issued": False,
+                      },
+                      "history_recorded":
+                      False,
+                  }
+                  try:
+                      status = (
+                          self.store.job_status(
+                              job_id=job_id
+                          )
+                      )
+                      worker = (
+                          self.store.get_account(
+                              worker_account
+                          )
+                      )
+                      worker_zid = worker.get(
+                          "zid"
+                      )
+                      company = (
+                          self.store.get_account(
+                              str(
+                                  status[
+                                      "company_account"
+                                  ]
+                              )
+                          )
+                      )
+                      company_zid = (
+                          company.get("zid")
+                      )
+                      if (
+                          worker_zid
+                          and company_zid
+                      ):
+                          ok, data, err = (
+                              self.link
+                              .issue_employment_credential(
+                                  subject_zid=str(
+                                      worker_zid
+                                  ),
+                                  issuer_zid=str(
+                                      company_zid
+                                  ),
+                                  title=str(
+                                      status[
+                                          "title"
+                                      ]
+                                  ),
+                                  detail=(
+                                      "contratacion"
+                                      " registrada en"
+                                      " MPE"
+                                  ),
+                              )
+                          )
+                          credential = {
+                              "issued": bool(
+                                  ok
+                              ),
+                          }
+                          if (
+                              ok
+                              and isinstance(
+                                  data, dict
+                              )
+                          ):
+                              credential[
+                                  "credential_id"
+                              ] = (
+                                  data.get(
+                                      "credential_id"
+                                  )
+                                  or data.get(
+                                      "id"
+                                  )
+                              )
+                          elif not ok:
+                              credential[
+                                  "error"
+                              ] = err
+                          result[
+                              "credential"
+                          ] = credential
+                      if worker_zid:
+                          hok, _hd, _he = (
+                              self.link
+                              .record_work_event(
+                                  str(
+                                      worker_zid
+                                  ),
+                                  "hired",
+                                  str(
+                                      status[
+                                          "title"
+                                      ]
+                                  ),
+                              )
+                          )
+                          result[
+                              "history_recorded"
+                          ] = bool(hok)
+                  except Exception:
+                      pass
+                  return result
+
+              def _network_on_leave(
+                  self,
+                  job_id: str,
+                  worker_account: str,
+              ) -> bool:
+                  try:
+                      worker = (
+                          self.store.get_account(
+                              worker_account
+                          )
+                      )
+                      worker_zid = worker.get(
+                          "zid"
+                      )
+                      if not worker_zid:
+                          return False
+                      status = (
+                          self.store.job_status(
+                              job_id=job_id
+                          )
+                      )
+                      hok, _hd, _he = (
+                          self.link.record_work_event(
+                              str(worker_zid),
+                              "left",
+                              str(
+                                  status["title"]
+                              ),
+                          )
+                      )
+                      return bool(hok)
+                  except Exception:
+                      return False
+
+              # ---------- GET ----------
+
+              def do_GET(self) -> None:
+                  path, query = (
+                      self._split_path()
+                  )
+                  try:
+                      if path in (
+                          "/",
+                          "/mpe",
+                          "/mpe/home",
+                      ):
+                          self._send_html(
+                              200,
+                              self._home(),
+                          )
+                          return
+                      if path == "/mpe/jobs":
+                          self._send_html(
+                              200,
+                              self._jobs_html(),
+                          )
+                          return
+                      if path == (
+                          "/mpe/government/summary"
+                      ):
+                          self._send_html(
+                              200,
+                              self._gov_html(),
+                          )
+                          return
+                      if path.startswith(
+                          "/mpe/trabajador/"
+                      ):
+                          account_id = path.split(
+                              "/mpe/trabajador/",
+                              1,
+                          )[1]
+                          self._worker_panel(
+                              account_id
+                          )
+                          return
+                      if path.startswith(
+                          "/mpe/empresa/"
+                      ):
+                          account_id = path.split(
+                              "/mpe/empresa/",
+                              1,
+                          )[1]
+                          self._company_panel(
+                              account_id
+                          )
+                          return
+                      if path == (
+                          "/mpe/api/health"
+                      ):
+                          self._ok(
+                              {
+                                  "app": "mpe",
+                                  "status": "ok",
+                              }
+                          )
+                          return
+                      if path == (
+                          "/mpe/api/summary"
+                      ):
+                          self._ok(
+                              self.store.summary()
+                          )
+                          return
+                      if path == (
+                          "/mpe/api/jobs"
+                      ):
+                          jobs = []
+                          for job in (
+                              self.store.list_jobs()
+                          ):
+                              jobs.append(
+                                  self.store
+                                  .job_status(
+                                      job_id=str(
+                                          job[
+                                              "job_id"
+                                          ]
+                                      )
+                                  )
+                              )
+                          self._ok(
+                              {"jobs": jobs}
+                          )
+                          return
+                      if path == (
+                          "/mpe/api/workers"
+                      ):
+                          profession = query.get(
+                              "profession"
+                          )
+                          workers = (
+                              self.store
+                              .list_workers(
+                                  profession=(
+                                      profession
+                                  )
+                              )
+                          )
+                          self._ok(
+                              {
+                                  "workers": list(
+                                      workers
+                                  )
+                              }
+                          )
+                          return
+                      if path.startswith(
+                          "/mpe/api/job/"
+                      ):
+                          job_id = path.split(
+                              "/mpe/api/job/",
+                              1,
+                          )[1]
+                          self._ok(
+                              self.store.job_status(
+                                  job_id=job_id
+                              )
+                          )
+                          return
+                      if path == (
+                          "/mpe/api/proposals"
+                      ):
+                          proposals = (
+                              self.store
+                              .list_proposals(
+                                  worker_account=(
+                                      query.get(
+                                          "worker"
+                                      )
+                                  ),
+                                  job_id=(
+                                      query.get(
+                                          "job"
+                                      )
+                                  ),
+                                  status=(
+                                      query.get(
+                                          "status",
+                                          "pending",
+                                      )
+                                  ),
+                              )
+                          )
+                          self._ok(
+                              {
+                                  "proposals": list(
+                                      proposals
+                                  )
+                              }
+                          )
+                          return
+                      self._api_error(
+                          404,
+                          "unknown path: "
+                          + path,
+                      )
+                  except LookupError as exc:
+                      self._api_error(
+                          404, str(exc)
+                      )
+                  except ValueError as exc:
+                      self._api_error(
+                          400, str(exc)
+                      )
+                  except Exception:
+                      self._api_error(
+                          500, "server error"
+                      )
+
+              def _home(self) -> str:
+                  return (
+                      "<html><head>"
+                      "<title>MPE</title></head>"
+                      "<body><h1>MPE - Mi Primer"
+                      " Empleo</h1>"
+                      "<p>El trabajo busca al"
+                      " trabajador.</p>"
+                      "<ul>"
+                      "<li>POST /mpe/register"
+                      " (form)</li>"
+                      "<li>POST /mpe/job"
+                      " (form)</li>"
+                      "<li>POST /mpe/apply"
+                      " (form)</li>"
+                      "<li>POST /mpe/proposal"
+                      " (form)</li>"
+                      "<li>POST"
+                      " /mpe/proposal-decide"
+                      " (form)</li>"
+                      "<li>POST /mpe/hire"
+                      " (form)</li>"
+                      "<li>POST /mpe/leave"
+                      " (form)</li>"
+                      "<li>GET"
+                      " /mpe/api/summary</li>"
+                      "</ul></body></html>"
+                  )
+
+              def _jobs_html(self) -> str:
+                  html = (
+                      "<html><body><h1>Vacantes"
+                      " abiertas</h1><ul>"
+                  )
+                  for job in (
+                      self.store.list_jobs()
+                  ):
+                      status = (
+                          self.store.job_status(
+                              job_id=str(
+                                  job["job_id"]
+                              )
+                          )
+                      )
+                      html += (
+                          "<li>"
+                          + str(
+                              status["job_id"]
+                          )
+                          + " | "
+                          + str(status["title"])
+                          + " | contratados "
+                          + str(status["hired"])
+                          + "/"
+                          + str(
+                              status["openings"]
+                          )
+                          + " | quedan "
+                          + str(
+                              status["remaining"]
+                          )
+                          + "</li>"
+                      )
+                  html += (
+                      "</ul></body></html>"
+                  )
+                  return html
+
+              def _gov_html(self) -> str:
+                  data = self.store.summary()
+                  return (
+                      "<html><body><h1>Resumen"
+                      " gobierno</h1>"
+                      "<p>cuentas: "
+                      + str(
+                          data["accounts_total"]
+                      )
+                      + "</p>"
+                      "<p>verificadas: "
+                      + str(
+                          data[
+                              "accounts_verified"
+                          ]
+                      )
+                      + "</p>"
+                      "<p>vacantes abiertas: "
+                      + str(data["open_jobs"])
+                      + "</p>"
+                      "<p>aplicaciones: "
+                      + str(
+                          data[
+                              "applications_total"
+                          ]
+                      )
+                      + "</p>"
+                      "<p>contrataciones"
+                      " activas: "
+                      + str(data["hires_total"])
+                      + "</p>"
+                      "<p>propuestas pendientes:"
+                      " "
+                      + str(
+                          data[
+                              "proposals_pending"
+                          ]
+                      )
+                      + "</p></body></html>"
+                  )
+
+              def _worker_panel(
+                  self, account_id: str,
+              ) -> None:
+                  try:
+                      account = (
+                          self.store.get_account(
+                              account_id
+                          )
+                      )
+                  except LookupError:
+                      self._html_error(
+                          404,
+                          "cuenta no existe",
+                      )
+                      return
+                  html = (
+                      "<html><body><h1>Panel"
+                      " trabajador</h1>"
+                      "<p>"
+                      + str(account["name"])
+                      + " ("
+                      + str(
+                          account["profession"]
+                      )
+                      + ")</p>"
+                      "<h2>Propuestas"
+                      " recibidas</h2><ul>"
+                  )
+                  proposals = (
+                      self.store.list_proposals(
+                          worker_account=(
+                              account_id
+                          ),
+                          status="pending",
+                      )
+                  )
+                  for proposal in proposals:
+                      html += (
+                          "<li>propuesta "
+                          + str(
+                              proposal[
+                                  "proposal_id"
+                              ]
+                          )
+                          + " para vacante "
+                          + str(proposal["job_id"])
+                          + " |"
+                          + " <form method='POST'"
+                          + " action="
+                          + "'/mpe/proposal-decide'>"
+                          + "<input type='hidden'"
+                          + " name='proposal_id'"
+                          + " value='"
+                          + str(
+                              proposal[
+                                  "proposal_id"
+                              ]
+                          )
+                          + "'>"
+                          + "<button name='decision'"
+                          + " value='aceptar'>"
+                          + "Aceptar</button>"
+                          + "<button name='decision'"
+                          + " value='rechazar'>"
+                          + "Rechazar</button>"
+                          + "</form></li>"
+                      )
+                  html += (
+                      "</ul><h2>Vacantes para ti"
+                      "</h2><ul>"
+                  )
+                  for job in (
+                      self.store.list_jobs(
+                          profession=account.get(
+                              "profession"
+                          )
+                      )
+                  ):
+                      html += (
+                          "<li>"
+                          + str(job["title"])
+                          + " ("
+                          + str(job["job_id"])
+                          + ")</li>"
+                      )
+                  html += "</ul></body></html>"
+                  self._send_html(200, html)
+
+              def _company_panel(
+                  self, account_id: str,
+              ) -> None:
+                  try:
+                      account = (
+                          self.store.get_account(
+                              account_id
+                          )
+                      )
+                  except LookupError:
+                      self._html_error(
+                          404,
+                          "cuenta no existe",
+                      )
+                      return
+                  if account.get("role") != (
+                      "empresa"
+                  ):
+                      self._html_error(
+                          400,
+                          "no es empresa",
+                      )
+                      return
+                  html = (
+                      "<html><body><h1>Panel"
+                      " empresa</h1><p>"
+                      + str(account["name"])
+                      + "</p><h2>Tus vacantes"
+                      "</h2><ul>"
+                  )
+                  for job in (
+                      self.store.list_company_jobs(
+                          company_account=(
+                              account_id
+                          )
+                      )
+                  ):
+                      status = (
+                          self.store.job_status(
+                              job_id=str(
+                                  job["job_id"]
+                              )
+                          )
+                      )
+                      html += (
+                          "<li>"
+                          + str(status["title"])
+                          + " | "
+                          + str(status["status"])
+                          + " | contratados "
+                          + str(status["hired"])
+                          + "/"
+                          + str(
+                              status["openings"]
+                          )
+                          + " | quedan "
+                          + str(
+                              status["remaining"]
+                          )
+                          + "</li>"
+                      )
+                  html += (
+                      "</ul><h2>Trabajadores"
+                      " disponibles</h2><ul>"
+                  )
+                  for worker in (
+                      self.store.list_workers()
+                  ):
+                      html += (
+                          "<li>"
+                          + str(worker["name"])
+                          + " ("
+                          + str(
+                              worker[
+                                  "profession"
+                              ]
+                          )
+                          + ")</li>"
+                      )
+                  html += "</ul></body></html>"
+                  self._send_html(200, html)
+
+              # ---------- POST ----------
+
+              def do_POST(self) -> None:
+                  path, _query = (
+                      self._split_path()
+                  )
+                  try:
+                      if path == "/mpe/register":
+                          self._register()
+                          return
+                      if path == "/mpe/job":
+                          self._post_job_form()
+                          return
+                      if path == "/mpe/apply":
+                          self._apply_form()
+                          return
+                      if path == "/mpe/proposal":
+                          self._proposal_form()
+                          return
+                      if path == (
+                          "/mpe/proposal-decide"
+                      ):
+                          self._decide_form()
+                          return
+                      if path == "/mpe/hire":
+                          self._hire_form()
+                          return
+                      if path == "/mpe/leave":
+                          self._leave_form()
+                          return
+                      if path == (
+                          "/mpe/api/accounts"
+                      ):
+                          self._api_account()
+                          return
+                      if path == "/mpe/api/jobs":
+                          self._api_job()
+                          return
+                      if path == (
+                          "/mpe/api/proposals"
+                      ):
+                          self._api_proposal()
+                          return
+                      if path == (
+                          "/mpe/api/proposals"
+                          "/decide"
+                      ):
+                          self._api_decide()
+                          return
+                      if path == (
+                          "/mpe/api/hires"
+                      ):
+                          self._api_hire()
+                          return
+                      if path == (
+                          "/mpe/api/leave"
+                      ):
+                          self._api_leave()
+                          return
+                      self._api_error(
+                          404,
+                          "unknown path: "
+                          + path,
+                      )
+                  except LookupError as exc:
+                      self._api_error(
+                          404, str(exc)
+                      )
+                  except (
+                      ValueError,
+                      PermissionError,
+                  ) as exc:
+                      self._api_error(
+                          400, str(exc)
+                      )
+                  except Exception:
+                      self._api_error(
+                          500, "server error"
+                      )
+
+              def _register(self) -> None:
+                  form = self._read_form()
+                  role = self._form_value(
+                      form, "role"
+                  )
+                  name = self._form_value(
+                      form, "name"
+                  )
+                  profession = self._form_value(
+                      form, "profession"
+                  )
+                  if role not in (
+                      "trabajador",
+                      "empresa",
+                  ):
+                      self._html_error(
+                          400, "role invalido"
+                      )
+                      return
+                  if not name:
+                      self._html_error(
+                          400, "name requerido"
+                      )
+                      return
+                  zid = None
+                  if role == "trabajador":
+                      ok, data, _err = (
+                          self.link.register_user(
+                              name
+                          )
+                      )
+                  else:
+                      ok, data, _err = (
+                          self.link
+                          .register_company(
+                              name
+                          )
+                      )
+                  if ok and data is not None:
+                      zid = _find_zid(data)
+                  account_id = _new_account_id()
+                  self.store.add_account(
+                      account_id=account_id,
+                      zid=zid,
+                      name=name,
+                      role=role,
+                      profession=(
+                          profession or None
+                      ),
+                  )
+                  if zid is not None:
+                      self.store.mark_verified(
+                          account_id=account_id
+                      )
+                  html = (
+                      "<html><body><h1>MPE</h1>"
+                      "<p>Cuenta registrada</p>"
+                      "<p>id: "
+                      + account_id
+                      + "</p><p>zid: "
+                      + str(zid)
+                      + "</p></body></html>"
+                  )
+                  self._send_html(200, html)
+
+              def _post_job_form(self) -> None:
+                  form = self._read_form()
+                  job = self.store.post_job(
+                      job_id=_new_job_id(),
+                      company_account=(
+                          self._form_value(
+                              form,
+                              "company_account",
+                          )
+                      ),
+                      title=self._form_value(
+                          form, "title"
+                      ),
+                      profession=(
+                          self._form_value(
+                              form,
+                              "profession",
+                          )
+                      ),
+                      openings=int(
+                          self._form_value(
+                              form, "openings",
+                              )
+                          or "1"
+                      ),
+                  )
+                  self._send_html(
+                      200,
+                      "<html><body><h1>MPE</h1>"
+                      "<p>Vacante publicada</p>"
+                      "<p>job: "
+                      + str(job["job_id"])
+                      + "</p></body></html>",
+                  )
+
+              def _apply_form(self) -> None:
+                  form = self._read_form()
+                  self.store.apply(
+                      application_id=(
+                          _new_application_id()
+                      ),
+                      job_id=self._form_value(
+                          form, "job_id"
+                      ),
+                      worker_account=(
+                          self._form_value(
+                              form,
+                              "worker_account",
+                          )
+                      ),
+                  )
+                  self._send_html(
+                      200,
+                      "<html><body><h1>MPE</h1>"
+                      "<p>Aplicacion enviada"
+                      "</p></body></html>",
+                  )
+
+              def _proposal_form(self) -> None:
+                  form = self._read_form()
+                  proposal = (
+                      self.store.create_proposal(
+                          proposal_id=(
+                              _new_proposal_id()
+                          ),
+                          job_id=(
+                              self._form_value(
+                                  form, "job_id"
+                              )
+                          ),
+                          company_account=(
+                              self._form_value(
+                                  form,
+                                  "company_account",
+                              )
+                          ),
+                          worker_account=(
+                              self._form_value(
+                                  form,
+                                  "worker_account",
+                              )
+                          ),
+                      )
+                  )
+                  self._send_html(
+                      200,
+                      "<html><body><h1>MPE</h1>"
+                      "<p>Propuesta enviada</p>"
+                      "<p>propuesta: "
+                      + str(
+                          proposal[
+                              "proposal_id"
+                          ]
+                      )
+                      + "</p></body></html>",
+                  )
+
+              def _decide_form(self) -> None:
+                  form = self._read_form()
+                  decision = self._form_value(
+                      form, "decision"
+                  )
+                  if decision not in (
+                      "aceptar",
+                      "rechazar",
+                  ):
+                      self._html_error(
+                          400,
+                          "decision invalida",
+                      )
+                      return
+                  result = (
+                      self.store.decide_proposal(
+                          proposal_id=(
+                              self._form_value(
+                                  form,
+                                  "proposal_id",
+                              )
+                          ),
+                          accepted=(
+                              decision
+                              == "aceptar"
+                          ),
+                      )
+                  )
+                  if result["status"] == (
+                      "accepted"
+                  ):
+                      net = (
+                          self._network_on_hire(
+                              str(
+                                  result["job_id"]
+                              ),
+                              str(
+                                  result[
+                                      "worker_account"
+                                  ]
+                              ),
+                          )
+                      )
+                      self._send_html(
+                          200,
+                          "<html><body><h1>MPE"
+                          "</h1><p>Contratado</p>"
+                          "<p>contratados: "
+                          + str(
+                              result["hire"][
+                                  "hired"
+                              ]
+                          )
+                          + " | quedan: "
+                          + str(
+                              result["hire"][
+                                  "remaining"
+                              ]
+                          )
+                          + "</p>"
+                          "<p>credencial: "
+                          + str(
+                              net["credential"][
+                                  "issued"
+                              ]
+                          )
+                          + "</p></body></html>",
+                      )
+                      return
+                  self._send_html(
+                      200,
+                      "<html><body><h1>MPE</h1>"
+                      "<p>Propuesta rechazada"
+                      "</p></body></html>",
+                  )
+
+              def _hire_form(self) -> None:
+                  form = self._read_form()
+                  job_id = self._form_value(
+                      form, "job_id"
+                  )
+                  worker_account = (
+                      self._form_value(
+                          form, "worker_account"
+                      )
+                  )
+                  hire = self.store.hire_worker(
+                      hire_id=_new_hire_id(),
+                      job_id=job_id,
+                      worker_account=(
+                          worker_account
+                      ),
+                  )
+                  net = self._network_on_hire(
+                      job_id, worker_account
+                  )
+                  self._send_html(
+                      200,
+                      "<html><body><h1>MPE</h1>"
+                      "<p>Contratado</p>"
+                      "<p>contratados: "
+                      + str(hire["hired"])
+                      + " | quedan: "
+                      + str(hire["remaining"])
+                      + " | estado: "
+                      + str(hire["job_status"])
+                      + "</p>"
+                      "<p>credencial: "
+                      + str(
+                          net["credential"][
+                              "issued"
+                          ]
+                      )
+                      + "</p></body></html>",
+                  )
+
+              def _leave_form(self) -> None:
+                  form = self._read_form()
+                  job_id = self._form_value(
+                      form, "job_id"
+                  )
+                  worker_account = (
+                      self._form_value(
+                          form, "worker_account"
+                      )
+                  )
+                  result = (
+                      self.store.worker_leaves(
+                          job_id=job_id,
+                          worker_account=(
+                              worker_account
+                          ),
+                      )
+                  )
+                  self._network_on_leave(
+                      job_id, worker_account
+                  )
+                  self._send_html(
+                      200,
+                      "<html><body><h1>MPE</h1>"
+                      "<p>Abandono registrado"
+                      "</p><p>reabierta: "
+                      + str(result["reopened"])
+                      + " | quedan: "
+                      + str(result["remaining"])
+                      + "</p></body></html>",
+                  )
+
+              def _api_account(self) -> None:
+                  doc = self._read_json()
+                  if doc is None:
+                      self._api_error(
+                          400, "invalid JSON"
+                      )
+                      return
+                  role = str(
+                      doc.get("role", "")
+                  )
+                  name = str(
+                      doc.get("name", "")
+                  )
+                  profession = doc.get(
+                      "profession"
+                  )
+                  zid = None
+                  if role == "trabajador":
+                      ok, data, _err = (
+                          self.link.register_user(
+                              name
+                          )
+                      )
+                  elif role == "empresa":
+                      ok, data, _err = (
+                          self.link
+                          .register_company(
+                              name
+                          )
+                      )
+                  else:
+                      self._api_error(
+                          400, "role invalido"
+                      )
+                      return
+                  if ok and data is not None:
+                      zid = _find_zid(data)
+                  account_id = _new_account_id()
+                  account = (
+                      self.store.add_account(
+                          account_id=account_id,
+                          zid=zid,
+                          name=name,
+                          role=role,
+                          profession=(
+                              str(profession)
+                              if profession
+                              else None
+                          ),
+                      )
+                  )
+                  if zid is not None:
+                      self.store.mark_verified(
+                          account_id=account_id
+                      )
+                  self._ok(account)
+
+              def _api_job(self) -> None:
+                  doc = self._read_json()
+                  if doc is None:
+                      self._api_error(
+                          400, "invalid JSON"
+                      )
+                      return
+                  job = self.store.post_job(
+                      job_id=_new_job_id(),
+                      company_account=str(
+                          doc.get(
+                              "company_account",
+                              "",
+                          )
+                      ),
+                      title=str(
+                          doc.get("title", "")
+                      ),
+                      profession=str(
+                          doc.get(
+                              "profession", ""
+                          )
+                      ),
+                      openings=int(
+                          doc.get("openings", 1)
+                      ),
+                  )
+                  self._ok(job)
+
+              def _api_proposal(self) -> None:
+                  doc = self._read_json()
+                  if doc is None:
+                      self._api_error(
+                          400, "invalid JSON"
+                      )
+                      return
+                  proposal = (
+                      self.store.create_proposal(
+                          proposal_id=(
+                              _new_proposal_id()
+                          ),
+                          job_id=str(
+                              doc.get(
+                                  "job_id", ""
+                              )
+                          ),
+                          company_account=str(
+                              doc.get(
+                                  "company_account",
+                                  "",
+                              )
+                          ),
+                          worker_account=str(
+                              doc.get(
+                                  "worker_account",
+                                  "",
+                              )
+                          ),
+                      )
+                  )
+                  self._ok(proposal)
+
+              def _api_decide(self) -> None:
+                  doc = self._read_json()
+                  if doc is None:
+                      self._api_error(
+                          400, "invalid JSON"
+                      )
+                      return
+                  decision = str(
+                      doc.get("decision", "")
+                  )
+                  if decision not in (
+                      "aceptar",
+                      "rechazar",
+                  ):
+                      self._api_error(
+                          400,
+                          "decision invalida",
+                      )
+                      return
+                  accepted = (
+                      decision == "aceptar"
+                  )
+                  result = (
+                      self.store.decide_proposal(
+                          proposal_id=str(
+                              doc.get(
+                                  "proposal_id",
+                                  "",
+                              )
+                          ),
+                          accepted=accepted,
+                      )
+                  )
+                  if accepted:
+                      result["network"] = (
+                          self._network_on_hire(
+                              str(
+                                  result["job_id"]
+                              ),
+                              str(
+                                  result[
+                                      "worker_account"
+                                  ]
+                              ),
+                          )
+                      )
+                  self._ok(result)
+
+              def _api_hire(self) -> None:
+                  doc = self._read_json()
+                  if doc is None:
+                      self._api_error(
+                          400, "invalid JSON"
+                      )
+                      return
+                  job_id = str(
+                      doc.get("job_id", "")
+                  )
+                  worker_account = str(
+                      doc.get(
+                          "worker_account", ""
+                      )
+                  )
+                  hire = self.store.hire_worker(
+                      hire_id=_new_hire_id(),
+                      job_id=job_id,
+                      worker_account=(
+                          worker_account
+                      ),
+                  )
+                  network = (
+                      self._network_on_hire(
+                          job_id,
+                          worker_account,
+                      )
+                  )
+                  self._ok(
+                      {
+                          "hire": hire,
+                          "network": network,
+                      }
+                  )
+
+              def _api_leave(self) -> None:
+                  doc = self._read_json()
+                  if doc is None:
+                      self._api_error(
+                          400, "invalid JSON"
+                      )
+                      return
+                  job_id = str(
+                      doc.get("job_id", "")
+                  )
+                  worker_account = str(
+                      doc.get(
+                          "worker_account", ""
+                      )
+                  )
+                  result = (
+                      self.store.worker_leaves(
+                          job_id=job_id,
+                          worker_account=(
+                              worker_account
+                          ),
+                      )
+                  )
+                  self._network_on_leave(
+                      job_id, worker_account
+                  )
+                  self._ok(result)
+
+
+          def serve_mpe(
+              store: MpeStore,
+              client: object,
+              *,
+              host: str = "127.0.0.1",
+              port: int = 0,
+          ) -> ThreadingHTTPServer:
+              handler = type(
+                  "BoundMpeHandler",
+                  (MpeApiHandler,),
+                  {
+                      "store": store,
+                      "link": MpeLink(client),
+                  },
+              )
+              server = ThreadingHTTPServer(
+                  (host, port), handler,
+              )
+              server.bound_port = (
+                  server.server_address[1]
+              )
+              return server
+          PYEOF
+          echo "server written"
+          wc -c apps/mi_primer_empleo/server.py
+
+      - name: Syntax check
+        run: |
+          set -euo pipefail
+          python -m py_compile \
+            apps/mi_primer_empleo/infrastructure/persistence/mpe_store.py \
+            apps/mi_primer_empleo/services/mpe_link.py \
+            apps/mi_primer_empleo/server.py
+          echo "syntax OK"
+
+      - name: Internal probe (dynamic openings cycle)
+        run: |
+          set -euo pipefail
+          PYTHONPATH="$PWD" python - <<'PYEOF'
+          import tempfile
+          from pathlib import Path
+
+          from shared_engines.common.clocks import (
+              FrozenClock,
+          )
+          from shared_engines.storage.database import (
+              SQLiteAdapter,
+          )
+
+          from apps.mi_primer_empleo.infrastructure.persistence.mpe_store import (
+              MpeStore,
+          )
+
+          tmp = Path(tempfile.mkdtemp())
+          db = SQLiteAdapter(tmp / "probe.db")
+          store = MpeStore(db, FrozenClock())
+          store.add_account(
+              account_id="MPE-co",
+              zid=None,
+              name="Co",
+              role="empresa",
+              profession=None,
+          )
+          for index in range(1, 4):
+              store.add_account(
+                  account_id="MPE-w" + str(index),
+                  zid=None,
+                  name="W" + str(index),
+                  role="trabajador",
+                  profession="albanil",
+              )
+          store.post_job(
+              job_id="JOB-1",
+              company_account="MPE-co",
+              title="Obra",
+              profession="albanil",
+              openings=2,
+          )
+          store.create_proposal(
+              proposal_id="PROP-1",
+              job_id="JOB-1",
+              company_account="MPE-co",
+              worker_account="MPE-w1",
+          )
+          result = store.decide_proposal(
+              proposal_id="PROP-1",
+              accepted=True,
+          )
+          assert result["hire"]["hired"] == 1
+          assert result["hire"]["remaining"] == 1
+          store.hire_worker(
+              hire_id="HIR-d1",
+              job_id="JOB-1",
+              worker_account="MPE-w2",
+          )
+          status = store.job_status(
+              job_id="JOB-1"
+          )
+          assert status["hired"] == 2
+          assert status["remaining"] == 0
+          assert status["status"] == "filled"
+          try:
+              store.hire_worker(
+                  hire_id="HIR-x",
+                  job_id="JOB-1",
+                  worker_account="MPE-w3",
+              )
+              raise AssertionError(
+                  "overfill must fail"
+              )
+          except ValueError:
+              pass
+          leave = store.worker_leaves(
+              job_id="JOB-1",
+              worker_account="MPE-w1",
+          )
+          assert leave["reopened"] is True
+          assert leave["remaining"] == 1
+          assert leave["status"] == "open"
+          print("PROBE OK: dynamic openings")
+          db.close()
+          PYEOF
+
+      - name: Write hiring e2e test
+        run: |
+          set -euo pipefail
+          cat > apps/mi_primer_empleo/tests/test_mpe_hiring_e2e.py <<'PYEOF'
+          """MPE hiring e2e: company searches workers, sends
+          proposals, worker accepts/rejects, dynamic openings
+          fill and reopen, EMPLOYMENT credential issued on the
+          network."""
+          from __future__ import annotations
+
+          import json
+          import re
+          import threading
+          import urllib.error
+          from pathlib import Path
+          from urllib.request import (
+              Request,
+              urlopen,
+          )
+
+          from shared_engines.common.clocks import FrozenClock
+          from shared_engines.runtime.capabilities import (
+              ZyraCapabilities,
+          )
+          from shared_engines.runtime.combined_api import (
+              serve_combined,
+          )
+          from shared_engines.runtime.config import RuntimeConfig
+          from shared_engines.runtime.kernel import ZyraKernel
+          from shared_engines.storage.database import SQLiteAdapter
+          from shared_engines.verification.signatures import (
+              Ed25519Signer,
+          )
+
+          from apps.mi_primer_empleo.infrastructure.network.network_client import (
+              NetworkClient,
+          )
+          from apps.mi_primer_empleo.infrastructure.persistence.mpe_store import (
+              MpeStore,
+          )
+          from apps.mi_primer_empleo.server import serve_mpe
+          from apps.mi_primer_empleo.services.mpe_link import (
+              MpeLink,
+          )
+
+
+          class _Ecosystem:
+              def __init__(self, tmp_path: Path) -> None:
+                  self.net_db = SQLiteAdapter(
+                      tmp_path / "network.db"
+                  )
+                  net_clock = FrozenClock()
+                  signer, _ = Ed25519Signer.generate()
+                  config = RuntimeConfig(
+                      host="127.0.0.1",
+                      port=0,
+                      api_token=None,
+                  )
+                  self.kernel = ZyraKernel(
+                      db=self.net_db,
+                      clock=net_clock,
+                      signer=signer,
+                      config=config,
+                  )
+                  self.kernel.bootstrap_root()
+                  self.caps = ZyraCapabilities(
+                      self.net_db,
+                      net_clock,
+                      identity=self.kernel.identity,
+                      signer=signer,
+                  )
+                  self.net_server = serve_combined(
+                      self.kernel,
+                      self.caps,
+                      host="127.0.0.1",
+                      port=0,
+                  )
+                  self.net_thread = threading.Thread(
+                      target=(
+                          self.net_server
+                          .serve_forever
+                      ),
+                      daemon=True,
+                  )
+                  self.net_thread.start()
+                  self.net_base = (
+                      "http://127.0.0.1:"
+                      f"{self.net_server.server_address[1]}"
+                  )
+                  self.client = NetworkClient(
+                      "http://127.0.0.1:"
+                      f"{self.net_server.server_address[1]}",
+                      max_retries=1,
+                  )
+                  self.mpe_db = SQLiteAdapter(
+                      tmp_path / "mpe.db"
+                  )
+                  self.store = MpeStore(
+                      self.mpe_db, FrozenClock()
+                  )
+                  self.link = MpeLink(self.client)
+                  self.mpe_server = serve_mpe(
+                      self.store, self.client
+                  )
+                  self.mpe_thread = threading.Thread(
+                      target=(
+                          self.mpe_server
+                          .serve_forever
+                      ),
+                      daemon=True,
+                  )
+                  self.mpe_thread.start()
+                  self.mpe_base = (
+                      "http://127.0.0.1:"
+                      f"{self.mpe_server.bound_port}"
+                  )
+
+              def close(self) -> None:
+                  self.mpe_server.shutdown()
+                  self.mpe_server.server_close()
+                  self.mpe_thread.join(timeout=5)
+                  self.net_server.shutdown()
+                  self.net_server.server_close()
+                  self.net_thread.join(timeout=5)
+                  self.mpe_db.close()
+                  self.net_db.close()
+
+
+          def _post_form(url: str, doc: dict) -> str:
+              request = Request(
+                  url,
+                  data=(
+                      "&".join(
+                          str(k)
+                          + "="
+                          + str(v)
+                          for k, v in doc.items()
+                      )
+                  ).encode("utf-8"),
+                  method="POST",
+              )
+              with urlopen(request, timeout=10) as r:
+                  return r.read().decode("utf-8")
+
+
+          def _post_json(
+              url: str, doc: dict,
+          ) -> dict:
+              request = Request(
+                  url,
+                  data=json.dumps(doc).encode(
+                      "utf-8"
+                  ),
+                  headers={
+                      "Content-Type":
+                      "application/json"
+                  },
+                  method="POST",
+              )
+              with urlopen(
+                  request, timeout=10
+              ) as response:
+                  body = json.loads(
+                      response.read().decode(
+                          "utf-8"
+                      )
+                  )
+              assert isinstance(body, dict)
+              return body
+
+
+          def _get_json(url: str) -> dict:
+              with urlopen(url, timeout=10) as r:
+                  body = json.loads(
+                      r.read().decode("utf-8")
+                  )
+              assert isinstance(body, dict)
+              return body
+
+
+          def _job_status(eco, job_id: str) -> dict:
+              body = _get_json(
+                  eco.mpe_base
+                  + "/mpe/api/job/"
+                  + job_id
+              )
+              data = body["data"]
+              assert isinstance(data, dict)
+              return data
+
+
+          def test_mpe_hiring_full_cycle(
+              tmp_path: Path,
+          ) -> None:
+              eco = _Ecosystem(tmp_path)
+              try:
+                  assert (
+                      eco.link.register_app()[0]
+                      is True
+                  )
+                  company_html = _post_form(
+                      eco.mpe_base
+                      + "/mpe/register",
+                      {
+                          "role": "empresa",
+                          "name": (
+                              "Constructora SV"
+                          ),
+                          "profession":
+                          "construccion",
+                      },
+                  )
+                  company_id = re.search(
+                      r"MPE-[a-f0-9]{12}",
+                      company_html,
+                  ).group(0)
+                  worker_ids: list[str] = []
+                  for index in range(1, 6):
+                      html = _post_form(
+                          eco.mpe_base
+                          + "/mpe/register",
+                          {
+                              "role":
+                              "trabajador",
+                              "name": "Albanil "
+                              + str(index),
+                              "profession":
+                              "albanil",
+                          },
+                      )
+                      worker_ids.append(
+                          re.search(
+                              r"MPE-[a-f0-9]{12}",
+                              html,
+                          ).group(0)
+                      )
+                  _post_form(
+                      eco.mpe_base + "/mpe/job",
+                      {
+                          "company_account": (
+                              company_id
+                          ),
+                          "title": (
+                              "Obra necesita"
+                              " albaniles"
+                          ),
+                          "profession":
+                          "albanil",
+                          "openings": 5,
+                      },
+                  )
+                  job_id = eco.store.list_jobs(
+                      profession="albanil"
+                  )[0]["job_id"]
+                  panel = _get_html(
+                      eco.mpe_base
+                      + "/mpe/empresa/"
+                      + company_id
+                  )
+                  assert "Albanil 1" in panel
+                  for index in range(3):
+                      _post_form(
+                          eco.mpe_base
+                          + "/mpe/proposal",
+                          {
+                              "company_account": (
+                                  company_id
+                              ),
+                              "job_id": job_id,
+                              "worker_account": (
+                                  worker_ids[
+                                      index
+                                  ]
+                              ),
+                          },
+                      )
+                  proposals = (
+                      eco.store.list_proposals(
+                          job_id=job_id,
+                          status="pending",
+                      )
+                  )
+                  assert len(proposals) == 3
+                  for proposal in proposals:
+                      html = _post_form(
+                          eco.mpe_base
+                          + "/mpe/"
+                          + "proposal-decide",
+                          {
+                              "proposal_id": (
+                                  proposal[
+                                      "proposal_id"
+                                  ]
+                              ),
+                              "decision":
+                              "aceptar",
+                          },
+                      )
+                      assert (
+                          "Contratado" in html
+                      )
+                  status = _job_status(
+                      eco, job_id
+                  )
+                  assert status["hired"] == 3
+                  assert (
+                      status["remaining"] == 2
+                  )
+                  assert (
+                      status["status"] == "open"
+                  )
+                  _post_form(
+                      eco.mpe_base
+                      + "/mpe/proposal",
+                      {
+                          "company_account": (
+                              company_id
+                          ),
+                          "job_id": job_id,
+                          "worker_account": (
+                              worker_ids[3]
+                          ),
+                      },
+                  )
+                  pending = (
+                      eco.store.list_proposals(
+                          job_id=job_id,
+                          worker_account=(
+                              worker_ids[3]
+                          ),
+                          status="pending",
+                      )
+                  )
+                  html = _post_form(
+                      eco.mpe_base
+                      + "/mpe/proposal-decide",
+                      {
+                          "proposal_id": pending[
+                              0
+                          ][
+                              "proposal_id"
+                          ],
+                          "decision":
+                          "rechazar",
+                      },
+                  )
+                  assert (
+                      "rechazada" in html
+                      or "rechazada".capitalize()
+                      in html
+                      or "Propuesta rechazada"
+                      in html
+                  )
+                  status = _job_status(
+                      eco, job_id
+                  )
+                  assert status["hired"] == 3
+                  for index in (3, 4):
+                      response = _post_json(
+                          eco.mpe_base
+                          + "/mpe/api/hires",
+                          {
+                              "job_id": job_id,
+                              "worker_account": (
+                                  worker_ids[
+                                      index
+                                  ]
+                              ),
+                          },
+                      )
+                      assert (
+                          response["ok"] is True
+                      )
+                  status = _job_status(
+                      eco, job_id
+                  )
+                  assert status["hired"] == 5
+                  assert (
+                      status["remaining"] == 0
+                  )
+                  assert status[
+                      "status"
+                  ] == "filled"
+                  try:
+                      _post_json(
+                          eco.mpe_base
+                          + "/mpe/api/hires",
+                          {
+                              "job_id": job_id,
+                              "worker_account": (
+                                  worker_ids[0]
+                              ),
+                          },
+                      )
+                      raise AssertionError(
+                          "overfill should fail"
+                      )
+                  except (
+                      urllib.error.HTTPError
+                  ) as exc:
+                      assert exc.code == 400
+                  leave = _post_json(
+                      eco.mpe_base
+                      + "/mpe/api/leave",
+                      {
+                          "job_id": job_id,
+                          "worker_account": (
+                              worker_ids[1]
+                          ),
+                      },
+                  )
+                  assert (
+                      leave["data"][
+                          "reopened"
+                      ]
+                      is True
+                  )
+                  status = _job_status(
+                      eco, job_id
+                  )
+                  assert status["hired"] == 4
+                  assert (
+                      status["remaining"] == 1
+                  )
+                  assert status[
+                      "status"
+                  ] == "open"
+                  worker_row = (
+                      eco.store.get_account(
+                          worker_ids[0]
+                      )
+                  )
+                  zid = worker_row.get("zid")
+                  assert isinstance(zid, str)
+                  assert zid.startswith("ZID-")
+                  ok, data, _err = (
+                      eco.client.get(
+                          "/certificates/"
+                          + zid
+                      )
+                  )
+                  assert ok is True
+                  text = json.dumps(
+                      data, default=str
+                  )
+                  assert (
+                      "employment" in text
+                  )
+              finally:
+                  eco.close()
+
+
+          def _get_html(url: str) -> str:
+              with urlopen(url, timeout=10) as r:
+                  return r.read().decode(
+                      "utf-8"
+                  )
+          PYEOF
+          echo "e2e written"
+
+      - name: Run MPE tests (regression + hiring e2e)
+        run: |
+          set -euo pipefail
+          PYTHONPATH="$PWD" python -m pytest -q -p no:cacheprovider --timeout=120 --timeout-method=thread apps/mi_primer_empleo/tests/
+          echo "MPE tests OK"
+          find apps/mi_primer_empleo -name '__pycache__' -type d \
+            -prune -exec rm -rf {} +
 
       - name: Commit and push (race-safe)
         run: |
@@ -136,7 +3259,7 @@ jobs:
           if git diff --cached --quiet; then
             echo "No changes."
           else
-            git commit -m "zyra: Q2 suite termination fix - root conftest forces daemon=True on all threads created during tests (outbox/servers/supervisors no longer block interpreter exit), pytest_sessionfinish reports leftover threads, full suite single-invocation gate with pytest-timeout 180s"
+            git commit -m "zyra: Q3 MPE hiring - migration 2 (proposals+hires), company searches and proposes, worker accepts/rejects, dynamic openings fill/reopen, EMPLOYMENT credential via /verification/credentials, work history via /history/append; old contracts preserved (regression kept); probe + hiring e2e"
             git push origin "HEAD:${{ github.ref_name }}"
           fi
-          echo "=== Q2 COMPLETE: SUITE ALWAYS TERMINATES ==="
+          echo "=== Q3 MPE COMPLETE ==="

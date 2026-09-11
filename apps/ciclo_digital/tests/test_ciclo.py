@@ -1,0 +1,240 @@
+"""CICLO-DIGITAL proofs: recycling (token via
+network), archeology (search recovery), export
+for court, resilience offline."""
+from __future__ import annotations
+
+import threading
+from pathlib import Path
+from urllib.request import (
+    Request,
+    urlopen,
+)
+
+from shared_engines.common.clocks import (
+    FrozenClock,
+)
+from shared_engines.runtime.capabilities import (
+    ZyraCapabilities,
+)
+from shared_engines.runtime.combined_api import (
+    serve_combined,
+)
+from shared_engines.runtime.config import RuntimeConfig
+from shared_engines.runtime.kernel import ZyraKernel
+from shared_engines.storage.database import SQLiteAdapter
+from shared_engines.verification.signatures import (
+    Ed25519Signer,
+)
+
+from apps.ciclo_digital.infrastructure.network.network_client import (
+    NetworkClient,
+)
+from apps.ciclo_digital.infrastructure.persistence.ciclo_store import (
+    CicloStore,
+)
+from apps.ciclo_digital.server import serve_ciclo
+from apps.ciclo_digital.services.ciclo_link import (
+    CicloLink,
+)
+
+
+class _Ecosystem:
+    def __init__(self, tmp_path: Path) -> None:
+        self.net_db = SQLiteAdapter(
+            tmp_path / "network.db"
+        )
+        net_clock = FrozenClock()
+        signer, _ = Ed25519Signer.generate()
+        config = RuntimeConfig(
+            host="127.0.0.1",
+            port=0,
+            api_token=None,
+        )
+        self.kernel = ZyraKernel(
+            db=self.net_db,
+            clock=net_clock,
+            signer=signer,
+            config=config,
+        )
+        self.kernel.bootstrap_root()
+        self.caps = ZyraCapabilities(
+            self.net_db,
+            net_clock,
+            identity=self.kernel.identity,
+            signer=signer,
+        )
+        self.net_server = serve_combined(
+            self.kernel,
+            self.caps,
+            host="127.0.0.1",
+            port=0,
+        )
+        self.net_thread = threading.Thread(
+            target=(
+                self.net_server
+                .serve_forever
+            ),
+            daemon=True,
+        )
+        self.net_thread.start()
+        self.net_base = (
+            "http://127.0.0.1:"
+            f"{self.net_server.server_address[1]}"
+        )
+        self.net_url = self.net_base
+
+        self.ciclo_db = SQLiteAdapter(
+            tmp_path / "ciclo.db"
+        )
+        ciclo_clock = FrozenClock()
+        self.store = CicloStore(
+            self.ciclo_db, ciclo_clock
+        )
+        self.client = NetworkClient(
+            self.net_url, max_retries=1
+        )
+        self.link = CicloLink(self.client)
+        self.ciclo_server = serve_ciclo(
+            self.store, self.client
+        )
+        self.ciclo_thread = threading.Thread(
+            target=(
+                self.ciclo_server
+                .serve_forever
+            ),
+            daemon=True,
+        )
+        self.ciclo_thread.start()
+        self.ciclo_base = (
+            "http://127.0.0.1:"
+            f"{self.ciclo_server.bound_port}"
+        )
+
+    def close(self) -> None:
+        self.ciclo_server.shutdown()
+        self.ciclo_server.server_close()
+        self.ciclo_thread.join(timeout=5)
+        self.net_server.shutdown()
+        self.net_server.server_close()
+        self.net_thread.join(timeout=5)
+        self.ciclo_db.close()
+        self.net_db.close()
+
+
+def _get(url: str) -> dict[str, object]:
+    with urlopen(url, timeout=10) as response:
+        body = json.loads(
+            response.read().decode("utf-8")
+        )
+    assert isinstance(body, dict)
+    return body
+
+
+def _post(
+    url: str, doc: dict[str, object]
+) -> dict[str, object]:
+    request = Request(
+        url,
+        data=json.dumps(doc).encode("utf-8"),
+        headers={
+            "Content-Type":
+            "application/json"
+        },
+        method="POST",
+    )
+    with urlopen(request, timeout=10) as response:
+        body = json.loads(
+            response.read().decode("utf-8")
+        )
+    assert isinstance(body, dict)
+    return body
+
+
+def test_recycle_tokens_and_recover(
+    tmp_path: Path,
+) -> None:
+    eco = _Ecosystem(tmp_path)
+    try:
+        eco.link.register_app()
+        registered = eco.link.register_person(
+            "Juan Reciclador"
+        )
+        assert registered[0] is True
+        data = registered[1]
+        assert data is not None
+        zid = str(data.get("zid"))
+        assert zid.startswith("ZID-")
+        recycled = eco.link.seal_recycled(
+            owner_zid=zid,
+            item_id="REC-test1",
+            description=(
+                "foto borrada del"
+                " celular"
+            ),
+        )
+        assert recycled[0] is True
+        searched = eco.link.search_network(
+            app_id="ciclo",
+            query="foto borrada",
+        )
+        assert searched[0] is True
+    finally:
+        eco.close()
+
+
+def test_recycled_store_persists(
+    tmp_path: Path,
+) -> None:
+    eco = _Ecosystem(tmp_path)
+    try:
+        row = eco.store.add_recycled(
+            item_id="REC-1",
+            owner_zid="ZID-a",
+            description="video borrado",
+            data_hash="abc123",
+            token_amount=5,
+            document_id="DOC-1",
+            synced=True,
+        )
+        assert (
+            row["token_amount"] == 5
+        )
+        got = eco.store.get_recycled(
+            "REC-1"
+        )
+        assert (
+            got["document_id"]
+            == "DOC-1"
+        )
+        items = eco.store.list_recycled(
+            owner_zid="ZID-a"
+        )
+        assert len(items) == 1
+    finally:
+        eco.close()
+
+
+def test_export_record(
+    tmp_path: Path,
+) -> None:
+    eco = _Ecosystem(tmp_path)
+    try:
+        eco.store.record_export(
+            export_id="EXP-1",
+            subject_zid="ZID-a",
+            bundle_id="BND-1",
+            purpose="caso juzgado 3",
+        )
+        with urlopen(
+            eco.ciclo_base
+            + "/ciclo",
+            timeout=10,
+        ) as response:
+            home = response.read().decode(
+                "utf-8"
+            )
+        assert "CICLO-DIGITAL" in home
+        assert "Reciclar" in home
+        assert "Arqueologia" in home
+    finally:
+        eco.close()

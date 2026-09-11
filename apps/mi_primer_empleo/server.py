@@ -1,4 +1,4 @@
-"""MPE HTTP surface: role-based screens."""
+"""MPE HTTP server - bidirectional employment."""
 from __future__ import annotations
 
 import json
@@ -7,715 +7,1609 @@ from http.server import (
     BaseHTTPRequestHandler,
     ThreadingHTTPServer,
 )
-from typing import Any, ClassVar
-from urllib.parse import urlparse
+from urllib.parse import parse_qs
 
 from apps.mi_primer_empleo.infrastructure.persistence.mpe_store import (
     MpeStore,
-)
-from apps.mi_primer_empleo.infrastructure.network.network_client import (
-    NetworkClient,
 )
 from apps.mi_primer_empleo.services.mpe_link import (
     MpeLink,
 )
 
-_CSS = (
-    "body{font-family:system-ui,sans-serif;"
-    "background:#0d1117;color:#e6edf3;"
-    "display:flex;justify-content:center;"
-    "padding:20px;margin:0}"
-    ".wrap{max-width:680px;width:100%}"
-    "h1{font-size:1.3rem}"
-    "h2{font-size:1rem;margin-top:20px;"
-    "color:#58a6ff}"
-    ".card{background:#161b22;border:1px solid"
-    " #30363d;border-radius:10px;padding:14px;"
-    "margin-top:10px}"
-    "button{background:#238636;color:#fff;"
-    "border:none;padding:12px 18px;border-radius:8px;"
-    "font-size:1rem;cursor:pointer;margin:6px 4px 0 0;"
-    "width:100%;text-align:left}"
-    "button.gray{background:#30363d}"
-    "input,select{width:100%;box-sizing:border-box;"
-    "background:#0d1117;color:#e6edf3;"
-    "border:1px solid #30363d;border-radius:6px;"
-    "padding:8px;margin:4px 0;font-size:0.95rem}"
-)
+
+def _new_account_id() -> str:
+    return "MPE-" + uuid.uuid4().hex[:12]
 
 
-def _page(title: str, body: str) -> str:
-    return (
-        "<!DOCTYPE html><html lang='es'><head>"
-        "<meta charset='utf-8'>"
-        "<meta name='viewport' content='width="
-        "device-width, initial-scale=1'>"
-        f"<title>{title}</title>"
-        f"<style>{_CSS}</style></head><body>"
-        f"<div class='wrap'>{body}</div></body>"
-        "</html>"
-    )
+def _new_job_id() -> str:
+    return "JOB-" + uuid.uuid4().hex[:10]
 
 
-class MpeApiHandler(
-    BaseHTTPRequestHandler
-):
-    store: ClassVar[MpeStore]
-    link: ClassVar[MpeLink]
+def _new_proposal_id() -> str:
+    return "PROP-" + uuid.uuid4().hex[:10]
+
+
+def _new_hire_id() -> str:
+    return "HIR-" + uuid.uuid4().hex[:10]
+
+
+def _new_application_id() -> str:
+    return "APP-" + uuid.uuid4().hex[:10]
+
+
+def _find_zid(doc):
+    if isinstance(doc, dict):
+        for key, value in (
+            doc.items()
+        ):
+            if (
+                str(key).lower()
+                == "zid"
+                and isinstance(
+                    value, str
+                )
+                and value.startswith(
+                    "ZID-"
+                )
+            ):
+                return value
+        for value in doc.values():
+            found = _find_zid(value)
+            if found is not None:
+                return found
+    elif isinstance(doc, list):
+        for item in doc:
+            found = _find_zid(item)
+            if found is not None:
+                return found
+    return None
+
+
+def _find_credential_id(doc):
+    if isinstance(doc, dict):
+        for key, value in (
+            doc.items()
+        ):
+            key_lower = str(
+                key
+            ).lower()
+            if (
+                (
+                    "credential"
+                    in key_lower
+                )
+                or key_lower == "id"
+            ) and isinstance(
+                value, str
+            ) and value:
+                return value
+        for value in doc.values():
+            found = (
+                _find_credential_id(
+                    value
+                )
+            )
+            if found is not None:
+                return found
+    elif isinstance(doc, list):
+        for item in doc:
+            found = (
+                _find_credential_id(
+                    item
+                )
+            )
+            if found is not None:
+                return found
+    return None
+
+
+class MpeApiHandler(BaseHTTPRequestHandler):
+    store: MpeStore
+    link: MpeLink
 
     def log_message(
-        self, format: str, *args: object
+        self, format: str, *args,
     ) -> None:
-        return None
+        pass
 
-    def do_GET(self) -> None:
-        self._safe("GET")
+    def _send_bytes(
+        self,
+        status: int,
+        ctype: str,
+        body: bytes,
+    ) -> None:
+        self.send_response(status)
+        self.send_header(
+            "Content-Type", ctype
+        )
+        self.send_header(
+            "Content-Length",
+            str(len(body)),
+        )
+        self.end_headers()
+        self.wfile.write(body)
 
-    def do_POST(self) -> None:
-        self._safe("POST")
-
-    def _safe(self, method: str) -> None:
-        try:
-            self._route(method)
-        except LookupError as exc:
-            self._html(
-                404,
-                _page(
-                    "No encontrado",
-                    "<h1>404</h1>"
-                    f"<p>{exc}</p>",
-                ),
-            )
-        except ValueError as exc:
-            self._html(
-                400,
-                _page(
-                    "Error",
-                    "<h1>Dato invalido"
-                    f"</h1><p>{exc}</p>",
-                ),
-            )
-        except Exception as exc:
-            self._html(
-                500,
-                _page(
-                    "Error",
-                    "<h1>Error interno"
-                    f"</h1><p>{exc}</p>",
-                ),
-            )
-
-    def _route(self, method: str) -> None:
-        path = urlparse(self.path).path
-        segments = [
-            s
-            for s in path.split("/")
-            if s
-        ]
-        if segments[:1] != ["mpe"]:
-            self._html(
-                404,
-                _page(
-                    "404",
-                    "<h1>Fuera de MPE"
-                    "</h1>",
-                ),
-            )
-            return
-        tail = segments[1:]
-        if method == "GET":
-            self._get(tail)
-        else:
-            self._post(tail)
-
-    def _get(self, s: list[str]) -> None:
-        if s[:1] == ["api"]:
-            self._api_get(s[1:])
-            return
-        store = type(self).store
-        if not s or s == ["home"]:
-            self._home()
-            return
-        if s[0] == "trabajador":
-            self._screen_worker(s)
-            return
-        if s[0] == "empresa":
-            self._screen_company(s)
-            return
-        if s == ["jobs"]:
-            jobs = store.list_jobs()
-            items = "".join(
-                "<li>• "
-                + j["title"]
-                + " ("
-                + j["profession"]
-                + ") - "
-                + str(j["openings"])
-                + " vacantes</li>"
-                for j in jobs
-            )
-            if not items:
-                items = (
-                    "<li>Sin vacantes"
-                    " abiertas</li>"
-                )
-            self._html(
-                200,
-                _page(
-                    "MPE - Vacantes",
-                    "<h1>Vacantes abiertas"
-                    "</h1><ul>"
-                    + items
-                    + "</ul>"
-                    "<a href='/mpe'>"
-                    "<button class='gray'>"
-                    "Inicio</button></a>",
-                ),
-            )
-            return
-        if s == ["government", "summary"]:
-            self._send(
-                200,
-                {
-                    "ok": True,
-                    "data": store.summary(),
-                },
-            )
-            return
-        self._html(
-            404,
-            _page("404", "<h1>No"
-            " encontrado</h1>"),
+    def _send_html(
+        self, status: int, html: str,
+    ) -> None:
+        self._send_bytes(
+            status,
+            "text/html",
+            html.encode("utf-8"),
         )
 
-    def _post(self, s: list[str]) -> None:
-        if s[:1] == ["api"]:
-            self._api_post(s[1:])
-            return
-        store = type(self).store
-        link = type(self).link
-        doc = self._read_form()
-        if s == ["register"]:
-            name = self._req(doc, "name")
-            role = str(
-                doc.get("role", "trabajador")
-            )
-            profession = doc.get(
-                "profession"
-            )
-            profession = (
-                str(profession)
-                if profession is not None
-                else None
-            )
-            account_id = (
-                "MPE-"
-                + uuid.uuid4().hex[:12]
-            )
-            zid: str | None = None
-            if role == "trabajador":
-                ok, data, _error = (
-                    link.register_user(name)
+    def _send_json(
+        self, status: int, doc: dict,
+    ) -> None:
+        self._send_bytes(
+            status,
+            "application/json",
+            json.dumps(doc).encode(
+                "utf-8"
+            ),
+        )
+
+    def _ok(self, data) -> None:
+        self._send_json(
+            200,
+            {"ok": True, "data": data},
+        )
+
+    def _api_error(
+        self,
+        status: int,
+        message: str,
+    ) -> None:
+        self._send_json(
+            status,
+            {
+                "ok": False,
+                "error": message,
+            },
+        )
+
+    def _html_error(
+        self,
+        status: int,
+        message: str,
+    ) -> None:
+        self._send_html(
+            status,
+            "<html><body><h1>MPE"
+            "</h1><p>Error: "
+            + message
+            + "</p></body></html>",
+        )
+
+    def _read_body(self) -> bytes:
+        try:
+            length = int(
+                self.headers.get(
+                    "Content-Length",
+                    "0",
                 )
-            else:
-                ok, data, _error = (
-                    link.register_company(
-                        name
+                or "0"
+            )
+        except Exception:
+            length = 0
+        if length <= 0:
+            return b""
+        return self.rfile.read(
+            length
+        )
+
+    def _read_form(self) -> dict:
+        raw = self._read_body()
+        parsed = parse_qs(
+            raw.decode("utf-8")
+        )
+        form: dict[str, str] = {}
+        for key, values in (
+            parsed.items()
+        ):
+            if values:
+                form[key] = values[0]
+        return form
+
+    def _read_json(self) -> dict | None:
+        raw = self._read_body()
+        if not raw:
+            return {}
+        try:
+            doc = json.loads(
+                raw.decode("utf-8")
+            )
+        except Exception:
+            return None
+        if not isinstance(doc, dict):
+            return None
+        return doc
+
+    @staticmethod
+    def _form_value(
+        form: dict, key: str,
+    ) -> str:
+        value = form.get(key, "")
+        if value is None:
+            return ""
+        return str(value)
+
+    def _split_path(self) -> tuple[
+        str, dict,
+    ]:
+        raw = self.path
+        if "?" in raw:
+            path, qs = raw.split(
+                "?", 1
+            )
+            query = {
+                k: v[0]
+                for k, v in parse_qs(
+                    qs
+                ).items()
+                if v
+            }
+        else:
+            path = raw
+            query = {}
+        return path, query
+
+    def _trust_best_effort(
+        self, zid: str | None,
+    ) -> bool:
+        if not zid:
+            return False
+        try:
+            ok, _d, _e = (
+                self.link.complete_trust(
+                    zid
+                )
+            )
+            return bool(ok)
+        except Exception:
+            return False
+
+    def _network_on_hire(
+        self,
+        job_id: str,
+        worker_account: str,
+    ) -> dict:
+        result: dict = {
+            "credential": {
+                "issued": False,
+            },
+            "history_recorded":
+            False,
+            "trust_completed":
+            False,
+        }
+        try:
+            status = (
+                self.store.job_status(
+                    job_id=job_id
+                )
+            )
+            worker = (
+                self.store.get_account(
+                    worker_account
+                )
+            )
+            worker_zid = worker.get(
+                "zid"
+            )
+            company = (
+                self.store.get_account(
+                    str(
+                        status[
+                            "company_account"
+                        ]
                     )
                 )
-            if ok and data is not None:
-                zid = str(data.get("zid"))
-            store.add_account(
-                account_id=account_id,
-                zid=zid,
-                name=name,
-                role=role,
-                profession=profession,
             )
-            zid_text = (
-                zid
-                if zid is not None
-                else "pendiente de conexion"
+            company_zid = (
+                company.get("zid")
             )
-            self._html(
-                200,
-                _page(
-                    "Bienvenido a MPE",
-                    "<h1>Cuenta creada"
-                    "</h1>"
-                    "<p>Tu ID:"
-                    f" <b>{account_id}"
-                    "</b></p>"
-                    "<p>Tu ZID de red: "
-                    f"<b>{zid_text}</b></p>"
-                    "<a href='/mpe/"
-                    f"{role}/{account_id}'>"
-                    "<button>Ir a mi panel"
-                    "</button></a>",
+            trust_ok = (
+                self._trust_best_effort(
+                    company_zid
+                )
+                and self
+                ._trust_best_effort(
+                    worker_zid
+                )
+            )
+            result[
+                "trust_completed"
+            ] = bool(trust_ok)
+            if (
+                worker_zid
+                and company_zid
+            ):
+                ok, data, err = (
+                    self.link
+                    .issue_employment_credential(
+                        subject_zid=str(
+                            worker_zid
+                        ),
+                        issuer_zid=str(
+                            company_zid
+                        ),
+                        title=str(
+                            status[
+                                "title"
+                            ]
+                        ),
+                        detail=(
+                            "contratacion"
+                            " registrada en"
+                            " MPE"
+                        ),
+                    )
+                )
+                credential = {
+                    "issued": bool(
+                        ok
+                    ),
+                }
+                if (
+                    ok
+                    and isinstance(
+                        data, dict
+                    )
+                ):
+                    credential_id = (
+                        _find_credential_id(
+                            data
+                        )
+                    )
+                    if (
+                        credential_id
+                    ):
+                        credential[
+                            "credential_id"
+                        ] = (
+                            credential_id
+                        )
+                elif not ok:
+                    credential[
+                        "error"
+                    ] = err
+                result[
+                    "credential"
+                ] = credential
+            if worker_zid:
+                hok, _hd, _he = (
+                    self.link
+                    .record_work_event(
+                        str(
+                            worker_zid
+                        ),
+                        "hired",
+                        str(
+                            status[
+                                "title"
+                            ]
+                        ),
+                    )
+                )
+                result[
+                    "history_recorded"
+                ] = bool(hok)
+        except Exception:
+            pass
+        return result
+
+    def _network_on_leave(
+        self,
+        job_id: str,
+        worker_account: str,
+    ) -> bool:
+        try:
+            worker = (
+                self.store.get_account(
+                    worker_account
+                )
+            )
+            worker_zid = worker.get(
+                "zid"
+            )
+            if not worker_zid:
+                return False
+            status = (
+                self.store.job_status(
+                    job_id=job_id
+                )
+            )
+            hok, _hd, _he = (
+                self.link.record_work_event(
+                    str(worker_zid),
+                    "left",
+                    str(
+                        status["title"]
+                    ),
+                )
+            )
+            return bool(hok)
+        except Exception:
+            return False
+
+    def do_GET(self) -> None:
+        path, query = (
+            self._split_path()
+        )
+        try:
+            if path in (
+                "/",
+                "/mpe",
+                "/mpe/home",
+            ):
+                self._send_html(
+                    200,
+                    self._home(),
+                )
+                return
+            if path == "/mpe/jobs":
+                self._send_html(
+                    200,
+                    self._jobs_html(),
+                )
+                return
+            if path == (
+                "/mpe/government/summary"
+            ):
+                self._send_html(
+                    200,
+                    self._gov_html(),
+                )
+                return
+            if path.startswith(
+                "/mpe/trabajador/"
+            ):
+                account_id = path.split(
+                    "/mpe/trabajador/",
+                    1,
+                )[1]
+                self._worker_panel(
+                    account_id
+                )
+                return
+            if path.startswith(
+                "/mpe/empresa/"
+            ):
+                account_id = path.split(
+                    "/mpe/empresa/",
+                    1,
+                )[1]
+                self._company_panel(
+                    account_id
+                )
+                return
+            if path == (
+                "/mpe/api/health"
+            ):
+                self._ok(
+                    {
+                        "app": "mpe",
+                        "status": "ok",
+                    }
+                )
+                return
+            if path == (
+                "/mpe/api/summary"
+            ):
+                self._ok(
+                    self.store.summary()
+                )
+                return
+            if path == (
+                "/mpe/api/jobs"
+            ):
+                jobs = []
+                for job in (
+                    self.store.list_jobs()
+                ):
+                    jobs.append(
+                        self.store
+                        .job_status(
+                            job_id=str(
+                                job[
+                                    "job_id"
+                                ]
+                            )
+                        )
+                    )
+                self._ok(
+                    {"jobs": jobs}
+                )
+                return
+            if path == (
+                "/mpe/api/workers"
+            ):
+                profession = query.get(
+                    "profession"
+                )
+                workers = (
+                    self.store
+                    .list_workers(
+                        profession=(
+                            profession
+                        )
+                    )
+                )
+                self._ok(
+                    {
+                        "workers": list(
+                            workers
+                        )
+                    }
+                )
+                return
+            if path.startswith(
+                "/mpe/api/job/"
+            ):
+                job_id = path.split(
+                    "/mpe/api/job/",
+                    1,
+                )[1]
+                self._ok(
+                    self.store.job_status(
+                        job_id=job_id
+                    )
+                )
+                return
+            if path == (
+                "/mpe/api/proposals"
+            ):
+                proposals = (
+                    self.store
+                    .list_proposals(
+                        worker_account=(
+                            query.get(
+                                "worker"
+                            )
+                        ),
+                        job_id=(
+                            query.get(
+                                "job"
+                            )
+                        ),
+                        status=(
+                            query.get(
+                                "status",
+                                "pending",
+                            )
+                        ),
+                    )
+                )
+                self._ok(
+                    {
+                        "proposals": list(
+                            proposals
+                        )
+                    }
+                )
+                return
+            if path == (
+                "/mpe/api/notifications"
+            ):
+                self._notifications(
+                    query
+                )
+                return
+            self._api_error(
+                404,
+                "unknown path: "
+                + path,
+            )
+        except LookupError as exc:
+            self._api_error(
+                404, str(exc)
+            )
+        except ValueError as exc:
+            self._api_error(
+                400, str(exc)
+            )
+        except Exception:
+            self._api_error(
+                500, "server error"
+            )
+
+    def _notifications(
+        self, query: dict,
+    ) -> None:
+        worker = query.get("worker")
+        items: list[dict] = []
+        if worker:
+            for proposal in (
+                self.store
+                .list_proposals(
+                    worker_account=(
+                        worker
+                    ),
+                    status="pending",
+                )
+            ):
+                items.append(
+                    {
+                        "kind":
+                        "proposal",
+                        "message": (
+                            "Una empresa"
+                            " quiere"
+                            " contratarte"
+                        ),
+                        "proposal_id": (
+                            proposal[
+                                "proposal_id"
+                            ]
+                        ),
+                        "job_id": (
+                            proposal[
+                                "job_id"
+                            ]
+                        ),
+                    }
+                )
+            account = (
+                self.store.get_account(
+                    worker
+                )
+            )
+            for job in (
+                self.store.list_jobs(
+                    profession=account.get(
+                        "profession"
+                    )
+                )
+            ):
+                items.append(
+                    {
+                        "kind":
+                        "job_opportunity",
+                        "job_id": job[
+                            "job_id"
+                        ],
+                        "title": job[
+                            "title"
+                        ],
+                    }
+                )
+        self._ok(
+            {
+                "worker": worker,
+                "notifications": (
+                    items
                 ),
+            }
+        )
+
+    def _home(self) -> str:
+        return (
+            "<html><head>"
+            "<title>MPE</title></head>"
+            "<body><h1>MPE - Mi Primer"
+            " Empleo</h1>"
+            "<p>El trabajo busca al"
+            " trabajador.</p>"
+            "<ul>"
+            "<li>POST /mpe/register"
+            " (form)</li>"
+            "<li>POST /mpe/job"
+            " (form)</li>"
+            "<li>POST /mpe/apply"
+            " (form)</li>"
+            "<li>POST /mpe/proposal"
+            " (form)</li>"
+            "<li>POST"
+            " /mpe/proposal-decide"
+            " (form)</li>"
+            "<li>POST /mpe/hire"
+            " (form)</li>"
+            "<li>POST /mpe/leave"
+            " (form)</li>"
+            "<li>GET"
+            " /mpe/api/notifications"
+            " ?worker=</li>"
+            "<li>GET"
+            " /mpe/api/summary</li>"
+            "</ul></body></html>"
+        )
+
+    def _jobs_html(self) -> str:
+        html = (
+            "<html><body><h1>Vacantes"
+            " abiertas</h1><ul>"
+        )
+        for job in (
+            self.store.list_jobs()
+        ):
+            status = (
+                self.store.job_status(
+                    job_id=str(
+                        job["job_id"]
+                    )
+                )
+            )
+            html += (
+                "<li>"
+                + str(
+                    status["job_id"]
+                )
+                + " | "
+                + str(status["title"])
+                + " | contratados "
+                + str(status["hired"])
+                + "/"
+                + str(
+                    status["openings"]
+                )
+                + " | quedan "
+                + str(
+                    status["remaining"]
+                )
+                + "</li>"
+            )
+        html += (
+            "</ul></body></html>"
+        )
+        return html
+
+    def _gov_html(self) -> str:
+        data = self.store.summary()
+        return (
+            "<html><body><h1>Resumen"
+            " gobierno</h1>"
+            "<p>cuentas: "
+            + str(
+                data["accounts_total"]
+            )
+            + "</p>"
+            "<p>verificadas: "
+            + str(
+                data[
+                    "accounts_verified"
+                ]
+            )
+            + "</p>"
+            "<p>vacantes abiertas: "
+            + str(data["open_jobs"])
+            + "</p>"
+            "<p>aplicaciones: "
+            + str(
+                data[
+                    "applications_total"
+                ]
+            )
+            + "</p>"
+            "<p>contrataciones"
+            " activas: "
+            + str(data["hires_total"])
+            + "</p>"
+            "<p>propuestas pendientes:"
+            " "
+            + str(
+                data[
+                    "proposals_pending"
+                ]
+            )
+            + "</p></body></html>"
+        )
+
+    def _worker_panel(
+        self, account_id: str,
+    ) -> None:
+        try:
+            account = (
+                self.store.get_account(
+                    account_id
+                )
+            )
+        except LookupError:
+            self._html_error(
+                404,
+                "cuenta no existe",
             )
             return
-        if s == ["job"]:
-            company_account = self._req(
-                doc, "company_account"
+        html = (
+            "<html><body><h1>Panel"
+            " trabajador</h1>"
+            "<p>"
+            + str(account["name"])
+            + " ("
+            + str(
+                account["profession"]
             )
-            row = store.post_job(
+            + ")</p>"
+            "<h2>Propuestas"
+            " recibidas</h2><ul>"
+        )
+        proposals = (
+            self.store.list_proposals(
+                worker_account=(
+                    account_id
+                ),
+                status="pending",
+            )
+        )
+        for proposal in proposals:
+            html += (
+                "<li>Una empresa quiere"
+                " contratarte (propuesta "
+                + str(
+                    proposal[
+                        "proposal_id"
+                    ]
+                )
+                + " para vacante "
+                + str(proposal["job_id"])
+                + ")"
+                + " <form method='POST'"
+                + " action="
+                + "'/mpe/proposal-decide'>"
+                + "<input type='hidden'"
+                + " name='proposal_id'"
+                + " value='"
+                + str(
+                    proposal[
+                        "proposal_id"
+                    ]
+                )
+                + "'>"
+                + "<button name='decision'"
+                + " value='aceptar'>"
+                + "Aceptar</button>"
+                + "<button name='decision'"
+                + " value='rechazar'>"
+                + "Rechazar</button>"
+                + "</form></li>"
+            )
+        html += (
+            "</ul><h2>Vacantes para ti"
+            "</h2><ul>"
+        )
+        for job in (
+            self.store.list_jobs(
+                profession=account.get(
+                    "profession"
+                )
+            )
+        ):
+            html += (
+                "<li>"
+                + str(job["title"])
+                + " ("
+                + str(job["job_id"])
+                + ")</li>"
+            )
+        html += "</ul></body></html>"
+        self._send_html(200, html)
+
+    def _company_panel(
+        self, account_id: str,
+    ) -> None:
+        try:
+            account = (
+                self.store.get_account(
+                    account_id
+                )
+            )
+        except LookupError:
+            self._html_error(
+                404,
+                "cuenta no existe",
+            )
+            return
+        if account.get("role") != (
+            "empresa"
+        ):
+            self._html_error(
+                400,
+                "no es empresa",
+            )
+            return
+        html = (
+            "<html><body><h1>Panel"
+            " empresa</h1><p>"
+            + str(account["name"])
+            + "</p><h2>Tus vacantes"
+            "</h2><ul>"
+        )
+        for job in (
+            self.store.list_company_jobs(
+                company_account=(
+                    account_id
+                )
+            )
+        ):
+            status = (
+                self.store.job_status(
+                    job_id=str(
+                        job["job_id"]
+                    )
+                )
+            )
+            html += (
+                "<li>"
+                + str(status["title"])
+                + " | "
+                + str(status["status"])
+                + " | contratados "
+                + str(status["hired"])
+                + "/"
+                + str(
+                    status["openings"]
+                )
+                + " | quedan "
+                + str(
+                    status["remaining"]
+                )
+                + "</li>"
+            )
+        html += (
+            "</ul><h2>Trabajadores"
+            " disponibles</h2><ul>"
+        )
+        for worker in (
+            self.store.list_workers()
+        ):
+            html += (
+                "<li>"
+                + str(worker["name"])
+                + " ("
+                + str(
+                    worker[
+                        "profession"
+                    ]
+                )
+                + ")</li>"
+            )
+        html += "</ul></body></html>"
+        self._send_html(200, html)
+
+    def do_POST(self) -> None:
+        path, _query = (
+            self._split_path()
+        )
+        try:
+            if path == "/mpe/register":
+                self._register()
+                return
+            if path == "/mpe/job":
+                self._post_job_form()
+                return
+            if path == "/mpe/apply":
+                self._apply_form()
+                return
+            if path == "/mpe/proposal":
+                self._proposal_form()
+                return
+            if path == (
+                "/mpe/proposal-decide"
+            ):
+                self._decide_form()
+                return
+            if path == "/mpe/hire":
+                self._hire_form()
+                return
+            if path == "/mpe/leave":
+                self._leave_form()
+                return
+            if path == (
+                "/mpe/api/accounts"
+            ):
+                self._api_account()
+                return
+            if path == "/mpe/api/jobs":
+                self._api_job()
+                return
+            if path == (
+                "/mpe/api/proposals"
+            ):
+                self._api_proposal()
+                return
+            if path == (
+                "/mpe/api/proposals"
+                "/decide"
+            ):
+                self._api_decide()
+                return
+            if path == (
+                "/mpe/api/hires"
+            ):
+                self._api_hire()
+                return
+            if path == (
+                "/mpe/api/leave"
+            ):
+                self._api_leave()
+                return
+            self._api_error(
+                404,
+                "unknown path: "
+                + path,
+            )
+        except LookupError as exc:
+            self._api_error(
+                404, str(exc)
+            )
+        except (
+            ValueError,
+            PermissionError,
+        ) as exc:
+            self._api_error(
+                400, str(exc)
+            )
+        except Exception:
+            self._api_error(
+                500, "server error"
+            )
+
+    def _register(self) -> None:
+        form = self._read_form()
+        role = self._form_value(
+            form, "role"
+        )
+        name = self._form_value(
+            form, "name"
+        )
+        profession = self._form_value(
+            form, "profession"
+        )
+        if role not in (
+            "trabajador",
+            "empresa",
+        ):
+            self._html_error(
+                400, "role invalido"
+            )
+            return
+        if not name:
+            self._html_error(
+                400, "name requerido"
+            )
+            return
+        zid = None
+        if role == "trabajador":
+            ok, data, _err = (
+                self.link.register_user(
+                    name
+                )
+            )
+        else:
+            ok, data, _err = (
+                self.link
+                .register_company(
+                    name
+                )
+            )
+        if ok and data is not None:
+            zid = _find_zid(data)
+        account_id = _new_account_id()
+        self.store.add_account(
+            account_id=account_id,
+            zid=zid,
+            name=name,
+            role=role,
+            profession=(
+                profession or None
+            ),
+        )
+        if zid is not None:
+            self._trust_best_effort(
+                zid
+            )
+            self.store.mark_verified(
+                account_id=account_id
+            )
+        html = (
+            "<html><body><h1>MPE</h1>"
+            "<p>Cuenta registrada</p>"
+            "<p>id: "
+            + account_id
+            + "</p><p>zid: "
+            + str(zid)
+            + "</p></body></html>"
+        )
+        self._send_html(200, html)
+
+    def _post_job_form(self) -> None:
+        form = self._read_form()
+        job = self.store.post_job(
+            job_id=_new_job_id(),
+            company_account=(
+                self._form_value(
+                    form,
+                    "company_account",
+                )
+            ),
+            title=self._form_value(
+                form, "title"
+            ),
+            profession=(
+                self._form_value(
+                    form,
+                    "profession",
+                )
+            ),
+            openings=int(
+                self._form_value(
+                    form, "openings"
+                )
+                or "1"
+            ),
+        )
+        self._send_html(
+            200,
+            "<html><body><h1>MPE</h1>"
+            "<p>Vacante publicada</p>"
+            "<p>job: "
+            + str(job["job_id"])
+            + "</p></body></html>",
+        )
+
+    def _apply_form(self) -> None:
+        form = self._read_form()
+        self.store.apply(
+            application_id=(
+                _new_application_id()
+            ),
+            job_id=self._form_value(
+                form, "job_id"
+            ),
+            worker_account=(
+                self._form_value(
+                    form,
+                    "worker_account",
+                )
+            ),
+        )
+        self._send_html(
+            200,
+            "<html><body><h1>MPE</h1>"
+            "<p>Aplicacion enviada"
+            "</p></body></html>",
+        )
+
+    def _proposal_form(self) -> None:
+        form = self._read_form()
+        proposal = (
+            self.store.create_proposal(
+                proposal_id=(
+                    _new_proposal_id()
+                ),
                 job_id=(
-                    "JOB-"
-                    + uuid.uuid4().hex[:10]
+                    self._form_value(
+                        form, "job_id"
+                    )
                 ),
                 company_account=(
-                    company_account
+                    self._form_value(
+                        form,
+                        "company_account",
+                    )
                 ),
-                title=self._req(
-                    doc, "title"
-                ),
-                profession=self._req(
-                    doc, "profession"
-                ),
-                openings=int(
-                    doc.get("openings", 1)
+                worker_account=(
+                    self._form_value(
+                        form,
+                        "worker_account",
+                    )
                 ),
             )
-            self._html(
-                200,
-                _page(
-                    "Vacante publicada",
-                    "<h1>Vacante publicada"
-                    "</h1>"
-                    f"<p>{row['title']} -"
-                    f" {row['openings']}"
-                    " vacantes</p>"
-                    "<a href='/mpe/empresa/"
-                    f"{company_account}'>"
-                    "<button>Volver</button>"
-                    "</a>",
-                ),
+        )
+        self._send_html(
+            200,
+            "<html><body><h1>MPE</h1>"
+            "<p>Propuesta enviada</p>"
+            "<p>propuesta: "
+            + str(
+                proposal[
+                    "proposal_id"
+                ]
+            )
+            + "</p></body></html>",
+        )
+
+    def _decide_form(self) -> None:
+        form = self._read_form()
+        decision = self._form_value(
+            form, "decision"
+        )
+        if decision not in (
+            "aceptar",
+            "rechazar",
+        ):
+            self._html_error(
+                400,
+                "decision invalida",
             )
             return
-        if s == ["apply"]:
-            worker_account = self._req(
-                doc, "worker_account"
-            )
-            app_id = (
-                "APP-"
-                + uuid.uuid4().hex[:10]
-            )
-            store.apply(
-                application_id=app_id,
-                job_id=self._req(
-                    doc, "job_id"
+        result = (
+            self.store.decide_proposal(
+                proposal_id=(
+                    self._form_value(
+                        form,
+                        "proposal_id",
+                    )
                 ),
+                accepted=(
+                    decision
+                    == "aceptar"
+                ),
+            )
+        )
+        if result["status"] == (
+            "accepted"
+        ):
+            net = (
+                self._network_on_hire(
+                    str(
+                        result["job_id"]
+                    ),
+                    str(
+                        result[
+                            "worker_account"
+                        ]
+                    ),
+                )
+            )
+            self._send_html(
+                200,
+                "<html><body><h1>MPE"
+                "</h1><p>Contratado</p>"
+                "<p>contratados: "
+                + str(
+                    result["hire"][
+                        "hired"
+                    ]
+                )
+                + " | quedan: "
+                + str(
+                    result["hire"][
+                        "remaining"
+                    ]
+                )
+                + "</p>"
+                "<p>credencial: "
+                + str(
+                    net["credential"][
+                        "issued"
+                    ]
+                )
+                + "</p></body></html>",
+            )
+            return
+        self._send_html(
+            200,
+            "<html><body><h1>MPE</h1>"
+            "<p>Propuesta rechazada"
+            "</p></body></html>",
+        )
+
+    def _hire_form(self) -> None:
+        form = self._read_form()
+        job_id = self._form_value(
+            form, "job_id"
+        )
+        worker_account = (
+            self._form_value(
+                form, "worker_account"
+            )
+        )
+        hire = self.store.hire_worker(
+            hire_id=_new_hire_id(),
+            job_id=job_id,
+            worker_account=(
+                worker_account
+            ),
+        )
+        net = self._network_on_hire(
+            job_id, worker_account
+        )
+        self._send_html(
+            200,
+            "<html><body><h1>MPE</h1>"
+            "<p>Contratado</p>"
+            "<p>contratados: "
+            + str(hire["hired"])
+            + " | quedan: "
+            + str(hire["remaining"])
+            + " | estado: "
+            + str(hire["job_status"])
+            + "</p>"
+            "<p>credencial: "
+            + str(
+                net["credential"][
+                    "issued"
+                ]
+            )
+            + "</p></body></html>",
+        )
+
+    def _leave_form(self) -> None:
+        form = self._read_form()
+        job_id = self._form_value(
+            form, "job_id"
+        )
+        worker_account = (
+            self._form_value(
+                form, "worker_account"
+            )
+        )
+        result = (
+            self.store.worker_leaves(
+                job_id=job_id,
                 worker_account=(
                     worker_account
                 ),
             )
-            self._html(
-                200,
-                _page(
-                    "Aplicacion enviada",
-                    "<h1>Aplicacion"
-                    " enviada</h1>"
-                    "<a href='/mpe/trabajador/"
-                    f"{worker_account}'>"
-                    "<button>Volver</button>"
-                    "</a>",
-                ),
-            )
-            return
-        self._html(
-            404,
-            _page("404", "<h1>Ruta"
-            " desconocida</h1>"),
+        )
+        self._network_on_leave(
+            job_id, worker_account
+        )
+        self._send_html(
+            200,
+            "<html><body><h1>MPE</h1>"
+            "<p>Abandono registrado"
+            "</p><p>reabierta: "
+            + str(result["reopened"])
+            + " | quedan: "
+            + str(result["remaining"])
+            + "</p></body></html>",
         )
 
-    def _read_form(
-        self,
-    ) -> dict[str, Any]:
-        length_header = self.headers.get(
-            "Content-Length"
-        )
-        if length_header is None:
-            raise ValueError(
-                "Content-Length required"
-            )
-        raw = self.rfile.read(
-            int(length_header)
-        ).decode("utf-8")
-        doc: dict[str, Any] = {}
-        for pair in raw.split("&"):
-            if "=" in pair:
-                key, value = pair.split(
-                    "=", 1
-                )
-                doc[key] = value.replace(
-                    "+", " "
-                )
-        return doc
-
-    def _read_json(
-        self,
-    ) -> dict[str, Any]:
-        length_header = self.headers.get(
-            "Content-Length"
-        )
-        if length_header is None:
-            raise ValueError(
-                "Content-Length required"
-            )
-        raw = self.rfile.read(
-            int(length_header)
-        )
-        parsed: Any = json.loads(
-            raw.decode("utf-8")
-        )
-        if not isinstance(parsed, dict):
-            raise ValueError(
-                "body must be a JSON"
-                " object"
-            )
-        return {
-            str(k): v
-            for k, v in parsed.items()
-        }
-
-    @staticmethod
-    def _req(
-        doc: dict[str, Any], key: str
-    ) -> str:
-        value: Any = doc.get(key)
-        if isinstance(value, int) and not isinstance(
-            value, bool
-        ):
-            value = str(value)
-        if not isinstance(value, str):
-            raise ValueError(
-                f"missing field: {key}"
-            )
-        if not value.strip():
-            raise ValueError(
-                f"missing field: {key}"
-            )
-        return value
-
-    def _api_get(self, s: list[str]) -> None:
-        store = type(self).store
-        if s == ["health"]:
-            self._send(
-                200,
-                {
-                    "ok": True,
-                    "data": {
-                        "app": "mpe",
-                        "status":
-                        "operational",
-                    },
-                },
-            )
-            return
-        if s == ["jobs"]:
-            self._send(
-                200,
-                {
-                    "ok": True,
-                    "data": list(
-                        store.list_jobs()
-                    ),
-                },
-            )
-            return
-        if s == ["summary"]:
-            self._send(
-                200,
-                {
-                    "ok": True,
-                    "data": store.summary(),
-                },
-            )
-            return
-        self._send(
-            404,
-            {
-                "ok": False,
-                "error": {
-                    "type": "not_found",
-                    "message":
-                    "unknown api route",
-                },
-            },
-        )
-
-    def _api_post(
-        self, s: list[str]
-    ) -> None:
-        store = type(self).store
+    def _api_account(self) -> None:
         doc = self._read_json()
-        if s == ["accounts"]:
-            account_id = (
-                "MPE-"
-                + uuid.uuid4().hex[:12]
+        if doc is None:
+            self._api_error(
+                400, "invalid JSON"
             )
-            row = store.add_account(
+            return
+        role = str(
+            doc.get("role", "")
+        )
+        name = str(
+            doc.get("name", "")
+        )
+        profession = doc.get(
+            "profession"
+        )
+        zid = None
+        if role == "trabajador":
+            ok, data, _err = (
+                self.link.register_user(
+                    name
+                )
+            )
+        elif role == "empresa":
+            ok, data, _err = (
+                self.link
+                .register_company(
+                    name
+                )
+            )
+        else:
+            self._api_error(
+                400, "role invalido"
+            )
+            return
+        if ok and data is not None:
+            zid = _find_zid(data)
+        account_id = _new_account_id()
+        account = (
+            self.store.add_account(
                 account_id=account_id,
-                zid=doc.get("zid"),
-                name=self._req(doc, "name"),
-                role=self._req(doc, "role"),
-                profession=doc.get(
-                    "profession"
+                zid=zid,
+                name=name,
+                role=role,
+                profession=(
+                    str(profession)
+                    if profession
+                    else None
                 ),
             )
-            self._send(
-                201,
-                {
-                    "ok": True,
-                    "data": row,
-                },
+        )
+        if zid is not None:
+            self._trust_best_effort(
+                zid
+            )
+            self.store.mark_verified(
+                account_id=account_id
+            )
+        self._ok(account)
+
+    def _api_job(self) -> None:
+        doc = self._read_json()
+        if doc is None:
+            self._api_error(
+                400, "invalid JSON"
             )
             return
-        if s == ["jobs"]:
-            row = store.post_job(
-                job_id=(
-                    "JOB-"
-                    + uuid.uuid4().hex[:10]
-                ),
-                company_account=self._req(
-                    doc,
+        job = self.store.post_job(
+            job_id=_new_job_id(),
+            company_account=str(
+                doc.get(
                     "company_account",
-                ),
-                title=self._req(
-                    doc, "title"
-                ),
-                profession=self._req(
-                    doc, "profession"
-                ),
-                openings=int(
-                    doc.get("openings", 1)
-                ),
-            )
-            self._send(
-                201,
-                {
-                    "ok": True,
-                    "data": row,
-                },
-            )
-            return
-        self._send(
-            404,
-            {
-                "ok": False,
-                "error": {
-                    "type": "not_found",
-                    "message":
-                    "unknown api route",
-                },
-            },
-        )
-
-    def _home(self) -> None:
-        body = (
-            "<h1>💼 Mi Primer Empleo"
-            "</h1>"
-            "<p>Tu historial laboral"
-            " VERIFICADO por la Red.</p>"
-            "<h2>Soy trabajador</h2>"
-            "<div class='card'>"
-            "<form method='POST'"
-            " action='/mpe/register'>"
-            "<input type='hidden'"
-            " name='role' value="
-            "'trabajador'>"
-            "<input name='name'"
-            " placeholder='Mi nombre'>"
-            "<input name='profession'"
-            " placeholder='Mi oficio'>"
-            "<button>Crear mi perfil"
-            "</button>"
-            "</form></div>"
-            "<h2>Soy empresa</h2>"
-            "<div class='card'>"
-            "<form method='POST'"
-            " action='/mpe/register'>"
-            "<input type='hidden'"
-            " name='role' value="
-            "'empresa'>"
-            "<input name='name'"
-            " placeholder='Nombre de la"
-            " empresa'>"
-            "<input name='profession'"
-            " placeholder='Sector'>"
-            "<button>Registrar empresa"
-            "</button>"
-            "</form></div>"
-            "<a href='/mpe/jobs'>"
-            "<button class='gray'>Ver"
-            " vacantes</button></a>"
-        )
-        self._html(200, _page("MPE", body))
-
-    def _screen_worker(
-        self, s: list[str]
-    ) -> None:
-        store = type(self).store
-        account_id = (
-            s[1] if len(s) > 1 else ""
-        )
-        row = store.get_account(
-            account_id
-        )
-        jobs = store.list_jobs(
-            profession=row.get(
-                "profession"
-            )
-        )
-        jobs_html = ""
-        for j in jobs:
-            jobs_html = (
-                jobs_html
-                + "<li>• "
-                + j["title"]
-                + " ("
-                + j["profession"]
-                + ") <form method='POST'"
-                + " action='/mpe/apply'>"
-                + "<input type='hidden'"
-                + " name='job_id'"
-                + " value='"
-                + j["job_id"]
-                + "'>"
-                + "<input type='hidden'"
-                + " name='worker_account'"
-                + " value='"
-                + account_id
-                + "'>"
-                + "<button>Aplicar"
-                + "</button></form></li>"
-            )
-        if not jobs_html:
-            jobs_html = (
-                "<li>Sin vacantes para"
-                " tu oficio</li>"
-            )
-        body = (
-            "<h1>Mi Panel — "
-            + str(row.get("name"))
-            + "</h1>"
-            "<h2>Vacantes para ti</h2>"
-            f"<ul>{jobs_html}</ul>"
-            "<a href='/mpe'><button"
-            " class='gray'>Inicio"
-            "</button></a>"
-        )
-        self._html(
-            200,
-            _page("MPE - Mi panel", body),
-        )
-
-    def _screen_company(
-        self, s: list[str]
-    ) -> None:
-        store = type(self).store
-        account_id = (
-            s[1] if len(s) > 1 else ""
-        )
-        row = store.get_account(
-            account_id
-        )
-        body = (
-            "<h1>Panel Empresa — "
-            + str(row.get("name"))
-            + "</h1>"
-            "<h2>Publicar vacante</h2>"
-            "<div class='card'>"
-            "<form method='POST'"
-            " action='/mpe/job'>"
-            "<input type='hidden'"
-            " name='company_account'"
-            f" value='{account_id}'>"
-            "<input name='title'"
-            " placeholder='Cargo'>"
-            "<input name='profession'"
-            " placeholder='Oficio'>"
-            "<input name='openings'"
-            " value='1'>"
-            "<button>Publicar</button>"
-            "</form></div>"
-            "<a href='/mpe/jobs'>"
-            "<button class='gray'>Ver"
-            " vacantes</button></a>"
-            "<a href='/mpe'><button"
-            " class='gray'>Inicio"
-            "</button></a>"
-        )
-        self._html(
-            200,
-            _page(
-                "MPE - Empresa", body
+                    "",
+                )
+            ),
+            title=str(
+                doc.get("title", "")
+            ),
+            profession=str(
+                doc.get(
+                    "profession", ""
+                )
+            ),
+            openings=int(
+                doc.get("openings", 1)
             ),
         )
+        self._ok(job)
 
-    def _html(
-        self, status: int, html: str
-    ) -> None:
-        body = html.encode("utf-8")
-        self.send_response(status)
-        self.send_header(
-            "Content-Type",
-            "text/html; charset=utf-8",
+    def _api_proposal(self) -> None:
+        doc = self._read_json()
+        if doc is None:
+            self._api_error(
+                400, "invalid JSON"
+            )
+            return
+        proposal = (
+            self.store.create_proposal(
+                proposal_id=(
+                    _new_proposal_id()
+                ),
+                job_id=str(
+                    doc.get(
+                        "job_id", ""
+                    )
+                ),
+                company_account=str(
+                    doc.get(
+                        "company_account",
+                        "",
+                    )
+                ),
+                worker_account=str(
+                    doc.get(
+                        "worker_account",
+                        "",
+                    )
+                ),
+            )
         )
-        self.send_header(
-            "Content-Length",
-            str(len(body)),
-        )
-        self.end_headers()
-        self.wfile.write(body)
+        self._ok(proposal)
 
-    def _send(
-        self,
-        status: int,
-        payload: dict[str, Any],
-    ) -> None:
-        body = json.dumps(payload).encode(
-            "utf-8"
+    def _api_decide(self) -> None:
+        doc = self._read_json()
+        if doc is None:
+            self._api_error(
+                400, "invalid JSON"
+            )
+            return
+        decision = str(
+            doc.get("decision", "")
         )
-        self.send_response(status)
-        self.send_header(
-            "Content-Type",
-            "application/json",
+        if decision not in (
+            "aceptar",
+            "rechazar",
+        ):
+            self._api_error(
+                400,
+                "decision invalida",
+            )
+            return
+        accepted = (
+            decision == "aceptar"
         )
-        self.send_header(
-            "Content-Length",
-            str(len(body)),
+        result = (
+            self.store.decide_proposal(
+                proposal_id=str(
+                    doc.get(
+                        "proposal_id",
+                        "",
+                    )
+                ),
+                accepted=accepted,
+            )
         )
-        self.end_headers()
-        self.wfile.write(body)
+        if accepted:
+            result["network"] = (
+                self._network_on_hire(
+                    str(
+                        result["job_id"]
+                    ),
+                    str(
+                        result[
+                            "worker_account"
+                        ]
+                    ),
+                )
+            )
+        self._ok(result)
 
-
-class MpeServer(ThreadingHTTPServer):
-    daemon_threads = True
-    allow_reuse_address = True
-
-    def __init__(
-        self, address: tuple[str, int]
-    ) -> None:
-        super().__init__(
-            address, MpeApiHandler
+    def _api_hire(self) -> None:
+        doc = self._read_json()
+        if doc is None:
+            self._api_error(
+                400, "invalid JSON"
+            )
+            return
+        job_id = str(
+            doc.get("job_id", "")
+        )
+        worker_account = str(
+            doc.get(
+                "worker_account", ""
+            )
+        )
+        hire = self.store.hire_worker(
+            hire_id=_new_hire_id(),
+            job_id=job_id,
+            worker_account=(
+                worker_account
+            ),
+        )
+        network = (
+            self._network_on_hire(
+                job_id,
+                worker_account,
+            )
+        )
+        self._ok(
+            {
+                "hire": hire,
+                "network": network,
+            }
         )
 
-    @property
-    def bound_port(self) -> int:
-        return int(
-            self.server_address[1]
+    def _api_leave(self) -> None:
+        doc = self._read_json()
+        if doc is None:
+            self._api_error(
+                400, "invalid JSON"
+            )
+            return
+        job_id = str(
+            doc.get("job_id", "")
         )
+        worker_account = str(
+            doc.get(
+                "worker_account", ""
+            )
+        )
+        result = (
+            self.store.worker_leaves(
+                job_id=job_id,
+                worker_account=(
+                    worker_account
+                ),
+            )
+        )
+        self._network_on_leave(
+            job_id, worker_account
+        )
+        self._ok(result)
 
 
 def serve_mpe(
     store: MpeStore,
-    client: NetworkClient,
+    client: object,
     *,
     host: str = "127.0.0.1",
     port: int = 0,
-) -> MpeServer:
-    MpeApiHandler.store = store
-    MpeApiHandler.link = MpeLink(client)
-    return MpeServer((host, port))
+) -> ThreadingHTTPServer:
+    handler = type(
+        "BoundMpeHandler",
+        (MpeApiHandler,),
+        {
+            "store": store,
+            "link": MpeLink(client),
+        },
+    )
+    server = ThreadingHTTPServer(
+        (host, port), handler,
+    )
+    server.bound_port = (
+        server.server_address[1]
+    )
+    return server

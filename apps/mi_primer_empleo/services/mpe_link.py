@@ -1,4 +1,4 @@
-"""MpeLink: MPE operations on the Network."""
+"""MpeLink - MPE operations on the Network."""
 from __future__ import annotations
 
 import base64
@@ -116,4 +116,24 @@ class MpeLink:
     ) -> tuple[bool, dict | None, str | None]:
         return self._client.get(
             f"/reputation/{zid}"
+        )
+
+    def issue_employment_credential(
+        self,
+        *,
+        subject_zid: str,
+        issuer_zid: str,
+        title: str,
+        detail: str,
+    ) -> tuple[bool, dict | None, str | None]:
+        return self._client.post(
+            "/verification/credentials",
+            {
+                "subject_zid": subject_zid,
+                "issuer_zid": issuer_zid,
+                "credential_type":
+                "employment",
+                "title": title,
+                "detail": detail,
+            },
         )

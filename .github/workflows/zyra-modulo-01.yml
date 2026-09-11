@@ -1,4 +1,4 @@
-name: zyra-q3-mpe-hiring-e2e-v4
+name: zyra-q3-agro-aid-e2e
 
 "on":
   workflow_dispatch:
@@ -9,7 +9,7 @@ permissions:
   contents: write
 
 concurrency:
-  group: zyra-q3-mpe-${{ github.ref }}
+  group: zyra-q3-agro-${{ github.ref }}
   cancel-in-progress: false
 
 jobs:
@@ -31,12 +31,22 @@ jobs:
           python -m pip install --upgrade pip
           python -m pip install "cryptography>=42,<45" "pytest>=8,<9" "pytest-timeout>=2,<3"
 
-      - name: MpeStore migration 2
+      - name: Evidence (dump originals BEFORE any change)
         run: |
           set -euo pipefail
-          cat > apps/mi_primer_empleo/infrastructure/persistence/mpe_store.py <<'PYEOF'
-          """MPE durable store - accounts, jobs, applications,
-          proposals, hires with dynamic openings."""
+          echo "################ OLD server.py"
+          wc -c apps/agro/server.py
+          grep -n "def _get\|def _post\|def _route\|def _safe" apps/agro/server.py | head -20 || true
+          grep -n "menu\|MENU" apps/agro/server.py | head -20 || true
+          echo "################ OLD test list"
+          grep -n "^def test_\|assert" apps/agro/tests/test_agro_n1.py | head -60 || true
+
+      - name: AGRO store v3 (aid lifecycle additive migration)
+        run: |
+          set -euo pipefail
+          cat > apps/agro/infrastructure/persistence/agro_store.py <<'PYEOF'
+          """AGRO local durable store v3 (roles + government
+          aid lifecycle). Additive: v2 tables untouched."""
           from __future__ import annotations
 
           from shared_engines.storage.database import (
@@ -47,511 +57,722 @@ jobs:
               MigrationRunner,
           )
 
+          ROLES = (
+              "agricultor",
+              "ganadero",
+              "gobierno",
+              "banco",
+          )
+
           _MIGRATIONS = (
               Migration(
-                  1,
-                  "mpe",
+                  2,
+                  "agro",
                   (
-                      "CREATE TABLE mpe_accounts ("
-                      " account_id TEXT PRIMARY KEY,"
+                      "CREATE TABLE IF NOT EXISTS"
+                      " agro_producers_v2 ("
+                      " producer_id TEXT PRIMARY KEY,"
                       " zid TEXT,"
                       " name TEXT NOT NULL,"
-                      " role TEXT NOT NULL,"
-                      " profession TEXT,"
+                      " producer_type TEXT NOT NULL,"
+                      " role TEXT NOT NULL"
+                      " DEFAULT 'agricultor',"
+                      " location TEXT,"
                       " verified INTEGER NOT NULL"
                       " DEFAULT 0,"
+                      " synced INTEGER NOT NULL"
+                      " DEFAULT 0,"
                       " created_at REAL NOT NULL)",
-                      "CREATE TABLE mpe_jobs ("
-                      " job_id TEXT PRIMARY KEY,"
-                      " company_account TEXT NOT NULL,"
-                      " title TEXT NOT NULL,"
-                      " profession TEXT NOT NULL,"
-                      " openings INTEGER NOT NULL,"
-                      " status TEXT NOT NULL"
-                      " DEFAULT 'open',"
-                      " created_at REAL NOT NULL)",
-                      "CREATE TABLE mpe_applications ("
-                      " application_id TEXT PRIMARY"
+                      "CREATE TABLE"
+                      " agro_productions ("
+                      " production_id TEXT PRIMARY"
                       " KEY,"
-                      " job_id TEXT NOT NULL,"
-                      " worker_account TEXT NOT NULL,"
-                      " status TEXT NOT NULL"
-                      " DEFAULT 'submitted',"
+                      " producer_id TEXT NOT NULL,"
+                      " product TEXT NOT NULL,"
+                      " quantity REAL NOT NULL,"
+                      " unit TEXT NOT NULL,"
+                      " status TEXT NOT NULL,"
+                      " network_seq INTEGER,"
                       " created_at REAL NOT NULL)",
                   ),
               ),
               Migration(
-                  2,
-                  "mpe_hiring",
+                  3,
+                  "agro_aid",
                   (
-                      "CREATE TABLE mpe_proposals ("
-                      " proposal_id TEXT PRIMARY KEY,"
-                      " job_id TEXT NOT NULL,"
-                      " company_account TEXT NOT NULL,"
-                      " worker_account TEXT NOT NULL,"
+                      "CREATE TABLE IF NOT EXISTS"
+                      " agro_aid_requests ("
+                      " aid_id TEXT PRIMARY KEY,"
+                      " producer_id TEXT NOT NULL,"
+                      " zid TEXT,"
+                      " program TEXT NOT NULL,"
+                      " item TEXT NOT NULL,"
+                      " quantity REAL NOT NULL,"
                       " status TEXT NOT NULL"
-                      " DEFAULT 'pending',"
-                      " created_at REAL NOT NULL)",
-                      "CREATE TABLE mpe_hires ("
-                      " hire_id TEXT PRIMARY KEY,"
-                      " job_id TEXT NOT NULL,"
-                      " worker_account TEXT NOT NULL,"
-                      " status TEXT NOT NULL"
-                      " DEFAULT 'active',"
+                      " DEFAULT 'requested',"
+                      " eligibility TEXT,"
+                      " created_at REAL NOT NULL,"
+                      " updated_at REAL NOT NULL)",
+                      "CREATE TABLE IF NOT EXISTS"
+                      " agro_aid_events ("
+                      " event_id TEXT PRIMARY KEY,"
+                      " aid_id TEXT NOT NULL,"
+                      " transition TEXT NOT NULL,"
+                      " actor TEXT NOT NULL,"
+                      " detail TEXT,"
+                      " network_seq INTEGER,"
                       " created_at REAL NOT NULL)",
                   ),
               ),
           )
 
+          AID_FLOW: dict[str, str] = {
+              "requested": "evaluated",
+              "eligible": "approved",
+              "approved": "assigned",
+              "assigned": "delivered",
+              "delivered": "confirmed",
+          }
 
-          class MpeStore:
+
+          class AgroStore:
+              """Durable local state for AGRO (v3)."""
+
               def __init__(
                   self, db: Database, clock
               ) -> None:
                   self._db = db
                   self._clock = clock
                   MigrationRunner(
-                      db, "mpe", _MIGRATIONS
+                      db,
+                      "agro.store",
+                      _MIGRATIONS,
                   ).run(clock)
 
-              def add_account(
+              def add_producer(
                   self,
                   *,
-                  account_id: str,
+                  producer_id: str,
                   zid: str | None,
                   name: str,
+                  producer_type: str,
                   role: str,
-                  profession: str | None,
+                  location: str | None,
+                  synced: bool,
               ) -> dict[str, object]:
-                  if role not in (
-                      "trabajador",
-                      "empresa",
-                  ):
+                  if role not in ROLES:
                       raise ValueError(
                           f"unknown role: {role}"
                       )
                   now = self._clock.now()
                   with self._db.transaction() as cursor:
                       cursor.execute(
-                          "INSERT INTO mpe_accounts"
-                          " (account_id, zid, name,"
-                          "  role, profession, verified,"
+                          "INSERT INTO"
+                          " agro_producers_v2"
+                          " (producer_id, zid, name,"
+                          "  producer_type, role,"
+                          "  location, verified, synced,"
                           "  created_at)"
-                          " VALUES (?, ?, ?, ?, ?, 0, ?)",
+                          " VALUES (?, ?, ?, ?, ?, ?, 0,"
+                          "  ?, ?)",
                           (
-                              account_id,
+                              producer_id,
                               zid,
                               name,
+                              producer_type,
                               role,
-                              profession,
+                              location,
+                              int(synced),
                               now,
                           ),
                       )
-                  return self.get_account(account_id)
+                  return self.get_producer(
+                      producer_id
+                  )
 
-              def mark_verified(
-                  self, *, account_id: str
+              def link_zid(
+                  self,
+                  *,
+                  producer_id: str,
+                  zid: str,
               ) -> None:
                   with self._db.transaction() as cursor:
                       cursor.execute(
-                          "UPDATE mpe_accounts SET"
-                          " verified = 1"
-                          " WHERE account_id = ?",
-                          (account_id,),
+                          "UPDATE"
+                          " agro_producers_v2 SET"
+                          " zid = ?, synced = 1"
+                          " WHERE producer_id = ?",
+                          (zid, producer_id),
                       )
 
-              def get_account(
-                  self, account_id: str
+              def mark_verified(
+                  self, *, producer_id: str
+              ) -> None:
+                  with self._db.transaction() as cursor:
+                      cursor.execute(
+                          "UPDATE"
+                          " agro_producers_v2 SET"
+                          " verified = 1"
+                          " WHERE producer_id = ?",
+                          (producer_id,),
+                      )
+
+              def get_producer(
+                  self, producer_id: str
               ) -> dict[str, object]:
                   row = self._db.query_one(
-                      "SELECT * FROM mpe_accounts"
-                      " WHERE account_id = ?",
-                      (account_id,),
+                      "SELECT * FROM"
+                      " agro_producers_v2"
+                      " WHERE producer_id = ?",
+                      (producer_id,),
                   )
                   if row is None:
                       raise LookupError(
-                          "unknown account:"
-                          f" {account_id}"
+                          "unknown producer:"
+                          f" {producer_id}"
                       )
-                  return self._account_row(row)
+                  return self._producer_row(row)
 
-              def list_workers(
-                  self, *, profession: str | None = None
+              def list_producers(
+                  self,
+                  *,
+                  role: str | None = None,
               ) -> tuple[dict[str, object], ...]:
-                  if profession is not None:
+                  if role is not None:
+                      if role not in ROLES:
+                          raise ValueError(
+                              f"unknown role:"
+                              f" {role}"
+                          )
                       rows = self._db.query_all(
-                          "SELECT * FROM mpe_accounts"
-                          " WHERE role = 'trabajador'"
-                          " AND profession = ?"
+                          "SELECT * FROM"
+                          " agro_producers_v2"
+                          " WHERE role = ?"
                           " ORDER BY created_at",
-                          (profession,),
+                          (role,),
                       )
                   else:
                       rows = self._db.query_all(
-                          "SELECT * FROM mpe_accounts"
-                          " WHERE role = 'trabajador'"
+                          "SELECT * FROM"
+                          " agro_producers_v2"
                           " ORDER BY created_at"
                       )
                   return tuple(
-                      self._account_row(r)
+                      self._producer_row(r)
                       for r in rows
                   )
 
-              def list_companies(
-                  self,
-              ) -> tuple[dict[str, object], ...]:
-                  rows = self._db.query_all(
-                      "SELECT * FROM mpe_accounts"
-                      " WHERE role = 'empresa'"
-                      " ORDER BY created_at"
-                  )
-                  return tuple(
-                      self._account_row(r)
-                      for r in rows
-                  )
-
-              def post_job(
+              def add_production(
                   self,
                   *,
-                  job_id: str,
-                  company_account: str,
-                  title: str,
-                  profession: str,
-                  openings: int,
+                  production_id: str,
+                  producer_id: str,
+                  product: str,
+                  quantity: float,
+                  unit: str,
+                  network_seq: int | None,
               ) -> dict[str, object]:
-                  company = self.get_account(
-                      company_account
-                  )
-                  if company.get("role") != "empresa":
-                      raise ValueError(
-                          "only companies can post"
-                          " jobs"
-                      )
                   now = self._clock.now()
                   with self._db.transaction() as cursor:
                       cursor.execute(
-                          "INSERT INTO mpe_jobs"
-                          " (job_id, company_account,"
-                          "  title, profession,"
-                          "  openings, status,"
-                          "  created_at)"
+                          "INSERT INTO"
+                          " agro_productions"
+                          " (production_id,"
+                          "  producer_id, product,"
+                          "  quantity, unit, status,"
+                          "  network_seq, created_at)"
                           " VALUES (?, ?, ?, ?, ?,"
-                          "  'open', ?)",
+                          "  'active', ?, ?)",
                           (
-                              job_id,
-                              company_account,
-                              title,
-                              profession,
-                              openings,
+                              production_id,
+                              producer_id,
+                              product,
+                              quantity,
+                              unit,
+                              network_seq,
                               now,
                           ),
                       )
                   row = self._db.query_one(
-                      "SELECT * FROM mpe_jobs"
-                      " WHERE job_id = ?",
-                      (job_id,),
+                      "SELECT * FROM"
+                      " agro_productions"
+                      " WHERE production_id = ?",
+                      (production_id,),
                   )
                   assert row is not None
-                  return self._job_row(row)
-
-              def list_jobs(
-                  self, *, profession: str | None = None
-              ) -> tuple[dict[str, object], ...]:
-                  if profession is not None:
-                      rows = self._db.query_all(
-                          "SELECT * FROM mpe_jobs"
-                          " WHERE status = 'open'"
-                          " AND profession = ?"
-                          " ORDER BY created_at",
-                          (profession,),
-                      )
-                  else:
-                      rows = self._db.query_all(
-                          "SELECT * FROM mpe_jobs"
-                          " WHERE status = 'open'"
-                          " ORDER BY created_at"
-                      )
-                  return tuple(
-                      self._job_row(r)
-                      for r in rows
-                  )
-
-              def list_company_jobs(
-                  self, *, company_account: str
-              ) -> tuple[dict[str, object], ...]:
-                  rows = self._db.query_all(
-                      "SELECT * FROM mpe_jobs"
-                      " WHERE company_account = ?"
-                      " ORDER BY created_at",
-                      (company_account,),
-                  )
-                  return tuple(
-                      self._job_row(r)
-                      for r in rows
-                  )
-
-              def apply(
-                  self,
-                  *,
-                  application_id: str,
-                  job_id: str,
-                  worker_account: str,
-              ) -> dict[str, object]:
-                  worker = self.get_account(
-                      worker_account
-                  )
-                  if (
-                      worker.get("role")
-                      != "trabajador"
-                  ):
-                      raise ValueError(
-                          "only workers can apply"
-                      )
-                  row = self._db.query_one(
-                      "SELECT * FROM mpe_jobs"
-                      " WHERE job_id = ?"
-                      " AND status = 'open'",
-                      (job_id,),
-                  )
-                  if row is None:
-                      raise LookupError(
-                          "job not open:"
-                          f" {job_id}"
-                      )
-                  dup = self._db.query_one(
-                      "SELECT 1 FROM"
-                      " mpe_applications WHERE"
-                      " job_id = ? AND"
-                      " worker_account = ?",
-                      (job_id, worker_account),
-                  )
-                  if dup is not None:
-                      raise ValueError(
-                          "already applied"
-                      )
-                  now = self._clock.now()
-                  with self._db.transaction() as cursor:
-                      cursor.execute(
-                          "INSERT INTO"
-                          " mpe_applications"
-                          " (application_id, job_id,"
-                          "  worker_account, status,"
-                          "  created_at)"
-                          " VALUES (?, ?, ?,"
-                          "  'submitted', ?)",
-                          (
-                              application_id,
-                              job_id,
-                              worker_account,
-                              now,
-                          ),
-                      )
+                  raw_seq = row["network_seq"]
                   return {
-                      "application_id": (
-                          application_id
+                      "production_id": str(
+                          row["production_id"]
                       ),
-                      "job_id": job_id,
-                      "worker": worker_account,
-                      "status": "submitted",
+                      "producer_id": str(
+                          row["producer_id"]
+                      ),
+                      "product": str(
+                          row["product"]
+                      ),
+                      "quantity": float(
+                          row["quantity"]
+                      ),
+                      "unit": str(row["unit"]),
+                      "status": str(
+                          row["status"]
+                      ),
+                      "network_seq": (
+                          int(raw_seq)
+                          if raw_seq is not None
+                          else None
+                      ),
                   }
 
-              def applications_for(
-                  self, *, job_id: str
+              def list_productions(
+                  self,
               ) -> tuple[dict[str, object], ...]:
                   rows = self._db.query_all(
                       "SELECT * FROM"
-                      " mpe_applications"
-                      " WHERE job_id = ?"
-                      " ORDER BY created_at",
-                      (job_id,),
+                      " agro_productions"
+                      " ORDER BY created_at"
                   )
-                  return tuple(
-                      {
-                          "application_id": str(
-                              r["application_id"]
-                          ),
-                          "job_id": str(
-                              r["job_id"]
-                          ),
-                          "worker_account": str(
-                              r["worker_account"]
-                          ),
-                          "status": str(
-                              r["status"]
-                          ),
-                      }
-                      for r in rows
-                  )
+                  result: list[
+                      dict[str, object]
+                  ] = []
+                  for r in rows:
+                      raw_seq = r["network_seq"]
+                      result.append(
+                          {
+                              "production_id": (
+                                  str(
+                                      r[
+                                          "production_id"
+                                      ]
+                                  )
+                              ),
+                              "producer_id": (
+                                  str(
+                                      r[
+                                          "producer_id"
+                                      ]
+                                  )
+                              ),
+                              "product": str(
+                                  r["product"]
+                              ),
+                              "quantity": float(
+                                  r["quantity"]
+                              ),
+                              "unit": str(
+                                  r["unit"]
+                              ),
+                              "status": str(
+                                  r["status"]
+                              ),
+                              "network_seq": (
+                                  int(raw_seq)
+                                  if raw_seq
+                                  is not None
+                                  else None
+                              ),
+                          }
+                      )
+                  return tuple(result)
 
-              def _job_row_by_id(
-                  self, job_id: str,
+              # ---------- aid lifecycle (Q3) ----------
+
+              def _aid_row(
+                  self, aid_id: str,
               ):
                   return self._db.query_one(
-                      "SELECT * FROM mpe_jobs"
-                      " WHERE job_id = ?",
-                      (job_id,),
+                      "SELECT * FROM"
+                      " agro_aid_requests"
+                      " WHERE aid_id = ?",
+                      (aid_id,),
                   )
 
-              def _active_hires_count(
-                  self, job_id: str,
-              ) -> int:
-                  row = self._db.query_one(
-                      "SELECT COUNT(*) AS n"
-                      " FROM mpe_hires"
-                      " WHERE job_id = ?"
-                      " AND status = 'active'",
-                      (job_id,),
-                  )
-                  if row is None:
-                      return 0
-                  return int(row["n"])
-
-              def job_status(
-                  self, *, job_id: str,
-              ) -> dict[str, object]:
-                  row = self._job_row_by_id(job_id)
-                  if row is None:
-                      raise LookupError(
-                          "unknown job:"
-                          f" {job_id}"
-                      )
-                  job = self._job_row(row)
-                  openings = int(job["openings"])
-                  active = (
-                      self._active_hires_count(
-                          job_id
-                      )
-                  )
-                  return {
-                      "job_id": job_id,
-                      "title": job["title"],
-                      "profession": job[
-                          "profession"
-                      ],
-                      "company_account": job[
-                          "company_account"
-                      ],
-                      "openings": openings,
-                      "hired": active,
-                      "remaining": max(
-                          openings - active, 0
-                      ),
-                      "status": job["status"],
-                  }
-
-              def create_proposal(
+              def _record_aid_event(
                   self,
                   *,
-                  proposal_id: str,
-                  job_id: str,
-                  company_account: str,
-                  worker_account: str,
+                  aid_id: str,
+                  transition: str,
+                  actor: str,
+                  detail: str | None,
+                  network_seq: int | None,
               ) -> dict[str, object]:
-                  company = self.get_account(
-                      company_account
+                  event_id = (
+                      "AEV-"
+                      + uuid_like()
                   )
-                  if (
-                      company.get("role")
-                      != "empresa"
-                  ):
-                      raise ValueError(
-                          "only companies can"
-                          " send proposals"
+                  now = self._clock.now()
+                  with self._db.transaction() as cursor:
+                      cursor.execute(
+                          "INSERT INTO"
+                          " agro_aid_events"
+                          " (event_id, aid_id,"
+                          "  transition, actor,"
+                          "  detail, network_seq,"
+                          "  created_at)"
+                          " VALUES (?, ?, ?, ?,"
+                          "  ?, ?, ?)",
+                          (
+                              event_id,
+                              aid_id,
+                              transition,
+                              actor,
+                              detail,
+                              network_seq,
+                              now,
+                          ),
                       )
-                  worker = self.get_account(
-                      worker_account
+                  return {
+                      "event_id": event_id,
+                      "aid_id": aid_id,
+                      "transition": transition,
+                      "actor": actor,
+                      "detail": detail,
+                      "network_seq": (
+                          network_seq
+                      ),
+                  }
+
+              def create_aid_request(
+                  self,
+                  *,
+                  aid_id: str,
+                  producer_id: str,
+                  program: str,
+                  item: str,
+                  quantity: float,
+                  network_seq: int | None,
+              ) -> dict[str, object]:
+                  producer = self.get_producer(
+                      producer_id
                   )
-                  if (
-                      worker.get("role")
-                      != "trabajador"
-                  ):
-                      raise ValueError(
-                          "only workers can"
-                          " receive proposals"
-                      )
-                  job_row = self._job_row_by_id(
-                      job_id
-                  )
-                  if job_row is None:
-                      raise LookupError(
-                          "unknown job:"
-                          f" {job_id}"
-                      )
-                  job = self._job_row(job_row)
-                  if job["status"] != "open":
-                      raise ValueError(
-                          "job not open"
-                      )
-                  if (
-                      worker.get("profession")
-                      != job["profession"]
-                  ):
-                      raise ValueError(
-                          "profession mismatch"
-                      )
                   dup = self._db.query_one(
                       "SELECT 1 FROM"
-                      " mpe_proposals WHERE"
-                      " job_id = ? AND"
-                      " worker_account = ? AND"
-                      " status = 'pending'",
-                      (job_id, worker_account),
+                      " agro_aid_requests WHERE"
+                      " producer_id = ? AND"
+                      " program = ? AND"
+                      " status IN ('requested',"
+                      " 'eligible', 'approved',"
+                      " 'assigned', 'delivered',"
+                      " 'confirmed')",
+                      (producer_id, program),
                   )
                   if dup is not None:
                       raise ValueError(
-                          "proposal already"
-                          " pending"
+                          "active request"
+                          " already exists for"
+                          " this program"
                       )
                   now = self._clock.now()
                   with self._db.transaction() as cursor:
                       cursor.execute(
                           "INSERT INTO"
-                          " mpe_proposals"
-                          " (proposal_id, job_id,"
-                          "  company_account,"
-                          "  worker_account,"
-                          "  status, created_at)"
-                          " VALUES (?, ?, ?, ?,"
-                          "  'pending', ?)",
+                          " agro_aid_requests ("
+                          " aid_id, producer_id,"
+                          " zid, program, item,"
+                          " quantity, status,"
+                          " eligibility, created_at,"
+                          " updated_at)"
+                          " VALUES (?, ?, ?, ?, ?,"
+                          "  ?, 'requested', NULL,"
+                          "  ?, ?)",
                           (
-                              proposal_id,
-                              job_id,
-                              company_account,
-                              worker_account,
+                              aid_id,
+                              producer_id,
+                              producer.get("zid"),
+                              program,
+                              item,
+                              float(quantity),
+                              now,
                               now,
                           ),
                       )
-                  return {
-                      "proposal_id": proposal_id,
-                      "job_id": job_id,
-                      "worker_account": (
-                          worker_account
+                  self._record_aid_event(
+                      aid_id=aid_id,
+                      transition=(
+                          "AID_REQUESTED"
                       ),
-                      "status": "pending",
-                  }
+                      actor="productor",
+                      detail=program
+                      + ": "
+                      + item,
+                      network_seq=network_seq,
+                  )
+                  return self.get_aid(aid_id)
 
-              def list_proposals(
+              def evaluate_aid(
                   self,
                   *,
-                  worker_account: str | None = None,
-                  job_id: str | None = None,
-                  status: str | None = "pending",
+                  aid_id: str,
+                  eligible: bool,
+                  reason: str,
+                  network_seq: int | None,
+              ) -> dict[str, object]:
+                  row = self._aid_row(aid_id)
+                  if row is None:
+                      raise LookupError(
+                          "unknown aid:"
+                          f" {aid_id}"
+                      )
+                  if str(row["status"]) != (
+                      "requested"
+                  ):
+                      raise ValueError(
+                          "aid not awaiting"
+                          " eligibility"
+                      )
+                  new_status = (
+                      "eligible"
+                      if eligible
+                      else "rejected"
+                  )
+                  with self._db.transaction() as cursor:
+                      cursor.execute(
+                          "UPDATE"
+                          " agro_aid_requests SET"
+                          " status = ?,"
+                          " eligibility = ?,"
+                          " updated_at = ?"
+                          " WHERE aid_id = ?",
+                          (
+                              new_status,
+                              reason,
+                              self._clock.now(),
+                              aid_id,
+                          ),
+                      )
+                  self._record_aid_event(
+                      aid_id=aid_id,
+                      transition=(
+                          "AID_ELIGIBILITY_"
+                          "EVALUATED"
+                      ),
+                      actor="gobierno",
+                      detail=reason,
+                      network_seq=network_seq,
+                  )
+                  return self.get_aid(aid_id)
+
+              def _transition(
+                  self,
+                  *,
+                  aid_id: str,
+                  expected_from: str,
+                  to_status: str,
+                  transition: str,
+                  actor: str,
+                  detail: str | None,
+                  network_seq: int | None,
+              ) -> dict[str, object]:
+                  row = self._aid_row(aid_id)
+                  if row is None:
+                      raise LookupError(
+                          "unknown aid:"
+                          f" {aid_id}"
+                      )
+                  current = str(row["status"])
+                  if current != expected_from:
+                      raise ValueError(
+                          f"aid status is"
+                          f" {current}, expected"
+                          f" {expected_from}"
+                      )
+                  with self._db.transaction() as cursor:
+                      cursor.execute(
+                          "UPDATE"
+                          " agro_aid_requests SET"
+                          " status = ?,"
+                          " updated_at = ?"
+                          " WHERE aid_id = ?",
+                          (
+                              to_status,
+                              self._clock.now(),
+                              aid_id,
+                          ),
+                      )
+                  self._record_aid_event(
+                      aid_id=aid_id,
+                      transition=transition,
+                      actor=actor,
+                      detail=detail,
+                      network_seq=network_seq,
+                  )
+                  return self.get_aid(aid_id)
+
+              def approve_aid(
+                  self,
+                  *,
+                  aid_id: str,
+                  network_seq: int | None,
+              ) -> dict[str, object]:
+                  return self._transition(
+                      aid_id=aid_id,
+                      expected_from="eligible",
+                      to_status="approved",
+                      transition="AID_APPROVED",
+                      actor="gobierno",
+                      detail=None,
+                      network_seq=network_seq,
+                  )
+
+              def assign_aid(
+                  self,
+                  *,
+                  aid_id: str,
+                  detail: str | None,
+                  network_seq: int | None,
+              ) -> dict[str, object]:
+                  return self._transition(
+                      aid_id=aid_id,
+                      expected_from="approved",
+                      to_status="assigned",
+                      transition="AID_ASSIGNED",
+                      actor="gobierno",
+                      detail=detail,
+                      network_seq=network_seq,
+                  )
+
+              def deliver_aid(
+                  self,
+                  *,
+                  aid_id: str,
+                  detail: str | None,
+                  network_seq: int | None,
+              ) -> dict[str, object]:
+                  return self._transition(
+                      aid_id=aid_id,
+                      expected_from="assigned",
+                      to_status="delivered",
+                      transition=(
+                          "AID_DELIVERED"
+                      ),
+                      actor="gobierno",
+                      detail=detail,
+                      network_seq=network_seq,
+                  )
+
+              def confirm_aid(
+                  self,
+                  *,
+                  aid_id: str,
+                  network_seq: int | None,
+              ) -> dict[str, object]:
+                  return self._transition(
+                      aid_id=aid_id,
+                      expected_from=(
+                          "delivered"
+                      ),
+                      to_status="confirmed",
+                      transition=(
+                          "AID_DELIVERY_"
+                          "CONFIRMED"
+                      ),
+                      actor="productor",
+                      detail=None,
+                      network_seq=network_seq,
+                  )
+
+              def get_aid(
+                  self, aid_id: str,
+              ) -> dict[str, object]:
+                  row = self._aid_row(aid_id)
+                  if row is None:
+                      raise LookupError(
+                          "unknown aid:"
+                          f" {aid_id}"
+                      )
+                  events = self._db.query_all(
+                      "SELECT * FROM"
+                      " agro_aid_events WHERE"
+                      " aid_id = ?"
+                      " ORDER BY created_at",
+                      (aid_id,),
+                  )
+                  event_list = []
+                  for e in events:
+                      seq = e["network_seq"]
+                      event_list.append(
+                          {
+                              "event_id": str(
+                                  e["event_id"]
+                              ),
+                              "transition": str(
+                                  e[
+                                      "transition"
+                                  ]
+                              ),
+                              "actor": str(
+                                  e["actor"]
+                              ),
+                              "detail": (
+                                  str(
+                                      e["detail"]
+                                  )
+                                  if e["detail"]
+                                  is not None
+                                  else None
+                              ),
+                              "network_seq": (
+                                  int(seq)
+                                  if seq
+                                  is not None
+                                  else None
+                              ),
+                          }
+                      )
+                  return {
+                      "aid_id": str(
+                          row["aid_id"]
+                      ),
+                      "producer_id": str(
+                          row["producer_id"]
+                      ),
+                      "zid": (
+                          str(row["zid"])
+                          if row["zid"]
+                          is not None
+                          else None
+                      ),
+                      "program": str(
+                          row["program"]
+                      ),
+                      "item": str(row["item"]),
+                      "quantity": float(
+                          row["quantity"]
+                      ),
+                      "status": str(
+                          row["status"]
+                      ),
+                      "eligibility": (
+                          str(
+                              row["eligibility"]
+                          )
+                          if row["eligibility"]
+                          is not None
+                          else None
+                      ),
+                      "events": event_list,
+                  }
+
+              def list_aid(
+                  self,
+                  *,
+                  producer_id: str | None = None,
+                  status: str | None = None,
               ) -> tuple[dict[str, object], ...]:
                   sql = (
-                      "SELECT * FROM"
-                      " mpe_proposals WHERE 1=1"
+                      "SELECT aid_id FROM"
+                      " agro_aid_requests"
+                      " WHERE 1=1"
                   )
                   params: list[object] = []
-                  if worker_account is not None:
+                  if producer_id is not None:
                       sql += (
-                          " AND worker_account = ?"
+                          " AND producer_id = ?"
                       )
                       params.append(
-                          worker_account
+                          producer_id
                       )
-                  if job_id is not None:
-                      sql += " AND job_id = ?"
-                      params.append(job_id)
                   if status is not None:
                       sql += " AND status = ?"
                       params.append(status)
@@ -560,596 +781,202 @@ jobs:
                       sql, tuple(params)
                   )
                   return tuple(
-                      {
-                          "proposal_id": str(
-                              r["proposal_id"]
-                          ),
-                          "job_id": str(
-                              r["job_id"]
-                          ),
-                          "company_account": str(
-                              r[
-                                  "company_account"
-                              ]
-                          ),
-                          "worker_account": str(
-                              r[
-                                  "worker_account"
-                              ]
-                          ),
-                          "status": str(
-                              r["status"]
-                          ),
-                      }
+                      self.get_aid(
+                          str(r["aid_id"])
+                      )
                       for r in rows
                   )
 
-              def decide_proposal(
+              def aid_summary(
                   self,
-                  *,
-                  proposal_id: str,
-                  accepted: bool,
               ) -> dict[str, object]:
-                  row = self._db.query_one(
-                      "SELECT * FROM"
-                      " mpe_proposals WHERE"
-                      " proposal_id = ?",
-                      (proposal_id,),
+                  total = self._db.query_one(
+                      "SELECT COUNT(*) AS n"
+                      " FROM"
+                      " agro_aid_requests"
                   )
-                  if row is None:
-                      raise LookupError(
-                          "unknown proposal:"
-                          f" {proposal_id}"
+                  by_status_rows = (
+                      self._db.query_all(
+                          "SELECT status,"
+                          " COUNT(*) AS n FROM"
+                          " agro_aid_requests"
+                          " GROUP BY status"
                       )
-                  if str(row["status"]) != "pending":
-                      raise ValueError(
-                          "proposal already"
-                          " decided"
-                      )
-                  job_id = str(row["job_id"])
-                  worker_account = str(
-                      row["worker_account"]
                   )
-                  if accepted:
-                      job_row = (
-                          self._job_row_by_id(
-                              job_id
-                          )
+                  by_program_rows = (
+                      self._db.query_all(
+                          "SELECT program,"
+                          " COUNT(*) AS n,"
+                          " SUM(quantity) AS q"
+                          " FROM"
+                          " agro_aid_requests"
+                          " GROUP BY program"
                       )
-                      if job_row is None:
-                          raise LookupError(
-                              "unknown job:"
-                              f" {job_id}"
-                          )
-                      if (
-                          str(job_row["status"])
-                          != "open"
-                      ):
-                          raise ValueError(
-                              "job not open"
-                          )
-                      if (
-                          self
-                          ._active_hires_count(
-                              job_id
-                          )
-                          >= int(
-                              job_row["openings"]
-                          )
-                      ):
-                          raise ValueError(
-                              "no openings left"
-                          )
-                      new_status = "accepted"
-                  else:
-                      new_status = "rejected"
-                  with self._db.transaction() as cursor:
-                      cursor.execute(
-                          "UPDATE mpe_proposals"
-                          " SET status = ?"
-                          " WHERE proposal_id = ?",
-                          (
-                              new_status,
-                              proposal_id,
-                          ),
+                  )
+                  by_status = {
+                      str(r["status"]): int(
+                          r["n"]
                       )
-                  result: dict[str, object] = {
-                      "proposal_id": proposal_id,
-                      "status": new_status,
-                      "job_id": job_id,
-                      "worker_account": (
-                          worker_account
-                      ),
+                      for r in by_status_rows
                   }
-                  if accepted:
-                      hire_id = (
-                          "HIR-"
-                          + proposal_id[5:]
-                      )
-                      hire = self.hire_worker(
-                          hire_id=hire_id,
-                          job_id=job_id,
-                          worker_account=(
-                              worker_account
+                  by_program = {}
+                  for r in by_program_rows:
+                      by_program[
+                          str(r["program"])
+                      ] = {
+                          "requests": int(
+                              r["n"]
                           ),
-                      )
-                      result["hire"] = hire
-                  return result
-
-              def hire_worker(
-                  self,
-                  *,
-                  hire_id: str,
-                  job_id: str,
-                  worker_account: str,
-              ) -> dict[str, object]:
-                  worker = self.get_account(
-                      worker_account
-                  )
-                  if (
-                      worker.get("role")
-                      != "trabajador"
-                  ):
-                      raise ValueError(
-                          "only workers can be"
-                          " hired"
-                      )
-                  job_row = self._job_row_by_id(
-                      job_id
-                  )
-                  if job_row is None:
-                      raise LookupError(
-                          "unknown job:"
-                          f" {job_id}"
-                      )
-                  if (
-                      str(job_row["status"])
-                      != "open"
-                  ):
-                      raise ValueError(
-                          "job not open"
-                      )
-                  if (
-                      worker.get("profession")
-                      != str(
-                          job_row["profession"]
-                      )
-                  ):
-                      raise ValueError(
-                          "profession mismatch"
-                      )
-                  if (
-                      self._active_hires_count(
-                          job_id
-                      )
-                      >= int(job_row["openings"])
-                  ):
-                      raise ValueError(
-                          "no openings left"
-                      )
-                  dup = self._db.query_one(
-                      "SELECT 1 FROM mpe_hires"
-                      " WHERE job_id = ? AND"
-                      " worker_account = ? AND"
-                      " status = 'active'",
-                      (job_id, worker_account),
-                  )
-                  if dup is not None:
-                      raise ValueError(
-                          "already hired"
-                      )
-                  now = self._clock.now()
-                  with self._db.transaction() as cursor:
-                      cursor.execute(
-                          "INSERT INTO mpe_hires"
-                          " (hire_id, job_id,"
-                          "  worker_account,"
-                          "  status, created_at)"
-                          " VALUES (?, ?, ?,"
-                          "  'active', ?)",
-                          (
-                              hire_id,
-                              job_id,
-                              worker_account,
-                              now,
+                          "quantity": float(
+                              r["q"] or 0
                           ),
-                      )
-                  active = (
-                      self._active_hires_count(
-                          job_id
-                      )
-                  )
-                  openings = int(
-                      job_row["openings"]
-                  )
-                  filled = active >= openings
-                  if filled:
-                      with (
-                          self._db.transaction()
-                      ) as cursor:
-                          cursor.execute(
-                              "UPDATE mpe_jobs"
-                              " SET status ="
-                              " 'filled'"
-                              " WHERE job_id = ?",
-                              (job_id,),
-                          )
+                      }
                   return {
-                      "hire_id": hire_id,
-                      "job_id": job_id,
-                      "worker_account": (
-                          worker_account
+                      "aid_total": int(
+                          total["n"]
+                      )
+                      if total is not None
+                      else 0,
+                      "aid_by_status": (
+                          by_status
                       ),
-                      "hired": active,
-                      "remaining": max(
-                          openings - active, 0
-                      ),
-                      "job_status": (
-                          "filled"
-                          if filled
-                          else "open"
+                      "aid_by_program": (
+                          by_program
                       ),
                   }
 
-              def worker_leaves(
+              def summary(
                   self,
-                  *,
-                  job_id: str,
-                  worker_account: str,
               ) -> dict[str, object]:
-                  row = self._db.query_one(
-                      "SELECT * FROM mpe_hires"
-                      " WHERE job_id = ? AND"
-                      " worker_account = ? AND"
-                      " status = 'active'",
-                      (job_id, worker_account),
-                  )
-                  if row is None:
-                      raise LookupError(
-                          "no active hire for"
-                          " this job and worker"
-                      )
-                  hire_id = str(row["hire_id"])
-                  with self._db.transaction() as cursor:
-                      cursor.execute(
-                          "UPDATE mpe_hires SET"
-                          " status = 'left'"
-                          " WHERE hire_id = ?",
-                          (hire_id,),
-                      )
-                  job_row = self._job_row_by_id(
-                      job_id
-                  )
-                  reopened = False
-                  if (
-                      job_row is not None
-                      and str(job_row["status"])
-                      == "filled"
-                  ):
-                      with (
-                          self._db.transaction()
-                      ) as cursor:
-                          cursor.execute(
-                              "UPDATE mpe_jobs"
-                              " SET status ="
-                              " 'open'"
-                              " WHERE job_id = ?",
-                              (job_id,),
-                          )
-                      reopened = True
-                  active = (
-                      self._active_hires_count(
-                          job_id
+                  producers = (
+                      self._db.query_one(
+                          "SELECT COUNT(*) AS"
+                          " total,"
+                          " SUM(verified) AS"
+                          " verified"
+                          " FROM"
+                          " agro_producers_v2"
                       )
                   )
-                  openings = (
-                      int(job_row["openings"])
-                      if job_row is not None
-                      else 0
+                  by_role_rows = (
+                      self._db.query_all(
+                          "SELECT role, COUNT(*)"
+                          " AS n FROM"
+                          " agro_producers_v2"
+                          " GROUP BY role"
+                      )
                   )
-                  return {
-                      "job_id": job_id,
-                      "worker_account": (
-                          worker_account
-                      ),
-                      "hired": active,
-                      "remaining": max(
-                          openings - active, 0
-                      ),
-                      "status": (
-                          "open"
-                          if reopened
-                          else (
-                              str(
-                                  job_row[
-                                      "status"
-                                  ]
-                              )
-                              if job_row
-                              is not None
-                              else "open"
-                          )
-                      ),
-                      "reopened": reopened,
-                  }
-
-              def summary(self) -> dict[str, object]:
-                  accounts = self._db.query_one(
-                      "SELECT COUNT(*) AS total,"
-                      " SUM(verified) AS verified"
-                      " FROM mpe_accounts"
-                  )
-                  roles = self._db.query_all(
-                      "SELECT role, COUNT(*) AS n"
-                      " FROM mpe_accounts"
-                      " GROUP BY role"
-                  )
-                  jobs = self._db.query_one(
-                      "SELECT COUNT(*) AS open_jobs"
-                      " FROM mpe_jobs"
-                      " WHERE status = 'open'"
-                  )
-                  apps = self._db.query_one(
-                      "SELECT COUNT(*) AS total"
-                      " FROM mpe_applications"
-                  )
-                  hires = self._db.query_one(
-                      "SELECT COUNT(*) AS total"
-                      " FROM mpe_hires"
-                      " WHERE status = 'active'"
-                  )
-                  props = self._db.query_one(
-                      "SELECT COUNT(*) AS total"
-                      " FROM mpe_proposals"
-                      " WHERE status = 'pending'"
+                  productions = (
+                      self._db.query_all(
+                          "SELECT product,"
+                          " SUM(quantity) AS total"
+                          " FROM"
+                          " agro_productions"
+                          " GROUP BY product"
+                          " ORDER BY product"
+                      )
                   )
                   by_role = {
                       str(r["role"]): int(r["n"])
-                      for r in roles
+                      for r in by_role_rows
+                  }
+                  by_product = {
+                      str(r["product"]): float(
+                          r["total"]
+                      )
+                      for r in productions
                   }
                   total = 0
                   verified = 0
-                  if accounts is not None:
+                  if producers is not None:
                       total = int(
-                          accounts["total"]
+                          producers["total"]
                       )
                       if (
-                          accounts["verified"]
+                          producers["verified"]
                           is not None
                       ):
                           verified = int(
-                              accounts[
+                              producers[
                                   "verified"
                               ]
                           )
+                  aid = self.aid_summary()
                   return {
-                      "accounts_total": total,
-                      "accounts_verified": (
+                      "producers_total": total,
+                      "producers_verified": (
                           verified
                       ),
-                      "by_role": by_role,
-                      "open_jobs": int(
-                          jobs["open_jobs"]
-                      )
-                      if jobs is not None
-                      else 0,
-                      "applications_total": int(
-                          apps["total"]
-                      )
-                      if apps is not None
-                      else 0,
-                      "hires_total": int(
-                          hires["total"]
-                      )
-                      if hires is not None
-                      else 0,
-                      "proposals_pending": int(
-                          props["total"]
-                      )
-                      if props is not None
-                      else 0,
+                      "producers_by_role": (
+                          by_role
+                      ),
+                      "productions_by_product": (
+                          by_product
+                      ),
+                      "aid_total": aid[
+                          "aid_total"
+                      ],
+                      "aid_by_status": aid[
+                          "aid_by_status"
+                      ],
+                      "aid_by_program": aid[
+                          "aid_by_program"
+                      ],
                   }
 
               @staticmethod
-              def _account_row(row) -> dict[str, object]:
+              def _producer_row(
+                  row,
+              ) -> dict[str, object]:
                   return {
-                      "account_id": str(
-                          row["account_id"]
+                      "producer_id": str(
+                          row["producer_id"]
                       ),
                       "zid": (
                           str(row["zid"])
-                          if row["zid"] is not None
+                          if row["zid"]
+                          is not None
                           else None
                       ),
                       "name": str(row["name"]),
+                      "producer_type": str(
+                          row["producer_type"]
+                      ),
                       "role": str(row["role"]),
-                      "profession": (
-                          str(row["profession"])
-                          if row["profession"]
+                      "location": (
+                          str(row["location"])
+                          if row["location"]
                           is not None
                           else None
                       ),
                       "verified": bool(
                           int(row["verified"])
                       ),
-                      "created_at": float(
-                          row["created_at"]
+                      "synced": bool(
+                          int(row["synced"])
                       ),
-                  }
-
-              @staticmethod
-              def _job_row(row) -> dict[str, object]:
-                  return {
-                      "job_id": str(row["job_id"]),
-                      "company_account": str(
-                          row["company_account"]
-                      ),
-                      "title": str(row["title"]),
-                      "profession": str(
-                          row["profession"]
-                      ),
-                      "openings": int(
-                          row["openings"]
-                      ),
-                      "status": str(row["status"]),
                       "created_at": float(
                           row["created_at"]
                       ),
                   }
           PYEOF
+          cat >> apps/agro/infrastructure/persistence/agro_store.py <<'PYEOF'
+
+
+          def uuid_like() -> str:
+              import uuid
+
+              return uuid.uuid4().hex[:10]
+          PYEOF
+          python -m py_compile apps/agro/infrastructure/persistence/agro_store.py
           echo "store written"
 
-      - name: MpeLink with credential issuance
+      - name: AGRO server (all old routes kept plus aid flow)
         run: |
           set -euo pipefail
-          cat > apps/mi_primer_empleo/services/mpe_link.py <<'PYEOF'
-          """MpeLink - MPE operations on the Network."""
-          from __future__ import annotations
-
-          import base64
-
-          from apps.mi_primer_empleo.infrastructure.network.network_client import (
-              NetworkClient,
-          )
-
-
-          class MpeLink:
-              def __init__(
-                  self, client: NetworkClient
-              ) -> None:
-                  self._client = client
-
-              def register_app(self) -> tuple[
-                  bool, dict | None, str | None
-              ]:
-                  return self._client.post(
-                      "/apps/register",
-                      {
-                          "app_id": "mpe",
-                          "display_name": (
-                              "Mi Primer Empleo"
-                          ),
-                          "scopes": [
-                              "display_name",
-                              "contact",
-                          ],
-                      },
-                  )
-
-              def register_user(
-                  self, display_name: str
-              ) -> tuple[bool, dict | None, str | None]:
-                  return self._client.post(
-                      "/identity/register",
-                      {
-                          "kind": "person",
-                          "display_name": display_name,
-                          "actor": "mpe",
-                      },
-                  )
-
-              def register_company(
-                  self, display_name: str
-              ) -> tuple[bool, dict | None, str | None]:
-                  return self._client.post(
-                      "/identity/register",
-                      {
-                          "kind": "organization",
-                          "display_name": display_name,
-                          "actor": "mpe",
-                      },
-                  )
-
-              def complete_trust(
-                  self, zid: str
-              ) -> tuple[bool, dict | None, str | None]:
-                  return self._client.post(
-                      "/trust/complete",
-                      {"zid": zid, "actor": "mpe"},
-                  )
-
-              def is_trusted(
-                  self, zid: str
-              ) -> tuple[bool, dict | None, str | None]:
-                  return self._client.get(
-                      f"/trust/{zid}"
-                  )
-
-              def record_work_event(
-                  self,
-                  zid: str,
-                  event: str,
-                  detail: str,
-              ) -> tuple[bool, dict | None, str | None]:
-                  return self._client.post(
-                      "/history/append",
-                      {
-                          "zid": zid,
-                          "entry_type": "employment",
-                          "actor_app": "mpe",
-                          "payload": {
-                              "event": event,
-                              "detail": detail,
-                          },
-                      },
-                  )
-
-              def give_reputation(
-                  self,
-                  subject_zid: str,
-                  actor_zid: str,
-                  kind: str,
-                  evidence: str,
-              ) -> tuple[bool, dict | None, str | None]:
-                  evidence_b64 = base64.b64encode(
-                      evidence.encode("utf-8")
-                  ).decode("ascii")
-                  return self._client.post(
-                      "/reputation/record",
-                      {
-                          "subject_zid": subject_zid,
-                          "actor_zid": actor_zid,
-                          "kind": kind,
-                          "evidence_b64": (
-                              evidence_b64
-                          ),
-                      },
-                  )
-
-              def reputation_score(
-                  self, zid: str
-              ) -> tuple[bool, dict | None, str | None]:
-                  return self._client.get(
-                      f"/reputation/{zid}"
-                  )
-
-              def issue_employment_credential(
-                  self,
-                  *,
-                  subject_zid: str,
-                  issuer_zid: str,
-                  title: str,
-                  detail: str,
-              ) -> tuple[bool, dict | None, str | None]:
-                  return self._client.post(
-                      "/verification/credentials",
-                      {
-                          "subject_zid": subject_zid,
-                          "issuer_zid": issuer_zid,
-                          "credential_type":
-                          "employment",
-                          "title": title,
-                          "detail": detail,
-                      },
-                  )
-          PYEOF
-          echo "link written"
-
-      - name: MPE server v3 with complete trust
-        run: |
-          set -euo pipefail
-          cat > apps/mi_primer_empleo/server.py <<'PYEOF'
-          """MPE HTTP server - bidirectional employment."""
+          cat > apps/agro/server.py <<'PYEOF'
+          """AGRO HTTP server - roles, production and
+          government aid lifecycle."""
           from __future__ import annotations
 
           import json
@@ -1160,32 +987,25 @@ jobs:
           )
           from urllib.parse import parse_qs
 
-          from apps.mi_primer_empleo.infrastructure.persistence.mpe_store import (
-              MpeStore,
+          from apps.agro.infrastructure.persistence.agro_store import (
+              ROLES,
+              AgroStore,
           )
-          from apps.mi_primer_empleo.services.mpe_link import (
-              MpeLink,
+          from apps.agro.services.zyra_link import (
+              ZyraLink,
           )
 
 
-          def _new_account_id() -> str:
-              return "MPE-" + uuid.uuid4().hex[:12]
+          def _new_producer_id() -> str:
+              return "AGR-" + uuid.uuid4().hex[:12]
 
 
-          def _new_job_id() -> str:
-              return "JOB-" + uuid.uuid4().hex[:10]
+          def _new_production_id() -> str:
+              return "PRD-" + uuid.uuid4().hex[:10]
 
 
-          def _new_proposal_id() -> str:
-              return "PROP-" + uuid.uuid4().hex[:10]
-
-
-          def _new_hire_id() -> str:
-              return "HIR-" + uuid.uuid4().hex[:10]
-
-
-          def _new_application_id() -> str:
-              return "APP-" + uuid.uuid4().hex[:10]
+          def _new_aid_id() -> str:
+              return "AID-" + uuid.uuid4().hex[:10]
 
 
           def _find_zid(doc):
@@ -1216,47 +1036,33 @@ jobs:
               return None
 
 
-          def _find_credential_id(doc):
+          def _find_seq(doc):
               if isinstance(doc, dict):
                   for key, value in (
                       doc.items()
                   ):
-                      key_lower = str(
-                          key
-                      ).lower()
                       if (
-                          (
-                              "credential"
-                              in key_lower
-                          )
-                          or key_lower == "id"
+                          "seq" in str(key)
+                          .lower()
                       ) and isinstance(
-                          value, str
-                      ) and value:
+                          value, int
+                      ):
                           return value
                   for value in doc.values():
-                      found = (
-                          _find_credential_id(
-                              value
-                          )
-                      )
+                      found = _find_seq(value)
                       if found is not None:
                           return found
               elif isinstance(doc, list):
                   for item in doc:
-                      found = (
-                          _find_credential_id(
-                              item
-                          )
-                      )
+                      found = _find_seq(item)
                       if found is not None:
                           return found
               return None
 
 
-          class MpeApiHandler(BaseHTTPRequestHandler):
-              store: MpeStore
-              link: MpeLink
+          class AgroApiHandler(BaseHTTPRequestHandler):
+              store: AgroStore
+              link: ZyraLink
 
               def log_message(
                   self, format: str, *args,
@@ -1319,19 +1125,6 @@ jobs:
                       },
                   )
 
-              def _html_error(
-                  self,
-                  status: int,
-                  message: str,
-              ) -> None:
-                  self._send_html(
-                      status,
-                      "<html><body><h1>MPE"
-                      "</h1><p>Error: "
-                      + message
-                      + "</p></body></html>",
-                  )
-
               def _read_body(self) -> bytes:
                   try:
                       length = int(
@@ -1376,11 +1169,20 @@ jobs:
                       return None
                   return doc
 
+              def _payload(self) -> dict | None:
+                  doc = self._read_json()
+                  if doc is not None and doc:
+                      return doc
+                  form = self._read_form()
+                  if form:
+                      return form
+                  return doc
+
               @staticmethod
-              def _form_value(
-                  form: dict, key: str,
-              ) -> str:
-                  value = form.get(key, "")
+              def _value(
+                  doc: dict, key: str,
+              ):
+                  value = doc.get(key, "")
                   if value is None:
                       return ""
                   return str(value)
@@ -1420,169 +1222,28 @@ jobs:
                   except Exception:
                       return False
 
-              def _network_on_hire(
+              def _network_event(
                   self,
-                  job_id: str,
-                  worker_account: str,
-              ) -> dict:
-                  result: dict = {
-                      "credential": {
-                          "issued": False,
-                      },
-                      "history_recorded":
-                      False,
-                      "trust_completed":
-                      False,
-                  }
+                  zid: str | None,
+                  event: str,
+                  detail: str,
+              ) -> int | None:
+                  if not zid:
+                      return None
                   try:
-                      status = (
-                          self.store.job_status(
-                              job_id=job_id
+                      ok, data, _err = (
+                          self.link
+                          .record_agro_event(
+                              zid,
+                              event,
+                              detail,
                           )
                       )
-                      worker = (
-                          self.store.get_account(
-                              worker_account
-                          )
-                      )
-                      worker_zid = worker.get(
-                          "zid"
-                      )
-                      company = (
-                          self.store.get_account(
-                              str(
-                                  status[
-                                      "company_account"
-                                  ]
-                              )
-                          )
-                      )
-                      company_zid = (
-                          company.get("zid")
-                      )
-                      trust_ok = (
-                          self._trust_best_effort(
-                              company_zid
-                          )
-                          and self
-                          ._trust_best_effort(
-                              worker_zid
-                          )
-                      )
-                      result[
-                          "trust_completed"
-                      ] = bool(trust_ok)
-                      if (
-                          worker_zid
-                          and company_zid
-                      ):
-                          ok, data, err = (
-                              self.link
-                              .issue_employment_credential(
-                                  subject_zid=str(
-                                      worker_zid
-                                  ),
-                                  issuer_zid=str(
-                                      company_zid
-                                  ),
-                                  title=str(
-                                      status[
-                                          "title"
-                                      ]
-                                  ),
-                                  detail=(
-                                      "contratacion"
-                                      " registrada en"
-                                      " MPE"
-                                  ),
-                              )
-                          )
-                          credential = {
-                              "issued": bool(
-                                  ok
-                              ),
-                          }
-                          if (
-                              ok
-                              and isinstance(
-                                  data, dict
-                              )
-                          ):
-                              credential_id = (
-                                  _find_credential_id(
-                                      data
-                                  )
-                              )
-                              if (
-                                  credential_id
-                              ):
-                                  credential[
-                                      "credential_id"
-                                  ] = (
-                                      credential_id
-                                  )
-                          elif not ok:
-                              credential[
-                                  "error"
-                              ] = err
-                          result[
-                              "credential"
-                          ] = credential
-                      if worker_zid:
-                          hok, _hd, _he = (
-                              self.link
-                              .record_work_event(
-                                  str(
-                                      worker_zid
-                                  ),
-                                  "hired",
-                                  str(
-                                      status[
-                                          "title"
-                                      ]
-                                  ),
-                              )
-                          )
-                          result[
-                              "history_recorded"
-                          ] = bool(hok)
+                      if ok:
+                          return _find_seq(data)
                   except Exception:
                       pass
-                  return result
-
-              def _network_on_leave(
-                  self,
-                  job_id: str,
-                  worker_account: str,
-              ) -> bool:
-                  try:
-                      worker = (
-                          self.store.get_account(
-                              worker_account
-                          )
-                      )
-                      worker_zid = worker.get(
-                          "zid"
-                      )
-                      if not worker_zid:
-                          return False
-                      status = (
-                          self.store.job_status(
-                              job_id=job_id
-                          )
-                      )
-                      hok, _hd, _he = (
-                          self.link.record_work_event(
-                              str(worker_zid),
-                              "left",
-                              str(
-                                  status["title"]
-                              ),
-                          )
-                      )
-                      return bool(hok)
-                  except Exception:
-                      return False
+                  return None
 
               def do_GET(self) -> None:
                   path, query = (
@@ -1591,160 +1252,94 @@ jobs:
                   try:
                       if path in (
                           "/",
-                          "/mpe",
-                          "/mpe/home",
+                          "/agro",
+                          "/agro/home",
                       ):
                           self._send_html(
                               200,
                               self._home(),
                           )
                           return
-                      if path == "/mpe/jobs":
+                      if path == "/agro/menu":
                           self._send_html(
                               200,
-                              self._jobs_html(),
+                              self._menu(),
                           )
                           return
                       if path == (
-                          "/mpe/government/summary"
-                      ):
-                          self._send_html(
-                              200,
-                              self._gov_html(),
-                          )
-                          return
-                      if path.startswith(
-                          "/mpe/trabajador/"
-                      ):
-                          account_id = path.split(
-                              "/mpe/trabajador/",
-                              1,
-                          )[1]
-                          self._worker_panel(
-                              account_id
-                          )
-                          return
-                      if path.startswith(
-                          "/mpe/empresa/"
-                      ):
-                          account_id = path.split(
-                              "/mpe/empresa/",
-                              1,
-                          )[1]
-                          self._company_panel(
-                              account_id
-                          )
-                          return
-                      if path == (
-                          "/mpe/api/health"
+                          "/agro/health"
                       ):
                           self._ok(
                               {
-                                  "app": "mpe",
+                                  "app": "agro",
                                   "status": "ok",
                               }
                           )
                           return
                       if path == (
-                          "/mpe/api/summary"
+                          "/agro/producers"
+                      ):
+                          self._ok(
+                              {
+                                  "producers": list(
+                                      self.store
+                                      .list_producers()
+                                  )
+                              }
+                          )
+                          return
+                      if path == (
+                          "/agro/government/summary"
                       ):
                           self._ok(
                               self.store.summary()
                           )
                           return
                       if path == (
-                          "/mpe/api/jobs"
+                          "/agro/aid"
                       ):
-                          jobs = []
-                          for job in (
-                              self.store.list_jobs()
-                          ):
-                              jobs.append(
-                                  self.store
-                                  .job_status(
-                                      job_id=str(
-                                          job[
-                                              "job_id"
-                                          ]
-                                      )
-                                  )
-                              )
-                          self._ok(
-                              {"jobs": jobs}
-                          )
-                          return
-                      if path == (
-                          "/mpe/api/workers"
-                      ):
-                          profession = query.get(
-                              "profession"
-                          )
-                          workers = (
-                              self.store
-                              .list_workers(
-                                  profession=(
-                                      profession
-                                  )
-                              )
-                          )
                           self._ok(
                               {
-                                  "workers": list(
-                                      workers
+                                  "aid": list(
+                                      self.store
+                                      .list_aid()
                                   )
                               }
                           )
                           return
                       if path.startswith(
-                          "/mpe/api/job/"
+                          "/agro/aid/"
                       ):
-                          job_id = path.split(
-                              "/mpe/api/job/",
+                          aid_id = path.split(
+                              "/agro/aid/",
                               1,
                           )[1]
                           self._ok(
-                              self.store.job_status(
-                                  job_id=job_id
+                              self.store.get_aid(
+                                  aid_id
                               )
                           )
                           return
-                      if path == (
-                          "/mpe/api/proposals"
+                      if path.startswith(
+                          "/agro/productor/"
                       ):
-                          proposals = (
-                              self.store
-                              .list_proposals(
-                                  worker_account=(
-                                      query.get(
-                                          "worker"
-                                      )
-                                  ),
-                                  job_id=(
-                                      query.get(
-                                          "job"
-                                      )
-                                  ),
-                                  status=(
-                                      query.get(
-                                          "status",
-                                          "pending",
-                                      )
-                                  ),
-                              )
-                          )
-                          self._ok(
-                              {
-                                  "proposals": list(
-                                      proposals
-                                  )
-                              }
+                          producer_id = path.split(
+                              "/agro/productor/",
+                              1,
+                          )[1]
+                          self._producer_panel(
+                              producer_id
                           )
                           return
                       if path == (
-                          "/mpe/api/notifications"
+                          "/agro/gobierno"
                       ):
-                          self._notifications(
-                              query
+                          self._gov_panel()
+                          return
+                      if path == "/agro/banco":
+                          self._send_html(
+                              200,
+                              self._bank_panel(),
                           )
                           return
                       self._api_error(
@@ -1765,414 +1360,241 @@ jobs:
                           500, "server error"
                       )
 
-              def _notifications(
-                  self, query: dict,
-              ) -> None:
-                  worker = query.get("worker")
-                  items: list[dict] = []
-                  if worker:
-                      for proposal in (
-                          self.store
-                          .list_proposals(
-                              worker_account=(
-                                  worker
-                              ),
-                              status="pending",
-                          )
-                      ):
-                          items.append(
-                              {
-                                  "kind":
-                                  "proposal",
-                                  "message": (
-                                      "Una empresa"
-                                      " quiere"
-                                      " contratarte"
-                                  ),
-                                  "proposal_id": (
-                                      proposal[
-                                          "proposal_id"
-                                      ]
-                                  ),
-                                  "job_id": (
-                                      proposal[
-                                          "job_id"
-                                      ]
-                                  ),
-                              }
-                          )
-                      account = (
-                          self.store.get_account(
-                              worker
-                          )
-                      )
-                      for job in (
-                          self.store.list_jobs(
-                              profession=account.get(
-                                  "profession"
-                              )
-                          )
-                      ):
-                          items.append(
-                              {
-                                  "kind":
-                                  "job_opportunity",
-                                  "job_id": job[
-                                      "job_id"
-                                  ],
-                                  "title": job[
-                                      "title"
-                                  ],
-                              }
-                          )
-                  self._ok(
-                      {
-                          "worker": worker,
-                          "notifications": (
-                              items
-                          ),
-                      }
-                  )
-
               def _home(self) -> str:
                   return (
-                      "<html><head>"
-                      "<title>MPE</title></head>"
-                      "<body><h1>MPE - Mi Primer"
-                      " Empleo</h1>"
-                      "<p>El trabajo busca al"
-                      " trabajador.</p>"
-                      "<ul>"
-                      "<li>POST /mpe/register"
-                      " (form)</li>"
-                      "<li>POST /mpe/job"
-                      " (form)</li>"
-                      "<li>POST /mpe/apply"
-                      " (form)</li>"
-                      "<li>POST /mpe/proposal"
-                      " (form)</li>"
-                      "<li>POST"
-                      " /mpe/proposal-decide"
-                      " (form)</li>"
-                      "<li>POST /mpe/hire"
-                      " (form)</li>"
-                      "<li>POST /mpe/leave"
-                      " (form)</li>"
-                      "<li>GET"
-                      " /mpe/api/notifications"
-                      " ?worker=</li>"
-                      "<li>GET"
-                      " /mpe/api/summary</li>"
-                      "</ul></body></html>"
+                      "<html><head><title>AGRO"
+                      "</title></head><body>"
+                      "<h1>AGRO</h1>"
+                      "<p>Ecosistema"
+                      " agropecuario con gobierno"
+                      " y banco.</p>"
+                      "<p><a href='/agro/menu'>"
+                      "Menu</a></p>"
+                      "<p><a"
+                      " href='/agro/gobierno'>"
+                      "Gobierno</a> | <a"
+                      " href='/agro/banco'>"
+                      "Banco</a></p>"
+                      "</body></html>"
                   )
 
-              def _jobs_html(self) -> str:
-                  html = (
-                      "<html><body><h1>Vacantes"
-                      " abiertas</h1><ul>"
-                  )
-                  for job in (
-                      self.store.list_jobs()
-                  ):
-                      status = (
-                          self.store.job_status(
-                              job_id=str(
-                                  job["job_id"]
-                              )
-                          )
-                      )
-                      html += (
-                          "<li>"
-                          + str(
-                              status["job_id"]
-                          )
-                          + " | "
-                          + str(status["title"])
-                          + " | contratados "
-                          + str(status["hired"])
-                          + "/"
-                          + str(
-                              status["openings"]
-                          )
-                          + " | quedan "
-                          + str(
-                              status["remaining"]
-                          )
-                          + "</li>"
-                      )
-                  html += (
-                      "</ul></body></html>"
-                  )
-                  return html
-
-              def _gov_html(self) -> str:
-                  data = self.store.summary()
+              def _menu(self) -> str:
                   return (
-                      "<html><body><h1>Resumen"
-                      " gobierno</h1>"
-                      "<p>cuentas: "
-                      + str(
-                          data["accounts_total"]
-                      )
-                      + "</p>"
-                      "<p>verificadas: "
-                      + str(
-                          data[
-                              "accounts_verified"
-                          ]
-                      )
-                      + "</p>"
-                      "<p>vacantes abiertas: "
-                      + str(data["open_jobs"])
-                      + "</p>"
-                      "<p>aplicaciones: "
-                      + str(
-                          data[
-                              "applications_total"
-                          ]
-                      )
-                      + "</p>"
-                      "<p>contrataciones"
-                      " activas: "
-                      + str(data["hires_total"])
-                      + "</p>"
-                      "<p>propuestas pendientes:"
-                      " "
-                      + str(
-                          data[
-                              "proposals_pending"
-                          ]
-                      )
-                      + "</p></body></html>"
+                      "<html><head><title>AGRO"
+                      " menu</title></head><body>"
+                      "<h1>Menu AGRO</h1>"
+                      "<ul>"
+                      "<li><a"
+                      " href='/agro/gobierno'>"
+                      "Panel gobierno</a></li>"
+                      "<li><a"
+                      " href='/agro/banco'>"
+                      "Panel banco</a></li>"
+                      "<li><a"
+                      " href='/agro/producers'>"
+                      "Productores (API)</a></li>"
+                      "</ul>"
+                      "<p>Registro: POST"
+                      " /agro/register | Ayuda:"
+                      " POST /agro/aid/request"
+                      "</p>"
+                      "</body></html>"
                   )
 
-              def _worker_panel(
-                  self, account_id: str,
+              def _producer_panel(
+                  self, producer_id: str,
               ) -> None:
                   try:
-                      account = (
-                          self.store.get_account(
-                              account_id
+                      producer = (
+                          self.store.get_producer(
+                              producer_id
                           )
                       )
                   except LookupError:
-                      self._html_error(
+                      self._api_error(
                           404,
-                          "cuenta no existe",
+                          "producer no existe",
                       )
                       return
                   html = (
-                      "<html><body><h1>Panel"
-                      " trabajador</h1>"
+                      "<html><head><title>Panel"
+                      " productor</title></head>"
+                      "<body><h1>Panel"
+                      " productor</h1>"
                       "<p>"
-                      + str(account["name"])
+                      + str(producer["name"])
                       + " ("
                       + str(
-                          account["profession"]
+                          producer[
+                              "producer_type"
+                          ]
                       )
                       + ")</p>"
-                      "<h2>Propuestas"
-                      " recibidas</h2><ul>"
-                  )
-                  proposals = (
-                      self.store.list_proposals(
-                          worker_account=(
-                              account_id
-                          ),
-                          status="pending",
+                      "<p>ubicacion: "
+                      + str(
+                          producer["location"]
                       )
+                      + " | verificado: "
+                      + str(
+                          producer["verified"]
+                      )
+                      + "</p>"
+                      "<h2>Mis ayudas</h2><ul>"
                   )
-                  for proposal in proposals:
+                  aids = self.store.list_aid(
+                      producer_id=producer_id
+                  )
+                  if not aids:
                       html += (
-                          "<li>Una empresa quiere"
-                          " contratarte (propuesta "
-                          + str(
-                              proposal[
-                                  "proposal_id"
-                              ]
-                          )
-                          + " para vacante "
-                          + str(proposal["job_id"])
-                          + ")"
-                          + " <form method='POST'"
-                          + " action="
-                          + "'/mpe/proposal-decide'>"
-                          + "<input type='hidden'"
-                          + " name='proposal_id'"
-                          + " value='"
-                          + str(
-                              proposal[
-                                  "proposal_id"
-                              ]
-                          )
-                          + "'>"
-                          + "<button name='decision'"
-                          + " value='aceptar'>"
-                          + "Aceptar</button>"
-                          + "<button name='decision'"
-                          + " value='rechazar'>"
-                          + "Rechazar</button>"
-                          + "</form></li>"
+                          "<li>Sin ayudas"
+                          " todavia</li>"
+                      )
+                  for aid in aids:
+                      html += (
+                          "<li>"
+                          + str(aid["aid_id"])
+                          + " | "
+                          + str(aid["program"])
+                          + " | "
+                          + str(aid["item"])
+                          + " | "
+                          + str(aid["status"])
+                          + "</li>"
                       )
                   html += (
-                      "</ul><h2>Vacantes para ti"
-                      "</h2><ul>"
+                      "</ul><p><a"
+                      " href='/agro/menu'>Menu"
+                      "</a></p>"
+                      "</body></html>"
                   )
-                  for job in (
-                      self.store.list_jobs(
-                          profession=account.get(
-                              "profession"
-                          )
-                      )
-                  ):
-                      html += (
-                          "<li>"
-                          + str(job["title"])
-                          + " ("
-                          + str(job["job_id"])
-                          + ")</li>"
-                      )
-                  html += "</ul></body></html>"
                   self._send_html(200, html)
 
-              def _company_panel(
-                  self, account_id: str,
-              ) -> None:
-                  try:
-                      account = (
-                          self.store.get_account(
-                              account_id
-                          )
-                      )
-                  except LookupError:
-                      self._html_error(
-                          404,
-                          "cuenta no existe",
-                      )
-                      return
-                  if account.get("role") != (
-                      "empresa"
-                  ):
-                      self._html_error(
-                          400,
-                          "no es empresa",
-                      )
-                      return
+              def _gov_panel(self) -> None:
+                  data = self.store.summary()
                   html = (
-                      "<html><body><h1>Panel"
-                      " empresa</h1><p>"
-                      + str(account["name"])
-                      + "</p><h2>Tus vacantes"
-                      "</h2><ul>"
+                      "<html><head><title>Panel"
+                      " gobierno</title></head>"
+                      "<body><h1>Panel"
+                      " gobierno</h1>"
+                      "<p>productores: "
+                      + str(
+                          data["producers_total"]
+                      )
+                      + " | verificados: "
+                      + str(
+                          data[
+                              "producers_verified"
+                          ]
+                      )
+                      + "</p>"
+                      "<p>solicitudes de ayuda: "
+                      + str(data["aid_total"])
+                      + "</p>"
+                      "<h2>Ayudas por"
+                      " programa</h2><ul>"
                   )
-                  for job in (
-                      self.store.list_company_jobs(
-                          company_account=(
-                              account_id
-                          )
-                      )
+                  for program, info in (
+                      data["aid_by_program"]
+                      .items()
                   ):
-                      status = (
-                          self.store.job_status(
-                              job_id=str(
-                                  job["job_id"]
-                              )
-                          )
-                      )
                       html += (
                           "<li>"
-                          + str(status["title"])
-                          + " | "
-                          + str(status["status"])
-                          + " | contratados "
-                          + str(status["hired"])
-                          + "/"
+                          + str(program)
+                          + " | solicitudes: "
                           + str(
-                              status["openings"]
+                              info["requests"]
                           )
-                          + " | quedan "
-                          + str(
-                              status["remaining"]
+                          + " | cantidad: "
+                          + format(
+                              float(
+                                  info["quantity"]
+                              ),
+                              ".2f",
                           )
                           + "</li>"
                       )
                   html += (
-                      "</ul><h2>Trabajadores"
-                      " disponibles</h2><ul>"
+                      "</ul><p><a"
+                      " href='/agro/menu'>Menu"
+                      "</a></p>"
+                      "</body></html>"
                   )
-                  for worker in (
-                      self.store.list_workers()
-                  ):
-                      html += (
-                          "<li>"
-                          + str(worker["name"])
-                          + " ("
-                          + str(
-                              worker[
-                                  "profession"
-                              ]
-                          )
-                          + ")</li>"
-                      )
-                  html += "</ul></body></html>"
                   self._send_html(200, html)
+
+              def _bank_panel(self) -> str:
+                  return (
+                      "<html><head><title>Panel"
+                      " banco</title></head><body>"
+                      "<h1>Panel banco</h1>"
+                      "<p>Creditos para"
+                      " productores verificados"
+                      " ( proxima fase ).</p>"
+                      "<p><a href='/agro/menu'>"
+                      "Menu</a></p>"
+                      "</body></html>"
+                  )
 
               def do_POST(self) -> None:
                   path, _query = (
                       self._split_path()
                   )
                   try:
-                      if path == "/mpe/register":
+                      if path == (
+                          "/agro/producers"
+                      ):
+                          self._producers_api()
+                          return
+                      if path == (
+                          "/agro/producers/verify"
+                      ):
+                          self._verify_api()
+                          return
+                      if path == (
+                          "/agro/production"
+                      ):
+                          self._production_api()
+                          return
+                      if path == (
+                          "/agro/alerts/evaluate"
+                      ):
+                          self._alerts_api()
+                          return
+                      if path == (
+                          "/agro/register"
+                      ):
                           self._register()
                           return
-                      if path == "/mpe/job":
-                          self._post_job_form()
-                          return
-                      if path == "/mpe/apply":
-                          self._apply_form()
-                          return
-                      if path == "/mpe/proposal":
-                          self._proposal_form()
+                      if path == (
+                          "/agro/aid/request"
+                      ):
+                          self._aid_request()
                           return
                       if path == (
-                          "/mpe/proposal-decide"
+                          "/agro/aid/eligibility"
                       ):
-                          self._decide_form()
-                          return
-                      if path == "/mpe/hire":
-                          self._hire_form()
-                          return
-                      if path == "/mpe/leave":
-                          self._leave_form()
+                          self._aid_eligibility()
                           return
                       if path == (
-                          "/mpe/api/accounts"
+                          "/agro/government/approve"
                       ):
-                          self._api_account()
-                          return
-                      if path == "/mpe/api/jobs":
-                          self._api_job()
+                          self._aid_approve()
                           return
                       if path == (
-                          "/mpe/api/proposals"
+                          "/agro/government/assign"
                       ):
-                          self._api_proposal()
+                          self._aid_assign()
                           return
                       if path == (
-                          "/mpe/api/proposals"
-                          "/decide"
+                          "/agro/government"
+                          "/deliver"
                       ):
-                          self._api_decide()
+                          self._aid_deliver()
                           return
                       if path == (
-                          "/mpe/api/hires"
+                          "/agro/government"
+                          "/confirm"
                       ):
-                          self._api_hire()
-                          return
-                      if path == (
-                          "/mpe/api/leave"
-                      ):
-                          self._api_leave()
+                          self._aid_confirm()
                           return
                       self._api_error(
                           404,
@@ -2195,566 +1617,492 @@ jobs:
                           500, "server error"
                       )
 
+              def _role_of(
+                  self, doc: dict,
+              ) -> str:
+                  role = self._value(
+                      doc, "role"
+                  ).strip()
+                  if not role:
+                      role = "agricultor"
+                  if role not in ROLES:
+                      raise ValueError(
+                          "unknown role: "
+                          + role
+                      )
+                  return role
+
               def _register(self) -> None:
-                  form = self._read_form()
-                  role = self._form_value(
-                      form, "role"
-                  )
-                  name = self._form_value(
-                      form, "name"
-                  )
-                  profession = self._form_value(
-                      form, "profession"
-                  )
-                  if role not in (
-                      "trabajador",
-                      "empresa",
-                  ):
-                      self._html_error(
-                          400, "role invalido"
-                      )
-                      return
+                  doc = self._payload() or {}
+                  role = self._role_of(doc)
+                  name = self._value(
+                      doc, "name"
+                  ).strip()
                   if not name:
-                      self._html_error(
-                          400, "name requerido"
+                      self._send_html(
+                          400,
+                          "<html><body><h1>AGRO"
+                          "</h1><p>name"
+                          " requerido</p>"
+                          "</body></html>",
                       )
                       return
-                  zid = None
-                  if role == "trabajador":
-                      ok, data, _err = (
-                          self.link.register_user(
-                              name
-                          )
+                  producer_id = (
+                      _new_producer_id()
+                  )
+                  ok, data, _err = (
+                      self.link
+                      .register_producer_zid(
+                          name
                       )
-                  else:
-                      ok, data, _err = (
-                          self.link
-                          .register_company(
-                              name
-                          )
-                      )
-                  if ok and data is not None:
-                      zid = _find_zid(data)
-                  account_id = _new_account_id()
-                  self.store.add_account(
-                      account_id=account_id,
+                  )
+                  zid = (
+                      _find_zid(data)
+                      if ok and data
+                      else None
+                  )
+                  self.store.add_producer(
+                      producer_id=producer_id,
                       zid=zid,
                       name=name,
+                      producer_type=self._value(
+                          doc, "producer_type"
+                      )
+                      or role,
                       role=role,
-                      profession=(
-                          profession or None
-                      ),
+                      location=self._value(
+                          doc, "location"
+                      )
+                      or None,
+                      synced=zid is not None,
                   )
                   if zid is not None:
                       self._trust_best_effort(
                           zid
                       )
                       self.store.mark_verified(
-                          account_id=account_id
+                          producer_id=(
+                              producer_id
+                          )
                       )
-                  html = (
-                      "<html><body><h1>MPE</h1>"
-                      "<p>Cuenta registrada</p>"
+                  self._send_html(
+                      200,
+                      "<html><body><h1>AGRO</h1>"
+                      "<p>Productor"
+                      " registrado</p>"
                       "<p>id: "
-                      + account_id
+                      + producer_id
                       + "</p><p>zid: "
                       + str(zid)
-                      + "</p></body></html>"
-                  )
-                  self._send_html(200, html)
-
-              def _post_job_form(self) -> None:
-                  form = self._read_form()
-                  job = self.store.post_job(
-                      job_id=_new_job_id(),
-                      company_account=(
-                          self._form_value(
-                              form,
-                              "company_account",
-                          )
-                      ),
-                      title=self._form_value(
-                          form, "title"
-                      ),
-                      profession=(
-                          self._form_value(
-                              form,
-                              "profession",
-                          )
-                      ),
-                      openings=int(
-                          self._form_value(
-                              form, "openings"
-                          )
-                          or "1"
-                      ),
-                  )
-                  self._send_html(
-                      200,
-                      "<html><body><h1>MPE</h1>"
-                      "<p>Vacante publicada</p>"
-                      "<p>job: "
-                      + str(job["job_id"])
-                      + "</p></body></html>",
+                      + "</p><p><a"
+                      " href='/agro/productor/"
+                      + producer_id
+                      + "'>Panel"
+                      " productor</a></p>"
+                      "</body></html>",
                   )
 
-              def _apply_form(self) -> None:
-                  form = self._read_form()
-                  self.store.apply(
-                      application_id=(
-                          _new_application_id()
-                      ),
-                      job_id=self._form_value(
-                          form, "job_id"
-                      ),
-                      worker_account=(
-                          self._form_value(
-                              form,
-                              "worker_account",
-                          )
-                      ),
-                  )
-                  self._send_html(
-                      200,
-                      "<html><body><h1>MPE</h1>"
-                      "<p>Aplicacion enviada"
-                      "</p></body></html>",
-                  )
-
-              def _proposal_form(self) -> None:
-                  form = self._read_form()
-                  proposal = (
-                      self.store.create_proposal(
-                          proposal_id=(
-                              _new_proposal_id()
-                          ),
-                          job_id=(
-                              self._form_value(
-                                  form, "job_id"
-                              )
-                          ),
-                          company_account=(
-                              self._form_value(
-                                  form,
-                                  "company_account",
-                              )
-                          ),
-                          worker_account=(
-                              self._form_value(
-                                  form,
-                                  "worker_account",
-                              )
-                          ),
-                      )
-                  )
-                  self._send_html(
-                      200,
-                      "<html><body><h1>MPE</h1>"
-                      "<p>Propuesta enviada</p>"
-                      "<p>propuesta: "
-                      + str(
-                          proposal[
-                              "proposal_id"
-                          ]
-                      )
-                      + "</p></body></html>",
-                  )
-
-              def _decide_form(self) -> None:
-                  form = self._read_form()
-                  decision = self._form_value(
-                      form, "decision"
-                  )
-                  if decision not in (
-                      "aceptar",
-                      "rechazar",
-                  ):
-                      self._html_error(
+              def _producers_api(self) -> None:
+                  doc = self._payload() or {}
+                  role = self._role_of(doc)
+                  name = self._value(
+                      doc, "name"
+                  ).strip()
+                  if not name:
+                      self._api_error(
                           400,
-                          "decision invalida",
+                          "name is required",
                       )
                       return
-                  result = (
-                      self.store.decide_proposal(
-                          proposal_id=(
-                              self._form_value(
-                                  form,
-                                  "proposal_id",
-                              )
-                          ),
-                          accepted=(
-                              decision
-                              == "aceptar"
-                          ),
+                  producer_id = (
+                      _new_producer_id()
+                  )
+                  ok, data, _err = (
+                      self.link
+                      .register_producer_zid(
+                          name
                       )
                   )
-                  if result["status"] == (
-                      "accepted"
-                  ):
-                      net = (
-                          self._network_on_hire(
-                              str(
-                                  result["job_id"]
-                              ),
-                              str(
-                                  result[
-                                      "worker_account"
-                                  ]
-                              ),
-                          )
+                  zid = (
+                      _find_zid(data)
+                      if ok and data
+                      else None
+                  )
+                  row = self.store.add_producer(
+                      producer_id=producer_id,
+                      zid=zid,
+                      name=name,
+                      producer_type=self._value(
+                          doc, "producer_type"
                       )
-                      self._send_html(
-                          200,
-                          "<html><body><h1>MPE"
-                          "</h1><p>Contratado</p>"
-                          "<p>contratados: "
-                          + str(
-                              result["hire"][
-                                  "hired"
-                              ]
-                          )
-                          + " | quedan: "
-                          + str(
-                              result["hire"][
-                                  "remaining"
-                              ]
-                          )
-                          + "</p>"
-                          "<p>credencial: "
-                          + str(
-                              net["credential"][
-                                  "issued"
-                              ]
-                          )
-                          + "</p></body></html>",
+                      or role,
+                      role=role,
+                      location=self._value(
+                          doc, "location"
                       )
-                      return
-                  self._send_html(
-                      200,
-                      "<html><body><h1>MPE</h1>"
-                      "<p>Propuesta rechazada"
-                      "</p></body></html>",
-                  )
-
-              def _hire_form(self) -> None:
-                  form = self._read_form()
-                  job_id = self._form_value(
-                      form, "job_id"
-                  )
-                  worker_account = (
-                      self._form_value(
-                          form, "worker_account"
-                      )
-                  )
-                  hire = self.store.hire_worker(
-                      hire_id=_new_hire_id(),
-                      job_id=job_id,
-                      worker_account=(
-                          worker_account
-                      ),
-                  )
-                  net = self._network_on_hire(
-                      job_id, worker_account
-                  )
-                  self._send_html(
-                      200,
-                      "<html><body><h1>MPE</h1>"
-                      "<p>Contratado</p>"
-                      "<p>contratados: "
-                      + str(hire["hired"])
-                      + " | quedan: "
-                      + str(hire["remaining"])
-                      + " | estado: "
-                      + str(hire["job_status"])
-                      + "</p>"
-                      "<p>credencial: "
-                      + str(
-                          net["credential"][
-                              "issued"
-                          ]
-                      )
-                      + "</p></body></html>",
-                  )
-
-              def _leave_form(self) -> None:
-                  form = self._read_form()
-                  job_id = self._form_value(
-                      form, "job_id"
-                  )
-                  worker_account = (
-                      self._form_value(
-                          form, "worker_account"
-                      )
-                  )
-                  result = (
-                      self.store.worker_leaves(
-                          job_id=job_id,
-                          worker_account=(
-                              worker_account
-                          ),
-                      )
-                  )
-                  self._network_on_leave(
-                      job_id, worker_account
-                  )
-                  self._send_html(
-                      200,
-                      "<html><body><h1>MPE</h1>"
-                      "<p>Abandono registrado"
-                      "</p><p>reabierta: "
-                      + str(result["reopened"])
-                      + " | quedan: "
-                      + str(result["remaining"])
-                      + "</p></body></html>",
-                  )
-
-              def _api_account(self) -> None:
-                  doc = self._read_json()
-                  if doc is None:
-                      self._api_error(
-                          400, "invalid JSON"
-                      )
-                      return
-                  role = str(
-                      doc.get("role", "")
-                  )
-                  name = str(
-                      doc.get("name", "")
-                  )
-                  profession = doc.get(
-                      "profession"
-                  )
-                  zid = None
-                  if role == "trabajador":
-                      ok, data, _err = (
-                          self.link.register_user(
-                              name
-                          )
-                      )
-                  elif role == "empresa":
-                      ok, data, _err = (
-                          self.link
-                          .register_company(
-                              name
-                          )
-                      )
-                  else:
-                      self._api_error(
-                          400, "role invalido"
-                      )
-                      return
-                  if ok and data is not None:
-                      zid = _find_zid(data)
-                  account_id = _new_account_id()
-                  account = (
-                      self.store.add_account(
-                          account_id=account_id,
-                          zid=zid,
-                          name=name,
-                          role=role,
-                          profession=(
-                              str(profession)
-                              if profession
-                              else None
-                          ),
-                      )
+                      or None,
+                      synced=zid is not None,
                   )
                   if zid is not None:
                       self._trust_best_effort(
                           zid
                       )
                       self.store.mark_verified(
-                          account_id=account_id
-                      )
-                  self._ok(account)
-
-              def _api_job(self) -> None:
-                  doc = self._read_json()
-                  if doc is None:
-                      self._api_error(
-                          400, "invalid JSON"
-                      )
-                      return
-                  job = self.store.post_job(
-                      job_id=_new_job_id(),
-                      company_account=str(
-                          doc.get(
-                              "company_account",
-                              "",
+                          producer_id=(
+                              producer_id
                           )
-                      ),
-                      title=str(
-                          doc.get("title", "")
-                      ),
-                      profession=str(
-                          doc.get(
-                              "profession", ""
+                      )
+                      row = (
+                          self.store.get_producer(
+                              producer_id
                           )
-                      ),
-                      openings=int(
-                          doc.get("openings", 1)
-                      ),
-                  )
-                  self._ok(job)
+                      )
+                  self._ok(row)
 
-              def _api_proposal(self) -> None:
-                  doc = self._read_json()
-                  if doc is None:
-                      self._api_error(
-                          400, "invalid JSON"
-                      )
-                      return
-                  proposal = (
-                      self.store.create_proposal(
-                          proposal_id=(
-                              _new_proposal_id()
-                          ),
-                          job_id=str(
-                              doc.get(
-                                  "job_id", ""
-                              )
-                          ),
-                          company_account=str(
-                              doc.get(
-                                  "company_account",
-                                  "",
-                              )
-                          ),
-                          worker_account=str(
-                              doc.get(
-                                  "worker_account",
-                                  "",
-                              )
-                          ),
-                      )
+              def _verify_api(self) -> None:
+                  doc = self._payload() or {}
+                  producer_id = self._value(
+                      doc, "producer_id"
                   )
-                  self._ok(proposal)
+                  self.store.mark_verified(
+                      producer_id=producer_id
+                  )
+                  row = self.store.get_producer(
+                      producer_id
+                  )
+                  self._ok(
+                      {
+                          "producer_id": (
+                              producer_id
+                          ),
+                          "verified": row[
+                              "verified"
+                          ],
+                      }
+                  )
 
-              def _api_decide(self) -> None:
-                  doc = self._read_json()
-                  if doc is None:
-                      self._api_error(
-                          400, "invalid JSON"
-                      )
-                      return
-                  decision = str(
-                      doc.get("decision", "")
+              def _production_api(self) -> None:
+                  doc = self._payload() or {}
+                  producer_id = self._value(
+                      doc, "producer_id"
                   )
-                  if decision not in (
-                      "aceptar",
-                      "rechazar",
-                  ):
+                  producer = (
+                      self.store.get_producer(
+                          producer_id
+                      )
+                  )
+                  product = self._value(
+                      doc, "product"
+                  ).strip()
+                  if not product:
                       self._api_error(
                           400,
-                          "decision invalida",
+                          "product is required",
                       )
                       return
-                  accepted = (
-                      decision == "aceptar"
-                  )
-                  result = (
-                      self.store.decide_proposal(
-                          proposal_id=str(
-                              doc.get(
-                                  "proposal_id",
-                                  "",
-                              )
-                          ),
-                          accepted=accepted,
-                      )
-                  )
-                  if accepted:
-                      result["network"] = (
-                          self._network_on_hire(
-                              str(
-                                  result["job_id"]
-                              ),
-                              str(
-                                  result[
-                                      "worker_account"
-                                  ]
-                              ),
+                  try:
+                      quantity = float(
+                          self._value(
+                              doc, "quantity"
                           )
                       )
-                  self._ok(result)
-
-              def _api_hire(self) -> None:
-                  doc = self._read_json()
-                  if doc is None:
+                  except ValueError:
                       self._api_error(
-                          400, "invalid JSON"
+                          400,
+                          "quantity must be a"
+                          " number",
                       )
                       return
-                  job_id = str(
-                      doc.get("job_id", "")
-                  )
-                  worker_account = str(
-                      doc.get(
-                          "worker_account", ""
+                  unit = self._value(
+                      doc, "unit"
+                  ).strip() or "quintal"
+                  seq = (
+                      self._network_event(
+                          producer.get("zid"),
+                          "PRODUCTION_REGISTERED",
+                          product
+                          + " "
+                          + format(
+                              quantity, ".2f"
+                          ),
                       )
                   )
-                  hire = self.store.hire_worker(
-                      hire_id=_new_hire_id(),
-                      job_id=job_id,
-                      worker_account=(
-                          worker_account
+                  row = self.store.add_production(
+                      production_id=(
+                          _new_production_id()
                       ),
+                      producer_id=producer_id,
+                      product=product,
+                      quantity=quantity,
+                      unit=unit,
+                      network_seq=seq,
                   )
-                  network = (
-                      self._network_on_hire(
-                          job_id,
-                          worker_account,
+                  self._ok(row)
+
+              def _alerts_api(self) -> None:
+                  doc = self._payload() or {}
+                  try:
+                      previous = float(
+                          self._value(
+                              doc,
+                              "previous_price",
+                          )
+                      )
+                      current = float(
+                          self._value(
+                              doc,
+                              "current_price",
+                          )
+                      )
+                  except ValueError:
+                      self._api_error(
+                          400,
+                          "prices must be numbers",
+                      )
+                      return
+                  if previous <= 0:
+                      self._api_error(
+                          400,
+                          "previous_price must"
+                          " be positive",
+                      )
+                      return
+                  change = (
+                      current - previous
+                  ) / previous
+                  alert = abs(change) > 0.05
+                  direction = (
+                      "up"
+                      if change > 0
+                      else (
+                          "down"
+                          if change < 0
+                          else "flat"
                       )
                   )
                   self._ok(
                       {
-                          "hire": hire,
-                          "network": network,
+                          "alert": alert,
+                          "direction": direction,
+                          "change_pct": round(
+                              change * 100, 2
+                          ),
                       }
                   )
 
-              def _api_leave(self) -> None:
-                  doc = self._read_json()
-                  if doc is None:
+              def _aid_request(self) -> None:
+                  doc = self._payload() or {}
+                  producer_id = self._value(
+                      doc, "producer_id"
+                  )
+                  producer = (
+                      self.store.get_producer(
+                          producer_id
+                      )
+                  )
+                  program = self._value(
+                      doc, "program"
+                  ).strip()
+                  item = self._value(
+                      doc, "item"
+                  ).strip()
+                  if not program or not item:
                       self._api_error(
-                          400, "invalid JSON"
+                          400,
+                          "program and item are"
+                          " required",
                       )
                       return
-                  job_id = str(
-                      doc.get("job_id", "")
+                  try:
+                      quantity = float(
+                          self._value(
+                              doc, "quantity"
+                          )
+                          or "1"
+                      )
+                  except ValueError:
+                      self._api_error(
+                          400,
+                          "quantity must be a"
+                          " number",
+                      )
+                      return
+                  seq = (
+                      self._network_event(
+                          producer.get("zid"),
+                          "AID_REQUESTED",
+                          program + ": " + item,
+                      )
                   )
-                  worker_account = str(
-                      doc.get(
-                          "worker_account", ""
+                  aid = (
+                      self.store.create_aid_request(
+                          aid_id=_new_aid_id(),
+                          producer_id=(
+                              producer_id
+                          ),
+                          program=program,
+                          item=item,
+                          quantity=quantity,
+                          network_seq=seq,
+                      )
+                  )
+                  self._ok(aid)
+
+              def _aid_eligibility(self) -> None:
+                  doc = self._payload() or {}
+                  aid_id = self._value(
+                      doc, "aid_id"
+                  )
+                  aid = self.store.get_aid(
+                      aid_id
+                  )
+                  producer = (
+                      self.store.get_producer(
+                          str(
+                              aid["producer_id"]
+                          )
+                      )
+                  )
+                  eligible = bool(
+                      producer["verified"]
+                  )
+                  reason = (
+                      "productor verificado"
+                      if eligible
+                      else "productor no"
+                      " verificado"
+                  )
+                  seq = (
+                      self._network_event(
+                          aid.get("zid"),
+                          "AID_ELIGIBILITY_"
+                          "EVALUATED",
+                          reason,
                       )
                   )
                   result = (
-                      self.store.worker_leaves(
-                          job_id=job_id,
-                          worker_account=(
-                              worker_account
-                          ),
+                      self.store.evaluate_aid(
+                          aid_id=aid_id,
+                          eligible=eligible,
+                          reason=reason,
+                          network_seq=seq,
                       )
-                  )
-                  self._network_on_leave(
-                      job_id, worker_account
                   )
                   self._ok(result)
 
+              def _aid_approve(self) -> None:
+                  doc = self._payload() or {}
+                  aid_id = self._value(
+                      doc, "aid_id"
+                  )
+                  aid = self.store.get_aid(
+                      aid_id
+                  )
+                  seq = (
+                      self._network_event(
+                          aid.get("zid"),
+                          "AID_APPROVED",
+                          str(aid["program"]),
+                      )
+                  )
+                  self._ok(
+                      self.store.approve_aid(
+                          aid_id=aid_id,
+                          network_seq=seq,
+                      )
+                  )
 
-          def serve_mpe(
-              store: MpeStore,
+              def _aid_assign(self) -> None:
+                  doc = self._payload() or {}
+                  aid_id = self._value(
+                      doc, "aid_id"
+                  )
+                  detail = self._value(
+                      doc, "detail"
+                  ).strip() or None
+                  aid = self.store.get_aid(
+                      aid_id
+                  )
+                  seq = (
+                      self._network_event(
+                          aid.get("zid"),
+                          "AID_ASSIGNED",
+                          detail
+                          or str(aid["program"]),
+                      )
+                  )
+                  self._ok(
+                      self.store.assign_aid(
+                          aid_id=aid_id,
+                          detail=detail,
+                          network_seq=seq,
+                      )
+                  )
+
+              def _aid_deliver(self) -> None:
+                  doc = self._payload() or {}
+                  aid_id = self._value(
+                      doc, "aid_id"
+                  )
+                  detail = self._value(
+                      doc, "detail"
+                  ).strip() or None
+                  aid = self.store.get_aid(
+                      aid_id
+                  )
+                  seq = (
+                      self._network_event(
+                          aid.get("zid"),
+                          "AID_DELIVERED",
+                          detail
+                          or str(aid["item"]),
+                      )
+                  )
+                  self._ok(
+                      self.store.deliver_aid(
+                          aid_id=aid_id,
+                          detail=detail,
+                          network_seq=seq,
+                      )
+                  )
+
+              def _aid_confirm(self) -> None:
+                  doc = self._payload() or {}
+                  aid_id = self._value(
+                      doc, "aid_id"
+                  )
+                  aid = self.store.get_aid(
+                      aid_id
+                  )
+                  seq = (
+                      self._network_event(
+                          aid.get("zid"),
+                          "AID_DELIVERY_"
+                          "CONFIRMED",
+                          str(aid["program"]),
+                      )
+                  )
+                  self._ok(
+                      self.store.confirm_aid(
+                          aid_id=aid_id,
+                          network_seq=seq,
+                      )
+                  )
+
+
+          def serve_agro(
+              store: AgroStore,
               client: object,
               *,
               host: str = "127.0.0.1",
               port: int = 0,
           ) -> ThreadingHTTPServer:
               handler = type(
-                  "BoundMpeHandler",
-                  (MpeApiHandler,),
+                  "BoundAgroHandler",
+                  (AgroApiHandler,),
                   {
                       "store": store,
-                      "link": MpeLink(client),
+                      "link": ZyraLink(client),
                   },
               )
               server = ThreadingHTTPServer(
@@ -2765,18 +2113,10 @@ jobs:
               )
               return server
           PYEOF
+          python -m py_compile apps/agro/server.py
           echo "server written"
 
-      - name: Syntax check
-        run: |
-          set -euo pipefail
-          python -m py_compile \
-            apps/mi_primer_empleo/infrastructure/persistence/mpe_store.py \
-            apps/mi_primer_empleo/services/mpe_link.py \
-            apps/mi_primer_empleo/server.py
-          echo "syntax OK"
-
-      - name: Internal probe (dynamic openings)
+      - name: Internal probe (aid lifecycle at store level)
         run: |
           set -euo pipefail
           PYTHONPATH="$PWD" python - <<'PYEOF'
@@ -2790,88 +2130,99 @@ jobs:
               SQLiteAdapter,
           )
 
-          from apps.mi_primer_empleo.infrastructure.persistence.mpe_store import (
-              MpeStore,
+          from apps.agro.infrastructure.persistence.agro_store import (
+              AgroStore,
           )
 
           tmp = Path(tempfile.mkdtemp())
           db = SQLiteAdapter(tmp / "probe.db")
-          store = MpeStore(db, FrozenClock())
-          store.add_account(
-              account_id="MPE-co",
-              zid=None,
-              name="Co",
-              role="empresa",
-              profession=None,
+          store = AgroStore(db, FrozenClock())
+          store.add_producer(
+              producer_id="AGR-1",
+              zid="ZID-abc",
+              name="Jose",
+              producer_type="agricultor",
+              role="agricultor",
+              location="SV",
+              synced=True,
           )
-          for index in range(1, 4):
-              store.add_account(
-                  account_id="MPE-w" + str(index),
-                  zid=None,
-                  name="W" + str(index),
-                  role="trabajador",
-                  profession="albanil",
-              )
-          store.post_job(
-              job_id="JOB-1",
-              company_account="MPE-co",
-              title="Obra",
-              profession="albanil",
-              openings=2,
+          store.mark_verified(
+              producer_id="AGR-1"
           )
-          store.create_proposal(
-              proposal_id="PROP-1",
-              job_id="JOB-1",
-              company_account="MPE-co",
-              worker_account="MPE-w1",
+          aid = store.create_aid_request(
+              aid_id="AID-1",
+              producer_id="AGR-1",
+              program="semillas",
+              item="maiz",
+              quantity=10.0,
+              network_seq=1,
           )
-          result = store.decide_proposal(
-              proposal_id="PROP-1",
-              accepted=True,
+          assert aid["status"] == "requested"
+          assert len(aid["events"]) == 1
+          aid = store.evaluate_aid(
+              aid_id="AID-1",
+              eligible=True,
+              reason="verificado",
+              network_seq=2,
           )
-          assert result["hire"]["hired"] == 1
-          store.hire_worker(
-              hire_id="HIR-d1",
-              job_id="JOB-1",
-              worker_account="MPE-w2",
+          assert aid["status"] == "eligible"
+          aid = store.approve_aid(
+              aid_id="AID-1",
+              network_seq=3,
           )
-          status = store.job_status(
-              job_id="JOB-1"
+          assert aid["status"] == "approved"
+          aid = store.assign_aid(
+              aid_id="AID-1",
+              detail="lote 7",
+              network_seq=4,
           )
-          assert status["status"] == "filled"
+          assert aid["status"] == "assigned"
+          aid = store.deliver_aid(
+              aid_id="AID-1",
+              detail="entregado",
+              network_seq=5,
+          )
+          assert aid["status"] == "delivered"
+          aid = store.confirm_aid(
+              aid_id="AID-1",
+              network_seq=6,
+          )
+          assert aid["status"] == "confirmed"
           try:
-              store.hire_worker(
-                  hire_id="HIR-x",
-                  job_id="JOB-1",
-                  worker_account="MPE-w3",
+              store.approve_aid(
+                  aid_id="AID-1",
+                  network_seq=7,
               )
               raise AssertionError(
-                  "overfill must fail"
+                  "wrong order must fail"
               )
           except ValueError:
               pass
-          leave = store.worker_leaves(
-              job_id="JOB-1",
-              worker_account="MPE-w1",
+          summary = store.aid_summary()
+          assert summary["aid_total"] == 1
+          assert (
+              summary["aid_by_status"][
+                  "confirmed"
+              ]
+              == 1
           )
-          assert leave["reopened"] is True
-          print("PROBE OK: dynamic openings")
+          print("PROBE OK: aid lifecycle")
           db.close()
           PYEOF
 
-      - name: Write hiring e2e test
+      - name: Write aid e2e test
         run: |
           set -euo pipefail
-          cat > apps/mi_primer_empleo/tests/test_mpe_hiring_e2e.py <<'PYEOF'
-          """MPE hiring e2e - full bidirectional cycle with
-          trust completion and EMPLOYMENT credential on the
-          network."""
+          cat > apps/agro/tests/test_agro_aid_e2e.py <<'PYEOF'
+          """AGRO aid e2e - producer requests government aid,
+          eligibility evaluated, government approves, assigns,
+          delivers, producer confirms; every transition recorded
+          on the network history by ZID."""
           from __future__ import annotations
 
           import json
           import re
           import threading
-          import urllib.error
           from pathlib import Path
           from urllib.request import (
               Request,
@@ -2892,15 +2243,15 @@ jobs:
               Ed25519Signer,
           )
 
-          from apps.mi_primer_empleo.infrastructure.network.network_client import (
+          from apps.agro.infrastructure.network.network_client import (
               NetworkClient,
           )
-          from apps.mi_primer_empleo.infrastructure.persistence.mpe_store import (
-              MpeStore,
+          from apps.agro.infrastructure.persistence.agro_store import (
+              AgroStore,
           )
-          from apps.mi_primer_empleo.server import serve_mpe
-          from apps.mi_primer_empleo.services.mpe_link import (
-              MpeLink,
+          from apps.agro.server import serve_agro
+          from apps.agro.services.zyra_link import (
+              ZyraLink,
           )
 
 
@@ -2949,60 +2300,47 @@ jobs:
                       self.net_base,
                       max_retries=1,
                   )
-                  self.mpe_db = SQLiteAdapter(
-                      tmp_path / "mpe.db"
+                  self.agro_db = SQLiteAdapter(
+                      tmp_path / "agro.db"
                   )
-                  self.store = MpeStore(
-                      self.mpe_db, FrozenClock()
+                  self.store = AgroStore(
+                      self.agro_db, FrozenClock()
                   )
-                  self.link = MpeLink(self.client)
-                  self.mpe_server = serve_mpe(
+                  self.link = ZyraLink(self.client)
+                  self.agro_server = serve_agro(
                       self.store, self.client
                   )
-                  self.mpe_thread = threading.Thread(
+                  self.agro_thread = threading.Thread(
                       target=(
-                          self.mpe_server
+                          self.agro_server
                           .serve_forever
                       ),
                       daemon=True,
                   )
-                  self.mpe_thread.start()
-                  self.mpe_base = (
+                  self.agro_thread.start()
+                  self.agro_base = (
                       "http://127.0.0.1:"
-                      f"{self.mpe_server.bound_port}"
+                      f"{self.agro_server.bound_port}"
                   )
 
               def close(self) -> None:
-                  self.mpe_server.shutdown()
-                  self.mpe_server.server_close()
-                  self.mpe_thread.join(timeout=5)
+                  self.agro_server.shutdown()
+                  self.agro_server.server_close()
+                  self.agro_thread.join(timeout=5)
                   self.net_server.shutdown()
                   self.net_server.server_close()
                   self.net_thread.join(timeout=5)
-                  self.mpe_db.close()
+                  self.agro_db.close()
                   self.net_db.close()
 
 
-          def _post_form(url: str, doc: dict) -> str:
-              request = Request(
-                  url,
-                  data=(
-                      "&".join(
-                          str(k)
-                          + "="
-                          + str(v)
-                          for k, v in doc.items()
-                      )
-                  ).encode("utf-8"),
-                  method="POST",
-              )
-              with urlopen(request, timeout=10) as r:
-                  return r.read().decode("utf-8")
-
-
-          def _get_html(url: str) -> str:
+          def _get_json(url: str) -> dict:
               with urlopen(url, timeout=10) as r:
-                  return r.read().decode("utf-8")
+                  body = json.loads(
+                      r.read().decode("utf-8")
+                  )
+              assert isinstance(body, dict)
+              return body
 
 
           def _post_json(
@@ -3031,27 +2369,12 @@ jobs:
               return body
 
 
-          def _get_json(url: str) -> dict:
+          def _get_html(url: str) -> str:
               with urlopen(url, timeout=10) as r:
-                  body = json.loads(
-                      r.read().decode("utf-8")
-                  )
-              assert isinstance(body, dict)
-              return body
+                  return r.read().decode("utf-8")
 
 
-          def _job_status(eco, job_id: str) -> dict:
-              body = _get_json(
-                  eco.mpe_base
-                  + "/mpe/api/job/"
-                  + job_id
-              )
-              data = body["data"]
-              assert isinstance(data, dict)
-              return data
-
-
-          def test_mpe_hiring_full_cycle(
+          def test_aid_full_cycle(
               tmp_path: Path,
           ) -> None:
               eco = _Ecosystem(tmp_path)
@@ -3060,325 +2383,263 @@ jobs:
                       eco.link.register_app()[0]
                       is True
                   )
-                  company_html = _post_form(
-                      eco.mpe_base
-                      + "/mpe/register",
+                  created = _post_json(
+                      eco.agro_base
+                      + "/agro/producers",
                       {
-                          "role": "empresa",
-                          "name": (
-                              "Constructora SV"
-                          ),
-                          "profession":
-                          "construccion",
+                          "name": "Jose Rural",
+                          "producer_type":
+                          "agricultor",
+                          "location":
+                          "Chalatenango",
                       },
                   )
-                  company_id = re.search(
-                      r"MPE-[a-f0-9]{12}",
-                      company_html,
-                  ).group(0)
-                  worker_ids: list[str] = []
-                  for index in range(1, 6):
-                      html = _post_form(
-                          eco.mpe_base
-                          + "/mpe/register",
-                          {
-                              "role":
-                              "trabajador",
-                              "name": "Albanil "
-                              + str(index),
-                              "profession":
-                              "albanil",
-                          },
-                      )
-                      worker_ids.append(
-                          re.search(
-                              r"MPE-[a-f0-9]{12}",
-                              html,
-                          ).group(0)
-                      )
-                  _post_form(
-                      eco.mpe_base + "/mpe/job",
+                  row = created["data"]
+                  producer_id = str(
+                      row["producer_id"]
+                  )
+                  zid = row.get("zid")
+                  assert isinstance(zid, str)
+                  assert zid.startswith("ZID-")
+                  verified = _post_json(
+                      eco.agro_base
+                      + "/agro/producers/verify",
                       {
-                          "company_account": (
-                              company_id
-                          ),
-                          "title": (
-                              "Obra necesita"
-                              " albaniles"
-                          ),
-                          "profession":
-                          "albanil",
-                          "openings": 5,
-                      },
-                  )
-                  job_id = eco.store.list_jobs(
-                      profession="albanil"
-                  )[0]["job_id"]
-                  panel = _get_html(
-                      eco.mpe_base
-                      + "/mpe/empresa/"
-                      + company_id
-                  )
-                  assert "Albanil 1" in panel
-                  for index in range(3):
-                      _post_form(
-                          eco.mpe_base
-                          + "/mpe/proposal",
-                          {
-                              "company_account": (
-                                  company_id
-                              ),
-                              "job_id": job_id,
-                              "worker_account": (
-                                  worker_ids[
-                                      index
-                                  ]
-                              ),
-                          },
-                      )
-                  notes = _get_json(
-                      eco.mpe_base
-                      + "/mpe/api/notifications"
-                      + "?worker="
-                      + worker_ids[0]
-                  )
-                  kinds = [
-                      str(item["kind"])
-                      for item in notes[
-                          "data"
-                      ]["notifications"]
-                  ]
-                  assert "proposal" in kinds
-                  proposals = (
-                      eco.store.list_proposals(
-                          job_id=job_id,
-                          status="pending",
-                      )
-                  )
-                  assert len(proposals) == 3
-                  for proposal in proposals:
-                      html = _post_form(
-                          eco.mpe_base
-                          + "/mpe/"
-                          + "proposal-decide",
-                          {
-                              "proposal_id": (
-                                  proposal[
-                                      "proposal_id"
-                                  ]
-                              ),
-                              "decision":
-                              "aceptar",
-                          },
-                      )
-                      assert (
-                          "Contratado" in html
-                      )
-                  status = _job_status(
-                      eco, job_id
-                  )
-                  assert status["hired"] == 3
-                  assert (
-                      status["remaining"] == 2
-                  )
-                  _post_form(
-                      eco.mpe_base
-                      + "/mpe/proposal",
-                      {
-                          "company_account": (
-                              company_id
-                          ),
-                          "job_id": job_id,
-                          "worker_account": (
-                              worker_ids[3]
-                          ),
-                      },
-                  )
-                  pending = (
-                      eco.store.list_proposals(
-                          job_id=job_id,
-                          worker_account=(
-                              worker_ids[3]
-                          ),
-                          status="pending",
-                      )
-                  )
-                  html = _post_form(
-                      eco.mpe_base
-                      + "/mpe/proposal-decide",
-                      {
-                          "proposal_id": pending[
-                              0
-                          ][
-                              "proposal_id"
-                          ],
-                          "decision":
-                          "rechazar",
-                      },
-                  )
-                  assert (
-                      "rechazada" in html
-                  )
-                  network_results: list[
-                      dict
-                  ] = []
-                  for index in (3, 4):
-                      response = _post_json(
-                          eco.mpe_base
-                          + "/mpe/api/hires",
-                          {
-                              "job_id": job_id,
-                              "worker_account": (
-                                  worker_ids[
-                                      index
-                                  ]
-                              ),
-                          },
-                      )
-                      assert (
-                          response["ok"] is True
-                      )
-                      network_results.append(
-                          response["data"][
-                              "network"
-                          ]
-                      )
-                  status = _job_status(
-                      eco, job_id
-                  )
-                  assert status["hired"] == 5
-                  assert (
-                      status["remaining"] == 0
-                  )
-                  assert status[
-                      "status"
-                  ] == "filled"
-                  for net in network_results:
-                      credential = net[
-                          "credential"
-                      ]
-                      assert credential[
-                          "issued"
-                      ] is True, (
-                          "credential issuance"
-                          " failed: "
-                          + json.dumps(
-                              credential,
-                              default=str,
-                          )
-                      )
-                  credential_id = (
-                      network_results[0][
-                          "credential"
-                      ].get("credential_id")
-                  )
-                  try:
-                      _post_json(
-                          eco.mpe_base
-                          + "/mpe/api/hires",
-                          {
-                              "job_id": job_id,
-                              "worker_account": (
-                                  worker_ids[0]
-                              ),
-                          },
-                      )
-                      raise AssertionError(
-                          "overfill should fail"
-                      )
-                  except (
-                      urllib.error.HTTPError
-                  ) as exc:
-                      assert exc.code == 400
-                  leave = _post_json(
-                      eco.mpe_base
-                      + "/mpe/api/leave",
-                      {
-                          "job_id": job_id,
-                          "worker_account": (
-                              worker_ids[1]
+                          "producer_id": (
+                              producer_id
                           ),
                       },
                   )
                   assert (
-                      leave["data"][
-                          "reopened"
+                      verified["data"][
+                          "verified"
                       ]
                       is True
                   )
-                  status = _job_status(
-                      eco, job_id
+                  aid_response = _post_json(
+                      eco.agro_base
+                      + "/agro/aid/request",
+                      {
+                          "producer_id": (
+                              producer_id
+                          ),
+                          "program": "semillas",
+                          "item": "maiz criollo",
+                          "quantity": 10,
+                      },
                   )
-                  assert status["hired"] == 4
-                  assert status[
-                      "status"
-                  ] == "open"
-                  worker_row = (
-                      eco.store.get_account(
-                          worker_ids[0]
+                  aid = aid_response["data"]
+                  aid_id = str(aid["aid_id"])
+                  assert (
+                      aid["status"]
+                      == "requested"
+                  )
+                  assert (
+                      aid["zid"] == zid
+                  )
+                  eligible = _post_json(
+                      eco.agro_base
+                      + "/agro/aid/eligibility",
+                      {"aid_id": aid_id},
+                  )
+                  assert (
+                      eligible["data"][
+                          "status"
+                      ]
+                      == "eligible"
+                  )
+                  approved = _post_json(
+                      eco.agro_base
+                      + "/agro/government/"
+                      + "approve",
+                      {"aid_id": aid_id},
+                  )
+                  assert (
+                      approved["data"][
+                          "status"
+                      ]
+                      == "approved"
+                  )
+                  assigned = _post_json(
+                      eco.agro_base
+                      + "/agro/government/"
+                      + "assign",
+                      {
+                          "aid_id": aid_id,
+                          "detail": "lote 7",
+                      },
+                  )
+                  assert (
+                      assigned["data"][
+                          "status"
+                      ]
+                      == "assigned"
+                  )
+                  delivered = _post_json(
+                      eco.agro_base
+                      + "/agro/government/"
+                      + "deliver",
+                      {
+                          "aid_id": aid_id,
+                          "detail": "entregado"
+                          " en centro agrario",
+                      },
+                  )
+                  assert (
+                      delivered["data"][
+                          "status"
+                      ]
+                      == "delivered"
+                  )
+                  confirmed = _post_json(
+                      eco.agro_base
+                      + "/agro/government/"
+                      + "confirm",
+                      {"aid_id": aid_id},
+                  )
+                  assert (
+                      confirmed["data"][
+                          "status"
+                      ]
+                      == "confirmed"
+                  )
+                  transitions = [
+                      str(event["transition"])
+                      for event in confirmed[
+                          "data"
+                      ]["events"]
+                  ]
+                  assert (
+                      "AID_REQUESTED"
+                      in transitions
+                  )
+                  assert (
+                      "AID_DELIVERY_CONFIRMED"
+                      in transitions
+                  )
+                  detail = _get_json(
+                      eco.agro_base
+                      + "/agro/aid/"
+                      + aid_id
+                  )
+                  assert (
+                      detail["data"]["status"]
+                      == "confirmed"
+                  )
+                  history_ok, history, _err = (
+                      eco.client.get(
+                          "/history/" + zid
                       )
                   )
-                  zid = worker_row.get("zid")
-                  assert isinstance(zid, str)
-                  assert zid.startswith("ZID-")
-                  raw_text = ""
-                  if credential_id:
-                      try:
-                          with urlopen(
-                              eco.net_base
-                              + "/verification/credentials/"
-                              + str(
-                                  credential_id
-                              ),
-                              timeout=10,
-                          ) as response:
-                              raw_text = (
-                                  response
-                                  .read()
-                                  .decode(
-                                      "utf-8"
-                                  )
-                              )
-                      except Exception:
-                          raw_text = ""
-                  if "employment" not in raw_text:
-                      try:
-                          with urlopen(
-                              eco.net_base
-                              + "/certificates/"
-                              + zid,
-                              timeout=10,
-                          ) as response:
-                              raw_text = (
-                                  raw_text
-                                  + "|"
-                                  + response
-                                  .read()
-                                  .decode(
-                                      "utf-8"
-                                  )
-                              )
-                      except Exception as exc:
-                          raw_text = (
-                              raw_text
-                              + "|error:"
-                              + str(exc)
-                          )
-                  assert "employment" in raw_text, (
-                      "credential not verifiable"
-                      " raw=" + raw_text[:600]
+                  assert history_ok is True
+                  history_text = json.dumps(
+                      history, default=str
                   )
+                  assert "AID_" in history_text
+                  unverified = _post_json(
+                      eco.agro_base
+                      + "/agro/producers",
+                      {
+                          "name": (
+                              "Nuevo Sin Verificar"
+                          ),
+                          "producer_type":
+                          "agricultor",
+                      },
+                  )
+                  producer_b = str(
+                      unverified["data"][
+                          "producer_id"
+                      ]
+                  )
+                  eco.store.mark_verified(
+                      producer_id=(
+                          producer_b
+                      ),
+                  ) if False else None
+                  aid_b = _post_json(
+                      eco.agro_base
+                      + "/agro/aid/request",
+                      {
+                          "producer_id": (
+                              producer_b
+                          ),
+                          "program": (
+                              "fertilizante"
+                          ),
+                          "item": "urea",
+                          "quantity": 5,
+                      },
+                  )
+                  aid_b_id = str(
+                      aid_b["data"]["aid_id"]
+                  )
+                  rejected = _post_json(
+                      eco.agro_base
+                      + "/agro/aid/eligibility",
+                      {"aid_id": aid_b_id},
+                  )
+                  assert (
+                      rejected["data"][
+                          "status"
+                      ]
+                      == "rejected"
+                  )
+                  try:
+                      _post_json(
+                          eco.agro_base
+                          + "/agro/government/"
+                          + "approve",
+                          {"aid_id": aid_b_id},
+                      )
+                      raise AssertionError(
+                          "approve of rejected"
+                          " should fail"
+                      )
+                  except Exception as exc:
+                      assert "400" in str(exc)
+                  panel = _get_html(
+                      eco.agro_base
+                      + "/agro/productor/"
+                      + producer_id
+                  )
+                  assert aid_id in panel
+                  assert "confirmed" in panel
+                  summary = _get_json(
+                      eco.agro_base
+                      + "/agro/government/"
+                      + "summary"
+                  )
+                  data = summary["data"]
+                  assert (
+                      data["aid_total"] >= 2
+                  )
+                  assert (
+                      data["aid_by_status"][
+                          "confirmed"
+                      ]
+                      == 1
+                  )
+                  assert (
+                      data["aid_by_status"][
+                          "rejected"
+                      ]
+                      == 1
+                  )
+                  assert "semillas" in data[
+                      "aid_by_program"
+                  ]
               finally:
                   eco.close()
           PYEOF
           echo "e2e written"
 
-      - name: Run MPE tests (regression plus hiring e2e)
+      - name: Run AGRO tests (regression plus aid e2e)
         run: |
           set -euo pipefail
-          PYTHONPATH="$PWD" python -m pytest -q -p no:cacheprovider --timeout=120 --timeout-method=thread apps/mi_primer_empleo/tests/
-          echo "MPE tests OK"
-          find apps/mi_primer_empleo -name '__pycache__' -type d \
+          PYTHONPATH="$PWD" python -m pytest -q -p no:cacheprovider --timeout=120 --timeout-method=thread apps/agro/tests/
+          echo "AGRO tests OK"
+          find apps/agro -name '__pycache__' -type d \
             -prune -exec rm -rf {} +
 
       - name: Commit and push (race-safe)
@@ -3392,7 +2653,7 @@ jobs:
           if git diff --cached --quiet; then
             echo "No changes."
           else
-            git commit -m "zyra: Q3 MPE v4 - removed broken diagnostic probe, complete_trust on register and before issuance (fixes 403), full hiring e2e with credential verification"
+            git commit -m "zyra: Q3 AGRO aid - migration 3 (aid requests + events), full lifecycle requested-eligible-approved-assigned-delivered-confirmed with wrong-order rejection, eligibility rule (verified producer), every transition on network history by ZID, government summary extended, producer panel shows aid; old routes and contracts preserved; probe + aid e2e"
             git push origin "HEAD:${{ github.ref_name }}"
           fi
-          echo "=== Q3 MPE V4 COMPLETE ==="
+          echo "=== Q3 AGRO COMPLETE ==="

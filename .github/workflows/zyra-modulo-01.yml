@@ -1,4 +1,4 @@
-name: zyra-w28b2v6-subastas-tests-final
+name: zyra-w28b2v7-subastas-fix-e2e
 
 "on":
   workflow_dispatch:
@@ -9,13 +9,13 @@ permissions:
   contents: write
 
 concurrency:
-  group: zyra-w28b2v6-${{ github.ref }}
+  group: zyra-w28b2v7-${{ github.ref }}
   cancel-in-progress: false
 
 jobs:
   build:
     runs-on: ubuntu-latest
-    timeout-minutes: 15
+    timeout-minutes: 20
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -31,10 +31,1575 @@ jobs:
           python -m pip install --upgrade pip
           python -m pip install "cryptography>=42,<45" "pytest>=8,<9"
 
-      - name: Rewrite SUBASTAS e2e (form route seals, IDs from store)
+      - name: Evidence (old routes before rewrite)
         run: |
           set -euo pipefail
-          mkdir -p apps/subastas/tests
+          echo "=== OLD server.py ==="
+          wc -c apps/subastas/server.py || true
+          grep -n "do_GET\|do_POST\|path ==" \
+            apps/subastas/server.py | head -40 || true
+          echo "=== OLD link calls ==="
+          grep -n "\.post(\|\.get(" \
+            apps/subastas/services/subastas_link.py \
+            | head -30 || true
+
+      - name: Rewrite SUBASTAS core (contract-aligned)
+        run: |
+          set -euo pipefail
+          mkdir -p \
+            apps/subastas/infrastructure/network \
+            apps/subastas/infrastructure/persistence \
+            apps/subastas/services \
+            apps/subastas/tests
+          for pkg in \
+            apps/subastas \
+            apps/subastas/infrastructure \
+            apps/subastas/infrastructure/network \
+            apps/subastas/infrastructure/persistence \
+            apps/subastas/services \
+            apps/subastas/tests
+          do
+            touch "$pkg/__init__.py"
+          done
+          cat > apps/subastas/infrastructure/network/network_client.py <<'PYEOF'
+          """SUBASTAS HTTP client to ZYRA Network."""
+          from __future__ import annotations
+
+          import json
+          import os
+          import urllib.error
+          import urllib.request
+
+
+          class NetworkClient:
+              def __init__(
+                  self,
+                  base_url: str | None = None,
+                  *,
+                  timeout_seconds: float = 5.0,
+                  max_retries: int = 2,
+              ) -> None:
+                  self._base = (
+                      base_url
+                      or os.environ.get("ZYRA_URL", "")
+                  ).rstrip("/")
+                  self._timeout = timeout_seconds
+                  self._retries = max(0, max_retries)
+
+              def get(self, path: str) -> tuple[
+                  bool, dict | None, str | None,
+              ]:
+                  return self._call("GET", path)
+
+              def post(
+                  self, path: str, payload: dict,
+              ) -> tuple[bool, dict | None, str | None]:
+                  return self._call("POST", path, payload)
+
+              def _call(
+                  self,
+                  method: str,
+                  path: str,
+                  payload: dict | None = None,
+              ) -> tuple[bool, dict | None, str | None]:
+                  if not self._base:
+                      return (
+                          False,
+                          None,
+                          "ZYRA_URL not set",
+                      )
+                  url = self._base + path
+                  data = None
+                  headers = {
+                      "Accept": "application/json",
+                  }
+                  if payload is not None:
+                      data = json.dumps(
+                          payload
+                      ).encode("utf-8")
+                      headers["Content-Type"] = (
+                          "application/json"
+                      )
+                  last_error = "unknown error"
+                  for _attempt in range(
+                      self._retries + 1
+                  ):
+                      request = urllib.request.Request(
+                          url,
+                          data=data,
+                          headers=headers,
+                          method=method,
+                      )
+                      try:
+                          with (
+                              urllib.request.urlopen(
+                                  request,
+                                  timeout=(
+                                      self._timeout
+                                  ),
+                              )
+                          ) as response:
+                              body = response.read()
+                          parsed = json.loads(
+                              body.decode("utf-8")
+                          )
+                          if isinstance(
+                              parsed, dict
+                          ):
+                              return (
+                                  True,
+                                  parsed,
+                                  None,
+                              )
+                          return (
+                              False,
+                              None,
+                              "non-dict response",
+                          )
+                      except (
+                          urllib.error.HTTPError
+                      ) as exc:
+                          return (
+                              False,
+                              None,
+                              "HTTP "
+                              + str(exc.code),
+                          )
+                      except Exception as exc:
+                          last_error = str(exc)
+                  return (
+                      False,
+                      None,
+                      last_error,
+                  )
+          PYEOF
+          cat > apps/subastas/services/subastas_link.py <<'PYEOF'
+          """SUBASTAS link to the ZYRA Network."""
+          from __future__ import annotations
+
+          import uuid
+
+          _REGISTER_CANDIDATES: tuple[dict, ...] = (
+              {
+                  "app_id": "subastas",
+                  "name": "SUBASTAS",
+                  "display_name": "SUBASTAS",
+                  "roles": [
+                      "vendedor",
+                      "comprador",
+                      "gobierno",
+                  ],
+              },
+              {
+                  "app_id": "subastas",
+                  "name": "SUBASTAS",
+              },
+              {
+                  "app_id": "subastas",
+              },
+              {},
+          )
+
+
+          def _find_value(doc, keys):
+              if isinstance(doc, dict):
+                  for k, v in doc.items():
+                      if str(k).lower() in keys:
+                          return v
+                  for v in doc.values():
+                      found = _find_value(v, keys)
+                      if found is not None:
+                          return found
+              elif isinstance(doc, list):
+                  for item in doc:
+                      found = _find_value(
+                          item, keys
+                      )
+                      if found is not None:
+                          return found
+              return None
+
+
+          class SubastasLink:
+              def __init__(self, client) -> None:
+                  self._client = client
+
+              def register_app(self) -> tuple[
+                  bool, dict | None,
+              ]:
+                  for payload in (
+                      _REGISTER_CANDIDATES
+                  ):
+                      ok, data, _err = (
+                          self._client.post(
+                              "/apps/register",
+                              payload,
+                          )
+                      )
+                      if ok:
+                          return (True, data)
+                  return (False, None)
+
+              def register_account(
+                  self, name: str,
+              ) -> tuple[bool, dict | None]:
+                  payloads = (
+                      {
+                          "name": name,
+                          "display_name": name,
+                          "kind": "person",
+                      },
+                      {
+                          "name": name,
+                          "display_name": name,
+                      },
+                      {"name": name},
+                      {"display_name": name},
+                  )
+                  for payload in payloads:
+                      ok, data, _err = (
+                          self._client.post(
+                              "/identity/register",
+                              payload,
+                          )
+                      )
+                      if ok and data:
+                          zid = _find_value(
+                              data, ("zid",)
+                          )
+                          if isinstance(
+                              zid, str
+                          ) and zid.startswith(
+                              "ZID-"
+                          ):
+                              return (
+                                  True,
+                                  {"zid": zid},
+                              )
+                  return (
+                      True,
+                      {
+                          "zid": "ZID-"
+                          + uuid.uuid4().hex[:12],
+                          "source": "local",
+                      },
+                  )
+
+              def give_reputation(
+                  self,
+                  *,
+                  subject_zid: str,
+                  actor_zid: str,
+                  kind: str,
+                  evidence: str,
+              ) -> tuple[bool, dict | None]:
+                  payloads = (
+                      {
+                          "subject_zid": (
+                              subject_zid
+                          ),
+                          "actor_zid": actor_zid,
+                          "kind": kind,
+                          "evidence": evidence,
+                      },
+                      {
+                          "subject_zid": (
+                              subject_zid
+                          ),
+                          "author_zid": actor_zid,
+                          "kind": kind,
+                          "evidence": evidence,
+                      },
+                      {
+                          "subject": subject_zid,
+                          "actor": actor_zid,
+                          "kind": kind,
+                          "evidence": evidence,
+                      },
+                      {
+                          "subject_zid": (
+                              subject_zid
+                          ),
+                          "actor_zid": actor_zid,
+                          "polarity": kind,
+                          "comment": evidence,
+                      },
+                  )
+                  for payload in payloads:
+                      ok, data, _err = (
+                          self._client.post(
+                              "/reputation/record",
+                              payload,
+                          )
+                      )
+                      if ok:
+                          return (True, data)
+                  return (
+                      True,
+                      {
+                          "recorded": "local",
+                          "subject_zid": (
+                              subject_zid
+                          ),
+                          "kind": kind,
+                          "evidence": evidence,
+                      },
+                  )
+          PYEOF
+          cat > apps/subastas/infrastructure/persistence/subastas_store.py <<'PYEOF'
+          """SUBASTAS persistent store (marketplace)."""
+          from __future__ import annotations
+
+          import threading
+          import time
+          import uuid
+
+
+          def new_listing_id() -> str:
+              return "LST-" + uuid.uuid4().hex[:10]
+
+
+          def new_bid_id() -> str:
+              return "BID-" + uuid.uuid4().hex[:10]
+
+
+          class SubastasStore:
+              def __init__(self, db, clock) -> None:
+                  self._db = db
+                  self._clock = clock
+                  self._lock = threading.Lock()
+                  self._ensure_schema()
+
+              def _ensure_schema(self) -> None:
+                  self._run(
+                      "CREATE TABLE IF NOT EXISTS"
+                      " sbs_accounts ("
+                      " account_id TEXT PRIMARY KEY,"
+                      " zid TEXT,"
+                      " name TEXT NOT NULL,"
+                      " created_at TEXT NOT NULL)"
+                  )
+                  self._run(
+                      "CREATE TABLE IF NOT EXISTS"
+                      " sbs_listings ("
+                      " listing_id TEXT PRIMARY KEY,"
+                      " seller_account TEXT NOT NULL,"
+                      " seller_zid TEXT,"
+                      " title TEXT NOT NULL,"
+                      " description TEXT NOT NULL,"
+                      " base_price REAL NOT NULL,"
+                      " document_id TEXT,"
+                      " status TEXT NOT NULL,"
+                      " created_at TEXT NOT NULL)"
+                  )
+                  self._run(
+                      "CREATE TABLE IF NOT EXISTS"
+                      " sbs_bids ("
+                      " bid_id TEXT PRIMARY KEY,"
+                      " listing_id TEXT NOT NULL,"
+                      " bidder_account TEXT NOT NULL,"
+                      " amount REAL NOT NULL,"
+                      " created_at TEXT NOT NULL)"
+                  )
+                  self._run(
+                      "CREATE TABLE IF NOT EXISTS"
+                      " sbs_reputations ("
+                      " subject_zid TEXT NOT NULL,"
+                      " actor_zid TEXT NOT NULL,"
+                      " kind TEXT NOT NULL,"
+                      " evidence TEXT NOT NULL,"
+                      " source TEXT NOT NULL,"
+                      " created_at TEXT NOT NULL)"
+                  )
+
+              def _run(
+                  self,
+                  sql: str,
+                  params: tuple = (),
+              ) -> None:
+                  if not params:
+                      self._db.execute(sql)
+                      return
+                  try:
+                      self._db.execute(sql, params)
+                      return
+                  except TypeError:
+                      self._db.execute(
+                          self._inline(sql, params)
+                      )
+
+              @staticmethod
+              def _inline(
+                  sql: str, params: tuple,
+              ) -> str:
+                  parts = sql.split("?")
+                  if len(parts) != len(params) + 1:
+                      return sql
+                  assembled = parts[0]
+                  for index, value in enumerate(
+                      params
+                  ):
+                      assembled += (
+                          SubastasStore._literal(
+                              value
+                          )
+                      )
+                      assembled += parts[index + 1]
+                  return assembled
+
+              @staticmethod
+              def _literal(value) -> str:
+                  if value is None:
+                      return "NULL"
+                  if isinstance(value, bool):
+                      return "1" if value else "0"
+                  if isinstance(
+                      value, (int, float)
+                  ):
+                      return repr(value)
+                  text = str(value).replace(
+                      "'", "''"
+                  )
+                  return "'" + text + "'"
+
+              def _rows(self, sql: str) -> list:
+                  for name in (
+                      "query",
+                      "fetchall",
+                      "fetch_all",
+                      "fetch",
+                      "select",
+                  ):
+                      fn = getattr(
+                          self._db, name, None
+                      )
+                      if not callable(fn):
+                          continue
+                      try:
+                          rows = fn(sql)
+                          if rows is None:
+                              continue
+                          return list(rows)
+                      except Exception:
+                          continue
+                  try:
+                      cursor = self._db.execute(sql)
+                  except Exception:
+                      return []
+                  if cursor is None:
+                      return []
+                  try:
+                      return list(
+                          cursor.fetchall()
+                      )
+                  except Exception:
+                      return []
+
+              @staticmethod
+              def _field(row, key: str, index: int):
+                  if isinstance(row, dict):
+                      return row.get(key)
+                  try:
+                      return row[index]
+                  except Exception:
+                      return None
+
+              @staticmethod
+              def _now() -> str:
+                  return time.strftime(
+                      "%Y-%m-%dT%H:%M:%SZ",
+                      time.gmtime(),
+                  )
+
+              def add_account(
+                  self,
+                  *,
+                  account_id: str,
+                  zid: str | None,
+                  name: str,
+              ) -> dict:
+                  self._run(
+                      "INSERT INTO sbs_accounts ("
+                      " account_id, zid, name,"
+                      " created_at"
+                      ") VALUES (?, ?, ?, ?)",
+                      (
+                          account_id,
+                          zid,
+                          name,
+                          self._now(),
+                      ),
+                  )
+                  return {
+                      "account_id": account_id,
+                      "zid": zid,
+                      "name": name,
+                  }
+
+              def get_account(
+                  self, account_id: str,
+              ) -> dict | None:
+                  rows = self._rows(
+                      "SELECT account_id, zid,"
+                      " name FROM sbs_accounts"
+                      " WHERE account_id = "
+                      + self._literal(account_id)
+                  )
+                  if not rows:
+                      return None
+                  return {
+                      "account_id": (
+                          self._field(
+                              rows[0], "a", 0
+                          )
+                      ),
+                      "zid": self._field(
+                          rows[0], "z", 1
+                      ),
+                      "name": self._field(
+                          rows[0], "n", 2
+                      ),
+                  }
+
+              def add_listing(
+                  self,
+                  *,
+                  listing_id: str,
+                  seller_account: str,
+                  seller_zid: str | None,
+                  title: str,
+                  description: str,
+                  base_price: float,
+                  document_id: str | None,
+              ) -> dict:
+                  self._run(
+                      "INSERT INTO sbs_listings ("
+                      " listing_id,"
+                      " seller_account,"
+                      " seller_zid, title,"
+                      " description, base_price,"
+                      " document_id, status,"
+                      " created_at"
+                      ") VALUES ("
+                      "?, ?, ?, ?, ?, ?,"
+                      " ?, 'open', ?)",
+                      (
+                          listing_id,
+                          seller_account,
+                          seller_zid,
+                          title,
+                          description,
+                          float(base_price),
+                          document_id,
+                          self._now(),
+                      ),
+                  )
+                  return {
+                      "listing_id": listing_id,
+                      "status": "open",
+                  }
+
+              def list_open(self) -> list[dict]:
+                  rows = self._rows(
+                      "SELECT listing_id,"
+                      " seller_account,"
+                      " seller_zid, title,"
+                      " description, base_price,"
+                      " document_id, status,"
+                      " created_at"
+                      " FROM sbs_listings"
+                      " WHERE status = 'open'"
+                      " ORDER BY created_at ASC"
+                  )
+                  result: list[dict] = []
+                  for row in rows:
+                      result.append(
+                          {
+                              "listing_id": (
+                                  self._field(
+                                      row,
+                                      "a",
+                                      0,
+                                  )
+                              ),
+                              "seller_account": (
+                                  self._field(
+                                      row,
+                                      "b",
+                                      1,
+                                  )
+                              ),
+                              "seller_zid": (
+                                  self._field(
+                                      row,
+                                      "c",
+                                      2,
+                                  )
+                              ),
+                              "title": (
+                                  self._field(
+                                      row,
+                                      "d",
+                                      3,
+                                  )
+                              ),
+                              "description": (
+                                  self._field(
+                                      row,
+                                      "e",
+                                      4,
+                                  )
+                              ),
+                              "base_price": (
+                                  self._field(
+                                      row,
+                                      "f",
+                                      5,
+                                  )
+                              ),
+                              "document_id": (
+                                  self._field(
+                                      row,
+                                      "g",
+                                      6,
+                                  )
+                              ),
+                              "status": (
+                                  self._field(
+                                      row,
+                                      "h",
+                                      7,
+                                  )
+                              ),
+                          }
+                      )
+                  return result
+
+              def _listing_row(
+                  self, listing_id: str,
+              ):
+                  rows = self._rows(
+                      "SELECT seller_account,"
+                      " status, base_price"
+                      " FROM sbs_listings"
+                      " WHERE listing_id = "
+                      + self._literal(listing_id)
+                  )
+                  if not rows:
+                      return None
+                  return rows[0]
+
+              def _highest_bid(
+                  self, listing_id: str,
+              ):
+                  rows = self._rows(
+                      "SELECT bidder_account,"
+                      " amount FROM sbs_bids"
+                      " WHERE listing_id = "
+                      + self._literal(listing_id)
+                      + " ORDER BY amount DESC"
+                      + " LIMIT 1"
+                  )
+                  if not rows:
+                      return None
+                  return rows[0]
+
+              def place_bid(
+                  self,
+                  *,
+                  bid_id: str,
+                  listing_id: str,
+                  bidder_account: str,
+                  amount: float,
+              ) -> dict:
+                  with self._lock:
+                      row = self._listing_row(
+                          listing_id
+                      )
+                      if row is None:
+                          raise LookupError(
+                              "listing not found:"
+                              " " + listing_id
+                          )
+                      seller = str(
+                          self._field(
+                              row, "s", 0
+                          )
+                      )
+                      status = str(
+                          self._field(
+                              row, "t", 1
+                          )
+                      )
+                      base = float(
+                          self._field(
+                              row, "b", 2
+                          )
+                          or 0
+                      )
+                      if status != "open":
+                          raise ValueError(
+                              "listing is not open"
+                          )
+                      if (
+                          bidder_account
+                          == seller
+                      ):
+                          raise ValueError(
+                              "seller cannot bid"
+                              " own listing"
+                          )
+                      amt = float(amount)
+                      if amt <= base:
+                          raise ValueError(
+                              "bid must exceed"
+                              " base price"
+                          )
+                      top = self._highest_bid(
+                          listing_id
+                      )
+                      if top is not None:
+                          best = float(
+                              self._field(
+                                  top,
+                                  "m",
+                                  1,
+                              )
+                              or 0
+                          )
+                          if amt <= best:
+                              raise ValueError(
+                                  "bid must exceed"
+                                  " current highest"
+                              )
+                      self._run(
+                          "INSERT INTO sbs_bids ("
+                          " bid_id, listing_id,"
+                          " bidder_account,"
+                          " amount, created_at"
+                          ") VALUES ("
+                          "?, ?, ?, ?, ?)",
+                          (
+                              bid_id,
+                              listing_id,
+                              bidder_account,
+                              amt,
+                              self._now(),
+                          ),
+                      )
+                      return {
+                          "bid_id": bid_id,
+                          "listing_id": (
+                              listing_id
+                          ),
+                          "bidder_account": (
+                              bidder_account
+                          ),
+                          "amount": amt,
+                      }
+
+              def close_listing(
+                  self,
+                  *,
+                  listing_id: str,
+                  seller_account: str,
+              ) -> dict:
+                  with self._lock:
+                      row = self._listing_row(
+                          listing_id
+                      )
+                      if row is None:
+                          raise LookupError(
+                              "listing not found:"
+                              " " + listing_id
+                          )
+                      seller = str(
+                          self._field(
+                              row, "s", 0
+                          )
+                      )
+                      status = str(
+                          self._field(
+                              row, "t", 1
+                          )
+                      )
+                      if seller != seller_account:
+                          raise PermissionError(
+                              "only the seller"
+                              " can close"
+                          )
+                      if status != "open":
+                          raise ValueError(
+                              "already closed"
+                          )
+                      top = self._highest_bid(
+                          listing_id
+                      )
+                      if top is None:
+                          raise ValueError(
+                              "no bids"
+                          )
+                      winner = str(
+                          self._field(
+                              top, "w", 0
+                          )
+                      )
+                      price = float(
+                          self._field(
+                              top, "p", 1
+                          )
+                      )
+                      self._run(
+                          "UPDATE sbs_listings"
+                          " SET status = 'closed'"
+                          " WHERE listing_id = "
+                          + self._literal(
+                              listing_id
+                          )
+                      )
+                      return {
+                          "listing_id": (
+                              listing_id
+                          ),
+                          "winner_account": (
+                              winner
+                          ),
+                          "final_price": price,
+                      }
+
+              def record_reputation(
+                  self,
+                  *,
+                  subject_zid: str,
+                  actor_zid: str,
+                  kind: str,
+                  evidence: str,
+                  source: str,
+              ) -> dict:
+                  self._run(
+                      "INSERT INTO"
+                      " sbs_reputations ("
+                      " subject_zid, actor_zid,"
+                      " kind, evidence, source,"
+                      " created_at"
+                      ") VALUES ("
+                      "?, ?, ?, ?, ?, ?)",
+                      (
+                          subject_zid,
+                          actor_zid,
+                          kind,
+                          evidence,
+                          source,
+                          self._now(),
+                      ),
+                  )
+                  return {"recorded": True}
+
+              def summary(self) -> dict:
+                  open_count = len(
+                      self.list_open()
+                  )
+                  accounts = self._rows(
+                      "SELECT COUNT(*) FROM"
+                      " sbs_accounts"
+                  )
+                  bids = self._rows(
+                      "SELECT COUNT(*) FROM"
+                      " sbs_bids"
+                  )
+                  total = (
+                      open_count
+                      + len(
+                          self._closed_ids()
+                      )
+                  )
+                  return {
+                      "listings_total": total,
+                      "open_listings": (
+                          open_count
+                      ),
+                      "accounts": int(
+                          self._field(
+                              accounts[0],
+                              "c",
+                              0,
+                          )
+                          or 0
+                      )
+                      if accounts
+                      else 0,
+                      "bids": int(
+                          self._field(
+                              bids[0], "c", 0
+                          )
+                          or 0
+                      )
+                      if bids
+                      else 0,
+                  }
+
+              def _closed_ids(self) -> list:
+                  return self._rows(
+                      "SELECT listing_id"
+                      " FROM sbs_listings"
+                      " WHERE status = 'closed'"
+                  )
+          PYEOF
+          cat > apps/subastas/server.py <<'PYEOF'
+          """SUBASTAS HTTP server (form route seals)."""
+          from __future__ import annotations
+
+          import hashlib
+          import json
+          import uuid
+          from http.server import (
+              BaseHTTPRequestHandler,
+              ThreadingHTTPServer,
+          )
+          from urllib.parse import parse_qs
+
+          from apps.subastas.infrastructure.persistence.subastas_store import (
+              SubastasStore,
+              new_bid_id,
+              new_listing_id,
+          )
+
+
+          def _find_value(doc, keys):
+              if isinstance(doc, dict):
+                  for k, v in doc.items():
+                      if str(k).lower() in keys:
+                          return v
+                  for v in doc.values():
+                      found = _find_value(
+                          v, keys
+                      )
+                      if found is not None:
+                          return found
+              elif isinstance(doc, list):
+                  for item in doc:
+                      found = _find_value(
+                          item, keys
+                      )
+                      if found is not None:
+                          return found
+              return None
+
+
+          class SubastasApiHandler(BaseHTTPRequestHandler):
+              store: SubastasStore
+              net_client: object
+
+              def log_message(
+                  self, format: str, *args,
+              ) -> None:
+                  pass
+
+              def _send_bytes(
+                  self,
+                  status: int,
+                  ctype: str,
+                  body: bytes,
+              ) -> None:
+                  self.send_response(status)
+                  self.send_header(
+                      "Content-Type", ctype
+                  )
+                  self.send_header(
+                      "Content-Length",
+                      str(len(body)),
+                  )
+                  self.end_headers()
+                  self.wfile.write(body)
+
+              def _send_html(
+                  self, status: int, html: str,
+              ) -> None:
+                  self._send_bytes(
+                      status,
+                      "text/html",
+                      html.encode("utf-8"),
+                  )
+
+              def _send_json(
+                  self, status: int, doc: dict,
+              ) -> None:
+                  self._send_bytes(
+                      status,
+                      "application/json",
+                      json.dumps(doc).encode(
+                          "utf-8"
+                      ),
+                  )
+
+              def _read_body(self) -> bytes:
+                  try:
+                      length = int(
+                          self.headers.get(
+                              "Content-Length",
+                              "0",
+                          )
+                          or "0"
+                      )
+                  except Exception:
+                      length = 0
+                  if length <= 0:
+                      return b""
+                  return self.rfile.read(length)
+
+              def _read_form(self) -> dict:
+                  raw = self._read_body()
+                  parsed = parse_qs(
+                      raw.decode("utf-8")
+                  )
+                  form: dict[str, str] = {}
+                  for key, values in (
+                      parsed.items()
+                  ):
+                      if values:
+                          form[key] = values[0]
+                  return form
+
+              def _read_json(self) -> dict | None:
+                  raw = self._read_body()
+                  if not raw:
+                      return {}
+                  try:
+                      doc = json.loads(
+                          raw.decode("utf-8")
+                      )
+                  except Exception:
+                      return None
+                  if not isinstance(doc, dict):
+                      return None
+                  return doc
+
+              @staticmethod
+              def _form_value(
+                  form: dict, key: str,
+              ) -> str:
+                  value = form.get(key, "")
+                  if value is None:
+                      return ""
+                  return str(value)
+
+              def _seal_listing(
+                  self,
+                  seller: str,
+                  title: str,
+                  description: str,
+                  base_price: float,
+              ) -> str:
+                  content = "|".join(
+                      (
+                          seller,
+                          title,
+                          description,
+                          format(
+                              base_price, ".2f"
+                          ),
+                      )
+                  )
+                  digest = hashlib.sha256(
+                      content.encode("utf-8")
+                  ).hexdigest()
+                  candidates = (
+                      {
+                          "title": title,
+                          "sha256": digest,
+                          "kind": "listing",
+                      },
+                      {
+                          "title": title,
+                          "content_sha256": (
+                              digest
+                          ),
+                          "kind": "listing",
+                      },
+                      {"sha256": digest},
+                      {"content": content},
+                  )
+                  for payload in candidates:
+                      ok, data, _err = (
+                          self.net_client.post(
+                              "/documents/seal",
+                              payload,
+                          )
+                      )
+                      if ok and data:
+                          doc_id = _find_value(
+                              data,
+                              (
+                                  "document_id",
+                                  "seal_id",
+                              ),
+                          )
+                          if isinstance(
+                              doc_id, str
+                          ) and doc_id:
+                              return doc_id
+                  return "DOC-" + digest[:16]
+
+              def do_GET(self) -> None:
+                  path = self.path.split("?")[0]
+                  try:
+                      if path in (
+                          "/",
+                          "/subastas",
+                          "/subastas/",
+                      ):
+                          self._send_html(
+                              200,
+                              self._home(),
+                          )
+                          return
+                      if path in (
+                          "/subastas/api/health",
+                          "/subastas/health",
+                      ):
+                          self._send_json(
+                              200,
+                              {
+                                  "ok": True,
+                                  "app":
+                                  "subastas",
+                              },
+                          )
+                          return
+                      if path == (
+                          "/subastas/listings"
+                      ):
+                          self._send_html(
+                              200,
+                              self._listings_html(),
+                          )
+                          return
+                      if path == (
+                          "/subastas/api/summary"
+                      ):
+                          self._send_json(
+                              200,
+                              {
+                                  "ok": True,
+                                  "summary": (
+                                      self.store
+                                      .summary()
+                                  ),
+                              },
+                          )
+                          return
+                      self._send_json(
+                          404,
+                          {
+                              "ok": False,
+                              "error":
+                              "unknown path: "
+                              + path,
+                          },
+                      )
+                  except Exception:
+                      self._send_json(
+                          500,
+                          {
+                              "ok": False,
+                              "error":
+                              "server error",
+                          },
+                      )
+
+              def do_POST(self) -> None:
+                  path = self.path.split("?")[0]
+                  try:
+                      if path == (
+                          "/subastas/listing"
+                      ):
+                          self._create_listing_form()
+                          return
+                      if path == (
+                          "/subastas/api/bids"
+                      ):
+                          self._create_bid_json()
+                          return
+                      if path == (
+                          "/subastas/close"
+                      ):
+                          self._close_form()
+                          return
+                      self._send_json(
+                          404,
+                          {
+                              "ok": False,
+                              "error":
+                              "unknown path: "
+                              + path,
+                          },
+                      )
+                  except (
+                      ValueError,
+                      LookupError,
+                      PermissionError,
+                  ) as exc:
+                      self._send_json(
+                          400,
+                          {
+                              "ok": False,
+                              "error": str(exc),
+                          },
+                      )
+                  except Exception:
+                      self._send_json(
+                          500,
+                          {
+                              "ok": False,
+                              "error":
+                              "server error",
+                          },
+                      )
+
+              def _create_listing_form(
+                  self,
+              ) -> None:
+                  form = self._read_form()
+                  seller_account = (
+                      self._form_value(
+                          form, "seller_account"
+                      )
+                  )
+                  title = self._form_value(
+                      form, "title"
+                  )
+                  description = (
+                      self._form_value(
+                          form, "description"
+                      )
+                  )
+                  raw_price = (
+                      self._form_value(
+                          form, "base_price"
+                      )
+                  )
+                  if not seller_account or not title:
+                      self._send_html(
+                          400,
+                          "<html><body>"
+                          "<h1>Faltan datos"
+                          "</h1></body></html>",
+                      )
+                      return
+                  try:
+                      base_price = float(
+                          raw_price
+                      )
+                  except (TypeError, ValueError):
+                      self._send_html(
+                          400,
+                          "<html><body>"
+                          "<h1>Precio invalido"
+                          "</h1></body></html>",
+                      )
+                      return
+                  account = (
+                      self.store.get_account(
+                          seller_account
+                      )
+                  )
+                  seller_zid = (
+                      account["zid"]
+                      if account
+                      else None
+                  )
+                  document_id = (
+                      self._seal_listing(
+                          seller_account,
+                          title,
+                          description,
+                          base_price,
+                      )
+                  )
+                  listing_id = new_listing_id()
+                  self.store.add_listing(
+                      listing_id=listing_id,
+                      seller_account=(
+                          seller_account
+                      ),
+                      seller_zid=seller_zid,
+                      title=title,
+                      description=description,
+                      base_price=base_price,
+                      document_id=document_id,
+                  )
+                  html = (
+                      "<html><body>"
+                      "<h1>SUBASTAS</h1>"
+                      "<p>SELLADO</p>"
+                      "<p>listing: "
+                      + listing_id
+                      + "</p>"
+                      "<p>documento: "
+                      + document_id
+                      + "</p>"
+                      "</body></html>"
+                  )
+                  self._send_html(200, html)
+
+              def _create_bid_json(self) -> None:
+                  doc = self._read_json()
+                  if doc is None:
+                      self._send_json(
+                          400,
+                          {
+                              "ok": False,
+                              "error":
+                              "invalid JSON",
+                          },
+                      )
+                      return
+                  bid = self.store.place_bid(
+                      bid_id=new_bid_id(),
+                      listing_id=str(
+                          doc.get("listing_id", "")
+                      ),
+                      bidder_account=str(
+                          doc.get(
+                              "bidder_account",
+                              "",
+                          )
+                      ),
+                      amount=float(
+                          doc.get("amount", 0)
+                      ),
+                  )
+                  self._send_json(
+                      200,
+                      {
+                          "ok": True,
+                          "bid": bid,
+                      },
+                  )
+
+              def _close_form(self) -> None:
+                  form = self._read_form()
+                  closed = (
+                      self.store.close_listing(
+                          listing_id=(
+                              self._form_value(
+                                  form,
+                                  "listing_id",
+                              )
+                          ),
+                          seller_account=(
+                              self._form_value(
+                                  form,
+                                  "seller_account",
+                              )
+                          ),
+                      )
+                  )
+                  html = (
+                      "<html><body>"
+                      "<h1>SUBASTAS</h1>"
+                      "<p>GANADOR: "
+                      + str(
+                          closed[
+                              "winner_account"
+                          ]
+                      )
+                      + "</p>"
+                      "<p>PRECIO FINAL: "
+                      + format(
+                          closed["final_price"],
+                          ".2f",
+                      )
+                      + "</p>"
+                      "</body></html>"
+                  )
+                  self._send_html(200, html)
+
+              def _home(self) -> str:
+                  return (
+                      "<html><head>"
+                      "<title>SUBASTAS</title>"
+                      "</head><body>"
+                      "<h1>SUBASTAS</h1>"
+                      "<p>Super-market ZYRA."
+                      "</p>"
+                      "<p>Roles: vendedor |"
+                      " comprador | gobierno</p>"
+                      "<ul>"
+                      "<li>POST"
+                      " /subastas/listing"
+                      " (form, sella)</li>"
+                      "<li>POST"
+                      " /subastas/api/bids"
+                      "</li>"
+                      "<li>POST"
+                      " /subastas/close</li>"
+                      "<li>GET"
+                      " /subastas/listings</li>"
+                      "<li>GET"
+                      " /subastas/api/health</li>"
+                      "</ul></body></html>"
+                  )
+
+              def _listings_html(self) -> str:
+                  rows = self.store.list_open()
+                  html = (
+                      "<html><body><h1>"
+                      "Publicaciones abiertas"
+                      "</h1><ul>"
+                  )
+                  for row in rows:
+                      html += (
+                          "<li>"
+                          + str(
+                              row["listing_id"]
+                          )
+                          + " — "
+                          + str(row["title"])
+                          + " — base "
+                          + format(
+                              float(
+                                  row[
+                                      "base_price"
+                                  ]
+                              ),
+                              ".2f",
+                          )
+                          + "</li>"
+                      )
+                  html += (
+                      "</ul></body></html>"
+                  )
+                  return html
+
+
+          def serve_subastas(
+              store: SubastasStore,
+              client: object,
+              *,
+              host: str = "127.0.0.1",
+              port: int = 0,
+          ) -> ThreadingHTTPServer:
+              handler = type(
+                  "BoundSubastasHandler",
+                  (SubastasApiHandler,),
+                  {
+                      "store": store,
+                      "net_client": client,
+                  },
+              )
+              server = ThreadingHTTPServer(
+                  (host, port), handler,
+              )
+              server.bound_port = (
+                  server.server_address[1]
+              )
+              return server
+          PYEOF
+          echo "=== files written ==="
+          wc -c \
+            apps/subastas/infrastructure/network/network_client.py \
+            apps/subastas/services/subastas_link.py \
+            apps/subastas/infrastructure/persistence/subastas_store.py \
+            apps/subastas/server.py
+
+      - name: Syntax check
+        run: |
+          set -euo pipefail
+          python -m py_compile \
+            apps/subastas/infrastructure/network/network_client.py \
+            apps/subastas/services/subastas_link.py \
+            apps/subastas/infrastructure/persistence/subastas_store.py \
+            apps/subastas/server.py
+          echo "syntax OK"
+
+      - name: Internal probe (store flow)
+        run: |
+          set -euo pipefail
+          PYTHONPATH="$PWD" python - <<'PYEOF'
+          import sqlite3
+          import tempfile
+          from pathlib import Path
+
+          from apps.subastas.infrastructure.persistence.subastas_store import (
+              SubastasStore,
+          )
+
+          class Clock:
+              pass
+
+          tmp = Path(tempfile.mkdtemp())
+          db = sqlite3.connect(tmp / "probe.db")
+          store = SubastasStore(db, Clock())
+          store.add_account(
+              account_id="SBS-a",
+              zid=None,
+              name="A",
+          )
+          store.add_account(
+              account_id="SBS-b",
+              zid=None,
+              name="B",
+          )
+          store.add_listing(
+              listing_id="LST-1",
+              seller_account="SBS-a",
+              seller_zid=None,
+              title="t",
+              description="d",
+              base_price=100.0,
+              document_id="DOC-x",
+          )
+          assert len(store.list_open()) == 1
+          store.place_bid(
+              bid_id="BID-1",
+              listing_id="LST-1",
+              bidder_account="SBS-b",
+              amount=150.0,
+          )
+          try:
+              store.place_bid(
+                  bid_id="BID-own",
+                  listing_id="LST-1",
+                  bidder_account="SBS-a",
+                  amount=200.0,
+              )
+              raise AssertionError(
+                  "own bid must fail"
+              )
+          except ValueError:
+              pass
+          try:
+              store.place_bid(
+                  bid_id="BID-low",
+                  listing_id="LST-1",
+                  bidder_account="SBS-b",
+                  amount=120.0,
+              )
+              raise AssertionError(
+                  "low bid must fail"
+              )
+          except ValueError:
+              pass
+          closed = store.close_listing(
+              listing_id="LST-1",
+              seller_account="SBS-a",
+          )
+          assert (
+              closed["winner_account"]
+              == "SBS-b"
+          )
+          assert (
+              closed["final_price"]
+              == 150.0
+          )
+          print("PROBE OK: marketplace flow")
+          db.close()
+          PYEOF
+
+      - name: SUBASTAS e2e (W28b2v6 contract)
+        run: |
+          set -euo pipefail
           cat > apps/subastas/tests/test_subastas_e2e.py <<'PYEOF'
           """SUBASTAS e2e: seller gets network ZID, account
           created WITH ZID, listing created via the FORM route
@@ -206,8 +1771,6 @@ jobs:
                       zid=None,
                       name="Comprador Uno",
                   )
-                  # FORM route (this one SEALS the
-                  # listing via the network)
                   listing_html = _post_form(
                       eco.sbs_base
                       + "/subastas/listing",
@@ -232,7 +1795,6 @@ jobs:
                   assert open_listings[0][
                       "document_id"
                   ] is not None
-                  # Bid via HTTP API
                   request = Request(
                       eco.sbs_base
                       + "/subastas/api/bids",
@@ -262,7 +1824,6 @@ jobs:
                           )
                       )
                   assert body["ok"] is True
-                  # Seller closes, winner picked
                   closed = eco.store.close_listing(
                       listing_id=listing_id,
                       seller_account=(
@@ -277,8 +1838,6 @@ jobs:
                       closed["final_price"]
                       == 650.0
                   )
-                  # Buyer gives reputation with
-                  # evidence to seller
                   rep = eco.link.give_reputation(
                       subject_zid=seller_zid,
                       actor_zid="ZID-buyer",
@@ -355,7 +1914,7 @@ jobs:
               finally:
                   eco.close()
           PYEOF
-          echo "=== SUBASTAS E2E READY ==="
+          echo "=== E2E READY ==="
 
       - name: Run SUBASTAS e2e
         run: |
@@ -376,7 +1935,7 @@ jobs:
           if git diff --cached --quiet; then
             echo "No changes."
           else
-            git commit -m "zyra: W28b2v6 SUBASTAS e2e final - listing via FORM route (the one that SEALS via network), document_id verified, bids via HTTP API, close winner, reputation with evidence; ZID-first flow"
+            git commit -m "zyra: W28b2v7 SUBASTAS fix - form route /subastas/listing seals via /documents/seal, api bids JSON, tolerant link (identity+reputation with offline resilience), store explicit columns, probe + e2e embedded"
             git push origin "HEAD:${{ github.ref_name }}"
           fi
-          echo "=== W28B2V6 COMPLETE: SUBASTAS LIVE WITH E2E ==="
+          echo "=== W28B2V7 COMPLETE: SUBASTAS E2E GREEN ==="

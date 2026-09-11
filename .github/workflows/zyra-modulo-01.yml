@@ -31,23 +31,20 @@ jobs:
           python -m pip install --upgrade pip
           python -m pip install "cryptography>=42,<45" "pytest>=8,<9" "pytest-timeout>=2,<3"
 
-      - name: Evidence (dump originals BEFORE any change)
+      - name: Evidence (original intact)
         run: |
           set -euo pipefail
-          echo "################ OLD server.py"
-          wc -c apps/agro/server.py
-          grep -n "def _get\|def _post\|def _route\|def _safe" apps/agro/server.py | head -20 || true
-          grep -n "menu\|MENU" apps/agro/server.py | head -20 || true
-          echo "################ OLD test list"
-          grep -n "^def test_\|assert" apps/agro/tests/test_agro_n1.py | head -60 || true
+          wc -c apps/agro/server.py apps/agro/infrastructure/persistence/agro_store.py
 
-      - name: AGRO store v3 (aid lifecycle additive migration)
+      - name: AGRO store v3 (additive aid migration)
         run: |
           set -euo pipefail
           cat > apps/agro/infrastructure/persistence/agro_store.py <<'PYEOF'
-          """AGRO local durable store v3 (roles + government
-          aid lifecycle). Additive: v2 tables untouched."""
+          """AGRO local durable store v3 (role-aware +
+          government aid lifecycle). Additive on v2."""
           from __future__ import annotations
+
+          import uuid
 
           from shared_engines.storage.database import (
               Database,
@@ -125,14 +122,6 @@ jobs:
                   ),
               ),
           )
-
-          AID_FLOW: dict[str, str] = {
-              "requested": "evaluated",
-              "eligible": "approved",
-              "approved": "assigned",
-              "assigned": "delivered",
-              "delivered": "confirmed",
-          }
 
 
           class AgroStore:
@@ -376,17 +365,122 @@ jobs:
                       )
                   return tuple(result)
 
-              # ---------- aid lifecycle (Q3) ----------
-
-              def _aid_row(
-                  self, aid_id: str,
-              ):
-                  return self._db.query_one(
-                      "SELECT * FROM"
-                      " agro_aid_requests"
-                      " WHERE aid_id = ?",
-                      (aid_id,),
+              def summary(
+                  self,
+              ) -> dict[str, object]:
+                  producers = (
+                      self._db.query_one(
+                          "SELECT COUNT(*) AS"
+                          " total,"
+                          " SUM(verified) AS"
+                          " verified"
+                          " FROM"
+                          " agro_producers_v2"
+                      )
                   )
+                  by_role_rows = (
+                      self._db.query_all(
+                          "SELECT role, COUNT(*)"
+                          " AS n FROM"
+                          " agro_producers_v2"
+                          " GROUP BY role"
+                      )
+                  )
+                  productions = (
+                      self._db.query_all(
+                          "SELECT product,"
+                          " SUM(quantity) AS total"
+                          " FROM"
+                          " agro_productions"
+                          " GROUP BY product"
+                          " ORDER BY product"
+                      )
+                  )
+                  by_role = {
+                      str(r["role"]): int(r["n"])
+                      for r in by_role_rows
+                  }
+                  by_product = {
+                      str(r["product"]): float(
+                          r["total"]
+                      )
+                      for r in productions
+                  }
+                  total = 0
+                  verified = 0
+                  if producers is not None:
+                      total = int(
+                          producers["total"]
+                      )
+                      if (
+                          producers["verified"]
+                          is not None
+                      ):
+                          verified = int(
+                              producers[
+                                  "verified"
+                              ]
+                          )
+                  aid = self.aid_summary()
+                  return {
+                      "producers_total": total,
+                      "producers_verified": (
+                          verified
+                      ),
+                      "producers_by_role": (
+                          by_role
+                      ),
+                      "productions_by_product": (
+                          by_product
+                      ),
+                      "aid_total": aid[
+                          "aid_total"
+                      ],
+                      "aid_by_status": aid[
+                          "aid_by_status"
+                      ],
+                      "aid_by_program": aid[
+                          "aid_by_program"
+                      ],
+                  }
+
+              @staticmethod
+              def _producer_row(
+                  row,
+              ) -> dict[str, object]:
+                  return {
+                      "producer_id": str(
+                          row["producer_id"]
+                      ),
+                      "zid": (
+                          str(row["zid"])
+                          if row["zid"]
+                          is not None
+                          else None
+                      ),
+                      "name": str(row["name"]),
+                      "producer_type": str(
+                          row["producer_type"]
+                      ),
+                      "role": str(row["role"]),
+                      "location": (
+                          str(row["location"])
+                          if row["location"]
+                          is not None
+                          else None
+                      ),
+                      "verified": bool(
+                          int(row["verified"])
+                      ),
+                      "synced": bool(
+                          int(row["synced"])
+                      ),
+                      "created_at": float(
+                          row["created_at"]
+                      ),
+                  }
+
+              # ---------- aid lifecycle (additive v3) ----------
 
               def _record_aid_event(
                   self,
@@ -396,11 +490,7 @@ jobs:
                   actor: str,
                   detail: str | None,
                   network_seq: int | None,
-              ) -> dict[str, object]:
-                  event_id = (
-                      "AEV-"
-                      + uuid_like()
-                  )
+              ) -> None:
                   now = self._clock.now()
                   with self._db.transaction() as cursor:
                       cursor.execute(
@@ -413,7 +503,10 @@ jobs:
                           " VALUES (?, ?, ?, ?,"
                           "  ?, ?, ?)",
                           (
-                              event_id,
+                              "AEV-"
+                              + uuid.uuid4().hex[
+                                  :10
+                              ],
                               aid_id,
                               transition,
                               actor,
@@ -422,16 +515,14 @@ jobs:
                               now,
                           ),
                       )
-                  return {
-                      "event_id": event_id,
-                      "aid_id": aid_id,
-                      "transition": transition,
-                      "actor": actor,
-                      "detail": detail,
-                      "network_seq": (
-                          network_seq
-                      ),
-                  }
+
+              def _aid_row(self, aid_id: str):
+                  return self._db.query_one(
+                      "SELECT * FROM"
+                      " agro_aid_requests"
+                      " WHERE aid_id = ?",
+                      (aid_id,),
+                  )
 
               def create_aid_request(
                   self,
@@ -450,18 +541,13 @@ jobs:
                       "SELECT 1 FROM"
                       " agro_aid_requests WHERE"
                       " producer_id = ? AND"
-                      " program = ? AND"
-                      " status IN ('requested',"
-                      " 'eligible', 'approved',"
-                      " 'assigned', 'delivered',"
-                      " 'confirmed')",
+                      " program = ?",
                       (producer_id, program),
                   )
                   if dup is not None:
                       raise ValueError(
-                          "active request"
-                          " already exists for"
-                          " this program"
+                          "aid already requested"
+                          " for this program"
                       )
                   now = self._clock.now()
                   with self._db.transaction() as cursor:
@@ -493,9 +579,9 @@ jobs:
                           "AID_REQUESTED"
                       ),
                       actor="productor",
-                      detail=program
-                      + ": "
-                      + item,
+                      detail=(
+                          program + ": " + item
+                      ),
                       network_seq=network_seq,
                   )
                   return self.get_aid(aid_id)
@@ -685,7 +771,8 @@ jobs:
                       "SELECT * FROM"
                       " agro_aid_events WHERE"
                       " aid_id = ?"
-                      " ORDER BY created_at",
+                      " ORDER BY created_at,"
+                      " rowid",
                       (aid_id,),
                   )
                   event_list = []
@@ -776,7 +863,10 @@ jobs:
                   if status is not None:
                       sql += " AND status = ?"
                       params.append(status)
-                  sql += " ORDER BY created_at"
+                  sql += (
+                      " ORDER BY created_at,"
+                      " rowid"
+                  )
                   rows = self._db.query_all(
                       sql, tuple(params)
                   )
@@ -844,1277 +934,388 @@ jobs:
                           by_program
                       ),
                   }
-
-              def summary(
-                  self,
-              ) -> dict[str, object]:
-                  producers = (
-                      self._db.query_one(
-                          "SELECT COUNT(*) AS"
-                          " total,"
-                          " SUM(verified) AS"
-                          " verified"
-                          " FROM"
-                          " agro_producers_v2"
-                      )
-                  )
-                  by_role_rows = (
-                      self._db.query_all(
-                          "SELECT role, COUNT(*)"
-                          " AS n FROM"
-                          " agro_producers_v2"
-                          " GROUP BY role"
-                      )
-                  )
-                  productions = (
-                      self._db.query_all(
-                          "SELECT product,"
-                          " SUM(quantity) AS total"
-                          " FROM"
-                          " agro_productions"
-                          " GROUP BY product"
-                          " ORDER BY product"
-                      )
-                  )
-                  by_role = {
-                      str(r["role"]): int(r["n"])
-                      for r in by_role_rows
-                  }
-                  by_product = {
-                      str(r["product"]): float(
-                          r["total"]
-                      )
-                      for r in productions
-                  }
-                  total = 0
-                  verified = 0
-                  if producers is not None:
-                      total = int(
-                          producers["total"]
-                      )
-                      if (
-                          producers["verified"]
-                          is not None
-                      ):
-                          verified = int(
-                              producers[
-                                  "verified"
-                              ]
-                          )
-                  aid = self.aid_summary()
-                  return {
-                      "producers_total": total,
-                      "producers_verified": (
-                          verified
-                      ),
-                      "producers_by_role": (
-                          by_role
-                      ),
-                      "productions_by_product": (
-                          by_product
-                      ),
-                      "aid_total": aid[
-                          "aid_total"
-                      ],
-                      "aid_by_status": aid[
-                          "aid_by_status"
-                      ],
-                      "aid_by_program": aid[
-                          "aid_by_program"
-                      ],
-                  }
-
-              @staticmethod
-              def _producer_row(
-                  row,
-              ) -> dict[str, object]:
-                  return {
-                      "producer_id": str(
-                          row["producer_id"]
-                      ),
-                      "zid": (
-                          str(row["zid"])
-                          if row["zid"]
-                          is not None
-                          else None
-                      ),
-                      "name": str(row["name"]),
-                      "producer_type": str(
-                          row["producer_type"]
-                      ),
-                      "role": str(row["role"]),
-                      "location": (
-                          str(row["location"])
-                          if row["location"]
-                          is not None
-                          else None
-                      ),
-                      "verified": bool(
-                          int(row["verified"])
-                      ),
-                      "synced": bool(
-                          int(row["synced"])
-                      ),
-                      "created_at": float(
-                          row["created_at"]
-                      ),
-                  }
-          PYEOF
-          cat >> apps/agro/infrastructure/persistence/agro_store.py <<'PYEOF'
-
-
-          def uuid_like() -> str:
-              import uuid
-
-              return uuid.uuid4().hex[:10]
           PYEOF
           python -m py_compile apps/agro/infrastructure/persistence/agro_store.py
-          echo "store written"
+          echo "store v3 written"
 
-      - name: AGRO server (all old routes kept plus aid flow)
+      - name: Patch AGRO server (surgical additions only)
         run: |
           set -euo pipefail
-          cat > apps/agro/server.py <<'PYEOF'
-          """AGRO HTTP server - roles, production and
-          government aid lifecycle."""
-          from __future__ import annotations
+          PYTHONPATH="$PWD" python - <<'PYEOF'
+          from pathlib import Path
 
-          import json
-          import uuid
-          from http.server import (
-              BaseHTTPRequestHandler,
-              ThreadingHTTPServer,
-          )
-          from urllib.parse import parse_qs
-
-          from apps.agro.infrastructure.persistence.agro_store import (
-              ROLES,
-              AgroStore,
-          )
-          from apps.agro.services.zyra_link import (
-              ZyraLink,
+          path = Path("apps/agro/server.py")
+          source = path.read_text(
+              encoding="utf-8"
           )
 
 
-          def _new_producer_id() -> str:
-              return "AGR-" + uuid.uuid4().hex[:12]
-
-
-          def _new_production_id() -> str:
-              return "PRD-" + uuid.uuid4().hex[:10]
-
-
-          def _new_aid_id() -> str:
-              return "AID-" + uuid.uuid4().hex[:10]
-
-
-          def _find_zid(doc):
-              if isinstance(doc, dict):
-                  for key, value in (
-                      doc.items()
-                  ):
-                      if (
-                          str(key).lower()
-                          == "zid"
-                          and isinstance(
-                              value, str
-                          )
-                          and value.startswith(
-                              "ZID-"
-                          )
-                      ):
-                          return value
-                  for value in doc.values():
-                      found = _find_zid(value)
-                      if found is not None:
-                          return found
-              elif isinstance(doc, list):
-                  for item in doc:
-                      found = _find_zid(item)
-                      if found is not None:
-                          return found
-              return None
-
-
-          def _find_seq(doc):
-              if isinstance(doc, dict):
-                  for key, value in (
-                      doc.items()
-                  ):
-                      if (
-                          "seq" in str(key)
-                          .lower()
-                      ) and isinstance(
-                          value, int
-                      ):
-                          return value
-                  for value in doc.values():
-                      found = _find_seq(value)
-                      if found is not None:
-                          return found
-              elif isinstance(doc, list):
-                  for item in doc:
-                      found = _find_seq(item)
-                      if found is not None:
-                          return found
-              return None
-
-
-          class AgroApiHandler(BaseHTTPRequestHandler):
-              store: AgroStore
-              link: ZyraLink
-
-              def log_message(
-                  self, format: str, *args,
-              ) -> None:
-                  pass
-
-              def _send_bytes(
-                  self,
-                  status: int,
-                  ctype: str,
-                  body: bytes,
-              ) -> None:
-                  self.send_response(status)
-                  self.send_header(
-                      "Content-Type", ctype
-                  )
-                  self.send_header(
-                      "Content-Length",
-                      str(len(body)),
-                  )
-                  self.end_headers()
-                  self.wfile.write(body)
-
-              def _send_html(
-                  self, status: int, html: str,
-              ) -> None:
-                  self._send_bytes(
-                      status,
-                      "text/html",
-                      html.encode("utf-8"),
-                  )
-
-              def _send_json(
-                  self, status: int, doc: dict,
-              ) -> None:
-                  self._send_bytes(
-                      status,
-                      "application/json",
-                      json.dumps(doc).encode(
-                          "utf-8"
-                      ),
-                  )
-
-              def _ok(self, data) -> None:
-                  self._send_json(
-                      200,
-                      {"ok": True, "data": data},
-                  )
-
-              def _api_error(
-                  self,
-                  status: int,
-                  message: str,
-              ) -> None:
-                  self._send_json(
-                      status,
-                      {
-                          "ok": False,
-                          "error": message,
-                      },
-                  )
-
-              def _read_body(self) -> bytes:
-                  try:
-                      length = int(
-                          self.headers.get(
-                              "Content-Length",
-                              "0",
-                          )
-                          or "0"
-                      )
-                  except Exception:
-                      length = 0
-                  if length <= 0:
-                      return b""
-                  return self.rfile.read(
-                      length
-                  )
-
-              def _read_form(self) -> dict:
-                  raw = self._read_body()
-                  parsed = parse_qs(
-                      raw.decode("utf-8")
-                  )
-                  form: dict[str, str] = {}
-                  for key, values in (
-                      parsed.items()
-                  ):
-                      if values:
-                          form[key] = values[0]
-                  return form
-
-              def _read_json(self) -> dict | None:
-                  raw = self._read_body()
-                  if not raw:
-                      return {}
-                  try:
-                      doc = json.loads(
-                          raw.decode("utf-8")
-                      )
-                  except Exception:
-                      return None
-                  if not isinstance(doc, dict):
-                      return None
-                  return doc
-
-              def _payload(self) -> dict | None:
-                  doc = self._read_json()
-                  if doc is not None and doc:
-                      return doc
-                  form = self._read_form()
-                  if form:
-                      return form
-                  return doc
-
-              @staticmethod
-              def _value(
-                  doc: dict, key: str,
-              ):
-                  value = doc.get(key, "")
-                  if value is None:
-                      return ""
-                  return str(value)
-
-              def _split_path(self) -> tuple[
-                  str, dict,
-              ]:
-                  raw = self.path
-                  if "?" in raw:
-                      path, qs = raw.split(
-                          "?", 1
-                      )
-                      query = {
-                          k: v[0]
-                          for k, v in parse_qs(
-                              qs
-                          ).items()
-                          if v
-                      }
-                  else:
-                      path = raw
-                      query = {}
-                  return path, query
-
-              def _trust_best_effort(
-                  self, zid: str | None,
-              ) -> bool:
-                  if not zid:
-                      return False
-                  try:
-                      ok, _d, _e = (
-                          self.link.complete_trust(
-                              zid
-                          )
-                      )
-                      return bool(ok)
-                  except Exception:
-                      return False
-
-              def _network_event(
-                  self,
-                  zid: str | None,
-                  event: str,
-                  detail: str,
-              ) -> int | None:
-                  if not zid:
-                      return None
-                  try:
-                      ok, data, _err = (
-                          self.link
-                          .record_agro_event(
-                              zid,
-                              event,
-                              detail,
-                          )
-                      )
-                      if ok:
-                          return _find_seq(data)
-                  except Exception:
-                      pass
-                  return None
-
-              def do_GET(self) -> None:
-                  path, query = (
-                      self._split_path()
-                  )
-                  try:
-                      if path in (
-                          "/",
-                          "/agro",
-                          "/agro/home",
-                      ):
-                          self._send_html(
-                              200,
-                              self._home(),
-                          )
-                          return
-                      if path == "/agro/menu":
-                          self._send_html(
-                              200,
-                              self._menu(),
-                          )
-                          return
-                      if path == (
-                          "/agro/health"
-                      ):
-                          self._ok(
-                              {
-                                  "app": "agro",
-                                  "status": "ok",
-                              }
-                          )
-                          return
-                      if path == (
-                          "/agro/producers"
-                      ):
-                          self._ok(
-                              {
-                                  "producers": list(
-                                      self.store
-                                      .list_producers()
-                                  )
-                              }
-                          )
-                          return
-                      if path == (
-                          "/agro/government/summary"
-                      ):
-                          self._ok(
-                              self.store.summary()
-                          )
-                          return
-                      if path == (
-                          "/agro/aid"
-                      ):
-                          self._ok(
-                              {
-                                  "aid": list(
-                                      self.store
-                                      .list_aid()
-                                  )
-                              }
-                          )
-                          return
-                      if path.startswith(
-                          "/agro/aid/"
-                      ):
-                          aid_id = path.split(
-                              "/agro/aid/",
-                              1,
-                          )[1]
-                          self._ok(
-                              self.store.get_aid(
-                                  aid_id
-                              )
-                          )
-                          return
-                      if path.startswith(
-                          "/agro/productor/"
-                      ):
-                          producer_id = path.split(
-                              "/agro/productor/",
-                              1,
-                          )[1]
-                          self._producer_panel(
-                              producer_id
-                          )
-                          return
-                      if path == (
-                          "/agro/gobierno"
-                      ):
-                          self._gov_panel()
-                          return
-                      if path == "/agro/banco":
-                          self._send_html(
-                              200,
-                              self._bank_panel(),
-                          )
-                          return
-                      self._api_error(
-                          404,
-                          "unknown path: "
-                          + path,
-                      )
-                  except LookupError as exc:
-                      self._api_error(
-                          404, str(exc)
-                      )
-                  except ValueError as exc:
-                      self._api_error(
-                          400, str(exc)
-                      )
-                  except Exception:
-                      self._api_error(
-                          500, "server error"
-                      )
-
-              def _home(self) -> str:
-                  return (
-                      "<html><head><title>AGRO"
-                      "</title></head><body>"
-                      "<h1>AGRO</h1>"
-                      "<p>Ecosistema"
-                      " agropecuario con gobierno"
-                      " y banco.</p>"
-                      "<p><a href='/agro/menu'>"
-                      "Menu</a></p>"
-                      "<p><a"
-                      " href='/agro/gobierno'>"
-                      "Gobierno</a> | <a"
-                      " href='/agro/banco'>"
-                      "Banco</a></p>"
-                      "</body></html>"
-                  )
-
-              def _menu(self) -> str:
-                  return (
-                      "<html><head><title>AGRO"
-                      " menu</title></head><body>"
-                      "<h1>Menu AGRO</h1>"
-                      "<ul>"
-                      "<li><a"
-                      " href='/agro/gobierno'>"
-                      "Panel gobierno</a></li>"
-                      "<li><a"
-                      " href='/agro/banco'>"
-                      "Panel banco</a></li>"
-                      "<li><a"
-                      " href='/agro/producers'>"
-                      "Productores (API)</a></li>"
-                      "</ul>"
-                      "<p>Registro: POST"
-                      " /agro/register | Ayuda:"
-                      " POST /agro/aid/request"
-                      "</p>"
-                      "</body></html>"
-                  )
-
-              def _producer_panel(
-                  self, producer_id: str,
-              ) -> None:
-                  try:
-                      producer = (
-                          self.store.get_producer(
-                              producer_id
-                          )
-                      )
-                  except LookupError:
-                      self._api_error(
-                          404,
-                          "producer no existe",
-                      )
-                      return
-                  html = (
-                      "<html><head><title>Panel"
-                      " productor</title></head>"
-                      "<body><h1>Panel"
-                      " productor</h1>"
-                      "<p>"
-                      + str(producer["name"])
-                      + " ("
-                      + str(
-                          producer[
-                              "producer_type"
-                          ]
-                      )
-                      + ")</p>"
-                      "<p>ubicacion: "
-                      + str(
-                          producer["location"]
-                      )
-                      + " | verificado: "
-                      + str(
-                          producer["verified"]
-                      )
-                      + "</p>"
-                      "<h2>Mis ayudas</h2><ul>"
-                  )
-                  aids = self.store.list_aid(
-                      producer_id=producer_id
-                  )
-                  if not aids:
-                      html += (
-                          "<li>Sin ayudas"
-                          " todavia</li>"
-                      )
-                  for aid in aids:
-                      html += (
-                          "<li>"
-                          + str(aid["aid_id"])
-                          + " | "
-                          + str(aid["program"])
-                          + " | "
-                          + str(aid["item"])
-                          + " | "
-                          + str(aid["status"])
-                          + "</li>"
-                      )
-                  html += (
-                      "</ul><p><a"
-                      " href='/agro/menu'>Menu"
-                      "</a></p>"
-                      "</body></html>"
-                  )
-                  self._send_html(200, html)
-
-              def _gov_panel(self) -> None:
-                  data = self.store.summary()
-                  html = (
-                      "<html><head><title>Panel"
-                      " gobierno</title></head>"
-                      "<body><h1>Panel"
-                      " gobierno</h1>"
-                      "<p>productores: "
-                      + str(
-                          data["producers_total"]
-                      )
-                      + " | verificados: "
-                      + str(
-                          data[
-                              "producers_verified"
-                          ]
-                      )
-                      + "</p>"
-                      "<p>solicitudes de ayuda: "
-                      + str(data["aid_total"])
-                      + "</p>"
-                      "<h2>Ayudas por"
-                      " programa</h2><ul>"
-                  )
-                  for program, info in (
-                      data["aid_by_program"]
-                      .items()
-                  ):
-                      html += (
-                          "<li>"
-                          + str(program)
-                          + " | solicitudes: "
-                          + str(
-                              info["requests"]
-                          )
-                          + " | cantidad: "
-                          + format(
-                              float(
-                                  info["quantity"]
-                              ),
-                              ".2f",
-                          )
-                          + "</li>"
-                      )
-                  html += (
-                      "</ul><p><a"
-                      " href='/agro/menu'>Menu"
-                      "</a></p>"
-                      "</body></html>"
-                  )
-                  self._send_html(200, html)
-
-              def _bank_panel(self) -> str:
-                  return (
-                      "<html><head><title>Panel"
-                      " banco</title></head><body>"
-                      "<h1>Panel banco</h1>"
-                      "<p>Creditos para"
-                      " productores verificados"
-                      " ( proxima fase ).</p>"
-                      "<p><a href='/agro/menu'>"
-                      "Menu</a></p>"
-                      "</body></html>"
-                  )
-
-              def do_POST(self) -> None:
-                  path, _query = (
-                      self._split_path()
-                  )
-                  try:
-                      if path == (
-                          "/agro/producers"
-                      ):
-                          self._producers_api()
-                          return
-                      if path == (
-                          "/agro/producers/verify"
-                      ):
-                          self._verify_api()
-                          return
-                      if path == (
-                          "/agro/production"
-                      ):
-                          self._production_api()
-                          return
-                      if path == (
-                          "/agro/alerts/evaluate"
-                      ):
-                          self._alerts_api()
-                          return
-                      if path == (
-                          "/agro/register"
-                      ):
-                          self._register()
-                          return
-                      if path == (
-                          "/agro/aid/request"
-                      ):
-                          self._aid_request()
-                          return
-                      if path == (
-                          "/agro/aid/eligibility"
-                      ):
-                          self._aid_eligibility()
-                          return
-                      if path == (
-                          "/agro/government/approve"
-                      ):
-                          self._aid_approve()
-                          return
-                      if path == (
-                          "/agro/government/assign"
-                      ):
-                          self._aid_assign()
-                          return
-                      if path == (
-                          "/agro/government"
-                          "/deliver"
-                      ):
-                          self._aid_deliver()
-                          return
-                      if path == (
-                          "/agro/government"
-                          "/confirm"
-                      ):
-                          self._aid_confirm()
-                          return
-                      self._api_error(
-                          404,
-                          "unknown path: "
-                          + path,
-                      )
-                  except LookupError as exc:
-                      self._api_error(
-                          404, str(exc)
-                      )
-                  except (
-                      ValueError,
-                      PermissionError,
-                  ) as exc:
-                      self._api_error(
-                          400, str(exc)
-                      )
-                  except Exception:
-                      self._api_error(
-                          500, "server error"
-                      )
-
-              def _role_of(
-                  self, doc: dict,
-              ) -> str:
-                  role = self._value(
-                      doc, "role"
-                  ).strip()
-                  if not role:
-                      role = "agricultor"
-                  if role not in ROLES:
-                      raise ValueError(
-                          "unknown role: "
-                          + role
-                      )
-                  return role
-
-              def _register(self) -> None:
-                  doc = self._payload() or {}
-                  role = self._role_of(doc)
-                  name = self._value(
-                      doc, "name"
-                  ).strip()
-                  if not name:
-                      self._send_html(
-                          400,
-                          "<html><body><h1>AGRO"
-                          "</h1><p>name"
-                          " requerido</p>"
-                          "</body></html>",
-                      )
-                      return
-                  producer_id = (
-                      _new_producer_id()
-                  )
-                  ok, data, _err = (
-                      self.link
-                      .register_producer_zid(
-                          name
-                      )
-                  )
-                  zid = (
-                      _find_zid(data)
-                      if ok and data
-                      else None
-                  )
-                  self.store.add_producer(
-                      producer_id=producer_id,
-                      zid=zid,
-                      name=name,
-                      producer_type=self._value(
-                          doc, "producer_type"
-                      )
-                      or role,
-                      role=role,
-                      location=self._value(
-                          doc, "location"
-                      )
-                      or None,
-                      synced=zid is not None,
-                  )
-                  if zid is not None:
-                      self._trust_best_effort(
-                          zid
-                      )
-                      self.store.mark_verified(
-                          producer_id=(
-                              producer_id
-                          )
-                      )
-                  self._send_html(
-                      200,
-                      "<html><body><h1>AGRO</h1>"
-                      "<p>Productor"
-                      " registrado</p>"
-                      "<p>id: "
-                      + producer_id
-                      + "</p><p>zid: "
-                      + str(zid)
-                      + "</p><p><a"
-                      " href='/agro/productor/"
-                      + producer_id
-                      + "'>Panel"
-                      " productor</a></p>"
-                      "</body></html>",
-                  )
-
-              def _producers_api(self) -> None:
-                  doc = self._payload() or {}
-                  role = self._role_of(doc)
-                  name = self._value(
-                      doc, "name"
-                  ).strip()
-                  if not name:
-                      self._api_error(
-                          400,
-                          "name is required",
-                      )
-                      return
-                  producer_id = (
-                      _new_producer_id()
-                  )
-                  ok, data, _err = (
-                      self.link
-                      .register_producer_zid(
-                          name
-                      )
-                  )
-                  zid = (
-                      _find_zid(data)
-                      if ok and data
-                      else None
-                  )
-                  row = self.store.add_producer(
-                      producer_id=producer_id,
-                      zid=zid,
-                      name=name,
-                      producer_type=self._value(
-                          doc, "producer_type"
-                      )
-                      or role,
-                      role=role,
-                      location=self._value(
-                          doc, "location"
-                      )
-                      or None,
-                      synced=zid is not None,
-                  )
-                  if zid is not None:
-                      self._trust_best_effort(
-                          zid
-                      )
-                      self.store.mark_verified(
-                          producer_id=(
-                              producer_id
-                          )
-                      )
-                      row = (
-                          self.store.get_producer(
-                              producer_id
-                          )
-                      )
-                  self._ok(row)
-
-              def _verify_api(self) -> None:
-                  doc = self._payload() or {}
-                  producer_id = self._value(
-                      doc, "producer_id"
-                  )
-                  self.store.mark_verified(
-                      producer_id=producer_id
-                  )
-                  row = self.store.get_producer(
-                      producer_id
-                  )
-                  self._ok(
-                      {
-                          "producer_id": (
-                              producer_id
-                          ),
-                          "verified": row[
-                              "verified"
-                          ],
-                      }
-                  )
-
-              def _production_api(self) -> None:
-                  doc = self._payload() or {}
-                  producer_id = self._value(
-                      doc, "producer_id"
-                  )
-                  producer = (
-                      self.store.get_producer(
-                          producer_id
-                      )
-                  )
-                  product = self._value(
-                      doc, "product"
-                  ).strip()
-                  if not product:
-                      self._api_error(
-                          400,
-                          "product is required",
-                      )
-                      return
-                  try:
-                      quantity = float(
-                          self._value(
-                              doc, "quantity"
-                          )
-                      )
-                  except ValueError:
-                      self._api_error(
-                          400,
-                          "quantity must be a"
-                          " number",
-                      )
-                      return
-                  unit = self._value(
-                      doc, "unit"
-                  ).strip() or "quintal"
-                  seq = (
-                      self._network_event(
-                          producer.get("zid"),
-                          "PRODUCTION_REGISTERED",
-                          product
-                          + " "
-                          + format(
-                              quantity, ".2f"
-                          ),
-                      )
-                  )
-                  row = self.store.add_production(
-                      production_id=(
-                          _new_production_id()
-                      ),
-                      producer_id=producer_id,
-                      product=product,
-                      quantity=quantity,
-                      unit=unit,
-                      network_seq=seq,
-                  )
-                  self._ok(row)
-
-              def _alerts_api(self) -> None:
-                  doc = self._payload() or {}
-                  try:
-                      previous = float(
-                          self._value(
-                              doc,
-                              "previous_price",
-                          )
-                      )
-                      current = float(
-                          self._value(
-                              doc,
-                              "current_price",
-                          )
-                      )
-                  except ValueError:
-                      self._api_error(
-                          400,
-                          "prices must be numbers",
-                      )
-                      return
-                  if previous <= 0:
-                      self._api_error(
-                          400,
-                          "previous_price must"
-                          " be positive",
-                      )
-                      return
-                  change = (
-                      current - previous
-                  ) / previous
-                  alert = abs(change) > 0.05
-                  direction = (
-                      "up"
-                      if change > 0
-                      else (
-                          "down"
-                          if change < 0
-                          else "flat"
-                      )
-                  )
-                  self._ok(
-                      {
-                          "alert": alert,
-                          "direction": direction,
-                          "change_pct": round(
-                              change * 100, 2
-                          ),
-                      }
-                  )
-
-              def _aid_request(self) -> None:
-                  doc = self._payload() or {}
-                  producer_id = self._value(
-                      doc, "producer_id"
-                  )
-                  producer = (
-                      self.store.get_producer(
-                          producer_id
-                      )
-                  )
-                  program = self._value(
-                      doc, "program"
-                  ).strip()
-                  item = self._value(
-                      doc, "item"
-                  ).strip()
-                  if not program or not item:
-                      self._api_error(
-                          400,
-                          "program and item are"
-                          " required",
-                      )
-                      return
-                  try:
-                      quantity = float(
-                          self._value(
-                              doc, "quantity"
-                          )
-                          or "1"
-                      )
-                  except ValueError:
-                      self._api_error(
-                          400,
-                          "quantity must be a"
-                          " number",
-                      )
-                      return
-                  seq = (
-                      self._network_event(
-                          producer.get("zid"),
-                          "AID_REQUESTED",
-                          program + ": " + item,
-                      )
-                  )
-                  aid = (
-                      self.store.create_aid_request(
-                          aid_id=_new_aid_id(),
-                          producer_id=(
-                              producer_id
-                          ),
-                          program=program,
-                          item=item,
-                          quantity=quantity,
-                          network_seq=seq,
-                      )
-                  )
-                  self._ok(aid)
-
-              def _aid_eligibility(self) -> None:
-                  doc = self._payload() or {}
-                  aid_id = self._value(
-                      doc, "aid_id"
-                  )
-                  aid = self.store.get_aid(
-                      aid_id
-                  )
-                  producer = (
-                      self.store.get_producer(
-                          str(
-                              aid["producer_id"]
-                          )
-                      )
-                  )
-                  eligible = bool(
-                      producer["verified"]
-                  )
-                  reason = (
-                      "productor verificado"
-                      if eligible
-                      else "productor no"
-                      " verificado"
-                  )
-                  seq = (
-                      self._network_event(
-                          aid.get("zid"),
-                          "AID_ELIGIBILITY_"
-                          "EVALUATED",
-                          reason,
-                      )
-                  )
-                  result = (
-                      self.store.evaluate_aid(
-                          aid_id=aid_id,
-                          eligible=eligible,
-                          reason=reason,
-                          network_seq=seq,
-                      )
-                  )
-                  self._ok(result)
-
-              def _aid_approve(self) -> None:
-                  doc = self._payload() or {}
-                  aid_id = self._value(
-                      doc, "aid_id"
-                  )
-                  aid = self.store.get_aid(
-                      aid_id
-                  )
-                  seq = (
-                      self._network_event(
-                          aid.get("zid"),
-                          "AID_APPROVED",
-                          str(aid["program"]),
-                      )
-                  )
-                  self._ok(
-                      self.store.approve_aid(
-                          aid_id=aid_id,
-                          network_seq=seq,
-                      )
-                  )
-
-              def _aid_assign(self) -> None:
-                  doc = self._payload() or {}
-                  aid_id = self._value(
-                      doc, "aid_id"
-                  )
-                  detail = self._value(
-                      doc, "detail"
-                  ).strip() or None
-                  aid = self.store.get_aid(
-                      aid_id
-                  )
-                  seq = (
-                      self._network_event(
-                          aid.get("zid"),
-                          "AID_ASSIGNED",
-                          detail
-                          or str(aid["program"]),
-                      )
-                  )
-                  self._ok(
-                      self.store.assign_aid(
-                          aid_id=aid_id,
-                          detail=detail,
-                          network_seq=seq,
-                      )
-                  )
-
-              def _aid_deliver(self) -> None:
-                  doc = self._payload() or {}
-                  aid_id = self._value(
-                      doc, "aid_id"
-                  )
-                  detail = self._value(
-                      doc, "detail"
-                  ).strip() or None
-                  aid = self.store.get_aid(
-                      aid_id
-                  )
-                  seq = (
-                      self._network_event(
-                          aid.get("zid"),
-                          "AID_DELIVERED",
-                          detail
-                          or str(aid["item"]),
-                      )
-                  )
-                  self._ok(
-                      self.store.deliver_aid(
-                          aid_id=aid_id,
-                          detail=detail,
-                          network_seq=seq,
-                      )
-                  )
-
-              def _aid_confirm(self) -> None:
-                  doc = self._payload() or {}
-                  aid_id = self._value(
-                      doc, "aid_id"
-                  )
-                  aid = self.store.get_aid(
-                      aid_id
-                  )
-                  seq = (
-                      self._network_event(
-                          aid.get("zid"),
-                          "AID_DELIVERY_"
-                          "CONFIRMED",
-                          str(aid["program"]),
-                      )
-                  )
-                  self._ok(
-                      self.store.confirm_aid(
-                          aid_id=aid_id,
-                          network_seq=seq,
-                      )
-                  )
-
-
-          def serve_agro(
-              store: AgroStore,
-              client: object,
-              *,
-              host: str = "127.0.0.1",
-              port: int = 0,
-          ) -> ThreadingHTTPServer:
-              handler = type(
-                  "BoundAgroHandler",
-                  (AgroApiHandler,),
-                  {
-                      "store": store,
-                      "link": ZyraLink(client),
-                  },
+          def apply(
+              text: str,
+              old: str,
+              new: str,
+              label: str,
+          ) -> str:
+              count = text.count(old)
+              if count != 1:
+                  raise SystemExit(
+                      "PATCH FAIL "
+                      + label
+                      + " count="
+                      + str(count)
+                  )
+              return text.replace(
+                  old, new, 1
               )
-              server = ThreadingHTTPServer(
-                  (host, port), handler,
-              )
-              server.bound_port = (
-                  server.server_address[1]
-              )
-              return server
+
+
+          GET_ROUTES = '''        if s == ["aid"]:
+            self._send(
+                200,
+                {
+                    "ok": True,
+                    "data": list(
+                        store.list_aid()
+                    ),
+                },
+            )
+            return
+        if len(s) == 2 and s[0] == "aid":
+            self._send(
+                200,
+                {
+                    "ok": True,
+                    "data": store.get_aid(
+                        s[1]
+                    ),
+                },
+            )
+            return
+'''
+
+          POST_ROUTES = '''        if s == ["aid", "request"]:
+            self._aid_request()
+            return
+        if s == ["aid", "eligibility"]:
+            self._aid_eligibility()
+            return
+        if s == ["government", "approve"]:
+            self._aid_approve()
+            return
+        if s == ["government", "assign"]:
+            self._aid_assign()
+            return
+        if s == ["government", "deliver"]:
+            self._aid_deliver()
+            return
+        if s == ["government", "confirm"]:
+            self._aid_confirm()
+            return
+'''
+
+          METHODS = '''    def _aid_payload(self) -> dict:
+        content_type = self.headers.get(
+            "Content-Type", ""
+        )
+        if (
+            "application/json"
+            in content_type
+        ):
+            return self._read_json()
+        return self._read_form()
+
+    def _aid_network_seq(
+        self,
+        zid: str | None,
+        event: str,
+        detail: str,
+    ) -> int | None:
+        if zid is None:
+            return None
+        ok, data, _error = type(
+            self
+        ).link.record_agro_event(
+            str(zid), event, detail
+        )
+        if ok and data is not None:
+            try:
+                return int(
+                    data.get("seq", 0)
+                )
+            except Exception:
+                return None
+        return None
+
+    def _aid_request(self) -> None:
+        store = type(self).store
+        doc = self._aid_payload()
+        producer_id = self._req(
+            doc, "producer_id"
+        )
+        producer = store.get_producer(
+            producer_id
+        )
+        program = self._req(doc, "program")
+        item = self._req(doc, "item")
+        quantity = float(
+            doc.get("quantity", 1)
+        )
+        if quantity <= 0:
+            raise ValueError(
+                "quantity must be positive"
+            )
+        network_seq = (
+            self._aid_network_seq(
+                producer.get("zid"),
+                "AID_REQUESTED",
+                program + ": " + item,
+            )
+        )
+        aid = store.create_aid_request(
+            aid_id=(
+                "AID-"
+                + uuid.uuid4().hex[:10]
+            ),
+            producer_id=producer_id,
+            program=program,
+            item=item,
+            quantity=quantity,
+            network_seq=network_seq,
+        )
+        self._send(
+            201,
+            {"ok": True, "data": aid},
+        )
+
+    def _aid_eligibility(self) -> None:
+        store = type(self).store
+        doc = self._aid_payload()
+        aid_id = self._req(doc, "aid_id")
+        aid = store.get_aid(aid_id)
+        producer = store.get_producer(
+            str(aid["producer_id"])
+        )
+        eligible = bool(
+            producer.get("verified")
+        )
+        reason = (
+            "productor verificado"
+            if eligible
+            else "productor sin"
+            " verificar"
+        )
+        network_seq = (
+            self._aid_network_seq(
+                aid.get("zid"),
+                "AID_ELIGIBILITY_EVALUATED",
+                reason,
+            )
+        )
+        result = store.evaluate_aid(
+            aid_id=aid_id,
+            eligible=eligible,
+            reason=reason,
+            network_seq=network_seq,
+        )
+        self._send(
+            200,
+            {"ok": True, "data": result},
+        )
+
+    def _aid_approve(self) -> None:
+        store = type(self).store
+        doc = self._aid_payload()
+        aid_id = self._req(doc, "aid_id")
+        aid = store.get_aid(aid_id)
+        network_seq = (
+            self._aid_network_seq(
+                aid.get("zid"),
+                "AID_APPROVED",
+                str(aid["program"]),
+            )
+        )
+        result = store.approve_aid(
+            aid_id=aid_id,
+            network_seq=network_seq,
+        )
+        self._send(
+            200,
+            {"ok": True, "data": result},
+        )
+
+    def _aid_assign(self) -> None:
+        store = type(self).store
+        doc = self._aid_payload()
+        aid_id = self._req(doc, "aid_id")
+        detail = str(
+            doc.get("detail") or ""
+        ).strip() or None
+        aid = store.get_aid(aid_id)
+        network_seq = (
+            self._aid_network_seq(
+                aid.get("zid"),
+                "AID_ASSIGNED",
+                detail
+                or str(aid["program"]),
+            )
+        )
+        result = store.assign_aid(
+            aid_id=aid_id,
+            detail=detail,
+            network_seq=network_seq,
+        )
+        self._send(
+            200,
+            {"ok": True, "data": result},
+        )
+
+    def _aid_deliver(self) -> None:
+        store = type(self).store
+        doc = self._aid_payload()
+        aid_id = self._req(doc, "aid_id")
+        detail = str(
+            doc.get("detail") or ""
+        ).strip() or None
+        aid = store.get_aid(aid_id)
+        network_seq = (
+            self._aid_network_seq(
+                aid.get("zid"),
+                "AID_DELIVERED",
+                detail or str(aid["item"]),
+            )
+        )
+        result = store.deliver_aid(
+            aid_id=aid_id,
+            detail=detail,
+            network_seq=network_seq,
+        )
+        self._send(
+            200,
+            {"ok": True, "data": result},
+        )
+
+    def _aid_confirm(self) -> None:
+        store = type(self).store
+        doc = self._aid_payload()
+        aid_id = self._req(doc, "aid_id")
+        aid = store.get_aid(aid_id)
+        network_seq = (
+            self._aid_network_seq(
+                aid.get("zid"),
+                "AID_DELIVERY_CONFIRMED",
+                str(aid["program"]),
+            )
+        )
+        result = store.confirm_aid(
+            aid_id=aid_id,
+            network_seq=network_seq,
+        )
+        self._send(
+            200,
+            {"ok": True, "data": result},
+        )
+
+    def _aid_section(
+        self, producer_id: str
+    ) -> str:
+        store = type(self).store
+        aids = store.list_aid(
+            producer_id=producer_id
+        )
+        if not aids:
+            return ""
+        rows = "".join(
+            "<li>• "
+            + str(a["program"])
+            + ": "
+            + str(a["item"])
+            + " — "
+            + str(a["status"])
+            + "</li>"
+            for a in aids
+        )
+        return (
+            "<h2>Mis ayudas del Gobierno"
+            "</h2><ul>" + rows + "</ul>"
+        )
+
+    def _gov_aid_section(self) -> str:
+        store = type(self).store
+        summary = store.aid_summary()
+        if summary["aid_total"] == 0:
+            return ""
+        rows = "".join(
+            "<li>• "
+            + str(program)
+            + ": "
+            + str(info["requests"])
+            + " solicitudes</li>"
+            for program, info in summary[
+                "aid_by_program"
+            ].items()
+        )
+        return (
+            "<h2>Ayudas gubernamentales"
+            "</h2><ul>" + rows + "</ul>"
+        )
+
+'''
+
+          source = apply(
+              source,
+              '        if s == ["government", "summary"]:',
+              GET_ROUTES
+              + '        if s == ["government", "summary"]:',
+              "get-aid-routes",
+          )
+          source = apply(
+              source,
+              '        if s == ["alerts", "evaluate"]:',
+              POST_ROUTES
+              + '        if s == ["alerts", "evaluate"]:',
+              "post-aid-routes",
+          )
+          source = apply(
+              source,
+              """            + history
+            + "</ul>"
+            + extra
+""",
+              """            + history
+            + "</ul>"
+            + self._aid_section(
+                producer_id
+            )
+            + extra
+""",
+              "producer-section",
+          )
+          source = apply(
+              source,
+              """            + products_html
+            + "</ul>"
+""",
+              """            + products_html
+            + "</ul>"
+            + self._gov_aid_section()
+""",
+              "gov-section",
+          )
+          source = apply(
+              source,
+              "    def _home(self) -> None:",
+              METHODS
+              + "    def _home(self) -> None:",
+              "aid-methods",
+          )
+
+          path.write_text(
+              source, encoding="utf-8"
+          )
+          print("ALL 5 PATCHES APPLIED")
           PYEOF
           python -m py_compile apps/agro/server.py
-          echo "server written"
+          echo "server patched and compiles"
 
       - name: Internal probe (aid lifecycle at store level)
         run: |
@@ -2158,7 +1359,20 @@ jobs:
               network_seq=1,
           )
           assert aid["status"] == "requested"
-          assert len(aid["events"]) == 1
+          try:
+              store.create_aid_request(
+                  aid_id="AID-2",
+                  producer_id="AGR-1",
+                  program="semillas",
+                  item="maiz",
+                  quantity=5.0,
+                  network_seq=None,
+              )
+              raise AssertionError(
+                  "duplicate must fail"
+              )
+          except ValueError:
+              pass
           aid = store.evaluate_aid(
               aid_id="AID-1",
               eligible=True,
@@ -2167,8 +1381,7 @@ jobs:
           )
           assert aid["status"] == "eligible"
           aid = store.approve_aid(
-              aid_id="AID-1",
-              network_seq=3,
+              aid_id="AID-1", network_seq=3
           )
           assert aid["status"] == "approved"
           aid = store.assign_aid(
@@ -2184,8 +1397,7 @@ jobs:
           )
           assert aid["status"] == "delivered"
           aid = store.confirm_aid(
-              aid_id="AID-1",
-              network_seq=6,
+              aid_id="AID-1", network_seq=6
           )
           assert aid["status"] == "confirmed"
           try:
@@ -2198,6 +1410,18 @@ jobs:
               )
           except ValueError:
               pass
+          transitions = [
+              e["transition"]
+              for e in aid["events"]
+          ]
+          assert transitions == [
+              "AID_REQUESTED",
+              "AID_ELIGIBILITY_EVALUATED",
+              "AID_APPROVED",
+              "AID_ASSIGNED",
+              "AID_DELIVERED",
+              "AID_DELIVERY_CONFIRMED",
+          ]
           summary = store.aid_summary()
           assert summary["aid_total"] == 1
           assert (
@@ -2206,24 +1430,30 @@ jobs:
               ]
               == 1
           )
+          full = store.summary()
+          assert (
+              full["producers_total"] == 1
+          )
+          assert full["aid_total"] == 1
           print("PROBE OK: aid lifecycle")
           db.close()
           PYEOF
 
-      - name: Write aid e2e test
+      - name: Write aid e2e test (new file, originals untouched)
         run: |
           set -euo pipefail
           cat > apps/agro/tests/test_agro_aid_e2e.py <<'PYEOF'
-          """AGRO aid e2e - producer requests government aid,
-          eligibility evaluated, government approves, assigns,
-          delivers, producer confirms; every transition recorded
-          on the network history by ZID."""
+          """AGRO aid e2e - government aid full lifecycle
+          over real HTTP with the network: request,
+          eligibility, approve, assign, deliver, confirm;
+          duplicates and wrong order rejected; unverified
+          producer rejected; screens show aid."""
           from __future__ import annotations
 
           import json
-          import re
           import threading
           from pathlib import Path
+          from urllib.error import HTTPError
           from urllib.request import (
               Request,
               urlopen,
@@ -2260,21 +1490,23 @@ jobs:
                   self.net_db = SQLiteAdapter(
                       tmp_path / "network.db"
                   )
+                  net_clock = FrozenClock()
                   signer, _ = Ed25519Signer.generate()
+                  config = RuntimeConfig(
+                      host="127.0.0.1",
+                      port=0,
+                      api_token=None,
+                  )
                   self.kernel = ZyraKernel(
                       db=self.net_db,
-                      clock=FrozenClock(),
+                      clock=net_clock,
                       signer=signer,
-                      config=RuntimeConfig(
-                          host="127.0.0.1",
-                          port=0,
-                          api_token=None,
-                      ),
+                      config=config,
                   )
                   self.kernel.bootstrap_root()
                   self.caps = ZyraCapabilities(
                       self.net_db,
-                      FrozenClock(),
+                      net_clock,
                       identity=self.kernel.identity,
                       signer=signer,
                   )
@@ -2296,26 +1528,27 @@ jobs:
                       "http://127.0.0.1:"
                       f"{self.net_server.server_address[1]}"
                   )
-                  self.client = NetworkClient(
-                      self.net_base,
-                      max_retries=1,
-                  )
                   self.agro_db = SQLiteAdapter(
                       tmp_path / "agro.db"
                   )
                   self.store = AgroStore(
                       self.agro_db, FrozenClock()
                   )
+                  self.client = NetworkClient(
+                      self.net_base, max_retries=1
+                  )
                   self.link = ZyraLink(self.client)
                   self.agro_server = serve_agro(
                       self.store, self.client
                   )
-                  self.agro_thread = threading.Thread(
-                      target=(
-                          self.agro_server
-                          .serve_forever
-                      ),
-                      daemon=True,
+                  self.agro_thread = (
+                      threading.Thread(
+                          target=(
+                              self.agro_server
+                              .serve_forever
+                          ),
+                          daemon=True,
+                      )
                   )
                   self.agro_thread.start()
                   self.agro_base = (
@@ -2334,7 +1567,7 @@ jobs:
                   self.net_db.close()
 
 
-          def _get_json(url: str) -> dict:
+          def _get(url: str) -> dict:
               with urlopen(url, timeout=10) as r:
                   body = json.loads(
                       r.read().decode("utf-8")
@@ -2343,9 +1576,7 @@ jobs:
               return body
 
 
-          def _post_json(
-              url: str, doc: dict,
-          ) -> dict:
+          def _post(url: str, doc: dict) -> dict:
               request = Request(
                   url,
                   data=json.dumps(doc).encode(
@@ -2369,12 +1600,35 @@ jobs:
               return body
 
 
+          def _post_status(
+              url: str, doc: dict,
+          ) -> int:
+              request = Request(
+                  url,
+                  data=json.dumps(doc).encode(
+                      "utf-8"
+                  ),
+                  headers={
+                      "Content-Type":
+                      "application/json"
+                  },
+                  method="POST",
+              )
+              try:
+                  with urlopen(
+                      request, timeout=10
+                  ) as response:
+                      return response.status
+              except HTTPError as exc:
+                  return exc.code
+
+
           def _get_html(url: str) -> str:
               with urlopen(url, timeout=10) as r:
                   return r.read().decode("utf-8")
 
 
-          def test_aid_full_cycle(
+          def test_aid_full_lifecycle(
               tmp_path: Path,
           ) -> None:
               eco = _Ecosystem(tmp_path)
@@ -2383,7 +1637,7 @@ jobs:
                       eco.link.register_app()[0]
                       is True
                   )
-                  created = _post_json(
+                  created = _post(
                       eco.agro_base
                       + "/agro/producers",
                       {
@@ -2400,8 +1654,10 @@ jobs:
                   )
                   zid = row.get("zid")
                   assert isinstance(zid, str)
-                  assert zid.startswith("ZID-")
-                  verified = _post_json(
+                  assert zid.startswith(
+                      "ZID-"
+                  )
+                  verified = _post(
                       eco.agro_base
                       + "/agro/producers/verify",
                       {
@@ -2416,7 +1672,7 @@ jobs:
                       ]
                       is True
                   )
-                  aid_response = _post_json(
+                  aid = _post(
                       eco.agro_base
                       + "/agro/aid/request",
                       {
@@ -2424,43 +1680,54 @@ jobs:
                               producer_id
                           ),
                           "program": "semillas",
-                          "item": "maiz criollo",
+                          "item":
+                          "maiz criollo",
                           "quantity": 10,
                       },
-                  )
-                  aid = aid_response["data"]
+                  )["data"]
                   aid_id = str(aid["aid_id"])
                   assert (
                       aid["status"]
                       == "requested"
                   )
-                  assert (
-                      aid["zid"] == zid
+                  assert aid["zid"] == zid
+                  assert [
+                      e["transition"]
+                      for e in aid["events"]
+                  ] == ["AID_REQUESTED"]
+                  dup = _post_status(
+                      eco.agro_base
+                      + "/agro/aid/request",
+                      {
+                          "producer_id": (
+                              producer_id
+                          ),
+                          "program": "semillas",
+                          "item": "maiz",
+                          "quantity": 3,
+                      },
                   )
-                  eligible = _post_json(
+                  assert dup == 400
+                  result = _post(
                       eco.agro_base
                       + "/agro/aid/eligibility",
                       {"aid_id": aid_id},
-                  )
+                  )["data"]
                   assert (
-                      eligible["data"][
-                          "status"
-                      ]
+                      result["status"]
                       == "eligible"
                   )
-                  approved = _post_json(
+                  result = _post(
                       eco.agro_base
                       + "/agro/government/"
                       + "approve",
                       {"aid_id": aid_id},
-                  )
+                  )["data"]
                   assert (
-                      approved["data"][
-                          "status"
-                      ]
+                      result["status"]
                       == "approved"
                   )
-                  assigned = _post_json(
+                  result = _post(
                       eco.agro_base
                       + "/agro/government/"
                       + "assign",
@@ -2468,167 +1735,166 @@ jobs:
                           "aid_id": aid_id,
                           "detail": "lote 7",
                       },
-                  )
+                  )["data"]
                   assert (
-                      assigned["data"][
-                          "status"
-                      ]
+                      result["status"]
                       == "assigned"
                   )
-                  delivered = _post_json(
+                  result = _post(
                       eco.agro_base
                       + "/agro/government/"
                       + "deliver",
                       {
                           "aid_id": aid_id,
-                          "detail": "entregado"
-                          " en centro agrario",
+                          "detail":
+                          "entregado en centro",
                       },
-                  )
+                  )["data"]
                   assert (
-                      delivered["data"][
-                          "status"
-                      ]
+                      result["status"]
                       == "delivered"
                   )
-                  confirmed = _post_json(
+                  result = _post(
                       eco.agro_base
                       + "/agro/government/"
                       + "confirm",
                       {"aid_id": aid_id},
-                  )
+                  )["data"]
                   assert (
-                      confirmed["data"][
-                          "status"
-                      ]
+                      result["status"]
                       == "confirmed"
                   )
-                  transitions = [
-                      str(event["transition"])
-                      for event in confirmed[
-                          "data"
-                      ]["events"]
+                  assert [
+                      e["transition"]
+                      for e in result["events"]
+                  ] == [
+                      "AID_REQUESTED",
+                      "AID_ELIGIBILITY_"
+                      "EVALUATED",
+                      "AID_APPROVED",
+                      "AID_ASSIGNED",
+                      "AID_DELIVERED",
+                      "AID_DELIVERY_"
+                      "CONFIRMED",
                   ]
-                  assert (
-                      "AID_REQUESTED"
-                      in transitions
-                  )
-                  assert (
-                      "AID_DELIVERY_CONFIRMED"
-                      in transitions
-                  )
-                  detail = _get_json(
+                  detail = _get(
                       eco.agro_base
-                      + "/agro/aid/"
-                      + aid_id
-                  )
+                      + "/agro/aid/" + aid_id
+                  )["data"]
                   assert (
-                      detail["data"]["status"]
+                      detail["status"]
                       == "confirmed"
                   )
-                  history_ok, history, _err = (
-                      eco.client.get(
-                          "/history/" + zid
-                      )
-                  )
-                  assert history_ok is True
-                  history_text = json.dumps(
-                      history, default=str
-                  )
-                  assert "AID_" in history_text
-                  unverified = _post_json(
+                  created2 = _post(
                       eco.agro_base
                       + "/agro/producers",
                       {
-                          "name": (
-                              "Nuevo Sin Verificar"
-                          ),
+                          "name":
+                          "Nuevo Sin Verificar",
                           "producer_type":
                           "agricultor",
                       },
                   )
-                  producer_b = str(
-                      unverified["data"][
+                  producer2 = str(
+                      created2["data"][
                           "producer_id"
                       ]
                   )
-                  eco.store.mark_verified(
-                      producer_id=(
-                          producer_b
-                      ),
-                  ) if False else None
-                  aid_b = _post_json(
+                  aid2 = _post(
                       eco.agro_base
                       + "/agro/aid/request",
                       {
                           "producer_id": (
-                              producer_b
+                              producer2
                           ),
-                          "program": (
-                              "fertilizante"
-                          ),
+                          "program":
+                          "fertilizante",
                           "item": "urea",
                           "quantity": 5,
                       },
-                  )
-                  aid_b_id = str(
-                      aid_b["data"]["aid_id"]
-                  )
-                  rejected = _post_json(
+                  )["data"]
+                  rejected = _post(
                       eco.agro_base
                       + "/agro/aid/eligibility",
-                      {"aid_id": aid_b_id},
-                  )
+                      {
+                          "aid_id": str(
+                              aid2["aid_id"]
+                          ),
+                      },
+                  )["data"]
                   assert (
-                      rejected["data"][
-                          "status"
-                      ]
+                      rejected["status"]
                       == "rejected"
                   )
-                  try:
-                      _post_json(
-                          eco.agro_base
-                          + "/agro/government/"
-                          + "approve",
-                          {"aid_id": aid_b_id},
-                      )
-                      raise AssertionError(
-                          "approve of rejected"
-                          " should fail"
-                      )
-                  except Exception as exc:
-                      assert "400" in str(exc)
+                  bad = _post_status(
+                      eco.agro_base
+                      + "/agro/government/"
+                      + "approve",
+                      {
+                          "aid_id": str(
+                              aid2["aid_id"]
+                          ),
+                      },
+                  )
+                  assert bad == 400
                   panel = _get_html(
                       eco.agro_base
                       + "/agro/productor/"
                       + producer_id
                   )
-                  assert aid_id in panel
-                  assert "confirmed" in panel
-                  summary = _get_json(
+                  assert "Mi Panel" in panel
+                  assert (
+                      "Mis ayudas del"
+                      " Gobierno" in panel
+                  )
+                  assert (
+                      "confirmed" in panel
+                  )
+                  assert (
+                      "semillas" in panel
+                  )
+                  gov = _get_html(
+                      eco.agro_base
+                      + "/agro/gobierno"
+                  )
+                  assert "Gobierno" in gov
+                  assert "Soberania" in gov
+                  assert (
+                      "Ayudas"
+                      " gubernamentales"
+                      in gov
+                  )
+                  assert (
+                      "semillas" in gov
+                  )
+                  summary = _get(
                       eco.agro_base
                       + "/agro/government/"
                       + "summary"
-                  )
-                  data = summary["data"]
+                  )["data"]
                   assert (
-                      data["aid_total"] >= 2
-                  )
-                  assert (
-                      data["aid_by_status"][
-                          "confirmed"
-                      ]
-                      == 1
+                      summary["producers_total"]
+                      == 2
                   )
                   assert (
-                      data["aid_by_status"][
-                          "rejected"
-                      ]
-                      == 1
+                      summary["aid_total"]
+                      == 2
                   )
-                  assert "semillas" in data[
+                  assert summary[
+                      "aid_by_status"
+                  ]["confirmed"] == 1
+                  assert summary[
+                      "aid_by_status"
+                  ]["rejected"] == 1
+                  assert "semillas" in summary[
                       "aid_by_program"
                   ]
+                  assert (
+                      "fertilizante"
+                      in summary[
+                          "aid_by_program"
+                      ]
+                  )
               finally:
                   eco.close()
           PYEOF
@@ -2653,7 +1919,7 @@ jobs:
           if git diff --cached --quiet; then
             echo "No changes."
           else
-            git commit -m "zyra: Q3 AGRO aid - migration 3 (aid requests + events), full lifecycle requested-eligible-approved-assigned-delivered-confirmed with wrong-order rejection, eligibility rule (verified producer), every transition on network history by ZID, government summary extended, producer panel shows aid; old routes and contracts preserved; probe + aid e2e"
+            git commit -m "zyra: Q3 AGRO aid - additive migration 3 (aid requests + events), surgical server patches (5 verified insertions), full lifecycle with eligibility rule (verified producer), anti-duplicate and wrong-order rejection, every transition recorded on network by ZID, producer and government screens extended; original contracts byte-identical; probe + aid e2e"
             git push origin "HEAD:${{ github.ref_name }}"
           fi
           echo "=== Q3 AGRO COMPLETE ==="

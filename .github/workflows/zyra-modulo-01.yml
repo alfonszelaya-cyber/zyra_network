@@ -1,4 +1,4 @@
-name: zyra-w28-3b-agro-server-complete
+name: zyra-w28b1-mpe-tests
 
 "on":
   workflow_dispatch:
@@ -9,7 +9,7 @@ permissions:
   contents: write
 
 concurrency:
-  group: zyra-w283b2-${{ github.ref }}
+  group: zyra-w28b1-${{ github.ref }}
   cancel-in-progress: false
 
 jobs:
@@ -31,956 +31,260 @@ jobs:
           python -m pip install --upgrade pip
           python -m pip install "cryptography>=42,<45" "pytest>=8,<9"
 
-      - name: Rewrite server.py COMPLETE (both halves, correct indent)
+      - name: MPE e2e proof
         run: |
           set -euo pipefail
-          cat > apps/agro/server.py <<'PYEOF'
-          """AGRO HTTP surface v4: role screens + JSON API
-          dual mode."""
+          mkdir -p apps/mi_primer_empleo/tests
+          cat > apps/mi_primer_empleo/tests/test_mpe_e2e.py <<'PYEOF'
+          """MPE e2e: company+worker registered over network
+          (ZID issued), company posts matched job, worker
+          panel shows it, worker applies, government summary
+          reflects it."""
           from __future__ import annotations
 
           import json
-          import uuid
-          from http.server import (
-              BaseHTTPRequestHandler,
-              ThreadingHTTPServer,
+          import re
+          import threading
+          from pathlib import Path
+          from urllib.request import (
+              Request,
+              urlopen,
           )
-          from typing import Any, ClassVar
-          from urllib.parse import urlparse
 
-          from apps.agro.infrastructure.persistence.agro_store import (
-              ROLES,
-              AgroStore,
+          from shared_engines.common.clocks import FrozenClock
+          from shared_engines.runtime.capabilities import (
+              ZyraCapabilities,
           )
-          from apps.agro.infrastructure.network.network_client import (
+          from shared_engines.runtime.combined_api import (
+              serve_combined,
+          )
+          from shared_engines.runtime.config import RuntimeConfig
+          from shared_engines.runtime.kernel import ZyraKernel
+          from shared_engines.storage.database import SQLiteAdapter
+          from shared_engines.verification.signatures import (
+              Ed25519Signer,
+          )
+
+          from apps.mi_primer_empleo.infrastructure.network.network_client import (
               NetworkClient,
           )
-          from apps.agro.modules.comercializacion.alertas_de_mercado.market_alert_service import (
-              MarketAlertService,
+          from apps.mi_primer_empleo.infrastructure.persistence.mpe_store import (
+              MpeStore,
           )
-          from apps.agro.services.zyra_link import ZyraLink
-
-          _CSS = (
-              "body{font-family:system-ui,sans-serif;"
-              "background:#0d1117;color:#e6edf3;"
-              "display:flex;justify-content:center;"
-              "padding:20px;margin:0}"
-              ".wrap{max-width:680px;width:100%}"
-              "h1{font-size:1.3rem}"
-              "h2{font-size:1rem;margin-top:20px;"
-              "color:#58a6ff}"
-              ".card{background:#161b22;border:1px solid"
-              " #30363d;border-radius:10px;padding:14px;"
-              "margin-top:10px}"
-              "button{background:#238636;color:#fff;"
-              "border:none;padding:12px 18px;border-radius:8px;"
-              "font-size:1rem;cursor:pointer;margin:6px 4px"
-              " 0 0;width:100%;text-align:left}"
-              "button.gray{background:#30363d}"
-              "input,select{width:100%;box-sizing:border-box;"
-              "background:#0d1117;color:#e6edf3;"
-              "border:1px solid #30363d;border-radius:6px;"
-              "padding:8px;margin:4px 0;font-size:0.95rem}"
+          from apps.mi_primer_empleo.server import serve_mpe
+          from apps.mi_primer_empleo.services.mpe_link import (
+              MpeLink,
           )
 
 
-          def _page(title: str, body: str) -> str:
-              return (
-                  "<!DOCTYPE html><html lang='es'><head>"
-                  "<meta charset='utf-8'>"
-                  "<meta name='viewport' content='width="
-                  "device-width, initial-scale=1'>"
-                  f"<title>{title}</title>"
-                  f"<style>{_CSS}</style></head><body>"
-                  f"<div class='wrap'>{body}</div></body>"
-                  "</html>"
+          class _Ecosystem:
+              def __init__(self, tmp_path: Path) -> None:
+                  self.net_db = SQLiteAdapter(
+                      tmp_path / "network.db"
+                  )
+                  net_clock = FrozenClock()
+                  signer, _ = Ed25519Signer.generate()
+                  config = RuntimeConfig(
+                      host="127.0.0.1",
+                      port=0,
+                      api_token=None,
+                  )
+                  self.kernel = ZyraKernel(
+                      db=self.net_db,
+                      clock=net_clock,
+                      signer=signer,
+                      config=config,
+                  )
+                  self.kernel.bootstrap_root()
+                  self.caps = ZyraCapabilities(
+                      self.net_db,
+                      net_clock,
+                      identity=self.kernel.identity,
+                      signer=signer,
+                  )
+                  self.net_server = serve_combined(
+                      self.kernel,
+                      self.caps,
+                      host="127.0.0.1",
+                      port=0,
+                  )
+                  self.net_thread = threading.Thread(
+                      target=(
+                          self.net_server
+                          .serve_forever
+                      ),
+                      daemon=True,
+                  )
+                  self.net_thread.start()
+                  self.net_base = (
+                      "http://127.0.0.1:"
+                      f"{self.net_server.server_address[1]}"
+                  )
+                  self.net_url = self.net_base
+
+                  self.mpe_db = SQLiteAdapter(
+                      tmp_path / "mpe.db"
+                  )
+                  mpe_clock = FrozenClock()
+                  self.store = MpeStore(
+                      self.mpe_db, mpe_clock
+                  )
+                  self.client = NetworkClient(
+                      self.net_url, max_retries=1
+                  )
+                  self.link = MpeLink(self.client)
+                  self.mpe_server = serve_mpe(
+                      self.store, self.client
+                  )
+                  self.mpe_thread = threading.Thread(
+                      target=(
+                          self.mpe_server
+                          .serve_forever
+                      ),
+                      daemon=True,
+                  )
+                  self.mpe_thread.start()
+                  self.mpe_base = (
+                      "http://127.0.0.1:"
+                      f"{self.mpe_server.bound_port}"
+                  )
+
+              def close(self) -> None:
+                  self.mpe_server.shutdown()
+                  self.mpe_server.server_close()
+                  self.mpe_thread.join(timeout=5)
+                  self.net_server.shutdown()
+                  self.net_server.server_close()
+                  self.net_thread.join(timeout=5)
+                  self.mpe_db.close()
+                  self.net_db.close()
+
+
+          def _post_form(url: str, doc: dict) -> str:
+              request = Request(
+                  url,
+                  data=(
+                      "&".join(
+                          str(k)
+                          + "="
+                          + str(v)
+                          for k, v in doc.items()
+                      )
+                  ).encode("utf-8"),
+                  method="POST",
               )
+              with urlopen(request, timeout=10) as r:
+                  return r.read().decode("utf-8")
 
 
-          class AgroApiHandler(
-              BaseHTTPRequestHandler
-          ):
-              store: ClassVar[AgroStore]
-              link: ClassVar[ZyraLink]
-              client: ClassVar[NetworkClient]
-              alerts: ClassVar[MarketAlertService] = (
-                  MarketAlertService()
-              )
+          def _get(url: str) -> str:
+              with urlopen(url, timeout=10) as r:
+                  return r.read().decode("utf-8")
 
-              def log_message(
-                  self, format: str, *args: object
-              ) -> None:
-                  return None
 
-              def do_GET(self) -> None:
-                  self._safe("GET")
-
-              def do_POST(self) -> None:
-                  self._safe("POST")
-
-              def _safe(self, method: str) -> None:
-                  try:
-                      self._route(method)
-                  except LookupError as exc:
-                      self._send(
-                          404,
-                          {
-                              "ok": False,
-                              "error": {
-                                  "type":
-                                  "not_found",
-                                  "message": str(
-                                      exc
-                                  ),
-                              },
-                          },
-                      )
-                  except ValueError as exc:
-                      self._send(
-                          400,
-                          {
-                              "ok": False,
-                              "error": {
-                                  "type":
-                                  "invalid_request",
-                                  "message": str(
-                                      exc
-                                  ),
-                              },
-                          },
-                      )
-                  except Exception as exc:
-                      self._send(
-                          500,
-                          {
-                              "ok": False,
-                              "error": {
-                                  "type":
-                                  "internal_error",
-                                  "message": str(
-                                      exc
-                                  ),
-                              },
-                          },
-                      )
-
-              def _route(self, method: str) -> None:
-                  path = urlparse(self.path).path
-                  segments = [
-                      s
-                      for s in path.split("/")
-                      if s
-                  ]
-                  if segments[:1] != ["agro"]:
-                      self._send(
-                          404,
-                          {
-                              "ok": False,
-                              "error": {
-                                  "type":
-                                  "not_found",
-                                  "message":
-                                  "outside /agro",
-                              },
-                          },
-                      )
-                      return
-                  tail = segments[1:]
-                  if method == "GET":
-                      self._get(tail)
-                  else:
-                      self._post(tail)
-
-              def _get(self, s: list[str]) -> None:
-                  store = type(self).store
-                  if s == ["health"]:
-                      self._send(
-                          200,
-                          {
-                              "ok": True,
-                              "data": {
-                                  "app": "agro",
-                                  "status":
-                                  "operational",
-                              },
-                          },
-                      )
-                      return
-                  if s == ["menu"]:
-                      self._send(
-                          200,
-                          {
-                              "ok": True,
-                              "data": {
-                                  "title": "AGRO",
-                                  "actions": [
-                                      {
-                                          "label":
-                                          "Vender mi"
-                                          " cosecha",
-                                          "route":
-                                          "/agro/production",
-                                      },
-                                      {
-                                          "label":
-                                          "Mi historial",
-                                          "route":
-                                          "/agro/government/summary",
-                                      },
-                                  ],
-                              },
-                          },
-                      )
-                      return
-                  if s == ["producers"]:
-                      self._send(
-                          200,
-                          {
-                              "ok": True,
-                              "data": list(
-                                  store.list_producers()
-                              ),
-                          },
-                      )
-                      return
-                  if s == ["government", "summary"]:
-                      self._send(
-                          200,
-                          {
-                              "ok": True,
-                              "data": store.summary(),
-                          },
-                      )
-                      return
-                  if not s or s == ["home"]:
-                      self._home()
-                      return
-                  if s[0] == "productor":
-                      self._screen_producer(s)
-                      return
-                  if s[0] == "gobierno":
-                      self._screen_government()
-                      return
-                  if s[0] == "banco":
-                      self._screen_bank()
-                      return
-                  self._send(
-                      404,
+          def test_mpe_full_journey(
+              tmp_path: Path,
+          ) -> None:
+              eco = _Ecosystem(tmp_path)
+              try:
+                  reg = eco.link.register_app()
+                  assert reg[0] is True
+                  company_html = _post_form(
+                      eco.mpe_base + "/mpe/register",
                       {
-                          "ok": False,
-                          "error": {
-                              "type": "not_found",
-                              "message":
-                              "unknown route",
-                          },
+                          "role": "empresa",
+                          "name": "Constructora SV",
+                          "profession": "construccion",
                       },
                   )
-
-              def _post(self, s: list[str]) -> None:
-                  store = type(self).store
-                  link = type(self).link
-                  content_type = self.headers.get(
-                      "Content-Type", ""
-                  )
-                  is_json = (
-                      "application/json"
-                      in content_type
-                  )
-                  if s == ["producers"]:
-                      if is_json:
-                          doc = self._read_json()
-                      else:
-                          doc = self._read_form()
-                      name = self._req(doc, "name")
-                      producer_type = self._req(
-                          doc, "producer_type"
-                      )
-                      role = str(
-                          doc.get("role", "agricultor")
-                      )
-                      if role not in ROLES:
-                          raise ValueError(
-                              f"unknown role: {role}"
-                          )
-                      location = doc.get("location")
-                      location = (
-                          str(location)
-                          if location is not None
-                          else None
-                      )
-                      producer_id = (
-                          "PRD-"
-                          + uuid.uuid4().hex[:12]
-                      )
-                      zid: str | None = None
-                      synced = False
-                      ok, data, _error = (
-                          link.register_producer_zid(
-                              name
-                          )
-                      )
-                      if ok and data is not None:
-                          zid = str(data.get("zid"))
-                          synced = True
-                      row = store.add_producer(
-                          producer_id=producer_id,
-                          zid=zid,
-                          name=name,
-                          producer_type=(
-                              producer_type
-                          ),
-                          role=role,
-                          location=location,
-                          synced=synced,
-                      )
-                      if is_json:
-                          self._send(
-                              201,
-                              {
-                                  "ok": True,
-                                  "data": row,
-                              },
-                          )
-                      else:
-                          self._html(
-                              200,
-                              _page(
-                                  "Registro listo",
-                                  "<h1>Registro listo"
-                                  "</h1><p>Tu ID: <b>"
-                                  + producer_id
-                                  + "</b></p>"
-                                  "<a href='/agro/productor/"
-                                  + producer_id
-                                  + "'><button>Ir a mi"
-                                  " panel</button></a>",
-                              ),
-                          )
-                      return
-                  if s == ["producers", "verify"]:
-                      if is_json:
-                          doc = self._read_json()
-                      else:
-                          doc = self._read_form()
-                      producer_id = self._req(
-                          doc, "producer_id"
-                      )
-                      row = store.get_producer(
-                          producer_id
-                      )
-                      zid = row.get("zid")
-                      if zid is None:
-                          raise ValueError(
-                              "producer has no"
-                              " network ZID yet"
-                          )
-                      ok, _data, _error = (
-                          link.complete_trust(
-                              str(zid)
-                          )
-                      )
-                      if not ok:
-                          raise ValueError(
-                              "network trust failed"
-                          )
-                      store.mark_verified(
-                          producer_id=producer_id
-                      )
-                      updated = store.get_producer(
-                          producer_id
-                      )
-                      if is_json:
-                          self._send(
-                              200,
-                              {
-                                  "ok": True,
-                                  "data": updated,
-                              },
-                          )
-                      else:
-                          self._html(
-                              200,
-                              _page(
-                                  "Verificado",
-                                  "<h1>Productor"
-                                  " VERIFICADO</h1>",
-                              ),
-                          )
-                      return
-                  if s == ["production"]:
-                      if is_json:
-                          doc = self._read_json()
-                      else:
-                          doc = self._read_form()
-                      producer_id = self._req(
-                          doc, "producer_id"
-                      )
-                      producer = store.get_producer(
-                          producer_id
-                      )
-                      product = self._req(
-                          doc, "product"
-                      )
-                      quantity = float(
-                          doc.get("quantity", 0)
-                      )
-                      if quantity <= 0:
-                          raise ValueError(
-                              "quantity must be"
-                              " positive"
-                          )
-                      unit = self._req(doc, "unit")
-                      network_seq: int | None = None
-                      zid = producer.get("zid")
-                      if zid is not None:
-                          ok, data, _error = (
-                              link.record_agro_event(
-                                  str(zid),
-                                  "production",
-                                  f"{product}:"
-                                  f" {quantity}"
-                                  f" {unit}",
-                              )
-                          )
-                          if (
-                              ok
-                              and data is not None
-                          ):
-                              network_seq = int(
-                                  data.get("seq", 0)
-                              )
-                      row = store.add_production(
-                          production_id=(
-                              "PRO-"
-                              + uuid.uuid4().hex[:12]
-                          ),
-                          producer_id=producer_id,
-                          product=product,
-                          quantity=quantity,
-                          unit=unit,
-                          network_seq=network_seq,
-                      )
-                      if is_json:
-                          self._send(
-                              201,
-                              {
-                                  "ok": True,
-                                  "data": row,
-                              },
-                          )
-                      else:
-                          self._html(
-                              200,
-                              _page(
-                                  "Cosecha"
-                                  " registrada",
-                                  "<h1>Guardado en la"
-                                  " Red</h1><a href="
-                                  "'/agro'><button>"
-                                  "Inicio</button></a>",
-                              ),
-                          )
-                      return
-                  if s == ["alerts", "evaluate"]:
-                      doc = self._read_json()
-                      previous = float(
-                          doc.get(
-                              "previous_price", 0
-                          )
-                      )
-                      current = float(
-                          doc.get(
-                              "current_price", 0
-                          )
-                      )
-                      result = (
-                          type(self).alerts.evaluate(
-                              previous, current
-                          )
-                      )
-                      self._send(
-                          200,
-                          {
-                              "ok": True,
-                              "data": result,
-                          },
-                      )
-                      return
-                  if s == ["register"]:
-                      doc = self._read_form()
-                      name = self._req(doc, "name")
-                      producer_type = self._req(
-                          doc, "producer_type"
-                      )
-                      role = str(
-                          doc.get("role", "agricultor")
-                      )
-                      if role not in ROLES:
-                          raise ValueError(
-                              f"unknown role: {role}"
-                          )
-                      location = doc.get("location")
-                      location = (
-                          str(location)
-                          if location is not None
-                          else None
-                      )
-                      producer_id = (
-                          "PRD-"
-                          + uuid.uuid4().hex[:12]
-                      )
-                      zid: str | None = None
-                      ok, data, _error = (
-                          link.register_producer_zid(
-                              name
-                          )
-                      )
-                      if ok and data is not None:
-                          zid = str(data.get("zid"))
-                      store.add_producer(
-                          producer_id=producer_id,
-                          zid=zid,
-                          name=name,
-                          producer_type=(
-                              producer_type
-                          ),
-                          role=role,
-                          location=location,
-                          synced=(
-                              zid is not None
-                          ),
-                      )
-                      self._html(
-                          200,
-                          _page(
-                              "Bienvenido a AGRO",
-                              "<h1>Registro listo"
-                              "</h1><p>Tu ID: <b>"
-                              + producer_id
-                              + "</b></p>"
-                              "<a href='/agro/productor/"
-                              + producer_id
-                              + "'><button>Ir a mi"
-                              " panel</button></a>",
-                          ),
-                      )
-                      return
-                  self._send(
-                      404,
+                  company_id = re.search(
+                      r"MPE-[a-f0-9]{12}",
+                      company_html,
+                  ).group(0)
+                  worker_html = _post_form(
+                      eco.mpe_base + "/mpe/register",
                       {
-                          "ok": False,
-                          "error": {
-                              "type": "not_found",
-                              "message":
-                              "unknown route",
-                          },
+                          "role": "trabajador",
+                          "name": "Pedro Albanil",
+                          "profession": "albanil",
                       },
                   )
-
-              def _read_form(
-                  self,
-              ) -> dict[str, Any]:
-                  length_header = self.headers.get(
-                      "Content-Length"
+                  worker_id = re.search(
+                      r"MPE-[a-f0-9]{12}",
+                      worker_html,
+                  ).group(0)
+                  worker_row = eco.store.get_account(
+                      worker_id
                   )
-                  if length_header is None:
-                      raise ValueError(
-                          "Content-Length required"
-                      )
-                  raw = self.rfile.read(
-                      int(length_header)
-                  ).decode("utf-8")
-                  doc: dict[str, Any] = {}
-                  for pair in raw.split("&"):
-                      if "=" in pair:
-                          key, value = pair.split(
-                              "=", 1
+                  zid = worker_row.get("zid")
+                  assert isinstance(zid, str)
+                  assert zid.startswith("ZID-")
+                  _post_form(
+                      eco.mpe_base + "/mpe/job",
+                      {
+                          "company_account": (
+                              company_id
+                          ),
+                          "title": (
+                              "Se necesita albanil"
+                          ),
+                          "profession": "albanil",
+                          "openings": 2,
+                      },
+                  )
+                  panel = _get(
+                      eco.mpe_base
+                      + "/mpe/trabajador/"
+                      + worker_id
+                  )
+                  assert (
+                      "Se necesita albanil"
+                      in panel
+                  )
+                  apply_html = _post_form(
+                      eco.mpe_base + "/mpe/apply",
+                      {
+                          "worker_account": (
+                              worker_id
+                          ),
+                          "job_id": eco.store.list_jobs(
+                              profession="albanil"
+                          )[0]["job_id"],
+                      },
+                  )
+                  assert (
+                      "Aplicacion enviada"
+                      in apply_html
+                  )
+                  with urlopen(
+                      eco.mpe_base
+                      + "/mpe/api/summary",
+                      timeout=10,
+                  ) as response:
+                      body = json.loads(
+                          response.read().decode(
+                              "utf-8"
                           )
-                          doc[key] = value.replace(
-                              "+", " "
-                          )
-                  return doc
-
-              def _read_json(
-                  self,
-              ) -> dict[str, Any]:
-                  length_header = self.headers.get(
-                      "Content-Length"
-                  )
-                  if length_header is None:
-                      raise ValueError(
-                          "Content-Length required"
                       )
-                  raw = self.rfile.read(
-                      int(length_header)
+                  data = body["data"]
+                  assert (
+                      data["accounts_total"] == 2
                   )
-                  parsed: Any = json.loads(
-                      raw.decode("utf-8")
+                  assert (
+                      data["applications_total"]
+                      == 1
                   )
-                  if not isinstance(parsed, dict):
-                      raise ValueError(
-                          "body must be a JSON"
-                          " object"
-                      )
-                  return {
-                      str(k): v
-                      for k, v in parsed.items()
-                  }
-
-              @staticmethod
-              def _req(
-                  doc: dict[str, Any], key: str
-              ) -> str:
-                  value: Any = doc.get(key)
-                  if isinstance(value, int) and not isinstance(
-                      value, bool
-                  ):
-                      value = str(value)
-                  if not isinstance(value, str):
-                      raise ValueError(
-                          f"missing field: {key}"
-                      )
-                  if not value.strip():
-                      raise ValueError(
-                          f"missing field: {key}"
-                      )
-                  return value
-
-              def _home(self) -> None:
-                  body = (
-                      "<h1>🛡️ AGRO</h1>"
-                      "<p>La Red de confianza"
-                      " para agricultores y"
-                      " ganaderos.</p>"
-                      "<h2>Soy productor</h2>"
-                      "<div class='card'>"
-                      "<form method='POST'"
-                      " action='/agro/register'>"
-                      "<input name='name'"
-                      " placeholder='Mi nombre'>"
-                      "<select name='role'>"
-                      "<option value='agricultor'>"
-                      "Agricultor</option>"
-                      "<option value='ganadero'>"
-                      "Ganadero</option>"
-                      "</select>"
-                      "<input name='producer_type'"
-                      " placeholder='Que produzco"
-                      " (maiz, ganado...)'>"
-                      "<input name='location'"
-                      " placeholder='Mi zona'>"
-                      "<button>Registrarme en la"
-                      " Red</button>"
-                      "</form></div>"
-                      "<h2>Soy Gobierno / Banco"
-                      "</h2>"
-                      "<div class='card'>"
-                      "<a href='/agro/gobierno'>"
-                      "<button>Vista Gobierno"
-                      "</button></a>"
-                      "<a href='/agro/banco'>"
-                      "<button class='gray'>Vista"
-                      " Banco</button></a>"
-                      "</div>"
-                  )
-                  self._html(200, _page("AGRO", body))
-
-              def _screen_producer(
-                  self, s: list[str]
-              ) -> None:
-                  store = type(self).store
-                  producer_id = (
-                      s[1] if len(s) > 1 else ""
-                  )
-                  row = store.get_producer(
-                      producer_id
-                  )
-                  zid = row.get("zid")
-                  verified = row.get("verified")
-                  if verified:
-                      badge = "✅ VERIFICADO"
-                      extra = ""
-                  else:
-                      badge = (
-                          "⚠️ Sin verificar"
-                          " (sin bonos)"
-                      )
-                      extra = (
-                          "<form method='POST'"
-                          " action='/agro/producers/verify'>"
-                          "<input type='hidden'"
-                          " name='producer_id'"
-                          f" value='{producer_id}'>"
-                          "<button>Verificarme para"
-                          " recibir bonos</button>"
-                          "</form>"
-                      )
-                  mine = [
-                      p
-                      for p in (
-                          store.list_productions()
-                      )
-                      if p["producer_id"]
-                      == producer_id
-                  ]
-                  history = "".join(
-                      "<li>• "
-                      + p["product"]
-                      + ": "
-                      + str(p["quantity"])
-                      + " "
-                      + p["unit"]
-                      + "</li>"
-                      for p in mine
-                  )
-                  if not history:
-                      history = (
-                          "<li>Sin registros</li>"
-                      )
-                  body = (
-                      "<h1>Mi Panel — "
-                      + str(row.get("name"))
-                      + "</h1>"
-                      "<p>"
-                      + badge
-                      + " · Rol: "
-                      + str(row.get("role"))
-                      + "</p>"
-                      "<h2>Registrar mi cosecha"
-                      "</h2>"
-                      "<div class='card'>"
-                      "<form method='POST'"
-                      " action='/agro/production'>"
-                      "<input type='hidden'"
-                      " name='producer_id'"
-                      f" value='{producer_id}'>"
-                      "<input name='product'"
-                      " placeholder='Producto'>"
-                      "<input name='quantity'"
-                      " placeholder='Cantidad'>"
-                      "<select name='unit'>"
-                      "<option value='quintal'>"
-                      "quintal</option>"
-                      "<option value='libra'>"
-                      "libra</option>"
-                      "</select>"
-                      "<button>Guardar en la"
-                      " Red</button>"
-                      "</form></div>"
-                      "<h2>Mi historial</h2><ul>"
-                      + history
-                      + "</ul>"
-                      + extra
-                      + "<a href='/agro'><button"
-                      " class='gray'>Inicio"
-                      "</button></a>"
-                  )
-                  self._html(
-                      200,
-                      _page("AGRO - Mi panel", body),
-                  )
-
-              def _screen_government(self) -> None:
-                  summary = type(
-                      self
-                  ).store.summary()
-                  total = summary["producers_total"]
-                  verified = summary[
-                      "producers_verified"
-                  ]
-                  by_role = summary[
-                      "producers_by_role"
-                  ]
-                  by_product = summary[
-                      "productions_by_product"
-                  ]
-                  roles_html = "".join(
-                      "<li>• "
-                      + k
-                      + ": "
-                      + str(v)
-                      + "</li>"
-                      for k, v in by_role.items()
-                  )
-                  if not roles_html:
-                      roles_html = (
-                          "<li>Sin datos</li>"
-                      )
-                  products_html = "".join(
-                      "<li>• "
-                      + k
-                      + ": "
-                      + str(v)
-                      + " quintales</li>"
-                      for k, v in (
-                          by_product.items()
-                      )
-                  )
-                  if not products_html:
-                      products_html = (
-                          "<li>Sin cosechas"
-                          " registradas</li>"
-                      )
-                  body = (
-                      "<h1>🏛️ AGRO — Vista"
-                      " Gobierno</h1>"
-                      "<h2>Soberania alimentaria"
-                      " nacional</h2>"
-                      "<div class='card'>"
-                      "<span class='big'>"
-                      + str(total)
-                      + "</span> productores<br>"
-                      "<span class='big'>"
-                      + str(verified)
-                      + "</span> verificados"
-                      "</div>"
-                      "<h2>Por rol</h2><ul>"
-                      + roles_html
-                      + "</ul>"
-                      "<h2>Produccion nacional"
-                      "</h2><ul>"
-                      + products_html
-                      + "</ul>"
-                      "<a href='/agro'><button"
-                      " class='gray'>Inicio"
-                      "</button></a>"
-                  )
-                  self._html(
-                      200,
-                      _page("AGRO - Gobierno", body),
-                  )
-
-              def _screen_bank(self) -> None:
-                  producers = type(
-                      self
-                  ).store.list_producers()
-                  rows = ""
-                  for p in producers:
-                      if p["verified"]:
-                          estado = (
-                              "✅ verificado"
-                              " (elegible para"
-                              " credito)"
-                          )
-                      else:
-                          estado = (
-                              "⚠️ sin verificar"
-                          )
-                      rows = (
-                          rows
-                          + "<li>• "
-                          + str(p["name"])
-                          + " - "
-                          + str(p["role"])
-                          + " - "
-                          + estado
-                          + "</li>"
-                      )
-                  if not rows:
-                      rows = (
-                          "<li>Sin productores</li>"
-                      )
-                  body = (
-                      "<h1>🏦 AGRO — Vista Banco"
-                      "</h1>"
-                      "<p>Elegibilidad de credito:"
-                      " basada en verificacion de"
-                      " la Red.</p>"
-                      "<ul>"
-                      + rows
-                      + "</ul>"
-                      "<a href='/agro'><button"
-                      " class='gray'>Inicio"
-                      "</button></a>"
-                  )
-                  self._html(
-                      200,
-                      _page("AGRO - Banco", body),
-                  )
-
-              def _html(
-                  self, status: int, html: str
-              ) -> None:
-                  body = html.encode("utf-8")
-                  self.send_response(status)
-                  self.send_header(
-                      "Content-Type",
-                      "text/html; charset=utf-8",
-                  )
-                  self.send_header(
-                      "Content-Length",
-                      str(len(body)),
-                  )
-                  self.end_headers()
-                  self.wfile.write(body)
-
-              def _send(
-                  self,
-                  status: int,
-                  payload: dict[str, Any],
-              ) -> None:
-                  body = json.dumps(payload).encode(
-                      "utf-8"
-                  )
-                  self.send_response(status)
-                  self.send_header(
-                      "Content-Type",
-                      "application/json",
-                  )
-                  self.send_header(
-                      "Content-Length",
-                      str(len(body)),
-                  )
-                  self.end_headers()
-                  self.wfile.write(body)
-
-
-          class AgroServer(ThreadingHTTPServer):
-              daemon_threads = True
-              allow_reuse_address = True
-
-              def __init__(
-                  self, address: tuple[str, int]
-              ) -> None:
-                  super().__init__(
-                      address, AgroApiHandler
-                  )
-
-              @property
-              def bound_port(self) -> int:
-                  return int(
-                      self.server_address[1]
-                  )
-
-
-          def serve_agro(
-              store: AgroStore,
-              client: NetworkClient,
-              *,
-              host: str = "127.0.0.1",
-              port: int = 0,
-          ) -> AgroServer:
-              AgroApiHandler.store = store
-              AgroApiHandler.link = ZyraLink(client)
-              AgroApiHandler.client = client
-              return AgroServer((host, port))
+              finally:
+                  eco.close()
           PYEOF
-          echo "server v4 complete"
+          echo "=== MPE E2E READY ==="
 
-      - name: Compile check
+      - name: Run MPE e2e
         run: |
           set -euo pipefail
-          python -m compileall -q apps/agro/server.py
-          echo "compile OK"
-          find apps/agro -name '__pycache__' -type d \
-            -prune -exec rm -rf {} +
-
-      - name: Run ALL AGRO tests
-        run: |
-          set -euo pipefail
-          PYTHONPATH="$PWD" python -m pytest -q -p no:cacheprovider apps/agro/tests/
-          echo "ALL AGRO tests OK"
-          find apps/agro -name '__pycache__' -type d \
+          PYTHONPATH="$PWD" python -m pytest -q -p no:cacheprovider apps/mi_primer_empleo/tests/test_mpe_e2e.py
+          echo "MPE e2e OK"
+          find apps/mi_primer_empleo -name '__pycache__' -type d \
             -prune -exec rm -rf {} +
 
       - name: Commit and push (race-safe)
@@ -994,7 +298,7 @@ jobs:
           if git diff --cached --quiet; then
             echo "No changes."
           else
-            git commit -m "zyra: W28-3b AGRO server v4 COMPLETE in single heredoc - fixed indentation (class-level methods), dual JSON/form _post with verify route, role screens, serve_agro; ALL tests"
+            git commit -m "zyra: W28b1 MPE e2e - network ZID issued to worker, company posts matched job, worker panel shows it (app searches FOR worker), apply, government summary; MPE 0-tests gap closed"
             git push origin "HEAD:${{ github.ref_name }}"
           fi
-          echo "=== W28-3B COMPLETE: AGRO FULLY GREEN ==="
+          echo "=== W28B1 COMPLETE ==="

@@ -1,4 +1,4 @@
-name: zyra-q3-agro-aid-e2e
+name: zyra-deploy-prep
 
 "on":
   workflow_dispatch:
@@ -9,13 +9,13 @@ permissions:
   contents: write
 
 concurrency:
-  group: zyra-q3-agro-${{ github.ref }}
+  group: zyra-deploy-${{ github.ref }}
   cancel-in-progress: false
 
 jobs:
   build:
     runs-on: ubuntu-latest
-    timeout-minutes: 25
+    timeout-minutes: 15
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -25,1680 +25,225 @@ jobs:
         with:
           python-version: "3.12"
 
-      - name: Install toolchain
+      - name: Install cryptography (production dep)
         run: |
           set -euo pipefail
           python -m pip install --upgrade pip
-          python -m pip install "cryptography>=42,<45" "pytest>=8,<9" "pytest-timeout>=2,<3"
+          python -m pip install "cryptography>=42,<45"
 
-      - name: Evidence (original intact)
+      - name: Evidence (state before)
         run: |
           set -euo pipefail
-          wc -c apps/agro/server.py apps/agro/infrastructure/persistence/agro_store.py
+          wc -c main.py render.yaml requirements.txt
+          echo "=== old main.py server section ==="
+          grep -n "ZyraServer\|serve_combined\|ZyraCapabilities" main.py || true
 
-      - name: AGRO store v3 (additive aid migration)
+      - name: Write requirements.txt (real deps)
         run: |
           set -euo pipefail
-          cat > apps/agro/infrastructure/persistence/agro_store.py <<'PYEOF'
-          """AGRO local durable store v3 (role-aware +
-          government aid lifecycle). Additive on v2."""
+          cat > requirements.txt <<'EOF'
+          cryptography>=42,<45
+          EOF
+          wc -c requirements.txt
+          cat requirements.txt
+
+      - name: Write main.py v2 (core plus capabilities in one port)
+        run: |
+          set -euo pipefail
+          cat > main.py <<'PYEOF'
+          """Zyra Network production entrypoint (persistent
+          authority + combined surface: core API and trust
+          capabilities on a single port)."""
           from __future__ import annotations
 
-          import uuid
-
-          from shared_engines.storage.database import (
-              Database,
-          )
-          from shared_engines.storage.migrations import (
-              Migration,
-              MigrationRunner,
-          )
-
-          ROLES = (
-              "agricultor",
-              "ganadero",
-              "gobierno",
-              "banco",
-          )
-
-          _MIGRATIONS = (
-              Migration(
-                  2,
-                  "agro",
-                  (
-                      "CREATE TABLE IF NOT EXISTS"
-                      " agro_producers_v2 ("
-                      " producer_id TEXT PRIMARY KEY,"
-                      " zid TEXT,"
-                      " name TEXT NOT NULL,"
-                      " producer_type TEXT NOT NULL,"
-                      " role TEXT NOT NULL"
-                      " DEFAULT 'agricultor',"
-                      " location TEXT,"
-                      " verified INTEGER NOT NULL"
-                      " DEFAULT 0,"
-                      " synced INTEGER NOT NULL"
-                      " DEFAULT 0,"
-                      " created_at REAL NOT NULL)",
-                      "CREATE TABLE"
-                      " agro_productions ("
-                      " production_id TEXT PRIMARY"
-                      " KEY,"
-                      " producer_id TEXT NOT NULL,"
-                      " product TEXT NOT NULL,"
-                      " quantity REAL NOT NULL,"
-                      " unit TEXT NOT NULL,"
-                      " status TEXT NOT NULL,"
-                      " network_seq INTEGER,"
-                      " created_at REAL NOT NULL)",
-                  ),
-              ),
-              Migration(
-                  3,
-                  "agro_aid",
-                  (
-                      "CREATE TABLE IF NOT EXISTS"
-                      " agro_aid_requests ("
-                      " aid_id TEXT PRIMARY KEY,"
-                      " producer_id TEXT NOT NULL,"
-                      " zid TEXT,"
-                      " program TEXT NOT NULL,"
-                      " item TEXT NOT NULL,"
-                      " quantity REAL NOT NULL,"
-                      " status TEXT NOT NULL"
-                      " DEFAULT 'requested',"
-                      " eligibility TEXT,"
-                      " created_at REAL NOT NULL,"
-                      " updated_at REAL NOT NULL)",
-                      "CREATE TABLE IF NOT EXISTS"
-                      " agro_aid_events ("
-                      " event_id TEXT PRIMARY KEY,"
-                      " aid_id TEXT NOT NULL,"
-                      " transition TEXT NOT NULL,"
-                      " actor TEXT NOT NULL,"
-                      " detail TEXT,"
-                      " network_seq INTEGER,"
-                      " created_at REAL NOT NULL)",
-                  ),
-              ),
-          )
-
-
-          class AgroStore:
-              """Durable local state for AGRO (v3)."""
-
-              def __init__(
-                  self, db: Database, clock
-              ) -> None:
-                  self._db = db
-                  self._clock = clock
-                  MigrationRunner(
-                      db,
-                      "agro.store",
-                      _MIGRATIONS,
-                  ).run(clock)
-
-              def add_producer(
-                  self,
-                  *,
-                  producer_id: str,
-                  zid: str | None,
-                  name: str,
-                  producer_type: str,
-                  role: str,
-                  location: str | None,
-                  synced: bool,
-              ) -> dict[str, object]:
-                  if role not in ROLES:
-                      raise ValueError(
-                          f"unknown role: {role}"
-                      )
-                  now = self._clock.now()
-                  with self._db.transaction() as cursor:
-                      cursor.execute(
-                          "INSERT INTO"
-                          " agro_producers_v2"
-                          " (producer_id, zid, name,"
-                          "  producer_type, role,"
-                          "  location, verified, synced,"
-                          "  created_at)"
-                          " VALUES (?, ?, ?, ?, ?, ?, 0,"
-                          "  ?, ?)",
-                          (
-                              producer_id,
-                              zid,
-                              name,
-                              producer_type,
-                              role,
-                              location,
-                              int(synced),
-                              now,
-                          ),
-                      )
-                  return self.get_producer(
-                      producer_id
-                  )
-
-              def link_zid(
-                  self,
-                  *,
-                  producer_id: str,
-                  zid: str,
-              ) -> None:
-                  with self._db.transaction() as cursor:
-                      cursor.execute(
-                          "UPDATE"
-                          " agro_producers_v2 SET"
-                          " zid = ?, synced = 1"
-                          " WHERE producer_id = ?",
-                          (zid, producer_id),
-                      )
-
-              def mark_verified(
-                  self, *, producer_id: str
-              ) -> None:
-                  with self._db.transaction() as cursor:
-                      cursor.execute(
-                          "UPDATE"
-                          " agro_producers_v2 SET"
-                          " verified = 1"
-                          " WHERE producer_id = ?",
-                          (producer_id,),
-                      )
-
-              def get_producer(
-                  self, producer_id: str
-              ) -> dict[str, object]:
-                  row = self._db.query_one(
-                      "SELECT * FROM"
-                      " agro_producers_v2"
-                      " WHERE producer_id = ?",
-                      (producer_id,),
-                  )
-                  if row is None:
-                      raise LookupError(
-                          "unknown producer:"
-                          f" {producer_id}"
-                      )
-                  return self._producer_row(row)
-
-              def list_producers(
-                  self,
-                  *,
-                  role: str | None = None,
-              ) -> tuple[dict[str, object], ...]:
-                  if role is not None:
-                      if role not in ROLES:
-                          raise ValueError(
-                              f"unknown role:"
-                              f" {role}"
-                          )
-                      rows = self._db.query_all(
-                          "SELECT * FROM"
-                          " agro_producers_v2"
-                          " WHERE role = ?"
-                          " ORDER BY created_at",
-                          (role,),
-                      )
-                  else:
-                      rows = self._db.query_all(
-                          "SELECT * FROM"
-                          " agro_producers_v2"
-                          " ORDER BY created_at"
-                      )
-                  return tuple(
-                      self._producer_row(r)
-                      for r in rows
-                  )
-
-              def add_production(
-                  self,
-                  *,
-                  production_id: str,
-                  producer_id: str,
-                  product: str,
-                  quantity: float,
-                  unit: str,
-                  network_seq: int | None,
-              ) -> dict[str, object]:
-                  now = self._clock.now()
-                  with self._db.transaction() as cursor:
-                      cursor.execute(
-                          "INSERT INTO"
-                          " agro_productions"
-                          " (production_id,"
-                          "  producer_id, product,"
-                          "  quantity, unit, status,"
-                          "  network_seq, created_at)"
-                          " VALUES (?, ?, ?, ?, ?,"
-                          "  'active', ?, ?)",
-                          (
-                              production_id,
-                              producer_id,
-                              product,
-                              quantity,
-                              unit,
-                              network_seq,
-                              now,
-                          ),
-                      )
-                  row = self._db.query_one(
-                      "SELECT * FROM"
-                      " agro_productions"
-                      " WHERE production_id = ?",
-                      (production_id,),
-                  )
-                  assert row is not None
-                  raw_seq = row["network_seq"]
-                  return {
-                      "production_id": str(
-                          row["production_id"]
-                      ),
-                      "producer_id": str(
-                          row["producer_id"]
-                      ),
-                      "product": str(
-                          row["product"]
-                      ),
-                      "quantity": float(
-                          row["quantity"]
-                      ),
-                      "unit": str(row["unit"]),
-                      "status": str(
-                          row["status"]
-                      ),
-                      "network_seq": (
-                          int(raw_seq)
-                          if raw_seq is not None
-                          else None
-                      ),
-                  }
-
-              def list_productions(
-                  self,
-              ) -> tuple[dict[str, object], ...]:
-                  rows = self._db.query_all(
-                      "SELECT * FROM"
-                      " agro_productions"
-                      " ORDER BY created_at"
-                  )
-                  result: list[
-                      dict[str, object]
-                  ] = []
-                  for r in rows:
-                      raw_seq = r["network_seq"]
-                      result.append(
-                          {
-                              "production_id": (
-                                  str(
-                                      r[
-                                          "production_id"
-                                      ]
-                                  )
-                              ),
-                              "producer_id": (
-                                  str(
-                                      r[
-                                          "producer_id"
-                                      ]
-                                  )
-                              ),
-                              "product": str(
-                                  r["product"]
-                              ),
-                              "quantity": float(
-                                  r["quantity"]
-                              ),
-                              "unit": str(
-                                  r["unit"]
-                              ),
-                              "status": str(
-                                  r["status"]
-                              ),
-                              "network_seq": (
-                                  int(raw_seq)
-                                  if raw_seq
-                                  is not None
-                                  else None
-                              ),
-                          }
-                      )
-                  return tuple(result)
-
-              def summary(
-                  self,
-              ) -> dict[str, object]:
-                  producers = (
-                      self._db.query_one(
-                          "SELECT COUNT(*) AS"
-                          " total,"
-                          " SUM(verified) AS"
-                          " verified"
-                          " FROM"
-                          " agro_producers_v2"
-                      )
-                  )
-                  by_role_rows = (
-                      self._db.query_all(
-                          "SELECT role, COUNT(*)"
-                          " AS n FROM"
-                          " agro_producers_v2"
-                          " GROUP BY role"
-                      )
-                  )
-                  productions = (
-                      self._db.query_all(
-                          "SELECT product,"
-                          " SUM(quantity) AS total"
-                          " FROM"
-                          " agro_productions"
-                          " GROUP BY product"
-                          " ORDER BY product"
-                      )
-                  )
-                  by_role = {
-                      str(r["role"]): int(r["n"])
-                      for r in by_role_rows
-                  }
-                  by_product = {
-                      str(r["product"]): float(
-                          r["total"]
-                      )
-                      for r in productions
-                  }
-                  total = 0
-                  verified = 0
-                  if producers is not None:
-                      total = int(
-                          producers["total"]
-                      )
-                      if (
-                          producers["verified"]
-                          is not None
-                      ):
-                          verified = int(
-                              producers[
-                                  "verified"
-                              ]
-                          )
-                  aid = self.aid_summary()
-                  return {
-                      "producers_total": total,
-                      "producers_verified": (
-                          verified
-                      ),
-                      "producers_by_role": (
-                          by_role
-                      ),
-                      "productions_by_product": (
-                          by_product
-                      ),
-                      "aid_total": aid[
-                          "aid_total"
-                      ],
-                      "aid_by_status": aid[
-                          "aid_by_status"
-                      ],
-                      "aid_by_program": aid[
-                          "aid_by_program"
-                      ],
-                  }
-
-              @staticmethod
-              def _producer_row(
-                  row,
-              ) -> dict[str, object]:
-                  return {
-                      "producer_id": str(
-                          row["producer_id"]
-                      ),
-                      "zid": (
-                          str(row["zid"])
-                          if row["zid"]
-                          is not None
-                          else None
-                      ),
-                      "name": str(row["name"]),
-                      "producer_type": str(
-                          row["producer_type"]
-                      ),
-                      "role": str(row["role"]),
-                      "location": (
-                          str(row["location"])
-                          if row["location"]
-                          is not None
-                          else None
-                      ),
-                      "verified": bool(
-                          int(row["verified"])
-                      ),
-                      "synced": bool(
-                          int(row["synced"])
-                      ),
-                      "created_at": float(
-                          row["created_at"]
-                      ),
-                  }
-
-              def _record_aid_event(
-                  self,
-                  *,
-                  aid_id: str,
-                  transition: str,
-                  actor: str,
-                  detail: str | None,
-                  network_seq: int | None,
-              ) -> None:
-                  now = self._clock.now()
-                  with self._db.transaction() as cursor:
-                      cursor.execute(
-                          "INSERT INTO"
-                          " agro_aid_events"
-                          " (event_id, aid_id,"
-                          "  transition, actor,"
-                          "  detail, network_seq,"
-                          "  created_at)"
-                          " VALUES (?, ?, ?, ?,"
-                          "  ?, ?, ?)",
-                          (
-                              "AEV-"
-                              + uuid.uuid4().hex[
-                                  :10
-                              ],
-                              aid_id,
-                              transition,
-                              actor,
-                              detail,
-                              network_seq,
-                              now,
-                          ),
-                      )
-
-              def _aid_row(self, aid_id: str):
-                  return self._db.query_one(
-                      "SELECT * FROM"
-                      " agro_aid_requests"
-                      " WHERE aid_id = ?",
-                      (aid_id,),
-                  )
-
-              def create_aid_request(
-                  self,
-                  *,
-                  aid_id: str,
-                  producer_id: str,
-                  program: str,
-                  item: str,
-                  quantity: float,
-                  network_seq: int | None,
-              ) -> dict[str, object]:
-                  producer = self.get_producer(
-                      producer_id
-                  )
-                  dup = self._db.query_one(
-                      "SELECT 1 FROM"
-                      " agro_aid_requests WHERE"
-                      " producer_id = ? AND"
-                      " program = ?",
-                      (producer_id, program),
-                  )
-                  if dup is not None:
-                      raise ValueError(
-                          "aid already requested"
-                          " for this program"
-                      )
-                  now = self._clock.now()
-                  with self._db.transaction() as cursor:
-                      cursor.execute(
-                          "INSERT INTO"
-                          " agro_aid_requests ("
-                          " aid_id, producer_id,"
-                          " zid, program, item,"
-                          " quantity, status,"
-                          " eligibility, created_at,"
-                          " updated_at)"
-                          " VALUES (?, ?, ?, ?, ?,"
-                          "  ?, 'requested', NULL,"
-                          "  ?, ?)",
-                          (
-                              aid_id,
-                              producer_id,
-                              producer.get("zid"),
-                              program,
-                              item,
-                              float(quantity),
-                              now,
-                              now,
-                          ),
-                      )
-                  self._record_aid_event(
-                      aid_id=aid_id,
-                      transition=(
-                          "AID_REQUESTED"
-                      ),
-                      actor="productor",
-                      detail=(
-                          program + ": " + item
-                      ),
-                      network_seq=network_seq,
-                  )
-                  return self.get_aid(aid_id)
-
-              def evaluate_aid(
-                  self,
-                  *,
-                  aid_id: str,
-                  eligible: bool,
-                  reason: str,
-                  network_seq: int | None,
-              ) -> dict[str, object]:
-                  row = self._aid_row(aid_id)
-                  if row is None:
-                      raise LookupError(
-                          "unknown aid:"
-                          f" {aid_id}"
-                      )
-                  if str(row["status"]) != (
-                      "requested"
-                  ):
-                      raise ValueError(
-                          "aid not awaiting"
-                          " eligibility"
-                      )
-                  new_status = (
-                      "eligible"
-                      if eligible
-                      else "rejected"
-                  )
-                  with self._db.transaction() as cursor:
-                      cursor.execute(
-                          "UPDATE"
-                          " agro_aid_requests SET"
-                          " status = ?,"
-                          " eligibility = ?,"
-                          " updated_at = ?"
-                          " WHERE aid_id = ?",
-                          (
-                              new_status,
-                              reason,
-                              self._clock.now(),
-                              aid_id,
-                          ),
-                      )
-                  self._record_aid_event(
-                      aid_id=aid_id,
-                      transition=(
-                          "AID_ELIGIBILITY_"
-                          "EVALUATED"
-                      ),
-                      actor="gobierno",
-                      detail=reason,
-                      network_seq=network_seq,
-                  )
-                  return self.get_aid(aid_id)
-
-              def _transition(
-                  self,
-                  *,
-                  aid_id: str,
-                  expected_from: str,
-                  to_status: str,
-                  transition: str,
-                  actor: str,
-                  detail: str | None,
-                  network_seq: int | None,
-              ) -> dict[str, object]:
-                  row = self._aid_row(aid_id)
-                  if row is None:
-                      raise LookupError(
-                          "unknown aid:"
-                          f" {aid_id}"
-                      )
-                  current = str(row["status"])
-                  if current != expected_from:
-                      raise ValueError(
-                          f"aid status is"
-                          f" {current}, expected"
-                          f" {expected_from}"
-                      )
-                  with self._db.transaction() as cursor:
-                      cursor.execute(
-                          "UPDATE"
-                          " agro_aid_requests SET"
-                          " status = ?,"
-                          " updated_at = ?"
-                          " WHERE aid_id = ?",
-                          (
-                              to_status,
-                              self._clock.now(),
-                              aid_id,
-                          ),
-                      )
-                  self._record_aid_event(
-                      aid_id=aid_id,
-                      transition=transition,
-                      actor=actor,
-                      detail=detail,
-                      network_seq=network_seq,
-                  )
-                  return self.get_aid(aid_id)
-
-              def approve_aid(
-                  self,
-                  *,
-                  aid_id: str,
-                  network_seq: int | None,
-              ) -> dict[str, object]:
-                  return self._transition(
-                      aid_id=aid_id,
-                      expected_from="eligible",
-                      to_status="approved",
-                      transition="AID_APPROVED",
-                      actor="gobierno",
-                      detail=None,
-                      network_seq=network_seq,
-                  )
-
-              def assign_aid(
-                  self,
-                  *,
-                  aid_id: str,
-                  detail: str | None,
-                  network_seq: int | None,
-              ) -> dict[str, object]:
-                  return self._transition(
-                      aid_id=aid_id,
-                      expected_from="approved",
-                      to_status="assigned",
-                      transition="AID_ASSIGNED",
-                      actor="gobierno",
-                      detail=detail,
-                      network_seq=network_seq,
-                  )
-
-              def deliver_aid(
-                  self,
-                  *,
-                  aid_id: str,
-                  detail: str | None,
-                  network_seq: int | None,
-              ) -> dict[str, object]:
-                  return self._transition(
-                      aid_id=aid_id,
-                      expected_from="assigned",
-                      to_status="delivered",
-                      transition=(
-                          "AID_DELIVERED"
-                      ),
-                      actor="gobierno",
-                      detail=detail,
-                      network_seq=network_seq,
-                  )
-
-              def confirm_aid(
-                  self,
-                  *,
-                  aid_id: str,
-                  network_seq: int | None,
-              ) -> dict[str, object]:
-                  return self._transition(
-                      aid_id=aid_id,
-                      expected_from=(
-                          "delivered"
-                      ),
-                      to_status="confirmed",
-                      transition=(
-                          "AID_DELIVERY_"
-                          "CONFIRMED"
-                      ),
-                      actor="productor",
-                      detail=None,
-                      network_seq=network_seq,
-                  )
-
-              def get_aid(
-                  self, aid_id: str,
-              ) -> dict[str, object]:
-                  row = self._aid_row(aid_id)
-                  if row is None:
-                      raise LookupError(
-                          "unknown aid:"
-                          f" {aid_id}"
-                      )
-                  events = self._db.query_all(
-                      "SELECT * FROM"
-                      " agro_aid_events WHERE"
-                      " aid_id = ?"
-                      " ORDER BY created_at,"
-                      " rowid",
-                      (aid_id,),
-                  )
-                  event_list = []
-                  for e in events:
-                      seq = e["network_seq"]
-                      event_list.append(
-                          {
-                              "event_id": str(
-                                  e["event_id"]
-                              ),
-                              "transition": str(
-                                  e[
-                                      "transition"
-                                  ]
-                              ),
-                              "actor": str(
-                                  e["actor"]
-                              ),
-                              "detail": (
-                                  str(
-                                      e["detail"]
-                                  )
-                                  if e["detail"]
-                                  is not None
-                                  else None
-                              ),
-                              "network_seq": (
-                                  int(seq)
-                                  if seq
-                                  is not None
-                                  else None
-                              ),
-                          }
-                      )
-                  return {
-                      "aid_id": str(
-                          row["aid_id"]
-                      ),
-                      "producer_id": str(
-                          row["producer_id"]
-                      ),
-                      "zid": (
-                          str(row["zid"])
-                          if row["zid"]
-                          is not None
-                          else None
-                      ),
-                      "program": str(
-                          row["program"]
-                      ),
-                      "item": str(row["item"]),
-                      "quantity": float(
-                          row["quantity"]
-                      ),
-                      "status": str(
-                          row["status"]
-                      ),
-                      "eligibility": (
-                          str(
-                              row["eligibility"]
-                          )
-                          if row["eligibility"]
-                          is not None
-                          else None
-                      ),
-                      "events": event_list,
-                  }
-
-              def list_aid(
-                  self,
-                  *,
-                  producer_id: str | None = None,
-                  status: str | None = None,
-              ) -> tuple[dict[str, object], ...]:
-                  sql = (
-                      "SELECT aid_id FROM"
-                      " agro_aid_requests"
-                      " WHERE 1=1"
-                  )
-                  params: list[object] = []
-                  if producer_id is not None:
-                      sql += (
-                          " AND producer_id = ?"
-                      )
-                      params.append(
-                          producer_id
-                      )
-                  if status is not None:
-                      sql += " AND status = ?"
-                      params.append(status)
-                  sql += (
-                      " ORDER BY created_at,"
-                      " rowid"
-                  )
-                  rows = self._db.query_all(
-                      sql, tuple(params)
-                  )
-                  return tuple(
-                      self.get_aid(
-                          str(r["aid_id"])
-                      )
-                      for r in rows
-                  )
-
-              def aid_summary(
-                  self,
-              ) -> dict[str, object]:
-                  total = self._db.query_one(
-                      "SELECT COUNT(*) AS n"
-                      " FROM"
-                      " agro_aid_requests"
-                  )
-                  by_status_rows = (
-                      self._db.query_all(
-                          "SELECT status,"
-                          " COUNT(*) AS n FROM"
-                          " agro_aid_requests"
-                          " GROUP BY status"
-                      )
-                  )
-                  by_program_rows = (
-                      self._db.query_all(
-                          "SELECT program,"
-                          " COUNT(*) AS n,"
-                          " SUM(quantity) AS q"
-                          " FROM"
-                          " agro_aid_requests"
-                          " GROUP BY program"
-                      )
-                  )
-                  by_status = {
-                      str(r["status"]): int(
-                          r["n"]
-                      )
-                      for r in by_status_rows
-                  }
-                  by_program = {}
-                  for r in by_program_rows:
-                      by_program[
-                          str(r["program"])
-                      ] = {
-                          "requests": int(
-                              r["n"]
-                          ),
-                          "quantity": float(
-                              r["q"] or 0
-                          ),
-                      }
-                  return {
-                      "aid_total": int(
-                          total["n"]
-                      )
-                      if total is not None
-                      else 0,
-                      "aid_by_status": (
-                          by_status
-                      ),
-                      "aid_by_program": (
-                          by_program
-                      ),
-                  }
-          PYEOF
-          python -m py_compile apps/agro/infrastructure/persistence/agro_store.py
-          echo "store v3 written"
-
-      - name: Patch AGRO server (route chains and methods only)
-        run: |
-          set -euo pipefail
-          PYTHONPATH="$PWD" python - <<'PYEOF'
+          import logging
+          import os
           from pathlib import Path
 
-          path = Path("apps/agro/server.py")
-          source = path.read_text(encoding="utf-8")
-
-          def apply(text, old, new, label):
-              count = text.count(old)
-              if count != 1:
-                  raise SystemExit(
-                      "PATCH FAIL " + label
-                      + " count=" + str(count)
-                  )
-              return text.replace(old, new, 1)
-
-          GET_ROUTES = "\n".join([
-              '        if s == ["aid"]:',
-              '            self._send(',
-              '                200,',
-              '                {',
-              '                    "ok": True,',
-              '                    "data": list(',
-              '                        store.list_aid()',
-              '                    ),',
-              '                },',
-              '            )',
-              '            return',
-              '        if len(s) == 2 and s[0] == "aid":',
-              '            self._send(',
-              '                200,',
-              '                {',
-              '                    "ok": True,',
-              '                    "data": store.get_aid(',
-              '                        s[1]',
-              '                    ),',
-              '                },',
-              '            )',
-              '            return',
-              '        if s == ["ayudas"]:',
-              '            self._screen_ayudas_gobierno()',
-              '            return',
-              '        if len(s) == 2 and s[0] == "ayudas":',
-              '            self._screen_ayudas(s[1])',
-              '            return',
-          ])
-
-          POST_ROUTES = "\n".join([
-              '        if s == ["aid", "request"]:',
-              '            self._aid_request()',
-              '            return',
-              '        if s == ["aid", "eligibility"]:',
-              '            self._aid_eligibility()',
-              '            return',
-              '        if s == ["government", "approve"]:',
-              '            self._aid_approve()',
-              '            return',
-              '        if s == ["government", "assign"]:',
-              '            self._aid_assign()',
-              '            return',
-              '        if s == ["government", "deliver"]:',
-              '            self._aid_deliver()',
-              '            return',
-              '        if s == ["government", "confirm"]:',
-              '            self._aid_confirm()',
-              '            return',
-          ])
-
-          METHODS = "\n".join([
-              '    def _aid_payload(self) -> dict:',
-              '        content_type = self.headers.get(',
-              '            "Content-Type", ""',
-              '        )',
-              '        if "application/json" in content_type:',
-              '            return self._read_json()',
-              '        return self._read_form()',
-              '',
-              '    def _aid_network_seq(',
-              '        self,',
-              '        zid: str | None,',
-              '        event: str,',
-              '        detail: str,',
-              '    ) -> int | None:',
-              '        if zid is None:',
-              '            return None',
-              '        ok, data, _error = type(self).link.record_agro_event(',
-              '            str(zid), event, detail',
-              '        )',
-              '        if ok and data is not None:',
-              '            try:',
-              '                return int(data.get("seq", 0))',
-              '            except Exception:',
-              '                return None',
-              '        return None',
-              '',
-              '    def _aid_request(self) -> None:',
-              '        store = type(self).store',
-              '        doc = self._aid_payload()',
-              '        producer_id = self._req(doc, "producer_id")',
-              '        producer = store.get_producer(producer_id)',
-              '        program = self._req(doc, "program")',
-              '        item = self._req(doc, "item")',
-              '        quantity = float(doc.get("quantity", 1))',
-              '        if quantity <= 0:',
-              '            raise ValueError(',
-              '                "quantity must be positive"',
-              '            )',
-              '        network_seq = self._aid_network_seq(',
-              '            producer.get("zid"),',
-              '            "AID_REQUESTED",',
-              '            program + ": " + item,',
-              '        )',
-              '        aid = store.create_aid_request(',
-              '            aid_id="AID-" + uuid.uuid4().hex[:10],',
-              '            producer_id=producer_id,',
-              '            program=program,',
-              '            item=item,',
-              '            quantity=quantity,',
-              '            network_seq=network_seq,',
-              '        )',
-              '        self._send(201, {"ok": True, "data": aid})',
-              '',
-              '    def _aid_eligibility(self) -> None:',
-              '        store = type(self).store',
-              '        doc = self._aid_payload()',
-              '        aid_id = self._req(doc, "aid_id")',
-              '        aid = store.get_aid(aid_id)',
-              '        producer = store.get_producer(',
-              '            str(aid["producer_id"])',
-              '        )',
-              '        eligible = bool(producer.get("verified"))',
-              '        reason = (',
-              '            "productor verificado"',
-              '            if eligible',
-              '            else "productor sin verificar"',
-              '        )',
-              '        network_seq = self._aid_network_seq(',
-              '            aid.get("zid"),',
-              '            "AID_ELIGIBILITY_EVALUATED",',
-              '            reason,',
-              '        )',
-              '        result = store.evaluate_aid(',
-              '            aid_id=aid_id,',
-              '            eligible=eligible,',
-              '            reason=reason,',
-              '            network_seq=network_seq,',
-              '        )',
-              '        self._send(200, {"ok": True, "data": result})',
-              '',
-              '    def _aid_approve(self) -> None:',
-              '        store = type(self).store',
-              '        doc = self._aid_payload()',
-              '        aid_id = self._req(doc, "aid_id")',
-              '        aid = store.get_aid(aid_id)',
-              '        network_seq = self._aid_network_seq(',
-              '            aid.get("zid"),',
-              '            "AID_APPROVED",',
-              '            str(aid["program"]),',
-              '        )',
-              '        result = store.approve_aid(',
-              '            aid_id=aid_id, network_seq=network_seq',
-              '        )',
-              '        self._send(200, {"ok": True, "data": result})',
-              '',
-              '    def _aid_assign(self) -> None:',
-              '        store = type(self).store',
-              '        doc = self._aid_payload()',
-              '        aid_id = self._req(doc, "aid_id")',
-              '        detail = str(doc.get("detail") or "").strip() or None',
-              '        aid = store.get_aid(aid_id)',
-              '        network_seq = self._aid_network_seq(',
-              '            aid.get("zid"),',
-              '            "AID_ASSIGNED",',
-              '            detail or str(aid["program"]),',
-              '        )',
-              '        result = store.assign_aid(',
-              '            aid_id=aid_id,',
-              '            detail=detail,',
-              '            network_seq=network_seq,',
-              '        )',
-              '        self._send(200, {"ok": True, "data": result})',
-              '',
-              '    def _aid_deliver(self) -> None:',
-              '        store = type(self).store',
-              '        doc = self._aid_payload()',
-              '        aid_id = self._req(doc, "aid_id")',
-              '        detail = str(doc.get("detail") or "").strip() or None',
-              '        aid = store.get_aid(aid_id)',
-              '        network_seq = self._aid_network_seq(',
-              '            aid.get("zid"),',
-              '            "AID_DELIVERED",',
-              '            detail or str(aid["item"]),',
-              '        )',
-              '        result = store.deliver_aid(',
-              '            aid_id=aid_id,',
-              '            detail=detail,',
-              '            network_seq=network_seq,',
-              '        )',
-              '        self._send(200, {"ok": True, "data": result})',
-              '',
-              '    def _aid_confirm(self) -> None:',
-              '        store = type(self).store',
-              '        doc = self._aid_payload()',
-              '        aid_id = self._req(doc, "aid_id")',
-              '        aid = store.get_aid(aid_id)',
-              '        network_seq = self._aid_network_seq(',
-              '            aid.get("zid"),',
-              '            "AID_DELIVERY_CONFIRMED",',
-              '            str(aid["program"]),',
-              '        )',
-              '        result = store.confirm_aid(',
-              '            aid_id=aid_id, network_seq=network_seq',
-              '        )',
-              '        self._send(200, {"ok": True, "data": result})',
-              '',
-              '    def _screen_ayudas(',
-              '        self, producer_id: str,',
-              '    ) -> None:',
-              '        store = type(self).store',
-              '        row = store.get_producer(producer_id)',
-              '        aids = store.list_aid(',
-              '            producer_id=producer_id',
-              '        )',
-              '        rows = "".join(',
-              '            "<li>- "',
-              '            + str(a["program"])',
-              '            + ": "',
-              '            + str(a["item"])',
-              '            + " - "',
-              '            + str(a["status"])',
-              '            + "</li>"',
-              '            for a in aids',
-              '        )',
-              '        if not rows:',
-              '            rows = (',
-              '                "<li>Sin ayudas todavia</li>"',
-              '            )',
-              '        body = (',
-              '            "<h1>Mis ayudas del Gobierno</h1>"',
-              '            "<p>"',
-              '            + str(row.get("name"))',
-              '            + "</p>"',
-              '            "<ul>"',
-              '            + rows',
-              '            + "</ul>"',
-              '            "<a href=\'/agro\'><button"',
-              '            " class=\'gray\'>Inicio"',
-              '            "</button></a>"',
-              '        )',
-              '        self._html(',
-              '            200,',
-              '            _page("AGRO - Ayudas", body),',
-              '        )',
-              '',
-              '    def _screen_ayudas_gobierno(',
-              '        self,',
-              '    ) -> None:',
-              '        store = type(self).store',
-              '        summary = store.aid_summary()',
-              '        rows = "".join(',
-              '            "<li>- "',
-              '            + str(program)',
-              '            + ": "',
-              '            + str(info["requests"])',
-              '            + " solicitudes, cantidad "',
-              '            + str(info["quantity"])',
-              '            + "</li>"',
-              '            for program, info in summary["aid_by_program"].items()',
-              '        )',
-              '        if not rows:',
-              '            rows = (',
-              '                "<li>Sin solicitudes de ayuda</li>"',
-              '            )',
-              '        body = (',
-              '            "<h1>Ayudas gubernamentales</h1>"',
-              '            "<p>Total: "',
-              '            + str(summary["aid_total"])',
-              '            + "</p>"',
-              '            "<h2>Por programa</h2><ul>"',
-              '            + rows',
-              '            + "</ul>"',
-              '            "<a href=\'/agro\'><button"',
-              '            " class=\'gray\'>Inicio"',
-              '            "</button></a>"',
-              '        )',
-              '        self._html(',
-              '            200,',
-              '            _page("AGRO - Ayudas", body),',
-              '        )',
-              '',
-          ])
-
-          source = apply(
-              source,
-              '        if s == ["government", "summary"]:',
-              GET_ROUTES
-              + "\n"
-              + '        if s == ["government", "summary"]:',
-              "get-routes",
-          )
-          source = apply(
-              source,
-              '        if s == ["alerts", "evaluate"]:',
-              POST_ROUTES
-              + "\n"
-              + '        if s == ["alerts", "evaluate"]:',
-              "post-routes",
-          )
-          source = apply(
-              source,
-              '    def _home(self) -> None:',
-              METHODS
-              + "\n"
-              + '    def _home(self) -> None:',
-              "methods",
-          )
-
-          path.write_text(source, encoding="utf-8")
-          print("ALL 3 PATCHES APPLIED")
-          PYEOF
-          python -m py_compile apps/agro/server.py
-          echo "server patched and compiles"
-
-      - name: Internal probe (aid lifecycle at store level)
-        run: |
-          set -euo pipefail
-          PYTHONPATH="$PWD" python - <<'PYEOF'
-          import tempfile
-          from pathlib import Path
-
-          from shared_engines.common.clocks import (
-              FrozenClock,
-          )
-          from shared_engines.storage.database import (
-              SQLiteAdapter,
-          )
-
-          from apps.agro.infrastructure.persistence.agro_store import (
-              AgroStore,
-          )
-
-          tmp = Path(tempfile.mkdtemp())
-          db = SQLiteAdapter(tmp / "probe.db")
-          store = AgroStore(db, FrozenClock())
-          store.add_producer(
-              producer_id="AGR-1",
-              zid="ZID-abc",
-              name="Jose",
-              producer_type="agricultor",
-              role="agricultor",
-              location="SV",
-              synced=True,
-          )
-          store.mark_verified(producer_id="AGR-1")
-          aid = store.create_aid_request(
-              aid_id="AID-1",
-              producer_id="AGR-1",
-              program="semillas",
-              item="maiz",
-              quantity=10.0,
-              network_seq=1,
-          )
-          assert aid["status"] == "requested"
-          try:
-              store.create_aid_request(
-                  aid_id="AID-2",
-                  producer_id="AGR-1",
-                  program="semillas",
-                  item="maiz",
-                  quantity=5.0,
-                  network_seq=None,
-              )
-              raise AssertionError("duplicate must fail")
-          except ValueError:
-              pass
-          aid = store.evaluate_aid(
-              aid_id="AID-1",
-              eligible=True,
-              reason="verificado",
-              network_seq=2,
-          )
-          assert aid["status"] == "eligible"
-          aid = store.approve_aid(aid_id="AID-1", network_seq=3)
-          assert aid["status"] == "approved"
-          aid = store.assign_aid(
-              aid_id="AID-1",
-              detail="lote 7",
-              network_seq=4,
-          )
-          assert aid["status"] == "assigned"
-          aid = store.deliver_aid(
-              aid_id="AID-1",
-              detail="entregado",
-              network_seq=5,
-          )
-          assert aid["status"] == "delivered"
-          aid = store.confirm_aid(aid_id="AID-1", network_seq=6)
-          assert aid["status"] == "confirmed"
-          try:
-              store.approve_aid(aid_id="AID-1", network_seq=7)
-              raise AssertionError("wrong order must fail")
-          except ValueError:
-              pass
-          transitions = [e["transition"] for e in aid["events"]]
-          assert transitions == [
-              "AID_REQUESTED",
-              "AID_ELIGIBILITY_EVALUATED",
-              "AID_APPROVED",
-              "AID_ASSIGNED",
-              "AID_DELIVERED",
-              "AID_DELIVERY_CONFIRMED",
-          ]
-          summary = store.aid_summary()
-          assert summary["aid_total"] == 1
-          assert summary["aid_by_status"]["confirmed"] == 1
-          full = store.summary()
-          assert full["producers_total"] == 1
-          assert full["aid_total"] == 1
-          print("PROBE OK: aid lifecycle")
-          db.close()
-          PYEOF
-
-      - name: Write aid e2e test (originals untouched)
-        run: |
-          set -euo pipefail
-          cat > apps/agro/tests/test_agro_aid_e2e.py <<'PYEOF'
-          """AGRO aid e2e - government aid full lifecycle over
-          real HTTP with the network; duplicates and wrong
-          order rejected; unverified producer rejected; new
-          aid screens served; original screens untouched."""
-          from __future__ import annotations
-
-          import json
-          import threading
-          from pathlib import Path
-          from urllib.error import HTTPError
-          from urllib.request import (
-              Request,
-              urlopen,
-          )
-
-          from shared_engines.common.clocks import FrozenClock
-          from shared_engines.runtime.capabilities import (
-              ZyraCapabilities,
-          )
-          from shared_engines.runtime.combined_api import (
-              serve_combined,
-          )
+          from shared_engines.authority.root import PersistentRootAuthority
+          from shared_engines.common.clocks import SystemClock
+          from shared_engines.runtime.capabilities import ZyraCapabilities
+          from shared_engines.runtime.combined_api import serve_combined
           from shared_engines.runtime.config import RuntimeConfig
           from shared_engines.runtime.kernel import ZyraKernel
           from shared_engines.storage.database import SQLiteAdapter
-          from shared_engines.verification.signatures import (
-              Ed25519Signer,
+
+          DATA_DIR = os.environ.get(
+              "ZYRA_DATA_DIR", "/tmp/zyra-data"
           )
-
-          from apps.agro.infrastructure.network.network_client import (
-              NetworkClient,
-          )
-          from apps.agro.infrastructure.persistence.agro_store import (
-              AgroStore,
-          )
-          from apps.agro.server import serve_agro
-          from apps.agro.services.zyra_link import (
-              ZyraLink,
-          )
+          DB_PATH = os.path.join(DATA_DIR, "zyra.db")
 
 
-          class _Ecosystem:
-              def __init__(self, tmp_path: Path) -> None:
-                  self.net_db = SQLiteAdapter(
-                      tmp_path / "network.db"
-                  )
-                  signer, _ = Ed25519Signer.generate()
-                  self.kernel = ZyraKernel(
-                      db=self.net_db,
-                      clock=FrozenClock(),
-                      signer=signer,
-                      config=RuntimeConfig(
-                          host="127.0.0.1",
-                          port=0,
-                          api_token=None,
-                      ),
-                  )
-                  self.kernel.bootstrap_root()
-                  self.caps = ZyraCapabilities(
-                      self.net_db,
-                      FrozenClock(),
-                      identity=self.kernel.identity,
-                      signer=signer,
-                  )
-                  self.net_server = serve_combined(
-                      self.kernel,
-                      self.caps,
-                      host="127.0.0.1",
-                      port=0,
-                  )
-                  self.net_thread = threading.Thread(
-                      target=self.net_server.serve_forever,
-                      daemon=True,
-                  )
-                  self.net_thread.start()
-                  self.net_base = (
-                      "http://127.0.0.1:"
-                      f"{self.net_server.server_address[1]}"
-                  )
-                  self.agro_db = SQLiteAdapter(
-                      tmp_path / "agro.db"
-                  )
-                  self.store = AgroStore(
-                      self.agro_db, FrozenClock()
-                  )
-                  self.client = NetworkClient(
-                      self.net_base, max_retries=1
-                  )
-                  self.link = ZyraLink(self.client)
-                  self.agro_server = serve_agro(
-                      self.store, self.client
-                  )
-                  self.agro_thread = threading.Thread(
-                      target=self.agro_server.serve_forever,
-                      daemon=True,
-                  )
-                  self.agro_thread.start()
-                  self.agro_base = (
-                      "http://127.0.0.1:"
-                      f"{self.agro_server.bound_port}"
-                  )
-
-              def close(self) -> None:
-                  self.agro_server.shutdown()
-                  self.agro_server.server_close()
-                  self.agro_thread.join(timeout=5)
-                  self.net_server.shutdown()
-                  self.net_server.server_close()
-                  self.net_thread.join(timeout=5)
-                  self.agro_db.close()
-                  self.net_db.close()
-
-
-          def _get(url: str) -> dict:
-              with urlopen(url, timeout=10) as r:
-                  body = json.loads(
-                      r.read().decode("utf-8")
-                  )
-              assert isinstance(body, dict)
-              return body
-
-
-          def _post(url: str, doc: dict) -> dict:
-              request = Request(
-                  url,
-                  data=json.dumps(doc).encode("utf-8"),
-                  headers={
-                      "Content-Type": "application/json"
-                  },
-                  method="POST",
+          def main() -> None:
+              logging.basicConfig(
+                  level=logging.INFO,
+                  format=(
+                      "%(asctime)s %(name)s "
+                      "%(levelname)s %(message)s"
+                  ),
               )
-              with urlopen(request, timeout=10) as response:
-                  body = json.loads(
-                      response.read().decode("utf-8")
-                  )
-              assert isinstance(body, dict)
-              return body
+              log = logging.getLogger("zyra.main")
 
-
-          def _post_status(url: str, doc: dict) -> int:
-              request = Request(
-                  url,
-                  data=json.dumps(doc).encode("utf-8"),
-                  headers={
-                      "Content-Type": "application/json"
-                  },
-                  method="POST",
+              master = os.environ.get(
+                  "ZYRA_ROOT_KEY"
               )
+              if not master:
+                  raise SystemExit(
+                      "ZYRA_ROOT_KEY is required"
+                      " (64 hex chars)."
+                  )
+              token = os.environ.get(
+                  "ZYRA_API_TOKEN"
+              ) or None
+              if token is not None and len(
+                  token
+              ) < 16:
+                  raise SystemExit(
+                      "ZYRA_API_TOKEN must be at"
+                      " least 16 characters"
+                  )
+              port = int(
+                  os.environ.get("ZYRA_PORT")
+                  or os.environ.get("PORT")
+                  or 8080
+              )
+
+              os.makedirs(
+                  DATA_DIR, exist_ok=True
+              )
+              db = SQLiteAdapter(
+                  DB_PATH, busy_timeout_ms=10_000
+              )
+              clock = SystemClock()
+
+              authority = PersistentRootAuthority(
+                  data_dir=Path(DATA_DIR),
+                  master_key_hex=master,
+              )
+              signer, status = (
+                  authority.load_or_create()
+              )
+              log.info(
+                  "root authority: %s"
+                  " fingerprint=%s",
+                  status.status.value,
+                  status.public_pem_fingerprint,
+              )
+
+              config = RuntimeConfig(
+                  host="0.0.0.0",
+                  port=port,
+                  max_body_bytes=5_000_000,
+                  api_token=token,
+              )
+              kernel = ZyraKernel(
+                  db=db,
+                  clock=clock,
+                  signer=signer,
+                  config=config,
+              )
+              root = kernel.bootstrap_root()
+              caps = ZyraCapabilities(
+                  db,
+                  clock,
+                  identity=kernel.identity,
+                  signer=signer,
+              )
+              server = serve_combined(
+                  kernel,
+                  caps,
+                  host=config.host,
+                  port=config.port,
+              )
+
+              log.info(
+                  "Zyra Network is LIVE"
+              )
+              log.info(
+                  "root zid=%s", root.zid
+              )
+              log.info(
+                  "combined surface on port"
+                  " %s: core API + 14 trust"
+                  " capability routes",
+                  port,
+              )
+
               try:
-                  with urlopen(request, timeout=10) as response:
-                      return response.status
-              except HTTPError as exc:
-                  return exc.code
-
-
-          def _get_html(url: str) -> str:
-              with urlopen(url, timeout=10) as r:
-                  return r.read().decode("utf-8")
-
-
-          def test_aid_full_lifecycle(tmp_path: Path) -> None:
-              eco = _Ecosystem(tmp_path)
-              try:
-                  assert eco.link.register_app()[0] is True
-                  created = _post(
-                      eco.agro_base + "/agro/producers",
-                      {
-                          "name": "Jose Rural",
-                          "producer_type": "agricultor",
-                          "location": "Chalatenango",
-                      },
-                  )
-                  row = created["data"]
-                  producer_id = str(row["producer_id"])
-                  zid = row.get("zid")
-                  assert isinstance(zid, str)
-                  assert zid.startswith("ZID-")
-                  verified = _post(
-                      eco.agro_base + "/agro/producers/verify",
-                      {"producer_id": producer_id},
-                  )
-                  assert verified["data"]["verified"] is True
-                  aid = _post(
-                      eco.agro_base + "/agro/aid/request",
-                      {
-                          "producer_id": producer_id,
-                          "program": "semillas",
-                          "item": "maiz criollo",
-                          "quantity": 10,
-                      },
-                  )["data"]
-                  aid_id = str(aid["aid_id"])
-                  assert aid["status"] == "requested"
-                  assert aid["zid"] == zid
-                  assert (
-                      aid["events"][0]["network_seq"]
-                      is not None
-                  )
-                  dup = _post_status(
-                      eco.agro_base + "/agro/aid/request",
-                      {
-                          "producer_id": producer_id,
-                          "program": "semillas",
-                          "item": "maiz",
-                          "quantity": 3,
-                      },
-                  )
-                  assert dup == 400
-                  result = _post(
-                      eco.agro_base + "/agro/aid/eligibility",
-                      {"aid_id": aid_id},
-                  )["data"]
-                  assert result["status"] == "eligible"
-                  result = _post(
-                      eco.agro_base
-                      + "/agro/government/approve",
-                      {"aid_id": aid_id},
-                  )["data"]
-                  assert result["status"] == "approved"
-                  result = _post(
-                      eco.agro_base
-                      + "/agro/government/assign",
-                      {"aid_id": aid_id, "detail": "lote 7"},
-                  )["data"]
-                  assert result["status"] == "assigned"
-                  result = _post(
-                      eco.agro_base
-                      + "/agro/government/deliver",
-                      {
-                          "aid_id": aid_id,
-                          "detail": "entregado en centro",
-                      },
-                  )["data"]
-                  assert result["status"] == "delivered"
-                  result = _post(
-                      eco.agro_base
-                      + "/agro/government/confirm",
-                      {"aid_id": aid_id},
-                  )["data"]
-                  assert result["status"] == "confirmed"
-                  assert [
-                      e["transition"] for e in result["events"]
-                  ] == [
-                      "AID_REQUESTED",
-                      "AID_ELIGIBILITY_EVALUATED",
-                      "AID_APPROVED",
-                      "AID_ASSIGNED",
-                      "AID_DELIVERED",
-                      "AID_DELIVERY_CONFIRMED",
-                  ]
-                  detail = _get(
-                      eco.agro_base + "/agro/aid/" + aid_id
-                  )["data"]
-                  assert detail["status"] == "confirmed"
-                  created2 = _post(
-                      eco.agro_base + "/agro/producers",
-                      {
-                          "name": "Nuevo Sin Verificar",
-                          "producer_type": "agricultor",
-                      },
-                  )
-                  producer2 = str(
-                      created2["data"]["producer_id"]
-                  )
-                  aid2 = _post(
-                      eco.agro_base + "/agro/aid/request",
-                      {
-                          "producer_id": producer2,
-                          "program": "fertilizante",
-                          "item": "urea",
-                          "quantity": 5,
-                      },
-                  )["data"]
-                  rejected = _post(
-                      eco.agro_base + "/agro/aid/eligibility",
-                      {"aid_id": str(aid2["aid_id"])},
-                  )["data"]
-                  assert rejected["status"] == "rejected"
-                  bad = _post_status(
-                      eco.agro_base
-                      + "/agro/government/approve",
-                      {"aid_id": str(aid2["aid_id"])},
-                  )
-                  assert bad == 400
-                  ayudas = _get_html(
-                      eco.agro_base
-                      + "/agro/ayudas/"
-                      + producer_id
-                  )
-                  assert "Mis ayudas del Gobierno" in ayudas
-                  assert "semillas" in ayudas
-                  assert "confirmed" in ayudas
-                  gov_aid = _get_html(
-                      eco.agro_base + "/agro/ayudas"
-                  )
-                  assert "Ayudas gubernamentales" in gov_aid
-                  assert "semillas" in gov_aid
-                  assert "fertilizante" in gov_aid
-                  panel = _get_html(
-                      eco.agro_base
-                      + "/agro/productor/"
-                      + producer_id
-                  )
-                  assert "Mi Panel" in panel
-                  assert "Jose Rural" in panel
-                  gov = _get_html(
-                      eco.agro_base + "/agro/gobierno"
-                  )
-                  assert "Gobierno" in gov
-                  assert "Soberania" in gov
-                  summary = _get(
-                      eco.agro_base
-                      + "/agro/government/summary"
-                  )["data"]
-                  assert summary["producers_total"] == 2
-                  assert summary["aid_total"] == 2
-                  assert summary["aid_by_status"]["confirmed"] == 1
-                  assert summary["aid_by_status"]["rejected"] == 1
-                  assert "semillas" in summary["aid_by_program"]
-                  assert (
-                      "fertilizante"
-                      in summary["aid_by_program"]
-                  )
+                  server.serve_forever()
+              except KeyboardInterrupt:
+                  pass
               finally:
-                  eco.close()
-          PYEOF
-          echo "e2e written"
+                  server.server_close()
+                  db.close()
 
-      - name: Run AGRO tests (regression plus aid e2e)
+
+          if __name__ == "__main__":
+              main()
+          PYEOF
+          python -m py_compile main.py
+          echo "main.py v2 written and compiles"
+
+      - name: Write render.yaml v2 (data dir included)
         run: |
           set -euo pipefail
-          PYTHONPATH="$PWD" python -m pytest -q -p no:cacheprovider --timeout=120 --timeout-method=thread apps/agro/tests/
-          echo "AGRO tests OK"
-          find apps/agro -name '__pycache__' -type d \
-            -prune -exec rm -rf {} +
+          cat > render.yaml <<'EOF'
+          services:
+            - type: web
+              name: zyra-network
+              runtime: python
+              plan: free
+              buildCommand: |
+                pip install --upgrade pip
+                pip install -r requirements.txt
+              startCommand: python main.py
+              healthCheckPath: /health
+              envVars:
+                - key: PYTHON_VERSION
+                  value: "3.12.4"
+                - key: ZYRA_PORT
+                  value: "10000"
+                - key: ZYRA_DATA_DIR
+                  value: "/tmp/zyra-data"
+                - key: ZYRA_ROOT_KEY
+                  sync: false
+                - key: ZYRA_API_TOKEN
+                  sync: false
+          EOF
+          echo "render.yaml v2 written"
+          cat render.yaml
+
+      - name: Smoke test (real production boot)
+        run: |
+          set -euo pipefail
+          export ZYRA_ROOT_KEY=$(python -c "import secrets; print(secrets.token_hex(32))")
+          export ZYRA_API_TOKEN="zyra-smoke-token-1234567890"
+          export ZYRA_PORT=8765
+          export ZYRA_DATA_DIR=/tmp/zyra-smoke
+          python main.py > /tmp/zyra.log 2>&1 &
+          PID=$!
+          sleep 5
+          if kill -0 "$PID" 2>/dev/null; then
+            echo "SMOKE OK: server process alive"
+          else
+            echo "SMOKE FAIL: server died"
+            cat /tmp/zyra.log
+            exit 1
+          fi
+          if grep -q "Zyra Network is LIVE" /tmp/zyra.log; then
+            echo "LOG CONFIRMS: LIVE"
+          else
+            echo "LOG MISSING LIVE MARKER"
+            cat /tmp/zyra.log
+            kill "$PID" || true
+            exit 1
+          fi
+          if grep -q "root zid=" /tmp/zyra.log; then
+            echo "ROOT ZID BOOTSTRAPPED"
+          fi
+          kill "$PID" || true
+          wait "$PID" 2>/dev/null || true
+          echo "=== SMOKE COMPLETE ==="
 
       - name: Commit and push (race-safe)
         run: |
@@ -1711,7 +256,7 @@ jobs:
           if git diff --cached --quiet; then
             echo "No changes."
           else
-            git commit -m "zyra: Q3 AGRO aid v3 - additive migration 3 (aid requests + events), server patched only in route chains and methods (original HTML untouched byte-identical), full lifecycle requested to confirmed, eligibility rule verified producer, anti-duplicate and wrong-order rejection, transitions on network history by ZID, new aid screens for producer and government; probe + aid e2e"
+            git commit -m "zyra: deploy prep - requirements.txt with real deps (was empty), main.py v2 serves core API plus 14 trust capabilities on one port via serve_combined (pattern proven in tests), render.yaml v2 with ZYRA_DATA_DIR and requirements install; production smoke boot passed"
             git push origin "HEAD:${{ github.ref_name }}"
           fi
-          echo "=== Q3 AGRO COMPLETE ==="
+          echo "=== DEPLOY PREP COMPLETE ==="

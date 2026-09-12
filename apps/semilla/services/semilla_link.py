@@ -7,32 +7,21 @@ from apps.semilla.infrastructure.network.network_client import (
 
 
 class SemillaLink:
-    def __init__(
-        self, client: NetworkClient
-    ) -> None:
+    def __init__(self, client: NetworkClient) -> None:
         self._client = client
 
-    def register_app(self) -> tuple[
-        bool, dict | None, str | None
-    ]:
+    def register_app(self) -> tuple[bool, dict | None, str | None]:
         return self._client.post(
             "/apps/register",
             {
                 "app_id": "semilla",
-                "display_name": (
-                    "SEMILLA - Educacion"
-                ),
-                "scopes": [
-                    "display_name",
-                    "contact",
-                ],
+                "display_name": "SEMILLA - Educacion",
+                "scopes": ["display_name", "contact"],
             },
         )
 
     def register_person(
-        self,
-        display_name: str,
-        kind: str = "person",
+        self, display_name: str, kind: str = "person",
     ) -> tuple[bool, dict | None, str | None]:
         return self._client.post(
             "/identity/register",
@@ -43,11 +32,14 @@ class SemillaLink:
             },
         )
 
+    def complete_trust(self, zid: str) -> tuple[bool, dict | None, str | None]:
+        return self._client.post(
+            "/trust/complete",
+            {"zid": zid, "actor": "semilla"},
+        )
+
     def record_milestone(
-        self,
-        zid: str,
-        milestone: str,
-        detail: str,
+        self, zid: str, milestone: str, detail: str,
     ) -> tuple[bool, dict | None, str | None]:
         return self._client.post(
             "/history/append",
@@ -55,32 +47,41 @@ class SemillaLink:
                 "zid": zid,
                 "entry_type": "education",
                 "actor_app": "semilla",
-                "payload": {
-                    "milestone": milestone,
-                    "detail": detail,
-                },
+                "payload": {"milestone": milestone, "detail": detail},
             },
         )
 
     def give_star(
-        self,
-        subject_zid: str,
-        actor_zid: str,
-        reason: str,
+        self, subject_zid: str, actor_zid: str, reason: str,
     ) -> tuple[bool, dict | None, str | None]:
         import base64
 
-        evidence = base64.b64encode(
-            reason.encode("utf-8")
-        ).decode("ascii")
+        evidence = base64.b64encode(reason.encode("utf-8")).decode("ascii")
         return self._client.post(
             "/reputation/record",
             {
-                "subject_zid": (
-                    subject_zid
-                ),
+                "subject_zid": subject_zid,
                 "actor_zid": actor_zid,
                 "kind": "positive",
                 "evidence_b64": evidence,
+            },
+        )
+
+    def issue_education_credential(
+        self,
+        *,
+        subject_zid: str,
+        issuer_zid: str,
+        title: str,
+        detail: str,
+    ) -> tuple[bool, dict | None, str | None]:
+        return self._client.post(
+            "/verification/credentials",
+            {
+                "subject_zid": subject_zid,
+                "issuer_zid": issuer_zid,
+                "credential_type": "education",
+                "title": title,
+                "detail": detail,
             },
         )

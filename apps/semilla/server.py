@@ -348,6 +348,15 @@ class SemillaApiHandler(
                 ),
             )
             return
+        if s[0] == "retos" and len(s) > 1:
+            self._screen_retos(s[1])
+            return
+        if s[0] == "talentos" and len(s) > 1:
+            self._screen_talentos(s[1])
+            return
+        if s[0] == "mensajes" and len(s) > 1:
+            self._screen_mensajes(s[1])
+            return
         if s[0] == "institucion":
             account_id = (
                 s[1] if len(s) > 1 else ""
@@ -505,6 +514,12 @@ class SemillaApiHandler(
                 ),
             )
             return
+        if s == ["challenge"]:
+            self._challenge_route(doc)
+            return
+        if s == ["advance"]:
+            self._advance_route(doc)
+            return
         if s == ["welfare"]:
             student_account = self._req(
                 doc, "student_account"
@@ -654,6 +669,18 @@ class SemillaApiHandler(
                 },
             )
             return
+        if len(s) == 2 and s[0] == "profile":
+            self._api_profile(s[1])
+            return
+        if len(s) == 2 and s[0] == "messages":
+            self._api_messages(s[1])
+            return
+        if len(s) == 2 and s[0] == "rewards":
+            self._api_rewards(s[1])
+            return
+        if len(s) == 2 and s[0] == "talents":
+            self._api_talents(s[1])
+            return
         if s == ["summary"]:
             self._send(
                 200,
@@ -680,6 +707,15 @@ class SemillaApiHandler(
     ) -> None:
         store = type(self).store
         doc = self._read_json()
+        if s == ["challenges"]:
+            self._api_challenge(doc)
+            return
+        if s == ["advance"]:
+            self._advance_route(doc)
+            return
+        if s == ["certify"]:
+            self._certify_route(doc)
+            return
         if s == ["accounts"]:
             account_id = (
                 "SEM-"
@@ -738,6 +774,352 @@ class SemillaApiHandler(
                     "type": "not_found",
                     "message":
                     "unknown api route",
+                },
+            },
+        )
+
+    def _trust_best_effort(self, zid: str | None) -> bool:
+        if not zid:
+            return False
+        try:
+            ok, _d, _e = type(self).link.complete_trust(str(zid))
+            return bool(ok)
+        except Exception:
+            return False
+
+    def _network_milestone(
+        self, zid: str | None, milestone: str, detail: str,
+    ) -> bool:
+        if not zid:
+            return False
+        try:
+            ok, _d, _e = type(self).link.record_milestone(
+                str(zid), milestone, detail
+            )
+            return bool(ok)
+        except Exception:
+            return False
+
+    def _announce_talent(self, student: dict, talent: dict) -> None:
+        store = type(self).store
+        text = (
+            str(student.get("name"))
+            + " ha demostrado talento en "
+            + str(talent["domain"])
+        )
+        for profesor in store.list_by_role(
+            role="profesor",
+            school=student.get("school"),
+        ):
+            store.add_message(
+                message_id="MSG-" + uuid.uuid4().hex[:10],
+                recipient=str(profesor["account_id"]),
+                text=text,
+                student_account=str(student["account_id"]),
+            )
+        store.add_message(
+            message_id="MSG-" + uuid.uuid4().hex[:10],
+            recipient="familia",
+            text=text,
+            student_account=str(student["account_id"]),
+        )
+        self._network_milestone(
+            student.get("zid"),
+            "talento",
+            str(talent["domain"]),
+        )
+
+    def _challenge_flow(self, doc: dict) -> dict:
+        store = type(self).store
+        tutor = type(self).tutor
+        student_account = self._req(doc, "student_account")
+        answer = self._req(doc, "answer")
+        state = store.get_challenge_state(student_account=student_account)
+        domain = str(state["domain"])
+        difficulty = int(state["difficulty"])
+        correct = tutor.check_answer(
+            domain=domain,
+            difficulty=difficulty,
+            submitted=answer,
+        )
+        new_difficulty = tutor.adapt_difficulty(
+            difficulty=difficulty, correct=correct
+        )
+        store.record_attempt(
+            attempt_id="ATT-" + uuid.uuid4().hex[:10],
+            student_account=student_account,
+            domain=domain,
+            difficulty=difficulty,
+            correct=correct,
+        )
+        store.set_challenge_state(
+            student_account=student_account,
+            domain=domain,
+            difficulty=new_difficulty,
+        )
+        points_earned = 0
+        if correct:
+            store.add_reward(
+                reward_id="REW-" + uuid.uuid4().hex[:10],
+                student_account=student_account,
+                kind="reto",
+                detail=domain + " nivel " + str(difficulty),
+                points=10,
+            )
+            points_earned = 10
+        student = store.get_account(student_account)
+        for talent in store.detect_talents(student_account=student_account):
+            self._announce_talent(student, talent)
+        return {
+            "correct": correct,
+            "domain": domain,
+            "difficulty": new_difficulty,
+            "points_earned": points_earned,
+            "total_points": store.total_points(student_account=student_account),
+        }
+
+    def _challenge_route(self, doc: dict) -> None:
+        result = self._challenge_flow(doc)
+        if result["correct"]:
+            feedback = "Correcto. Nivel ahora: " + str(result["difficulty"])
+        else:
+            feedback = "Incorrecto. Sigue intentando."
+        back_link = (
+            "<a href='/semilla/retos/"
+            + self._req(doc, "student_account")
+            + "'><button>Volver a retos</button></a>"
+        )
+        self._html(
+            200,
+            _page(
+                "Reto SEMILLA",
+                "<h1>Reto SEMILLA</h1>"
+                "<p>" + feedback + "</p>"
+                "<p>Puntos: " + str(result["total_points"]) + "</p>"
+                + back_link
+            ),
+        )
+
+    def _api_challenge(self, doc: dict) -> None:
+        result = self._challenge_flow(doc)
+        self._send(200, {"ok": True, "data": result})
+
+    def _advance_route(self, doc: dict) -> None:
+        store = type(self).store
+        student_account = self._req(doc, "student_account")
+        new_grade = self._req(doc, "new_grade")
+        student = store.get_account(student_account)
+        if student.get("role") != "alumno":
+            raise ValueError("only students advance")
+        store.update_grade(account_id=student_account, new_grade=new_grade)
+        milestone = self._network_milestone(
+            student.get("zid"),
+            "avance",
+            new_grade,
+        )
+        text = str(student.get("name")) + " avanza a " + new_grade
+        store.add_message(
+            message_id="MSG-" + uuid.uuid4().hex[:10],
+            recipient="familia",
+            text=text,
+            student_account=student_account,
+        )
+        for profesor in store.list_by_role(
+            role="profesor",
+            school=student.get("school"),
+        ):
+            store.add_message(
+                message_id="MSG-" + uuid.uuid4().hex[:10],
+                recipient=str(profesor["account_id"]),
+                text=text,
+                student_account=student_account,
+            )
+        self._send(
+            200,
+            {
+                "ok": True,
+                "data": {
+                    "student_account": student_account,
+                    "grade": new_grade,
+                    "milestone_recorded": bool(milestone),
+                },
+            },
+        )
+
+    def _certify_route(self, doc: dict) -> None:
+        store = type(self).store
+        student_account = self._req(doc, "student_account")
+        teacher_account = self._req(doc, "teacher_account")
+        student = store.get_account(student_account)
+        teacher = store.get_account(teacher_account)
+        if student.get("zid") is None:
+            raise ValueError("student has no network ZID")
+        if teacher.get("zid") is None:
+            ok, data, _e = type(self).link.register_person(
+                str(teacher.get("name"))
+            )
+            if ok and data is not None:
+                zid = data.get("zid")
+                if zid:
+                    store.set_zid(account_id=teacher_account, zid=str(zid))
+        teacher = store.get_account(teacher_account)
+        talents = store.list_talents(student_account=student_account)
+        average = store.average_of(student_account=student_account)
+        if not talents and (average is None or average < 8.0):
+            raise ValueError("sin merito certifiable")
+        self._trust_best_effort(student.get("zid"))
+        self._trust_best_effort(teacher.get("zid"))
+        ok, data, err = type(self).link.issue_education_credential(
+            subject_zid=str(student.get("zid")),
+            issuer_zid=str(teacher.get("zid")),
+            title="Certificado SEMILLA",
+            detail="trayectoria educativa verificada",
+        )
+        result = {"issued": bool(ok)}
+        if ok and data is not None:
+            credential_id = data.get("credential_id") or data.get("id")
+            if credential_id:
+                result["credential_id"] = credential_id
+        elif not ok:
+            result["error"] = err
+        store.add_message(
+            message_id="MSG-" + uuid.uuid4().hex[:10],
+            recipient="familia",
+            text="Certificado educativo emitido para "
+            + str(student.get("name")),
+            student_account=student_account,
+        )
+        self._send(200, {"ok": True, "data": result})
+
+    def _screen_retos(self, student_id: str) -> None:
+        store = type(self).store
+        tutor = type(self).tutor
+        student = store.get_account(student_id)
+        state = store.get_challenge_state(student_account=student_id)
+        challenge = tutor.next_challenge(
+            domain=str(state["domain"]),
+            difficulty=int(state["difficulty"]),
+        )
+        options_html = "".join(
+            "<option value='" + o + "'>" + o + "</option>"
+            for o in challenge["options"]
+        )
+        attempts = store.attempts_of(student_account=student_id)
+        body = (
+            "<h1>Retos SEMILLA</h1>"
+            "<p>" + str(student.get("name")) + "</p>"
+            "<p>Area: " + str(challenge["domain"])
+            + " | Nivel: " + str(challenge["difficulty"])
+            + " | Intentos: " + str(len(attempts)) + "</p>"
+            "<div class='card'>"
+            "<form method='POST' action='/semilla/challenge'>"
+            "<input type='hidden' name='student_account'"
+            " value='" + student_id + "'>"
+            "<p><b>" + str(challenge["question"]) + "</b></p>"
+            "<select name='answer'>" + options_html + "</select>"
+            "<button>Enviar respuesta</button></form></div>"
+            "<p><small>El Tutor mide tu respuesta. No resuelve el reto por ti.</small></p>"
+            "<a href='/semilla'><button class='gray'>Inicio</button></a>"
+        )
+        self._html(200, _page("SEMILLA - Retos", body))
+
+    def _screen_talentos(self, student_id: str) -> None:
+        store = type(self).store
+        tutor = type(self).tutor
+        student = store.get_account(student_id)
+        for talent in store.detect_talents(student_account=student_id):
+            self._announce_talent(student, talent)
+        talents = store.list_talents(student_account=student_id)
+        grades = store.grades_of(student_account=student_id)
+        attendance = store.attendance_rate(student_account=student_id)
+        profile = tutor.student_profile(grades=grades, attendance=attendance)
+        rows = "".join(
+            "<li>- " + str(t["domain"])
+            + " (" + str(t["evidence"]) + ")</li>"
+            for t in talents
+        )
+        if not rows:
+            rows = "<li>Talento en formacion: sigue intentando</li>"
+        state = store.get_challenge_state(student_account=student_id)
+        body = (
+            "<h1>Talentos detectados</h1>"
+            "<p>" + str(student.get("name")) + "</p>"
+            "<ul>" + rows + "</ul>"
+            "<p>Recomendado: retos de " + str(state["domain"])
+            + " nivel " + str(state["difficulty"]) + "</p>"
+            "<p>Fortalezas: " + ", ".join(profile["strengths"]) + "</p>"
+            "<p>Por reforzar: " + ", ".join(profile["weaknesses"]) + "</p>"
+            "<a href='/semilla/retos/" + student_id
+            + "'><button>Ir a mis retos</button></a>"
+            "<a href='/semilla'><button class='gray'>Inicio</button></a>"
+        )
+        self._html(200, _page("SEMILLA - Talentos", body))
+
+    def _screen_mensajes(self, recipient_id: str) -> None:
+        store = type(self).store
+        messages = store.messages_of(recipient=recipient_id)
+        rows = "".join(
+            "<li>- " + str(m["text"]) + "</li>"
+            for m in messages
+        )
+        if not rows:
+            rows = "<li>Sin mensajes todavia</li>"
+        body = (
+            "<h1>Mensajes</h1>"
+            "<ul>" + rows + "</ul>"
+            "<a href='/semilla'><button class='gray'>Inicio</button></a>"
+        )
+        self._html(200, _page("SEMILLA - Mensajes", body))
+
+    def _api_profile(self, account_id: str) -> None:
+        store = type(self).store
+        student = store.get_account(account_id)
+        grades = store.grades_of(student_account=account_id)
+        attendance = store.attendance_rate(student_account=account_id)
+        profile = type(self).tutor.student_profile(
+            grades=grades, attendance=attendance
+        )
+        profile["student_account"] = account_id
+        profile["name"] = str(student.get("name"))
+        self._send(200, {"ok": True, "data": profile})
+
+    def _api_messages(self, recipient_id: str) -> None:
+        store = type(self).store
+        messages = store.messages_of(recipient=recipient_id)
+        self._send(
+            200,
+            {
+                "ok": True,
+                "data": {
+                    "recipient": recipient_id,
+                    "messages": list(messages),
+                },
+            },
+        )
+
+    def _api_rewards(self, account_id: str) -> None:
+        store = type(self).store
+        self._send(
+            200,
+            {
+                "ok": True,
+                "data": {
+                    "student_account": account_id,
+                    "total_points": store.total_points(student_account=account_id),
+                    "rewards": list(store.rewards_of(student_account=account_id)),
+                },
+            },
+        )
+
+    def _api_talents(self, account_id: str) -> None:
+        store = type(self).store
+        self._send(
+            200,
+            {
+                "ok": True,
+                "data": {
+                    "student_account": account_id,
+                    "talents": list(store.list_talents(student_account=account_id)),
                 },
             },
         )

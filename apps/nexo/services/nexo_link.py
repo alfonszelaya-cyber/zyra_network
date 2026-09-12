@@ -41,6 +41,26 @@ class NexoLink:
             },
         )
 
+    def register_person(
+        self, display_name: str
+    ) -> tuple[bool, dict | None, str | None]:
+        return self._client.post(
+            "/identity/register",
+            {
+                "kind": "person",
+                "display_name": display_name,
+                "actor": "nexo",
+            },
+        )
+
+    def complete_trust(
+        self, zid: str,
+    ) -> tuple[bool, dict | None, str | None]:
+        return self._client.post(
+            "/trust/complete",
+            {"zid": zid, "actor": "nexo"},
+        )
+
     def record_fiscal_event(
         self,
         zid: str,
@@ -80,5 +100,25 @@ class NexoLink:
                 + invoice_id,
                 "content_b64": encoded,
                 "actor_app": "nexo",
+            },
+        )
+
+    def issue_financial_credential(
+        self,
+        *,
+        subject_zid: str,
+        issuer_zid: str,
+        title: str,
+        detail: str,
+    ) -> tuple[bool, dict | None, str | None]:
+        return self._client.post(
+            "/verification/credentials",
+            {
+                "subject_zid": subject_zid,
+                "issuer_zid": issuer_zid,
+                "credential_type":
+                "financial",
+                "title": title,
+                "detail": detail,
             },
         )

@@ -1,5 +1,6 @@
 """NexoCore durable ledger: hash-chained
-accounting between ZIDs (fiscal kinds only)."""
+accounting between ZIDs (fiscal kinds only)
++ document analysis with provenance."""
 from __future__ import annotations
 
 import hashlib
@@ -46,6 +47,40 @@ _MIGRATIONS = (
             " prev_hash TEXT NOT NULL,"
             " synced INTEGER NOT NULL"
             " DEFAULT 0,"
+            " created_at REAL NOT NULL)",
+        ),
+    ),
+    Migration(
+        2,
+        "nexo_vision",
+        (
+            "CREATE TABLE nexo_analyses ("
+            " analysis_id TEXT PRIMARY KEY,"
+            " content_sha256 TEXT NOT NULL,"
+            " model_id TEXT NOT NULL,"
+            " model_version TEXT NOT NULL,"
+            " verdict TEXT NOT NULL,"
+            " confidence REAL NOT NULL,"
+            " classification TEXT NOT NULL,"
+            " detail TEXT,"
+            " created_at REAL NOT NULL)",
+            "CREATE TABLE nexo_documents ("
+            " document_id TEXT PRIMARY KEY,"
+            " content_sha256 TEXT NOT NULL,"
+            " title TEXT NOT NULL,"
+            " analysis_id TEXT NOT NULL,"
+            " kind TEXT NOT NULL,"
+            " amount REAL NOT NULL,"
+            " seller_zid TEXT NOT NULL,"
+            " buyer_zid TEXT NOT NULL,"
+            " operation_id TEXT NOT NULL,"
+            " invoice_id TEXT,"
+            " synced INTEGER NOT NULL"
+            " DEFAULT 0,"
+            " created_at REAL NOT NULL)",
+            "CREATE TABLE nexo_duplicates ("
+            " duplicate_id TEXT PRIMARY KEY,"
+            " content_sha256 TEXT NOT NULL,"
             " created_at REAL NOT NULL)",
         ),
     ),
@@ -270,7 +305,9 @@ class NexoStore:
                 != prev
             ):
                 return False
-            prev = str(r["entry_hash"])
+            prev = str(
+                r["entry_hash"]
+            )
         return True
 
     def list_operations(
@@ -339,5 +376,327 @@ class NexoStore:
             "by_kind": by_kind,
             "chain_intact": (
                 self.verify_chain()
+            ),
+        }
+
+    def save_analysis(
+        self,
+        *,
+        analysis_id: str,
+        content_sha256: str,
+        model_id: str,
+        model_version: str,
+        verdict: str,
+        confidence: float,
+        classification: str,
+        detail: str | None,
+    ) -> dict[str, object]:
+        now = self._clock.now()
+        with self._db.transaction() as cursor:
+            cursor.execute(
+                "INSERT INTO nexo_analyses"
+                " (analysis_id,"
+                "  content_sha256, model_id,"
+                "  model_version, verdict,"
+                "  confidence, classification,"
+                "  detail, created_at)"
+                " VALUES (?, ?, ?, ?, ?,"
+                "  ?, ?, ?, ?)",
+                (
+                    analysis_id,
+                    content_sha256,
+                    model_id,
+                    model_version,
+                    verdict,
+                    float(confidence),
+                    classification,
+                    detail,
+                    now,
+                ),
+            )
+        return {
+            "analysis_id": analysis_id,
+            "content_sha256": (
+                content_sha256
+            ),
+            "model_id": model_id,
+            "model_version": (
+                model_version
+            ),
+            "verdict": verdict,
+            "confidence": float(
+                confidence
+            ),
+            "classification": (
+                classification
+            ),
+        }
+
+    def get_analysis(
+        self, analysis_id: str,
+    ) -> dict[str, object] | None:
+        row = self._db.query_one(
+            "SELECT * FROM nexo_analyses"
+            " WHERE analysis_id = ?",
+            (analysis_id,),
+        )
+        if row is None:
+            return None
+        return {
+            "analysis_id": str(
+                row["analysis_id"]
+            ),
+            "content_sha256": str(
+                row["content_sha256"]
+            ),
+            "model_id": str(
+                row["model_id"]
+            ),
+            "model_version": str(
+                row["model_version"]
+            ),
+            "verdict": str(
+                row["verdict"]
+            ),
+            "confidence": float(
+                row["confidence"]
+            ),
+            "classification": str(
+                row["classification"]
+            ),
+        }
+
+    def save_document(
+        self,
+        *,
+        document_id: str,
+        content_sha256: str,
+        title: str,
+        analysis_id: str,
+        kind: str,
+        amount: float,
+        seller_zid: str,
+        buyer_zid: str,
+        operation_id: str,
+        invoice_id: str | None,
+        synced: bool,
+    ) -> dict[str, object]:
+        now = self._clock.now()
+        with self._db.transaction() as cursor:
+            cursor.execute(
+                "INSERT INTO nexo_documents"
+                " (document_id,"
+                "  content_sha256, title,"
+                "  analysis_id, kind, amount,"
+                "  seller_zid, buyer_zid,"
+                "  operation_id, invoice_id,"
+                "  synced, created_at)"
+                " VALUES (?, ?, ?, ?, ?,"
+                "  ?, ?, ?, ?, ?, ?, ?)",
+                (
+                    document_id,
+                    content_sha256,
+                    title,
+                    analysis_id,
+                    kind,
+                    float(amount),
+                    seller_zid,
+                    buyer_zid,
+                    operation_id,
+                    invoice_id,
+                    int(synced),
+                    now,
+                ),
+            )
+        return {
+            "document_id": document_id,
+            "content_sha256": (
+                content_sha256
+            ),
+            "analysis_id": analysis_id,
+            "kind": kind,
+            "amount": float(amount),
+            "operation_id": (
+                operation_id
+            ),
+            "invoice_id": invoice_id,
+            "synced": synced,
+        }
+
+    def find_document_by_sha(
+        self, content_sha256: str,
+    ) -> dict[str, object] | None:
+        row = self._db.query_one(
+            "SELECT * FROM nexo_documents"
+            " WHERE content_sha256 = ?",
+            (content_sha256,),
+        )
+        if row is None:
+            return None
+        return {
+            "document_id": str(
+                row["document_id"]
+            ),
+            "content_sha256": str(
+                row["content_sha256"]
+            ),
+            "operation_id": str(
+                row["operation_id"]
+            ),
+        }
+
+    def get_document(
+        self, document_id: str,
+    ) -> dict[str, object] | None:
+        row = self._db.query_one(
+            "SELECT * FROM nexo_documents"
+            " WHERE document_id = ?",
+            (document_id,),
+        )
+        if row is None:
+            return None
+        analysis = self.get_analysis(
+            str(row["analysis_id"])
+        )
+        op_row = self._db.query_one(
+            "SELECT seq, entry_hash FROM"
+            " nexo_operations WHERE"
+            " operation_id = ?",
+            (str(row["operation_id"]),),
+        )
+        return {
+            "document_id": str(
+                row["document_id"]
+            ),
+            "content_sha256": str(
+                row["content_sha256"]
+            ),
+            "title": str(row["title"]),
+            "kind": str(row["kind"]),
+            "amount": float(
+                row["amount"]
+            ),
+            "seller_zid": str(
+                row["seller_zid"]
+            ),
+            "buyer_zid": str(
+                row["buyer_zid"]
+            ),
+            "operation_id": str(
+                row["operation_id"]
+            ),
+            "operation_seq": (
+                int(op_row["seq"])
+                if op_row is not None
+                else None
+            ),
+            "operation_hash": (
+                str(op_row["entry_hash"])
+                if op_row is not None
+                else None
+            ),
+            "invoice_id": (
+                str(row["invoice_id"])
+                if row["invoice_id"]
+                is not None
+                else None
+            ),
+            "synced": bool(
+                int(row["synced"])
+            ),
+            "analysis": analysis,
+        }
+
+    def list_documents(
+        self,
+    ) -> tuple[dict[str, object], ...]:
+        rows = self._db.query_all(
+            "SELECT document_id FROM"
+            " nexo_documents"
+            " ORDER BY created_at"
+        )
+        return tuple(
+            self.get_document(
+                str(r["document_id"])
+            )
+            for r in rows
+        )
+
+    def record_duplicate(
+        self, *, content_sha256: str,
+    ) -> dict[str, object]:
+        import uuid
+
+        now = self._clock.now()
+        duplicate_id = (
+            "DUP-"
+            + uuid.uuid4().hex[:10]
+        )
+        with self._db.transaction() as cursor:
+            cursor.execute(
+                "INSERT INTO"
+                " nexo_duplicates ("
+                " duplicate_id,"
+                "  content_sha256,"
+                "  created_at)"
+                " VALUES (?, ?, ?)",
+                (
+                    duplicate_id,
+                    content_sha256,
+                    now,
+                ),
+            )
+        return {
+            "duplicate_id": (
+                duplicate_id
+            ),
+            "content_sha256": (
+                content_sha256
+            ),
+        }
+
+    def count_duplicates(self) -> int:
+        row = self._db.query_one(
+            "SELECT COUNT(*) AS n FROM"
+            " nexo_duplicates"
+        )
+        return (
+            int(row["n"])
+            if row is not None
+            else 0
+        )
+
+    def review_summary(
+        self,
+    ) -> dict[str, object]:
+        base = self.summary()
+        docs = self._db.query_one(
+            "SELECT COUNT(*) AS n FROM"
+            " nexo_documents"
+        )
+        anas = self._db.query_one(
+            "SELECT COUNT(*) AS n FROM"
+            " nexo_analyses"
+        )
+        return {
+            "chain_intact": base[
+                "chain_intact"
+            ],
+            "operations_total": base[
+                "operations_total"
+            ],
+            "by_kind": base["by_kind"],
+            "documents_total": (
+                int(docs["n"])
+                if docs is not None
+                else 0
+            ),
+            "analyses_total": (
+                int(anas["n"])
+                if anas is not None
+                else 0
+            ),
+            "duplicates_blocked": (
+                self.count_duplicates()
             ),
         }

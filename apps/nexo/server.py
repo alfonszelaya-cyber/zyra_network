@@ -144,6 +144,12 @@ class NexoApiHandler(
         if not s or s == ["home"]:
             self._home()
             return
+        if s == ["revision"]:
+            self._screen_revision()
+            return
+        if s[0] == "documento" and len(s) > 1:
+            self._screen_documento(s[1])
+            return
         if s[0] == "contador":
             summary = store.summary()
             if summary["chain_intact"]:
@@ -475,6 +481,12 @@ class NexoApiHandler(
 
     def _api_get(self, s: list[str]) -> None:
         store = type(self).store
+        if s == ["review"]:
+            self._api_review()
+            return
+        if len(s) == 2 and s[0] == "documents":
+            self._api_document_detail(s[1])
+            return
         if s == ["health"]:
             self._send(
                 200,
@@ -540,6 +552,12 @@ class NexoApiHandler(
     ) -> None:
         store = type(self).store
         doc = self._read_json()
+        if s == ["documents"]:
+            self._documents_route(doc)
+            return
+        if s == ["review", "certify"]:
+            self._api_certify(doc)
+            return
         if s == ["companies"]:
             company_id = (
                 "EMP-"
@@ -602,6 +620,296 @@ class NexoApiHandler(
                 },
             },
         )
+
+    def _trust_best_effort(self, zid: str | None) -> bool:
+        if not zid:
+            return False
+        try:
+            ok, _d, _e = type(self).link.complete_trust(str(zid))
+            return bool(ok)
+        except Exception:
+            return False
+
+    @staticmethod
+    def _classify_content(text: str) -> tuple[str, float]:
+        lowered = text.lower()
+        if "factura de venta" in lowered or "venta" in lowered:
+            return "venta", 0.95
+        if "compra" in lowered:
+            return "compra", 0.95
+        if "pago" in lowered:
+            return "pago", 0.95
+        if "cobro" in lowered:
+            return "cobro", 0.95
+        if "ajuste" in lowered:
+            return "ajuste", 0.95
+        return "venta", 0.60
+
+    def _documents_route(self, doc: dict) -> None:
+        store = type(self).store
+        link = type(self).link
+        content = self._req(doc, "content")
+        seller = self._req(doc, "seller_zid")
+        buyer = self._req(doc, "buyer_zid")
+        amount = float(doc.get("amount", 0))
+        if amount <= 0:
+            self._send(
+                200,
+                {
+                    "ok": False,
+                    "error": {
+                        "type": "invalid_amount",
+                        "message": "amount must be positive",
+                    },
+                },
+            )
+            return
+        import hashlib
+        import uuid
+        content_sha = hashlib.sha256(
+            content.encode("utf-8")
+        ).hexdigest()
+        duplicate = store.find_document_by_sha(content_sha)
+        if duplicate is not None:
+            store.record_duplicate(content_sha256=content_sha)
+            self._send(
+                200,
+                {
+                    "ok": False,
+                    "error": {
+                        "type": "duplicate_document",
+                        "message": (
+                            "este documento ya fue registrado"
+                        ),
+                        "document_id": duplicate["document_id"],
+                    },
+                },
+            )
+            return
+        kind, confidence = self._classify_content(content)
+        analysis_id = "ANA-" + uuid.uuid4().hex[:10]
+        analysis = store.save_analysis(
+            analysis_id=analysis_id,
+            content_sha256=content_sha,
+            model_id="nexo-rules-classifier",
+            model_version="1.0",
+            verdict="classified",
+            confidence=confidence,
+            classification=kind,
+            detail=content[:120],
+        )
+        operation_id = "OP-" + uuid.uuid4().hex[:12]
+        row = store.record_operation(
+            operation_id=operation_id,
+            kind=kind,
+            seller_zid=seller,
+            buyer_zid=buyer,
+            amount=amount,
+            description=content[:80],
+            invoice_id=None,
+            synced=False,
+        )
+        invoice_id = None
+        synced = False
+        try:
+            ok, data, _error = link.seal_invoice(
+                owner_zid=seller,
+                invoice_id=operation_id,
+                content=content.encode("utf-8"),
+            )
+            if ok and data is not None:
+                invoice_id = str(data.get("document_id"))
+                synced = True
+        except Exception:
+            invoice_id = None
+            synced = False
+        try:
+            link.record_fiscal_event(
+                seller,
+                kind,
+                operation_id + ": $" + str(amount),
+            )
+        except Exception:
+            pass
+        document_id = "DOC-" + uuid.uuid4().hex[:10]
+        document = store.save_document(
+            document_id=document_id,
+            content_sha256=content_sha,
+            title=content[:60],
+            analysis_id=analysis_id,
+            kind=kind,
+            amount=amount,
+            seller_zid=seller,
+            buyer_zid=buyer,
+            operation_id=operation_id,
+            invoice_id=invoice_id,
+            synced=synced,
+        )
+        self._send(
+            201,
+            {
+                "ok": True,
+                "data": {
+                    "document": document,
+                    "analysis": analysis,
+                    "operation": {
+                        "seq": row["seq"],
+                        "entry_hash": row["entry_hash"],
+                    },
+                },
+            },
+        )
+
+    def _api_review(self) -> None:
+        store = type(self).store
+        self._send(
+            200,
+            {"ok": True, "data": store.review_summary()},
+        )
+
+    def _api_document_detail(self, document_id: str) -> None:
+        store = type(self).store
+        document = store.get_document(document_id)
+        if document is None:
+            self._send(
+                200,
+                {
+                    "ok": False,
+                    "error": {
+                        "type": "not_found",
+                        "message": "unknown document",
+                    },
+                },
+            )
+            return
+        self._send(200, {"ok": True, "data": document})
+
+    def _api_certify(self, doc: dict) -> None:
+        store = type(self).store
+        link = type(self).link
+        subject = self._req(doc, "subject_zid")
+        issuer = self._req(doc, "issuer_zid")
+        if not store.verify_chain():
+            self._send(
+                200,
+                {
+                    "ok": False,
+                    "error": {
+                        "type": "chain_altered",
+                        "message": "la cadena fue alterada",
+                    },
+                },
+            )
+            return
+        documents = [
+            d
+            for d in store.list_documents()
+            if d["seller_zid"] == subject
+        ]
+        if not documents:
+            self._send(
+                200,
+                {
+                    "ok": False,
+                    "error": {
+                        "type": "no_documents",
+                        "message": "sin documentos del sujeto",
+                    },
+                },
+            )
+            return
+        self._trust_best_effort(subject)
+        self._trust_best_effort(issuer)
+        ok, data, err = link.issue_financial_credential(
+            subject_zid=subject,
+            issuer_zid=issuer,
+            title="Constancia de revision contable",
+            detail=(
+                str(len(documents))
+                + " documentos verificados,"
+                + " cadena intacta"
+            ),
+        )
+        result = {"issued": bool(ok)}
+        if ok and data is not None:
+            credential_id = (
+                data.get("credential_id") or data.get("id")
+            )
+            if credential_id:
+                result["credential_id"] = credential_id
+        elif not ok:
+            result["error"] = err
+        self._send(200, {"ok": True, "data": result})
+
+    def _screen_revision(self) -> None:
+        store = type(self).store
+        review = store.review_summary()
+        if review["chain_intact"]:
+            chain = "<div class='ok'>Cadena INTACTA</div>"
+        else:
+            chain = "<div class='bad'>CADENA ALTERADA</div>"
+        rows = ""
+        for d in store.list_documents():
+            analysis = d.get("analysis") or {}
+            rows = (
+                rows
+                + "<li>- " + str(d["title"])
+                + " | " + str(d["kind"])
+                + " | $" + str(d["amount"])
+                + " | sha " + str(d["content_sha256"])[:12]
+                + " | modelo " + str(analysis.get("model_id"))
+                + " v" + str(analysis.get("model_version"))
+                + " | confianza " + str(analysis.get("confidence"))
+                + "</li>"
+            )
+        if not rows:
+            rows = "<li>Sin documentos registrados</li>"
+        body = (
+            "<h1>Revision del Contador</h1>"
+            + chain
+            + "<p>Documentos: " + str(review["documents_total"]) + "</p>"
+            + "<p>Analisis IA: " + str(review["analyses_total"]) + "</p>"
+            + "<p>Duplicados bloqueados: " + str(review["duplicates_blocked"]) + "</p>"
+            + "<h2>Documentos con provenance</h2><ul>"
+            + rows
+            + "</ul>"
+            "<a href='/nexo'><button class='gray'>Inicio</button></a>"
+        )
+        self._html(200, _page("NEXO - Revision", body))
+
+    def _screen_documento(self, document_id: str) -> None:
+        store = type(self).store
+        document = store.get_document(document_id)
+        if document is None:
+            self._html(
+                404,
+                _page("404", "<h1>No encontrado</h1>"),
+            )
+            return
+        analysis = document.get("analysis") or {}
+        body = (
+            "<h1>Documento " + str(document["document_id"]) + "</h1>"
+            "<p>Titulo: " + str(document["title"]) + "</p>"
+            "<p>Tipo: " + str(document["kind"])
+            + " | Monto: $" + str(document["amount"]) + "</p>"
+            "<p>SHA256: " + str(document["content_sha256"]) + "</p>"
+            "<h2>Analisis IA (provenance)</h2>"
+            "<p>Modelo: " + str(analysis.get("model_id"))
+            + " v" + str(analysis.get("model_version")) + "</p>"
+            "<p>Verdict: " + str(analysis.get("verdict"))
+            + " | Confianza: " + str(analysis.get("confidence")) + "</p>"
+            "<p>Analysis ID: " + str(analysis.get("analysis_id")) + "</p>"
+            "<h2>Asiento contable</h2>"
+            "<p>Operacion #" + str(document["operation_seq"])
+            + " | hash " + str(document["operation_hash"]) + "</p>"
+            "<h2>Factura</h2>"
+            "<p>" + (str(document["invoice_id"])
+            + " (sellada en la Red)"
+            if document["synced"]
+            else "pendiente de sello") + "</p>"
+            "<a href='/nexo/revision'><button class='gray'>Revision</button></a>"
+        )
+        self._html(200, _page("NEXO - Documento", body))
 
     def _home(self) -> None:
         body = (

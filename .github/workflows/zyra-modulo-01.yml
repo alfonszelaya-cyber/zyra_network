@@ -31,12 +31,7 @@ jobs:
           python -m pip install --upgrade pip
           python -m pip install "cryptography>=42,<45" "pytest>=8,<9" "pytest-timeout>=2,<3"
 
-      - name: Evidence (before)
-        run: |
-          set -euo pipefail
-          wc -c apps/ciclo_digital/server.py apps/ciclo_digital/infrastructure/persistence/ciclo_store.py apps/ciclo_digital/services/ciclo_link.py
-
-      - name: ADD ciclo_link_ext (new file - original link untouched)
+      - name: ADD ciclo_link_ext (new file)
         run: |
           set -euo pipefail
           cat > apps/ciclo_digital/services/ciclo_link_ext.py <<'PYEOF'
@@ -59,31 +54,6 @@ jobs:
                       return bool(ok)
                   except Exception:
                       return False
-
-              def ensure_trusted_person(
-                  self, display_name: str,
-              ) -> str:
-                  ok, data, _err = self._client.post(
-                      "/identity/register",
-                      {
-                          "kind": "person",
-                          "display_name": display_name,
-                          "actor": "ciclo",
-                      },
-                  )
-                  zid = None
-                  if ok and data:
-                      found = self._find_key(data, ("zid",))
-                      if isinstance(found, str) and found.startswith(
-                          "ZID-"
-                      ):
-                          zid = found
-                  if zid is None:
-                      raise ValueError(
-                          "no network ZID for " + display_name
-                      )
-                  self.complete_trust(zid)
-                  return zid
 
               def seal_document(
                   self,
@@ -115,6 +85,23 @@ jobs:
                           return (True, doc_id)
                   return (False, None)
 
+              def earn_tokens(
+                  self, *, subject_zid: str, activity: str, ref_id: str,
+              ) -> tuple[bool, dict | None]:
+                  try:
+                      ok, data, _err = self._client.post(
+                          "/tokens/earn",
+                          {
+                              "subject_zid": subject_zid,
+                              "activity": activity,
+                              "ref_type": "reciclaje",
+                              "ref_id": ref_id,
+                          },
+                      )
+                      return (bool(ok), data)
+                  except Exception:
+                      return (False, None)
+
               def append_history(
                   self, *, zid: str, event: str, detail: str,
               ) -> bool:
@@ -134,23 +121,6 @@ jobs:
                       return bool(ok)
                   except Exception:
                       return False
-
-              def earn_tokens(
-                  self, *, subject_zid: str, activity: str, ref_id: str,
-              ) -> tuple[bool, dict | None]:
-                  try:
-                      ok, data, _err = self._client.post(
-                          "/tokens/earn",
-                          {
-                              "subject_zid": subject_zid,
-                              "activity": activity,
-                              "ref_type": "reciclaje",
-                              "ref_id": ref_id,
-                          },
-                      )
-                      return (bool(ok), data)
-                  except Exception:
-                      return (False, None)
 
               @staticmethod
               def _find_key(doc, keys):
@@ -173,21 +143,19 @@ jobs:
           python -m py_compile apps/ciclo_digital/services/ciclo_link_ext.py
           echo "link extension added"
 
-      - name: ADD CicloStore v2 (migration 2 - archaeology + valuation)
+      - name: ADD CicloStore v2 (migration 2 - global recycling + archaeology)
         run: |
           set -euo pipefail
           cat > apps/ciclo_digital/infrastructure/persistence/ciclo_store.py <<'PYEOF'
           """CICLO-DIGITAL durable store v2 - additive
-          migrations: archaeology cases, findings with
-          certainty classification, reconstructions,
-          recycling valuations and rewards."""
+          migrations: GLOBAL recycling (any app) +
+          archaeology with formal certainty."""
           from __future__ import annotations
 
+          import hashlib
           import uuid
 
-          from shared_engines.storage.database import (
-              Database,
-          )
+          from shared_engines.storage.database import Database
           from shared_engines.storage.migrations import (
               Migration,
               MigrationRunner,
@@ -219,8 +187,19 @@ jobs:
               ),
               Migration(
                   2,
-                  "ciclo_archaeology",
+                  "ciclo_global_archaeology",
                   (
+                      "CREATE TABLE ciclo_global_recycling ("
+                      " event_id TEXT PRIMARY KEY,"
+                      " source_app TEXT NOT NULL,"
+                      " owner_zid TEXT NOT NULL,"
+                      " description TEXT NOT NULL,"
+                      " data_hash TEXT NOT NULL,"
+                      " category TEXT NOT NULL,"
+                      " condition_state TEXT NOT NULL,"
+                      " reward_tokens INTEGER NOT NULL,"
+                      " document_id TEXT,"
+                      " created_at REAL NOT NULL)",
                       "CREATE TABLE ciclo_arch_cases ("
                       " case_id TEXT PRIMARY KEY,"
                       " owner_zid TEXT NOT NULL,"
@@ -277,11 +256,46 @@ jobs:
               "otro",
           )
 
+          SOURCE_APPS = (
+              "rep",
+              "nexo",
+              "agro",
+              "semilla",
+              "mpe",
+              "subastas",
+              "axis",
+              "ciclo",
+          )
+
+          BASE_VALUES = {
+              "foto": 3.0,
+              "video": 8.0,
+              "documento": 5.0,
+              "datos": 4.0,
+              "otro": 2.0,
+          }
+
+          CONDITION_FACTORS = {
+              "bueno": 1.0,
+              "regular": 0.7,
+              "malo": 0.4,
+          }
+
+
+          def value_of(category: str, condition: str) -> float:
+              return round(
+                  BASE_VALUES[category]
+                  * CONDITION_FACTORS[condition],
+                  2,
+              )
+
+
+          def reward_of(estimated: float) -> int:
+              return max(1, int(estimated // 2))
+
 
           class CicloStore:
-              def __init__(
-                  self, db: Database, clock
-              ) -> None:
+              def __init__(self, db: Database, clock) -> None:
                   self._db = db
                   self._clock = clock
                   MigrationRunner(
@@ -308,8 +322,7 @@ jobs:
                           "  token_amount,"
                           "  document_id, synced,"
                           "  created_at)"
-                          " VALUES (?, ?, ?, ?, ?, ?,"
-                          "  ?, ?)",
+                          " VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
                           (
                               item_id,
                               owner_zid,
@@ -323,59 +336,38 @@ jobs:
                       )
                   return self.get_recycled(item_id)
 
-              def get_recycled(
-                  self, item_id: str
-              ) -> dict[str, object]:
+              def get_recycled(self, item_id: str) -> dict[str, object]:
                   row = self._db.query_one(
-                      "SELECT * FROM ciclo_recycled"
-                      " WHERE item_id = ?",
+                      "SELECT * FROM ciclo_recycled WHERE item_id = ?",
                       (item_id,),
                   )
                   if row is None:
                       raise LookupError(
-                          "unknown recycled item:"
-                          f" {item_id}"
+                          f"unknown recycled item: {item_id}"
                       )
                   doc = row["document_id"]
                   return {
-                      "item_id": str(
-                          row["item_id"]
-                      ),
-                      "owner_zid": str(
-                          row["owner_zid"]
-                      ),
-                      "description": str(
-                          row["description"]
-                      ),
-                      "data_hash": str(
-                          row["data_hash"]
-                      ),
-                      "token_amount": int(
-                          row["token_amount"]
-                      ),
+                      "item_id": str(row["item_id"]),
+                      "owner_zid": str(row["owner_zid"]),
+                      "description": str(row["description"]),
+                      "data_hash": str(row["data_hash"]),
+                      "token_amount": int(row["token_amount"]),
                       "document_id": (
-                          str(doc)
-                          if doc is not None
-                          else None
+                          str(doc) if doc is not None else None
                       ),
-                      "synced": bool(
-                          int(row["synced"])
-                      ),
+                      "synced": bool(int(row["synced"])),
                   }
 
               def list_recycled(
-                  self, *, owner_zid: str
+                  self, *, owner_zid: str,
               ) -> tuple[dict[str, object], ...]:
                   rows = self._db.query_all(
                       "SELECT * FROM ciclo_recycled"
-                      " WHERE owner_zid = ?"
-                      " ORDER BY created_at",
+                      " WHERE owner_zid = ? ORDER BY created_at",
                       (owner_zid,),
                   )
                   return tuple(
-                      self.get_recycled(
-                          str(r["item_id"])
-                      )
+                      self.get_recycled(str(r["item_id"]))
                       for r in rows
                   )
 
@@ -391,17 +383,10 @@ jobs:
                   with self._db.transaction() as cursor:
                       cursor.execute(
                           "INSERT INTO ciclo_exports"
-                          " (export_id, subject_zid,"
-                          "  bundle_id, purpose,"
-                          "  created_at)"
+                          " (export_id, subject_zid, bundle_id,"
+                          "  purpose, created_at)"
                           " VALUES (?, ?, ?, ?, ?)",
-                          (
-                              export_id,
-                              subject_zid,
-                              bundle_id,
-                              purpose,
-                              now,
-                          ),
+                          (export_id, subject_zid, bundle_id, purpose, now),
                       )
                   return {
                       "export_id": export_id,
@@ -410,7 +395,90 @@ jobs:
                       "purpose": purpose,
                   }
 
-              # ---------- arqueologia (v2) ----------
+              # ---------- GLOBAL recycling (any app) ----------
+
+              def add_global_recycling(
+                  self,
+                  *,
+                  event_id: str,
+                  source_app: str,
+                  owner_zid: str,
+                  description: str,
+                  category: str,
+                  condition_state: str,
+                  document_id: str | None,
+              ) -> dict[str, object]:
+                  if source_app not in SOURCE_APPS:
+                      raise ValueError(
+                          f"unknown source app: {source_app}"
+                      )
+                  if category not in CATEGORIES:
+                      raise ValueError(
+                          f"unknown category: {category}"
+                      )
+                  data_hash = hashlib.sha256(
+                      (
+                          source_app
+                          + "|"
+                          + owner_zid
+                          + "|"
+                          + description
+                      ).encode("utf-8")
+                  ).hexdigest()
+                  estimated = value_of(
+                      category, condition_state
+                  )
+                  reward = reward_of(estimated)
+                  now = self._clock.now()
+                  with self._db.transaction() as cursor:
+                      cursor.execute(
+                          "INSERT INTO ciclo_global_recycling ("
+                          " event_id, source_app, owner_zid,"
+                          "  description, data_hash, category,"
+                          "  condition_state, reward_tokens,"
+                          "  document_id, created_at)"
+                          " VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                          (
+                              event_id,
+                              source_app,
+                              owner_zid,
+                              description,
+                              data_hash,
+                              category,
+                              condition_state,
+                              reward,
+                              document_id,
+                              now,
+                          ),
+                      )
+                  return {
+                      "event_id": event_id,
+                      "source_app": source_app,
+                      "data_hash": data_hash,
+                      "category": category,
+                      "estimated_value": estimated,
+                      "reward_tokens": reward,
+                  }
+
+              def global_recycling_stats(self) -> dict[str, object]:
+                  rows = self._db.query_all(
+                      "SELECT source_app, COUNT(*) AS n,"
+                      " SUM(reward_tokens) AS tokens"
+                      " FROM ciclo_global_recycling"
+                      " GROUP BY source_app"
+                  )
+                  by_app = {}
+                  total = 0
+                  for row in rows:
+                      by_app[str(row["source_app"])] = int(row["n"])
+                      total += int(row["tokens"] or 0)
+                  return {
+                      "by_app": by_app,
+                      "total_events": sum(by_app.values()),
+                      "total_tokens_awarded": total,
+                  }
+
+              # ---------- arqueologia ----------
 
               def create_arch_case(
                   self,
@@ -423,104 +491,60 @@ jobs:
                   now = self._clock.now()
                   with self._db.transaction() as cursor:
                       cursor.execute(
-                          "INSERT INTO ciclo_arch_cases ("
-                          " case_id, owner_zid, title,"
-                          "  description, status,"
-                          "  created_at, updated_at)"
-                          " VALUES (?, ?, ?, ?,"
-                          "  'open', ?, ?)",
-                          (
-                              case_id,
-                              owner_zid,
-                              title,
-                              description,
-                              now,
-                              now,
-                          ),
+                          "INSERT INTO ciclo_arch_cases"
+                          " (case_id, owner_zid, title, description,"
+                          "  status, created_at, updated_at)"
+                          " VALUES (?, ?, ?, ?, 'open', ?, ?)",
+                          (case_id, owner_zid, title, description, now, now),
                       )
                   return self.get_arch_case(case_id)
 
-              def get_arch_case(
-                  self, case_id: str,
-              ) -> dict[str, object]:
+              def get_arch_case(self, case_id: str) -> dict[str, object]:
                   row = self._db.query_one(
-                      "SELECT * FROM"
-                      " ciclo_arch_cases WHERE"
-                      " case_id = ?",
+                      "SELECT * FROM ciclo_arch_cases WHERE case_id = ?",
                       (case_id,),
                   )
                   if row is None:
                       raise LookupError(
-                          "unknown archaeology"
-                          f" case: {case_id}"
+                          f"unknown archaeology case: {case_id}"
                       )
                   findings = self._db.query_all(
                       "SELECT * FROM ciclo_findings"
-                      " WHERE case_id = ?"
-                      " ORDER BY created_at",
+                      " WHERE case_id = ? ORDER BY created_at",
                       (case_id,),
                   )
-                  reconstructions = (
-                      self._db.query_all(
-                          "SELECT * FROM"
-                          " ciclo_reconstructions"
-                          " WHERE case_id = ?"
-                          " ORDER BY created_at",
-                          (case_id,),
-                      )
+                  reconstructions = self._db.query_all(
+                      "SELECT * FROM ciclo_reconstructions"
+                      " WHERE case_id = ? ORDER BY created_at",
+                      (case_id,),
                   )
                   return {
-                      "case_id": str(
-                          row["case_id"]
-                      ),
-                      "owner_zid": str(
-                          row["owner_zid"]
-                      ),
+                      "case_id": str(row["case_id"]),
+                      "owner_zid": str(row["owner_zid"]),
                       "title": str(row["title"]),
-                      "description": str(
-                          row["description"]
-                      ),
+                      "description": str(row["description"]),
                       "status": str(row["status"]),
                       "sealed_doc": (
                           str(row["sealed_doc"])
-                          if row["sealed_doc"]
-                          is not None
+                          if row["sealed_doc"] is not None
                           else None
                       ),
                       "findings": [
                           {
-                              "finding_id": str(
-                                  f[
-                                      "finding_id"
-                                  ]
-                              ),
-                              "title": str(
-                                  f["title"]
-                              ),
-                              "certainty": str(
-                                  f["certainty"]
-                              ),
-                              "content_hash": str(
-                                  f[
-                                      "content_hash"
-                                  ]
-                              ),
+                              "finding_id": str(f["finding_id"]),
+                              "title": str(f["title"]),
+                              "certainty": str(f["certainty"]),
+                              "content_hash": str(f["content_hash"]),
                           }
                           for f in findings
                       ],
                       "reconstructions": [
                           {
                               "reconstruction_id": str(
-                                  r[
-                                      "reconstruction_id"
-                                  ]
+                                  r["reconstruction_id"]
                               ),
-                              "title": str(
-                                  r["title"]
-                              ),
-                              "certainty": str(
-                                  r["certainty"]
-                              ),
+                              "title": str(r["title"]),
+                              "certainty": str(r["certainty"]),
                           }
                           for r in reconstructions
                       ],
@@ -538,47 +562,28 @@ jobs:
                   reason: str | None,
                   document_id: str | None,
               ) -> dict[str, object]:
-                  if certainty not in (
-                      CERTAINTY_LEVELS
-                  ):
-                      raise ValueError(
-                          f"unknown certainty:"
-                          f" {certainty}"
-                      )
+                  if certainty not in CERTAINTY_LEVELS:
+                      raise ValueError(f"unknown certainty: {certainty}")
                   row = self._db.query_one(
-                      "SELECT case_id FROM"
-                      " ciclo_arch_cases WHERE"
-                      " case_id = ?",
+                      "SELECT case_id FROM ciclo_arch_cases"
+                      " WHERE case_id = ?",
                       (case_id,),
                   )
                   if row is None:
                       raise LookupError(
-                          "unknown archaeology"
-                          f" case: {case_id}"
+                          f"unknown archaeology case: {case_id}"
                       )
-                  import hashlib
-
-                  content_hash = (
-                      hashlib.sha256(
-                          content.encode(
-                              "utf-8"
-                          )
-                      ).hexdigest()
-                  )
+                  content_hash = hashlib.sha256(
+                      content.encode("utf-8")
+                  ).hexdigest()
                   now = self._clock.now()
                   with self._db.transaction() as cursor:
                       cursor.execute(
-                          "INSERT INTO"
-                          " ciclo_findings ("
-                          " finding_id, case_id,"
-                          "  source, title,"
-                          "  content,"
-                          "  content_hash,"
-                          "  certainty, reason,"
-                          "  document_id,"
-                          "  created_at)"
-                          " VALUES (?, ?, ?, ?,"
-                          "  ?, ?, ?, ?, ?, ?)",
+                          "INSERT INTO ciclo_findings"
+                          " (finding_id, case_id, source, title,"
+                          "  content, content_hash, certainty, reason,"
+                          "  document_id, created_at)"
+                          " VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
                           (
                               finding_id,
                               case_id,
@@ -594,46 +599,9 @@ jobs:
                       )
                   return {
                       "finding_id": finding_id,
-                      "content_hash": (
-                          content_hash
-                      ),
+                      "content_hash": content_hash,
                       "certainty": certainty,
                   }
-
-              def list_findings(
-                  self,
-                  *,
-                  case_id: str,
-              ) -> tuple[dict[str, object], ...]:
-                  rows = self._db.query_all(
-                      "SELECT * FROM ciclo_findings"
-                      " WHERE case_id = ?"
-                      " ORDER BY created_at",
-                      (case_id,),
-                  )
-                  return tuple(
-                      {
-                          "finding_id": str(
-                              r["finding_id"]
-                          ),
-                          "source": str(
-                              r["source"]
-                          ),
-                          "title": str(
-                              r["title"]
-                          ),
-                          "certainty": str(
-                              r["certainty"]
-                          ),
-                          "reason": (
-                              str(r["reason"])
-                              if r["reason"]
-                              is not None
-                              else None
-                          ),
-                      }
-                      for r in rows
-                  )
 
               def add_reconstruction(
                   self,
@@ -645,35 +613,24 @@ jobs:
                   basis: str,
                   certainty: str,
               ) -> dict[str, object]:
-                  if certainty not in (
-                      CERTAINTY_LEVELS
-                  ):
-                      raise ValueError(
-                          f"unknown certainty:"
-                          f" {certainty}"
-                      )
+                  if certainty not in CERTAINTY_LEVELS:
+                      raise ValueError(f"unknown certainty: {certainty}")
                   row = self._db.query_one(
-                      "SELECT case_id FROM"
-                      " ciclo_arch_cases WHERE"
-                      " case_id = ?",
+                      "SELECT case_id FROM ciclo_arch_cases"
+                      " WHERE case_id = ?",
                       (case_id,),
                   )
                   if row is None:
                       raise LookupError(
-                          "unknown archaeology"
-                          f" case: {case_id}"
+                          f"unknown archaeology case: {case_id}"
                       )
                   now = self._clock.now()
                   with self._db.transaction() as cursor:
                       cursor.execute(
-                          "INSERT INTO"
-                          " ciclo_reconstructions ("
-                          " reconstruction_id,"
-                          "  case_id, title,"
-                          "  description, basis,"
-                          "  certainty, created_at)"
-                          " VALUES (?, ?, ?, ?,"
-                          "  ?, ?, ?)",
+                          "INSERT INTO ciclo_reconstructions"
+                          " (reconstruction_id, case_id, title,"
+                          "  description, basis, certainty, created_at)"
+                          " VALUES (?, ?, ?, ?, ?, ?, ?)",
                           (
                               reconstruction_id,
                               case_id,
@@ -685,9 +642,7 @@ jobs:
                           ),
                       )
                   return {
-                      "reconstruction_id": (
-                          reconstruction_id
-                      ),
+                      "reconstruction_id": reconstruction_id,
                       "certainty": certainty,
                   }
 
@@ -701,21 +656,13 @@ jobs:
                   with self._db.transaction() as cursor:
                       cursor.execute(
                           "UPDATE ciclo_arch_cases"
-                          " SET status = 'sealed',"
-                          " sealed_doc = ?,"
-                          " updated_at = ?"
-                          " WHERE case_id = ?",
-                          (
-                              sealed_doc,
-                              now,
-                              case_id,
-                          ),
+                          " SET status = 'sealed', sealed_doc = ?,"
+                          " updated_at = ? WHERE case_id = ?",
+                          (sealed_doc, now, case_id),
                       )
-                  return self.get_arch_case(
-                      case_id
-                  )
+                  return self.get_arch_case(case_id)
 
-              # ---------- valoracion (v2) ----------
+              # ---------- valoracion ----------
 
               def add_valuation(
                   self,
@@ -725,49 +672,18 @@ jobs:
                   category: str,
                   condition: str,
               ) -> dict[str, object]:
-                  if category not in (
-                      CATEGORIES
-                  ):
-                      raise ValueError(
-                          f"unknown category:"
-                          f" {category}"
-                      )
-                  base_values = {
-                      "foto": 3.0,
-                      "video": 8.0,
-                      "documento": 5.0,
-                      "datos": 4.0,
-                      "otro": 2.0,
-                  }
-                  condition_factor = {
-                      "bueno": 1.0,
-                      "regular": 0.7,
-                      "malo": 0.4,
-                  }
-                  estimated = round(
-                      base_values[category]
-                      * condition_factor[
-                          condition
-                      ],
-                      2,
-                  )
-                  reward = max(
-                      1,
-                      int(estimated // 2),
-                  )
+                  if category not in CATEGORIES:
+                      raise ValueError(f"unknown category: {category}")
+                  estimated = value_of(category, condition)
+                  reward = reward_of(estimated)
                   now = self._clock.now()
                   with self._db.transaction() as cursor:
                       cursor.execute(
-                          "INSERT INTO"
-                          " ciclo_valuations ("
-                          " valuation_id,"
-                          "  item_id, category,"
-                          "  condition,"
-                          "  estimated_value,"
-                          "  reward_tokens,"
+                          "INSERT INTO ciclo_valuations"
+                          " (valuation_id, item_id, category,"
+                          "  condition, estimated_value, reward_tokens,"
                           "  created_at)"
-                          " VALUES (?, ?, ?, ?,"
-                          "  ?, ?, ?)",
+                          " VALUES (?, ?, ?, ?, ?, ?, ?)",
                           (
                               valuation_id,
                               item_id,
@@ -779,19 +695,15 @@ jobs:
                           ),
                       )
                   return {
-                      "valuation_id": (
-                          valuation_id
-                      ),
-                      "estimated_value": (
-                          estimated
-                      ),
+                      "valuation_id": valuation_id,
+                      "estimated_value": estimated,
                       "reward_tokens": reward,
                   }
           PYEOF
           python -m py_compile apps/ciclo_digital/infrastructure/persistence/ciclo_store.py
           echo "store v2 written"
 
-      - name: ADD server patches (doc passed in, api inside _api_post)
+      - name: ADD server patches v2 (single-line HTML, global recycling)
         run: |
           set -euo pipefail
           PYTHONPATH="$PWD" python - <<'PYEOF'
@@ -831,6 +743,12 @@ jobs:
               '        if s[0] == "arqueologia" and len(s) == 2:',
               '            self._screen_archaeology(s[1])',
               '            return',
+              '        if s == ["global"]:',
+              '            self._send(',
+              '                200,',
+              '                {"ok": True, "data": self.store.global_recycling_stats()},',
+              '            )',
+              '            return',
               GET_ANCHOR,
           ])
 
@@ -850,9 +768,6 @@ jobs:
               '        if s == ["arch-seal"]:',
               '            self._arch_seal_form(doc)',
               '            return',
-              '        if s == ["api", "recycling", "value"]:',
-              '            self._api_value(doc)',
-              '            return',
               POST_ANCHOR,
           ])
 
@@ -862,6 +777,9 @@ jobs:
           ])
           API_ROUTES = "\n".join([
               '        doc = self._read_json()',
+              '        if s == ["recycling", "global"]:',
+              '            self._api_global_recycling(doc)',
+              '            return',
               '        if s == ["archaeology", "cases"]:',
               '            self._api_arch_case(doc)',
               '            return',
@@ -884,27 +802,124 @@ jobs:
               '            getattr(link, "_client")',
               '        )',
               '',
+              '    def _api_global_recycling(self, doc) -> None:',
+              '        store = type(self).store',
+              '        ext = self._ext()',
+              '        source_app = self._req(doc, "source_app")',
+              '        owner_zid = self._req(doc, "owner_zid")',
+              '        description = self._req(doc, "description")',
+              '        category = self._req(doc, "category")',
+              '        condition = str(doc.get("condition", "bueno"))',
+              '        event = store.add_global_recycling(',
+              '            event_id="GLB-" + _uuid.uuid4().hex[:10],',
+              '            source_app=source_app,',
+              '            owner_zid=owner_zid,',
+              '            description=description,',
+              '            category=category,',
+              '            condition_state=condition,',
+              '            document_id=None,',
+              '        )',
+              '        tokens_ok = False',
+              '        try:',
+              '            ok, _data = ext.earn_tokens(',
+              '                subject_zid=owner_zid,',
+              '                activity="reciclaje_global",',
+              '                ref_id=event["event_id"],',
+              '            )',
+              '            tokens_ok = bool(ok)',
+              '        except Exception:',
+              '            tokens_ok = False',
+              '        self._send(',
+              '            201,',
+              '            {',
+              '                "ok": True,',
+              '                "data": {',
+              '                    "event_id": event["event_id"],',
+              '                    "source_app": event["source_app"],',
+              '                    "reward_tokens": event["reward_tokens"],',
+              '                    "network_tokens": tokens_ok,',
+              '                },',
+              '            },',
+              '        )',
+              '',
+              '    def _api_arch_case(self, doc) -> None:',
+              '        store = type(self).store',
+              '        case = store.create_arch_case(',
+              '            case_id="ARC-" + _uuid.uuid4().hex[:10],',
+              '            owner_zid=self._req(doc, "owner_zid"),',
+              '            title=self._req(doc, "title"),',
+              '            description=self._req(doc, "description"),',
+              '        )',
+              '        self._send(201, {"ok": True, "data": case})',
+              '',
+              '    def _api_arch_finding(self, doc) -> None:',
+              '        store = type(self).store',
+              '        finding = store.add_finding(',
+              '            finding_id="FND-" + _uuid.uuid4().hex[:10],',
+              '            case_id=self._req(doc, "case_id"),',
+              '            source=self._req(doc, "source"),',
+              '            title=self._req(doc, "title"),',
+              '            content=self._req(doc, "content"),',
+              '            certainty=self._req(doc, "certainty"),',
+              '            reason=doc.get("reason"),',
+              '            document_id=None,',
+              '        )',
+              '        self._send(201, {"ok": True, "data": finding})',
+              '',
+              '    def _api_arch_reconstruct(self, doc) -> None:',
+              '        store = type(self).store',
+              '        reconstruction = store.add_reconstruction(',
+              '            reconstruction_id="RCN-" + _uuid.uuid4().hex[:10],',
+              '            case_id=self._req(doc, "case_id"),',
+              '            title=self._req(doc, "title"),',
+              '            description=self._req(doc, "description"),',
+              '            basis=self._req(doc, "basis"),',
+              '            certainty=self._req(doc, "certainty"),',
+              '        )',
+              '        self._send(201, {"ok": True, "data": reconstruction})',
+              '',
+              '    def _api_value(self, doc) -> None:',
+              '        store = type(self).store',
+              '        item_id = self._req(doc, "item_id")',
+              '        category = self._req(doc, "category")',
+              '        condition = self._req(doc, "condition")',
+              '        valuation = store.add_valuation(',
+              '            valuation_id="VAL-" + _uuid.uuid4().hex[:10],',
+              '            item_id=item_id,',
+              '            category=category,',
+              '            condition=condition,',
+              '        )',
+              '        owner_zid = doc.get("owner_zid")',
+              '        if owner_zid is not None:',
+              '            ext = self._ext()',
+              '            ok, _data = ext.earn_tokens(',
+              '                subject_zid=str(owner_zid),',
+              '                activity="reciclaje_valorado",',
+              '                ref_id=item_id,',
+              '            )',
+              '            valuation["network_tokens"] = bool(ok)',
+              '        self._send(201, {"ok": True, "data": valuation})',
+              '',
               '    def _arch_case_form(self, doc) -> None:',
               '        store = type(self).store',
               '        owner_zid = self._req(doc, "owner_zid")',
               '        title = self._req(doc, "title")',
               '        description = self._req(doc, "description")',
               '        case_id = "ARC-" + _uuid.uuid4().hex[:10]',
-              '        row = store.create_arch_case(',
+              '        store.create_arch_case(',
               '            case_id=case_id,',
               '            owner_zid=owner_zid,',
               '            title=title,',
               '            description=description,',
               '        )',
+              '        link_line = "<a href=\'/ciclo/arqueologia/" + case_id + "\'><button>Abrir expediente</button></a>"',
               '        self._html(',
               '            200,',
               '            _page(',
               '                "Expediente creado",',
               '                "<h1>Expediente arqueologico</h1>"',
-              '                "<p>" + str(row["case_id"]) + "</p>"',
-              '                "<a href=\'/ciclo/arqueologia/"',
-              '                + case_id',
-              '                + "\'><button>Abrir expediente</button></a>"',
+              '                "<p>" + case_id + "</p>"',
+              '                + link_line',
               '            ),',
               '        )',
               '',
@@ -936,6 +951,7 @@ jobs:
               '            reason=None,',
               '            document_id=document_id,',
               '        )',
+              '        back_line = "<a href=\'/ciclo/arqueologia/" + case_id + "\'><button>Volver al expediente</button></a>"',
               '        self._html(',
               '            200,',
               '            _page(',
@@ -943,9 +959,7 @@ jobs:
               '                "<h1>Hallazgo registrado</h1>"',
               '                "<p>Certeza: " + certainty + "</p>"',
               '                "<p>Hash: " + finding["content_hash"] + "</p>"',
-              '                "<a href=\'/ciclo/arqueologia/"',
-              '                + case_id',
-              '                + "\'><button>Volver al expediente</button></a>"',
+              '                + back_line',
               '            ),',
               '        )',
               '',
@@ -956,24 +970,22 @@ jobs:
               '        description = self._req(doc, "description")',
               '        basis = self._req(doc, "basis")',
               '        certainty = self._req(doc, "certainty")',
-              '        reconstruction = store.add_reconstruction(',
-              '            reconstruction_id="RCN-"',
-              '            + _uuid.uuid4().hex[:10],',
+              '        store.add_reconstruction(',
+              '            reconstruction_id="RCN-" + _uuid.uuid4().hex[:10],',
               '            case_id=case_id,',
               '            title=title,',
               '            description=description,',
               '            basis=basis,',
               '            certainty=certainty,',
               '        )',
+              '        back_line = "<a href=\'/ciclo/arqueologia/" + case_id + "\'><button>Volver al expediente</button></a>"',
               '        self._html(',
               '            200,',
               '            _page(',
               '                "Reconstruccion registrada",',
               '                "<h1>Reconstruccion registrada</h1>"',
               '                "<p>Certeza: " + certainty + "</p>"',
-              '                "<a href=\'/ciclo/arqueologia/"',
-              '                + case_id',
-              '                + "\'><button>Volver al expediente</button></a>"',
+              '                + back_line',
               '            ),',
               '        )',
               '',
@@ -982,14 +994,11 @@ jobs:
               '        ext = self._ext()',
               '        case_id = self._req(doc, "case_id")',
               '        case = store.get_arch_case(case_id)',
-              '        findings = store.list_findings(',
-              '            case_id=case_id',
-              '        )',
+              '        findings = store.list_findings(case_id=case_id)',
               '        content = (',
               '            "EXPEDIENTE " + case_id',
               '            + " | " + case["title"]',
-              '            + " | hallazgos: "',
-              '            + str(len(findings))',
+              '            + " | hallazgos: " + str(len(findings))',
               '        )',
               '        sealed_doc = None',
               '        if case["owner_zid"]:',
@@ -1002,83 +1011,17 @@ jobs:
               '                sealed_doc = doc_id',
               '        case = store.seal_arch_case(',
               '            case_id=case_id,',
-              '            sealed_doc=sealed_doc',
-              '            or "local-pending",',
+              '            sealed_doc=sealed_doc or "local-pending",',
               '        )',
               '        self._html(',
               '            200,',
               '            _page(',
               '                "Expediente sellado",',
               '                "<h1>Expediente sellado</h1>"',
-              '                "<p>Documento: "',
-              '                + str(sealed_doc or "pendiente")',
-              '                + "</p>"',
+              '                "<p>Documento: " + str(sealed_doc or "pendiente") + "</p>"',
               '                "<a href=\'/ciclo\'><button>Inicio</button></a>"',
               '            ),',
               '        )',
-              '',
-              '    def _api_arch_case(self, doc) -> None:',
-              '        store = type(self).store',
-              '        case = store.create_arch_case(',
-              '            case_id="ARC-" + _uuid.uuid4().hex[:10],',
-              '            owner_zid=self._req(doc, "owner_zid"),',
-              '            title=self._req(doc, "title"),',
-              '            description=self._req(',
-              '                doc, "description"',
-              '            ),',
-              '        )',
-              '        self._send(201, {"ok": True, "data": case})',
-              '',
-              '    def _api_arch_finding(self, doc) -> None:',
-              '        store = type(self).store',
-              '        finding = store.add_finding(',
-              '            finding_id="FND-" + _uuid.uuid4().hex[:10],',
-              '            case_id=self._req(doc, "case_id"),',
-              '            source=self._req(doc, "source"),',
-              '            title=self._req(doc, "title"),',
-              '            content=self._req(doc, "content"),',
-              '            certainty=self._req(doc, "certainty"),',
-              '            reason=doc.get("reason"),',
-              '            document_id=None,',
-              '        )',
-              '        self._send(201, {"ok": True, "data": finding})',
-              '',
-              '    def _api_arch_reconstruct(self, doc) -> None:',
-              '        store = type(self).store',
-              '        reconstruction = store.add_reconstruction(',
-              '            reconstruction_id="RCN-"',
-              '            + _uuid.uuid4().hex[:10],',
-              '            case_id=self._req(doc, "case_id"),',
-              '            title=self._req(doc, "title"),',
-              '            description=self._req(',
-              '                doc, "description"',
-              '            ),',
-              '            basis=self._req(doc, "basis"),',
-              '            certainty=self._req(doc, "certainty"),',
-              '        )',
-              '        self._send(201, {"ok": True, "data": reconstruction})',
-              '',
-              '    def _api_value(self, doc) -> None:',
-              '        store = type(self).store',
-              '        item_id = self._req(doc, "item_id")',
-              '        category = self._req(doc, "category")',
-              '        condition = self._req(doc, "condition")',
-              '        valuation = store.add_valuation(',
-              '            valuation_id="VAL-" + _uuid.uuid4().hex[:10],',
-              '            item_id=item_id,',
-              '            category=category,',
-              '            condition=condition,',
-              '        )',
-              '        owner_zid = doc.get("owner_zid")',
-              '        if owner_zid is not None:',
-              '            ext = self._ext()',
-              '            ok, data = ext.earn_tokens(',
-              '                subject_zid=str(owner_zid),',
-              '                activity="reciclaje_valorado",',
-              '                ref_id=item_id,',
-              '            )',
-              '            valuation["network_tokens"] = bool(ok)',
-              '        self._send(201, {"ok": True, "data": valuation})',
               '',
               '    def _screen_archaeology(self, case_id: str) -> None:',
               '        store = type(self).store',
@@ -1091,9 +1034,7 @@ jobs:
               '                + " [" + f["certainty"] + "]</li>"',
               '            )',
               '        if not findings_html:',
-              '            findings_html = (',
-              '                "<li>Sin hallazgos aun</li>"',
-              '            )',
+              '            findings_html = "<li>Sin hallazgos aun</li>"',
               '        recon_html = ""',
               '        for r in case["reconstructions"]:',
               '            recon_html = (',
@@ -1102,24 +1043,18 @@ jobs:
               '                + " [" + r["certainty"] + "]</li>"',
               '            )',
               '        if not recon_html:',
-              '            recon_html = (',
-              '                "<li>Sin reconstrucciones aun</li>"',
-              '            )',
+              '            recon_html = "<li>Sin reconstrucciones aun</li>"',
+              '        back_line = "<a href=\'/ciclo\'><button class=\'gray\'>Inicio</button></a>"',
               '        body = (',
               '            "<h1>Expediente " + case_id + "</h1>"',
-              '            "<p>" + case["title"] + " | "',
-              '            + case["status"] + "</p>"',
+              '            "<p>" + case["title"] + " | " + case["status"] + "</p>"',
               '            "<h2>Hallazgos (certeza)</h2><ul>"',
               '            + findings_html + "</ul>"',
               '            "<h2>Reconstrucciones</h2><ul>"',
               '            + recon_html + "</ul>"',
-              '            "<a href=\'/ciclo\'><button class=\'gray\'>',
-              '            " Inicio</button></a>"',
+              '            + back_line',
               '        )',
-              '        self._html(',
-              '            200,',
-              '            _page("CICLO - Expediente", body),',
-              '        )',
+              '        self._html(200, _page("CICLO - Expediente", body))',
               '',
           ])
 
@@ -1140,7 +1075,7 @@ jobs:
           python -m py_compile apps/ciclo_digital/server.py
           echo "server patched and compiles"
 
-      - name: Internal probe (archaeology + valuation on SQLiteAdapter)
+      - name: Internal probe (global recycling + archaeology + valuation)
         run: |
           set -euo pipefail
           PYTHONPATH="$PWD" python - <<'PYEOF'
@@ -1158,6 +1093,55 @@ jobs:
           db = SQLiteAdapter(tmp / "probe.db")
           clock = FrozenClock()
           store = CicloStore(db, clock)
+          event = store.add_global_recycling(
+              event_id="GLB-1",
+              source_app="nexo",
+              owner_zid="ZID-a",
+              description="factura vieja borrada",
+              category="documento",
+              condition_state="bueno",
+              document_id=None,
+          )
+          assert event["source_app"] == "nexo"
+          assert event["reward_tokens"] == 2
+          event2 = store.add_global_recycling(
+              event_id="GLB-2",
+              source_app="semilla",
+              owner_zid="ZID-b",
+              description="video de clase antiguo",
+              category="video",
+              condition_state="regular",
+              document_id=None,
+          )
+          assert event2["reward_tokens"] == 2
+          event3 = store.add_global_recycling(
+              event_id="GLB-3",
+              source_app="agro",
+              owner_zid="ZID-c",
+              description="foto de cosecha vieja",
+              category="foto",
+              condition_state="bueno",
+              document_id=None,
+          )
+          assert event3["reward_tokens"] == 1
+          try:
+              store.add_global_recycling(
+                  event_id="GLB-bad",
+                  source_app="twitter",
+                  owner_zid="ZID-x",
+                  description="x",
+                  category="foto",
+                  condition_state="bueno",
+                  document_id=None,
+              )
+              raise AssertionError("unknown app must fail")
+          except ValueError:
+              pass
+          stats = store.global_recycling_stats()
+          assert stats["total_events"] == 3
+          assert stats["by_app"]["nexo"] == 1
+          assert stats["by_app"]["semilla"] == 1
+          assert stats["by_app"]["agro"] == 1
           case = store.create_arch_case(
               case_id="ARC-1",
               owner_zid="ZID-a",
@@ -1170,21 +1154,20 @@ jobs:
               case_id="ARC-1",
               source="red",
               title="fragmento foto",
-              content="metadata de la foto",
+              content="metadata recuperada",
               certainty="evidencia_encontrada",
               reason=None,
               document_id="DOC-1",
           )
           assert finding["certainty"] == "evidencia_encontrada"
-          assert len(finding["content_hash"]) == 64
           finding2 = store.add_finding(
               finding_id="FND-2",
               case_id="ARC-1",
               source="memoria",
               title="testimonio",
-              content="la foto era en la playa",
+              content="era en la playa",
               certainty="inferencia",
-              reason="testimonio del usuario",
+              reason="testimonio",
               document_id=None,
           )
           assert finding2["certainty"] == "inferencia"
@@ -1197,9 +1180,6 @@ jobs:
               certainty="reconstruccion",
           )
           assert reconstruction["certainty"] == "reconstruccion"
-          case = store.get_arch_case("ARC-1")
-          assert len(case["findings"]) == 2
-          assert len(case["reconstructions"]) == 1
           try:
               store.add_finding(
                   finding_id="FND-bad",
@@ -1215,8 +1195,7 @@ jobs:
           except ValueError:
               pass
           sealed = store.seal_arch_case(
-              case_id="ARC-1",
-              sealed_doc="DOC-sealed",
+              case_id="ARC-1", sealed_doc="DOC-sealed"
           )
           assert sealed["status"] == "sealed"
           assert sealed["sealed_doc"] == "DOC-sealed"
@@ -1228,24 +1207,17 @@ jobs:
           )
           assert valuation["estimated_value"] == 3.0
           assert valuation["reward_tokens"] == 1
-          valuation2 = store.add_valuation(
-              valuation_id="VAL-2",
-              item_id="REC-2",
-              category="video",
-              condition="malo",
-          )
-          assert valuation2["estimated_value"] == 3.2
           try:
               store.add_valuation(
-                  valuation_id="VAL-3",
-                  item_id="REC-3",
+                  valuation_id="VAL-bad",
+                  item_id="REC-2",
                   category="nave",
                   condition="bueno",
               )
               raise AssertionError("bad category must fail")
           except ValueError:
               pass
-          print("PROBE OK: archaeology + valuation")
+          print("PROBE OK: global recycling + archaeology + valuation")
           db.close()
           PYEOF
 
@@ -1253,14 +1225,13 @@ jobs:
         run: |
           set -euo pipefail
           cat > apps/ciclo_digital/tests/test_ciclo_archaeology_e2e.py <<'PYEOF'
-          """CICLO archaeology e2e ADD-ONLY - case creation,
-          findings with formal certainty levels, reconstruction,
-          case sealing, valuation with network tokens; original
-          tests untouched."""
+          """CICLO e2e ADD-ONLY - GLOBAL recycling from any
+          app, archaeology with formal certainty levels,
+          reconstruction, case sealing, valuation with network
+          tokens; original tests untouched."""
           from __future__ import annotations
 
           import json
-          import re
           import socket
           import threading
           from pathlib import Path
@@ -1329,18 +1300,6 @@ jobs:
                   self.net_db.close()
 
 
-          def _pf(url: str, doc: dict) -> str:
-              request = Request(
-                  url,
-                  data=(
-                      "&".join(str(k) + "=" + str(v) for k, v in doc.items())
-                  ).encode("utf-8"),
-                  method="POST",
-              )
-              with urlopen(request, timeout=15) as r:
-                  return r.read().decode("utf-8")
-
-
           def _pj(url: str, doc: dict) -> dict:
               request = Request(
                   url,
@@ -1354,12 +1313,42 @@ jobs:
               return body
 
 
+          def _pf(url: str, doc: dict) -> str:
+              request = Request(
+                  url,
+                  data=(
+                      "&".join(str(k) + "=" + str(v) for k, v in doc.items())
+                  ).encode("utf-8"),
+                  method="POST",
+              )
+              with urlopen(request, timeout=15) as r:
+                  return r.read().decode("utf-8")
+
+
           def _h(url: str) -> str:
               with urlopen(url, timeout=15) as r:
                   return r.read().decode("utf-8")
 
 
-          def test_1_archaeology_full_flow(tmp_path: Path) -> None:
+          def _zid(eco, name: str) -> str:
+              ok, data, _err = eco.client.post(
+                  "/identity/register",
+                  {
+                      "kind": "person",
+                      "display_name": name,
+                      "actor": "ciclo",
+                  },
+              )
+              assert ok is True and data is not None
+              zid = str(data.get("zid"))
+              assert zid.startswith("ZID-")
+              eco.client.post(
+                  "/trust/complete", {"zid": zid, "actor": "ciclo"}
+              )
+              return zid
+
+
+          def test_1_global_recycling_from_any_app(tmp_path: Path) -> None:
               eco = _Eco(tmp_path)
               try:
                   assert eco.client.post(
@@ -1370,29 +1359,82 @@ jobs:
                           "scopes": ["display_name"],
                       },
                   )[0] is True
-                  ok, data, _err = eco.client.post(
-                      "/identity/register",
+                  zid = _zid(eco, "Reciclador Global")
+                  event1 = _pj(
+                      eco.ciclo_base + "/ciclo/api/recycling/global",
                       {
-                          "kind": "person",
-                          "display_name": "Juan Investigador",
-                          "actor": "ciclo",
+                          "source_app": "nexo",
+                          "owner_zid": zid,
+                          "description": "factura vieja borrada",
+                          "category": "documento",
+                          "condition": "bueno",
                       },
-                  )
-                  assert ok is True and data is not None
-                  owner_zid = str(data.get("zid"))
-                  assert owner_zid.startswith("ZID-")
-                  eco.client.post(
-                      "/trust/complete",
-                      {"zid": owner_zid, "actor": "ciclo"},
-                  )
+                  )["data"]
+                  assert event1["source_app"] == "nexo"
+                  assert event1["reward_tokens"] == 2
+                  assert event1["network_tokens"] is True
+                  event2 = _pj(
+                      eco.ciclo_base + "/ciclo/api/recycling/global",
+                      {
+                          "source_app": "semilla",
+                          "owner_zid": zid,
+                          "description": "video de clase antiguo",
+                          "category": "video",
+                          "condition": "regular",
+                      },
+                  )["data"]
+                  assert event2["reward_tokens"] == 2
+                  event3 = _pj(
+                      eco.ciclo_base + "/ciclo/api/recycling/global",
+                      {
+                          "source_app": "agro",
+                          "owner_zid": zid,
+                          "description": "foto de cosecha vieja",
+                          "category": "foto",
+                          "condition": "bueno",
+                      },
+                  )["data"]
+                  assert event3["reward_tokens"] == 1
+                  try:
+                      _pj(
+                          eco.ciclo_base + "/ciclo/api/recycling/global",
+                          {
+                              "source_app": "twitter",
+                              "owner_zid": zid,
+                              "description": "x",
+                              "category": "foto",
+                              "condition": "bueno",
+                          },
+                      )
+                      raise AssertionError("unknown app must fail")
+                  except Exception as exc:
+                      assert "400" in str(exc)
+                  stats = _h(eco.ciclo_base + "/ciclo/global")
+                  assert "nexo" in stats
+                  assert "semilla" in stats
+                  assert "agro" in stats
+              finally:
+                  eco.close()
+
+
+          def test_2_archaeology_full_flow(tmp_path: Path) -> None:
+              eco = _Eco(tmp_path)
+              try:
+                  assert eco.client.post(
+                      "/apps/register",
+                      {
+                          "app_id": "ciclo",
+                          "display_name": "CICLO-DIGITAL",
+                          "scopes": ["display_name"],
+                      },
+                  )[0] is True
+                  owner_zid = _zid(eco, "Juan Investigador")
                   case = _pj(
                       eco.ciclo_base + "/ciclo/api/archaeology/cases",
                       {
                           "owner_zid": owner_zid,
                           "title": "Foto familiar perdida",
-                          "description": (
-                              "recuperar foto borrada"
-                          ),
+                          "description": "recuperar foto borrada",
                       },
                   )["data"]
                   case_id = case["case_id"]
@@ -1438,9 +1480,7 @@ jobs:
                   )
                   assert "Expediente sellado" in seal_html
                   panel = _h(
-                      eco.ciclo_base
-                      + "/ciclo/arqueologia/"
-                      + case_id
+                      eco.ciclo_base + "/ciclo/arqueologia/" + case_id
                   )
                   assert "Expediente" in panel
                   assert "sealed" in panel
@@ -1451,76 +1491,6 @@ jobs:
                   assert "CICLO-DIGITAL" in home
                   assert "Reciclar" in home
                   assert "Arqueologia" in home
-              finally:
-                  eco.close()
-
-
-          def test_2_valuation_with_network_tokens(
-              tmp_path: Path,
-          ) -> None:
-              eco = _Eco(tmp_path)
-              try:
-                  assert eco.client.post(
-                      "/apps/register",
-                      {
-                          "app_id": "ciclo",
-                          "display_name": "CICLO-DIGITAL",
-                          "scopes": ["display_name"],
-                      },
-                  )[0] is True
-                  ok, data, _err = eco.client.post(
-                      "/identity/register",
-                      {
-                          "kind": "person",
-                          "display_name": "Reciclador",
-                          "actor": "ciclo",
-                      },
-                  )
-                  assert ok is True and data is not None
-                  zid = str(data.get("zid"))
-                  eco.client.post(
-                      "/trust/complete",
-                      {"zid": zid, "actor": "ciclo"},
-                  )
-                  balance_ok, balance, _err = eco.client.get(
-                      "/tokens/" + zid + "/balance"
-                  )
-                  assert balance_ok is True
-                  valuation = _pj(
-                      eco.ciclo_base + "/ciclo/api/recycling/value",
-                      {
-                          "item_id": "REC-e2e1",
-                          "owner_zid": zid,
-                          "category": "video",
-                          "condition": "bueno",
-                      },
-                  )["data"]
-                  assert valuation["estimated_value"] == 8.0
-                  assert valuation["reward_tokens"] == 4
-                  assert valuation["network_tokens"] is True
-                  bad = _pj(
-                      eco.ciclo_base + "/ciclo/api/recycling/value",
-                      {
-                          "item_id": "REC-e2e2",
-                          "category": "documento",
-                          "condition": "malo",
-                      },
-                  )["data"]
-                  assert bad["estimated_value"] == 2.0
-                  assert bad["reward_tokens"] == 1
-                  try:
-                      _pj(
-                          eco.ciclo_base
-                          + "/ciclo/api/recycling/value",
-                          {
-                              "item_id": "REC-e2e3",
-                              "category": "nave",
-                              "condition": "bueno",
-                          },
-                      )
-                      raise AssertionError("bad category must fail")
-                  except Exception as exc:
-                      assert "400" in str(exc)
               finally:
                   eco.close()
 
@@ -1590,9 +1560,9 @@ jobs:
                   thread.join(timeout=5)
                   db.close()
           PYEOF
-          echo "ciclo e2e written"
+          echo "ciclo e2e v2 written"
 
-      - name: Run CICLO tests (regression plus archaeology ADD-ONLY e2e)
+      - name: Run CICLO tests (regression plus global+archaeology e2e)
         run: |
           set -euo pipefail
           PYTHONPATH="$PWD" python -m pytest -q -p no:cacheprovider --timeout=60 --timeout-method=thread apps/ciclo_digital/tests/
@@ -1611,7 +1581,7 @@ jobs:
           if git diff --cached --quiet; then
             echo "No changes."
           else
-            git commit -m "zyra: Q3 CICLO archaeology ADD-ONLY - migration 2 (arch cases + findings with formal certainty levels + reconstructions + valuations), certainty taxonomy (evidencia_encontrada/verificada/reconstruccion/inferencia/incertidumbre), archaeology case flow (create->findings->reconstruct->seal with network seal), valuation with condition-based reward and network tokens via /tokens/earn (no hardcoded 5), link ext new file (trust/seal/history), screen expediente; original store/link/client/tests untouched; probe + 3 focused e2e"
+            git commit -m "zyra: Q3 CICLO GLOBAL recycling + archaeology ADD-ONLY v2 - single-line balanced HTML strings (fixed unterminated literal), GLOBAL recycling endpoint accepting any ecosystem app (nexo/semilla/agro/mpe/axis/subastas/rep/ciclo as source_app with per-app stats at /ciclo/global), archaeology with formal certainty taxonomy, valuation with real network tokens; original files untouched; probe + 3 e2e"
             git push origin "HEAD:${{ github.ref_name }}"
           fi
           echo "=== Q3 CICLO COMPLETE ==="

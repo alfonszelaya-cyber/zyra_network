@@ -1,4 +1,4 @@
-name: zyra-q3-sbs-addonly
+name: zyra-q3-axis-emergencias-e2e
 
 "on":
   workflow_dispatch:
@@ -9,7 +9,7 @@ permissions:
   contents: write
 
 concurrency:
-  group: zyra-sbs-add-${{ github.ref }}
+  group: zyra-q3-axis-${{ github.ref }}
   cancel-in-progress: false
 
 jobs:
@@ -31,696 +31,1347 @@ jobs:
           python -m pip install --upgrade pip
           python -m pip install "cryptography>=42,<45" "pytest>=8,<9" "pytest-timeout>=2,<3"
 
-      - name: ADD CommerceStore (new file - original store untouched)
+      - name: Evidence (before)
         run: |
           set -euo pipefail
-          cat > apps/subastas/infrastructure/persistence/subastas_commerce.py <<'PYEOF'
-          """SUBASTAS commerce layer - ADD-ONLY module."""
+          wc -c apps/axis/server.py apps/axis/infrastructure/persistence/axis_store.py apps/axis/services/axis_link.py
+
+      - name: ADD axis_link_ext (trust + canonical helpers, new file)
+        run: |
+          set -euo pipefail
+          cat > apps/axis/services/axis_link_ext.py <<'PYEOF'
+          """AXIS link extension - ADD-ONLY module.
+
+          Trust completion and canonical network calls
+          using the patterns proven by MPE/SEMILLA.
+          Does not modify axis_link.py."""
           from __future__ import annotations
 
-          import threading
-          import time
+          import base64
+
+
+          class AxisLinkExt:
+              def __init__(self, client) -> None:
+                  self._client = client
+
+              def complete_trust(self, zid: str) -> bool:
+                  try:
+                      ok, _d, _e = self._client.post(
+                          "/trust/complete",
+                          {"zid": zid, "actor": "axis"},
+                      )
+                      return bool(ok)
+                  except Exception:
+                      return False
+
+              def ensure_trusted_person(
+                  self, display_name: str,
+              ) -> str:
+                  ok, data, _err = self._client.post(
+                      "/identity/register",
+                      {
+                          "kind": "person",
+                          "display_name": display_name,
+                          "actor": "axis",
+                      },
+                  )
+                  zid = None
+                  if ok and data:
+                      found = self._find_zid(data)
+                      if found:
+                          zid = found
+                  if zid is None:
+                      raise ValueError(
+                          "no network ZID for "
+                          + display_name
+                      )
+                  self.complete_trust(zid)
+                  return zid
+
+              def seal_evidence_canonical(
+                  self,
+                  *,
+                  owner_zid: str,
+                  title: str,
+                  content: str,
+              ) -> tuple[bool, str | None]:
+                  encoded = base64.b64encode(
+                      content.encode("utf-8")
+                  ).decode("ascii")
+                  try:
+                      ok, data, _err = self._client.post(
+                          "/documents/seal",
+                          {
+                              "owner_zid": owner_zid,
+                              "title": title,
+                              "content_b64": encoded,
+                              "actor_app": "axis",
+                          },
+                      )
+                  except Exception:
+                      return (False, None)
+                  if ok and data:
+                      doc_id = self._find_key(
+                          data,
+                          ("document_id", "seal_id"),
+                      )
+                      if isinstance(doc_id, str):
+                          return (True, doc_id)
+                  return (False, None)
+
+              def append_history(
+                  self,
+                  *,
+                  zid: str,
+                  event: str,
+                  detail: str,
+              ) -> bool:
+                  try:
+                      ok, _d, _e = self._client.post(
+                          "/history/append",
+                          {
+                              "zid": zid,
+                              "entry_type": "health",
+                              "actor_app": "axis",
+                              "payload": {
+                                  "event": event,
+                                  "detail": detail,
+                              },
+                          },
+                      )
+                      return bool(ok)
+                  except Exception:
+                      return False
+
+              @staticmethod
+              def _find_zid(doc):
+                  if isinstance(doc, dict):
+                      for key, value in doc.items():
+                          if (
+                              str(key).lower() == "zid"
+                              and isinstance(value, str)
+                              and value.startswith("ZID-")
+                          ):
+                              return value
+                      for value in doc.values():
+                          found = (
+                              AxisLinkExt._find_zid(
+                                  value
+                              )
+                          )
+                          if found:
+                              return found
+                  elif isinstance(doc, list):
+                      for item in doc:
+                          found = (
+                              AxisLinkExt._find_zid(
+                                  item
+                              )
+                          )
+                          if found:
+                              return found
+                  return None
+
+              @staticmethod
+              def _find_key(doc, keys):
+                  if isinstance(doc, dict):
+                      for key, value in doc.items():
+                          if str(key).lower() in keys:
+                              return value
+                      for value in doc.values():
+                          found = AxisLinkExt._find_key(
+                              value, keys
+                          )
+                          if found is not None:
+                              return found
+                  elif isinstance(doc, list):
+                      for item in doc:
+                          found = AxisLinkExt._find_key(
+                              item, keys
+                          )
+                          if found is not None:
+                              return found
+                  return None
+          PYEOF
+          touch apps/axis/services/__init__.py
+          python -m py_compile apps/axis/services/axis_link_ext.py
+          echo "link extension added"
+
+      - name: ADD AxisStore v2 (migration 2 - health followup emergencies custody)
+        run: |
+          set -euo pipefail
+          cat > apps/axis/infrastructure/persistence/axis_store.py <<'PYEOF'
+          """AXIS durable store (5 roles) + health followup
+          + emergencies + evidence chain. Additive v2."""
+          from __future__ import annotations
+
+          import hashlib
           import uuid
 
-          PLATFORM_FEE_RATE = 0.05
+          from shared_engines.storage.database import (
+              Database,
+          )
+          from shared_engines.storage.migrations import (
+              Migration,
+              MigrationRunner,
+          )
+
+          ROLES = (
+              "paciente",
+              "medico",
+              "abogado",
+              "policia",
+              "gobierno",
+          )
+
+          _MIGRATIONS = (
+              Migration(
+                  1,
+                  "axis",
+                  (
+                      "CREATE TABLE axis_accounts ("
+                      " account_id TEXT PRIMARY KEY,"
+                      " zid TEXT,"
+                      " name TEXT NOT NULL,"
+                      " role TEXT NOT NULL,"
+                      " created_at REAL NOT NULL)",
+                      "CREATE TABLE axis_medical ("
+                      " record_id TEXT PRIMARY KEY,"
+                      " patient_account TEXT NOT NULL,"
+                      " doctor_account TEXT NOT NULL,"
+                      " diagnosis TEXT NOT NULL,"
+                      " next_appointment TEXT,"
+                      " sealed_doc TEXT,"
+                      " created_at REAL NOT NULL)",
+                      "CREATE TABLE axis_legal_cases ("
+                      " case_id TEXT PRIMARY KEY,"
+                      " client_account TEXT NOT NULL,"
+                      " lawyer_account TEXT NOT NULL,"
+                      " status TEXT NOT NULL,"
+                      " detail TEXT NOT NULL,"
+                      " sealed_doc TEXT,"
+                      " created_at REAL NOT NULL,"
+                      " updated_at REAL NOT NULL)",
+                      "CREATE TABLE axis_incidents ("
+                      " incident_id TEXT PRIMARY KEY,"
+                      " police_account TEXT NOT NULL,"
+                      " description TEXT NOT NULL,"
+                      " sealed_doc TEXT,"
+                      " created_at REAL NOT NULL)",
+                  ),
+              ),
+              Migration(
+                  2,
+                  "axis_emergencias",
+                  (
+                      "CREATE TABLE axis_exams ("
+                      " exam_id TEXT PRIMARY KEY,"
+                      " patient_account TEXT NOT NULL,"
+                      " doctor_account TEXT NOT NULL,"
+                      " exam_type TEXT NOT NULL,"
+                      " status TEXT NOT NULL,"
+                      " created_at REAL NOT NULL)",
+                      "CREATE TABLE axis_exam_results ("
+                      " result_id TEXT PRIMARY KEY,"
+                      " exam_id TEXT NOT NULL,"
+                      " patient_account TEXT NOT NULL,"
+                      " summary TEXT NOT NULL,"
+                      " severity TEXT NOT NULL,"
+                      " requires_followup INTEGER NOT NULL,"
+                      " followup_reason TEXT,"
+                      " sealed_doc TEXT,"
+                      " created_at REAL NOT NULL)",
+                      "CREATE TABLE axis_appointments ("
+                      " appointment_id TEXT PRIMARY KEY,"
+                      " patient_account TEXT NOT NULL,"
+                      " doctor_account TEXT NOT NULL,"
+                      " result_id TEXT,"
+                      " reason TEXT NOT NULL,"
+                      " scheduled_at TEXT NOT NULL,"
+                      " status TEXT NOT NULL,"
+                      " created_at REAL NOT NULL)",
+                      "CREATE TABLE axis_emergencies ("
+                      " emergency_id TEXT PRIMARY KEY,"
+                      " source_app TEXT NOT NULL,"
+                      " subject_account TEXT,"
+                      " subject_zid TEXT,"
+                      " emergency_type TEXT NOT NULL,"
+                      " severity TEXT NOT NULL,"
+                      " description TEXT NOT NULL,"
+                      " status TEXT NOT NULL,"
+                      " created_at REAL NOT NULL,"
+                      " resolved_at REAL)",
+                      "CREATE TABLE axis_dispatches ("
+                      " dispatch_id TEXT PRIMARY KEY,"
+                      " emergency_id TEXT NOT NULL,"
+                      " agency TEXT NOT NULL,"
+                      " priority TEXT NOT NULL,"
+                      " status TEXT NOT NULL,"
+                      " created_at REAL NOT NULL,"
+                      " acknowledged_at REAL,"
+                      " arrived_at REAL)",
+                      "CREATE TABLE axis_timeline ("
+                      " timeline_id TEXT PRIMARY KEY,"
+                      " emergency_id TEXT NOT NULL,"
+                      " actor TEXT NOT NULL,"
+                      " event_type TEXT NOT NULL,"
+                      " detail TEXT,"
+                      " occurred_at REAL NOT NULL)",
+                      "CREATE TABLE axis_evidence_chain ("
+                      " custody_id TEXT PRIMARY KEY,"
+                      " evidence_id TEXT NOT NULL,"
+                      " previous_hash TEXT NOT NULL,"
+                      " event_hash TEXT NOT NULL,"
+                      " actor_zid TEXT NOT NULL,"
+                      " action TEXT NOT NULL,"
+                      " document_id TEXT,"
+                      " occurred_at REAL NOT NULL)",
+                  ),
+              ),
+          )
+
+          AGENCIES = (
+              "policia",
+              "bomberos",
+              "ambulancia",
+              "hospital",
+          )
 
 
-          def _nid(prefix: str) -> str:
-              return prefix + uuid.uuid4().hex[:10]
+          class AxisStore:
+              """Durable state for AXIS."""
 
-
-          class CommerceStore:
-              """ADD-ONLY commerce layer over the existing
-              SUBASTAS database."""
-
-              def __init__(self, db, clock) -> None:
+              def __init__(
+                  self, db: Database, clock
+              ) -> None:
                   self._db = db
                   self._clock = clock
-                  self._lock = threading.Lock()
-                  self._ensure_schema()
+                  MigrationRunner(
+                      db, "axis", _MIGRATIONS
+                  ).run(clock)
 
-              def _now(self) -> float:
-                  try:
-                      return float(self._clock.now())
-                  except Exception:
-                      return time.time()
-
-              def _ensure_schema(self) -> None:
-                  for ddl in (
-                      "ALTER TABLE sbs_listings ADD COLUMN winner_account TEXT",
-                      "ALTER TABLE sbs_listings ADD COLUMN final_price REAL",
-                      "ALTER TABLE sbs_listings ADD COLUMN closed_at REAL",
-                  ):
-                      try:
-                          self._db.execute(ddl)
-                      except Exception:
-                          pass
-                  for ddl in (
-                      "CREATE TABLE IF NOT EXISTS sbs_orders ("
-                      " order_id TEXT PRIMARY KEY,"
-                      " listing_id TEXT NOT NULL,"
-                      " buyer_account TEXT NOT NULL,"
-                      " buyer_zid TEXT,"
-                      " seller_account TEXT NOT NULL,"
-                      " seller_zid TEXT,"
-                      " source TEXT NOT NULL,"
-                      " subtotal REAL NOT NULL,"
-                      " platform_fee REAL NOT NULL,"
-                      " total REAL NOT NULL,"
-                      " currency TEXT NOT NULL DEFAULT 'USD',"
-                      " status TEXT NOT NULL,"
-                      " created_at REAL NOT NULL,"
-                      " updated_at REAL NOT NULL)",
-                      "CREATE TABLE IF NOT EXISTS sbs_payments ("
-                      " payment_id TEXT PRIMARY KEY,"
-                      " order_id TEXT NOT NULL,"
-                      " provider TEXT NOT NULL,"
-                      " amount REAL NOT NULL,"
-                      " currency TEXT NOT NULL DEFAULT 'USD',"
-                      " status TEXT NOT NULL,"
-                      " created_at REAL NOT NULL)",
-                      "CREATE TABLE IF NOT EXISTS sbs_commissions ("
-                      " commission_id TEXT PRIMARY KEY,"
-                      " order_id TEXT NOT NULL,"
-                      " rate REAL NOT NULL,"
-                      " gross_amount REAL NOT NULL,"
-                      " commission_amount REAL NOT NULL,"
-                      " currency TEXT NOT NULL DEFAULT 'USD',"
-                      " created_at REAL NOT NULL)",
-                      "CREATE TABLE IF NOT EXISTS sbs_settlements ("
-                      " settlement_id TEXT PRIMARY KEY,"
-                      " order_id TEXT NOT NULL,"
-                      " seller_account TEXT NOT NULL,"
-                      " gross_amount REAL NOT NULL,"
-                      " commission REAL NOT NULL,"
-                      " net_amount REAL NOT NULL,"
-                      " currency TEXT NOT NULL DEFAULT 'USD',"
-                      " status TEXT NOT NULL,"
-                      " created_at REAL NOT NULL)",
-                      "CREATE TABLE IF NOT EXISTS sbs_shipments ("
-                      " shipment_id TEXT PRIMARY KEY,"
-                      " order_id TEXT NOT NULL,"
-                      " carrier TEXT NOT NULL,"
-                      " origin TEXT NOT NULL,"
-                      " destination TEXT NOT NULL,"
-                      " status TEXT NOT NULL,"
-                      " created_at REAL NOT NULL,"
-                      " updated_at REAL NOT NULL)",
-                      "CREATE TABLE IF NOT EXISTS sbs_tracking_events ("
-                      " event_id TEXT PRIMARY KEY,"
-                      " shipment_id TEXT NOT NULL,"
-                      " status TEXT NOT NULL,"
-                      " location TEXT,"
-                      " description TEXT,"
-                      " occurred_at REAL NOT NULL)",
-                      "CREATE TABLE IF NOT EXISTS sbs_reputation_events ("
-                      " event_id TEXT PRIMARY KEY,"
-                      " order_id TEXT,"
-                      " subject_zid TEXT NOT NULL,"
-                      " actor_zid TEXT NOT NULL,"
-                      " kind TEXT NOT NULL,"
-                      " evidence TEXT NOT NULL,"
-                      " network_recorded INTEGER NOT NULL DEFAULT 0,"
-                      " created_at REAL NOT NULL)",
-                      "CREATE TABLE IF NOT EXISTS sbs_opportunities ("
-                      " opportunity_id TEXT PRIMARY KEY,"
-                      " title TEXT NOT NULL,"
-                      " category TEXT,"
-                      " purchase_price REAL NOT NULL,"
-                      " shipping_cost REAL NOT NULL,"
-                      " fees REAL NOT NULL,"
-                      " estimated_sale_price REAL NOT NULL,"
-                      " total_cost REAL NOT NULL,"
-                      " expected_profit REAL NOT NULL,"
-                      " margin_percent REAL NOT NULL,"
-                      " demand_score REAL NOT NULL,"
-                      " risk_score REAL NOT NULL,"
-                      " opportunity_score REAL NOT NULL,"
-                      " status TEXT NOT NULL,"
-                      " created_at REAL NOT NULL)",
-                  ):
-                      self._db.execute(ddl)
-
-              def _run(self, sql, params=()) -> None:
-                  if not params:
-                      self._db.execute(sql)
-                      return
-                  try:
-                      self._db.execute(sql, params)
-                      return
-                  except TypeError:
-                      self._db.execute(self._inline(sql, params))
-
-              @staticmethod
-              def _inline(sql, params) -> str:
-                  parts = sql.split("?")
-                  if len(parts) != len(params) + 1:
-                      return sql
-                  assembled = parts[0]
-                  for index, value in enumerate(params):
-                      assembled += CommerceStore._literal(value)
-                      assembled += parts[index + 1]
-                  return assembled
-
-              @staticmethod
-              def _literal(value) -> str:
-                  if value is None:
-                      return "NULL"
-                  if isinstance(value, bool):
-                      return "1" if value else "0"
-                  if isinstance(value, (int, float)):
-                      return repr(value)
-                  text = str(value).replace("'", "''")
-                  return "'" + text + "'"
-
-              def _rows(self, sql) -> list:
-                  for name in ("query", "fetchall", "fetch_all", "fetch", "select"):
-                      fn = getattr(self._db, name, None)
-                      if not callable(fn):
-                          continue
-                      try:
-                          rows = fn(sql)
-                          if rows is None:
-                              continue
-                          return list(rows)
-                      except Exception:
-                          continue
-                  try:
-                      cursor = self._db.execute(sql)
-                  except Exception:
-                      return []
-                  if cursor is None:
-                      return []
-                  try:
-                      return list(cursor.fetchall())
-                  except Exception:
-                      return []
-
-              @staticmethod
-              def _field(row, key, index):
-                  if isinstance(row, dict):
-                      return row.get(key)
-                  try:
-                      return row[index]
-                  except Exception:
-                      return None
-
-              def persist_winner(self, *, listing_id: str) -> dict:
-                  with self._lock:
-                      rows = self._rows(
-                          "SELECT bidder_account, amount FROM sbs_bids"
-                          " WHERE listing_id = "
-                          + self._literal(listing_id)
-                          + " ORDER BY amount DESC LIMIT 1"
+              def add_account(
+                  self,
+                  *,
+                  account_id: str,
+                  zid: str | None,
+                  name: str,
+                  role: str,
+              ) -> dict[str, object]:
+                  if role not in ROLES:
+                      raise ValueError(
+                          f"unknown role: {role}"
                       )
-                      if not rows:
-                          raise LookupError("no bids for: " + listing_id)
-                      winner = str(self._field(rows[0], "w", 0))
-                      price = float(self._field(rows[0], "p", 1))
-                      now = self._now()
-                      self._run(
-                          "UPDATE sbs_listings SET"
-                          " winner_account = "
-                          + self._literal(winner)
-                          + ", final_price = "
-                          + self._literal(price)
-                          + ", closed_at = "
-                          + self._literal(now)
-                          + " WHERE listing_id = "
-                          + self._literal(listing_id)
-                      )
-                      return {
-                          "listing_id": listing_id,
-                          "winner_account": winner,
-                          "final_price": price,
-                      }
-
-              def get_listing_full(self, listing_id: str):
-                  rows = self._rows(
-                      "SELECT listing_id, seller_account, seller_zid,"
-                      " title, base_price, document_id, status,"
-                      " winner_account, final_price, closed_at"
-                      " FROM sbs_listings WHERE listing_id = "
-                      + self._literal(listing_id)
-                  )
-                  if not rows:
-                      return None
-                  row = rows[0]
-                  return {
-                      "listing_id": self._field(row, "a", 0),
-                      "seller_account": self._field(row, "b", 1),
-                      "seller_zid": self._field(row, "c", 2),
-                      "title": self._field(row, "d", 3),
-                      "base_price": self._field(row, "e", 4),
-                      "document_id": self._field(row, "f", 5),
-                      "status": self._field(row, "g", 6),
-                      "winner_account": self._field(row, "h", 7),
-                      "final_price": self._field(row, "i", 8),
-                      "closed_at": self._field(row, "j", 9),
-                  }
-
-              def account_zid(self, account_id: str):
-                  rows = self._rows(
-                      "SELECT zid FROM sbs_accounts WHERE account_id = "
-                      + self._literal(account_id)
-                  )
-                  if not rows:
-                      return None
-                  zid = self._field(rows[0], "z", 0)
-                  return str(zid) if zid is not None else None
-
-              def create_order(
-                  self, *, order_id, listing_id, buyer_account, source,
-              ) -> dict:
-                  with self._lock:
-                      listing = self.get_listing_full(listing_id)
-                      if listing is None:
-                          raise LookupError("listing not found: " + listing_id)
-                      if source == "auction":
-                          if listing["status"] != "closed":
-                              raise ValueError("auction not closed yet")
-                          if listing["winner_account"] != buyer_account:
-                              raise ValueError("buyer is not the auction winner")
-                          subtotal = float(listing["final_price"] or 0)
-                      else:
-                          if listing["status"] != "open":
-                              raise ValueError("listing is not open")
-                          subtotal = float(listing["base_price"])
-                      dup = self._rows(
-                          "SELECT order_id FROM sbs_orders WHERE listing_id = "
-                          + self._literal(listing_id)
-                      )
-                      if dup:
-                          raise ValueError("order already exists for this listing")
-                      fee = round(subtotal * PLATFORM_FEE_RATE, 2)
-                      now = self._now()
-                      self._run(
-                          "INSERT INTO sbs_orders ("
-                          " order_id, listing_id, buyer_account, buyer_zid,"
-                          " seller_account, seller_zid, source, subtotal,"
-                          " platform_fee, total, currency, status,"
-                          " created_at, updated_at"
-                          ") VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?,"
-                          " 'USD', 'created', ?, ?)",
+                  now = self._clock.now()
+                  with self._db.transaction() as cursor:
+                      cursor.execute(
+                          "INSERT INTO axis_accounts"
+                          " (account_id, zid, name,"
+                          "  role, created_at)"
+                          " VALUES (?, ?, ?, ?, ?)",
                           (
-                              order_id,
-                              listing_id,
-                              buyer_account,
-                              self.account_zid(buyer_account),
-                              listing["seller_account"],
-                              listing["seller_zid"],
-                              source,
-                              subtotal,
-                              fee,
-                              subtotal,
-                              now,
+                              account_id,
+                              zid,
+                              name,
+                              role,
                               now,
                           ),
                       )
-                      return self.get_order(order_id)
+                  return self.get_account(account_id)
 
-              def get_order(self, order_id: str) -> dict:
-                  rows = self._rows(
-                      "SELECT order_id, listing_id, buyer_account,"
-                      " buyer_zid, seller_account, seller_zid, source,"
-                      " subtotal, platform_fee, total, currency, status,"
-                      " created_at, updated_at FROM sbs_orders"
-                      " WHERE order_id = "
-                      + self._literal(order_id)
+              def get_account(
+                  self, account_id: str
+              ) -> dict[str, object]:
+                  row = self._db.query_one(
+                      "SELECT * FROM axis_accounts"
+                      " WHERE account_id = ?",
+                      (account_id,),
                   )
-                  if not rows:
-                      raise LookupError("order not found: " + order_id)
-                  row = rows[0]
-                  order = {
-                      "order_id": self._field(row, "a", 0),
-                      "listing_id": self._field(row, "b", 1),
-                      "buyer_account": self._field(row, "c", 2),
-                      "buyer_zid": self._field(row, "d", 3),
-                      "seller_account": self._field(row, "e", 4),
-                      "seller_zid": self._field(row, "f", 5),
-                      "source": self._field(row, "g", 6),
-                      "subtotal": self._field(row, "h", 7),
-                      "platform_fee": self._field(row, "i", 8),
-                      "total": self._field(row, "j", 9),
-                      "currency": self._field(row, "k", 10),
-                      "status": self._field(row, "l", 11),
-                      "payments": [],
-                      "commission": None,
-                      "settlement": None,
-                      "shipment": None,
-                  }
-                  pays = self._rows(
-                      "SELECT payment_id, provider, amount, status"
-                      " FROM sbs_payments WHERE order_id = "
-                      + self._literal(order_id)
-                  )
-                  for p in pays:
-                      order["payments"].append(
-                          {
-                              "payment_id": self._field(p, "a", 0),
-                              "provider": self._field(p, "b", 1),
-                              "amount": self._field(p, "c", 2),
-                              "status": self._field(p, "d", 3),
-                          }
-                      )
-                  com = self._rows(
-                      "SELECT commission_id, rate, commission_amount"
-                      " FROM sbs_commissions WHERE order_id = "
-                      + self._literal(order_id)
-                  )
-                  if com:
-                      order["commission"] = {
-                          "commission_id": self._field(com[0], "a", 0),
-                          "rate": self._field(com[0], "b", 1),
-                          "commission_amount": self._field(com[0], "c", 2),
-                      }
-                  stl = self._rows(
-                      "SELECT settlement_id, gross_amount, commission,"
-                      " net_amount, status FROM sbs_settlements"
-                      " WHERE order_id = "
-                      + self._literal(order_id)
-                  )
-                  if stl:
-                      order["settlement"] = {
-                          "settlement_id": self._field(stl[0], "a", 0),
-                          "gross_amount": self._field(stl[0], "b", 1),
-                          "commission": self._field(stl[0], "c", 2),
-                          "net_amount": self._field(stl[0], "d", 3),
-                          "status": self._field(stl[0], "e", 4),
-                      }
-                  shp = self._rows(
-                      "SELECT shipment_id, carrier, origin, destination,"
-                      " status FROM sbs_shipments WHERE order_id = "
-                      + self._literal(order_id)
-                  )
-                  if shp:
-                      order["shipment"] = {
-                          "shipment_id": self._field(shp[0], "a", 0),
-                          "carrier": self._field(shp[0], "b", 1),
-                          "origin": self._field(shp[0], "c", 2),
-                          "destination": self._field(shp[0], "d", 3),
-                          "status": self._field(shp[0], "e", 4),
-                      }
-                  return order
-
-              def pay_order(self, *, order_id, provider) -> dict:
-                  with self._lock:
-                      order = self.get_order(order_id)
-                      if order["status"] != "created":
-                          raise ValueError("order is not payable")
-                      now = self._now()
-                      self._run(
-                          "INSERT INTO sbs_payments ("
-                          " payment_id, order_id, provider, amount,"
-                          " currency, status, created_at"
-                          ") VALUES (?, ?, ?, ?, 'USD', 'captured', ?)",
-                          (_nid("PAY-"), order_id, provider, order["total"], now),
-                      )
-                      self._run(
-                          "INSERT INTO sbs_commissions ("
-                          " commission_id, order_id, rate, gross_amount,"
-                          " commission_amount, currency, created_at"
-                          ") VALUES (?, ?, ?, ?, ?, 'USD', ?)",
-                          (
-                              _nid("COM-"),
-                              order_id,
-                              PLATFORM_FEE_RATE,
-                              order["total"],
-                              order["platform_fee"],
-                              now,
-                          ),
-                      )
-                      self._run(
-                          "UPDATE sbs_orders SET status = 'paid', updated_at = "
-                          + self._literal(now)
-                          + " WHERE order_id = "
-                          + self._literal(order_id)
-                      )
-                      return self.get_order(order_id)
-
-              def settle_order(self, *, order_id) -> dict:
-                  with self._lock:
-                      order = self.get_order(order_id)
-                      if order["status"] != "paid":
-                          raise ValueError("order is not settleable")
-                      net = round(order["total"] - order["platform_fee"], 2)
-                      self._run(
-                          "INSERT INTO sbs_settlements ("
-                          " settlement_id, order_id, seller_account,"
-                          " gross_amount, commission, net_amount,"
-                          " currency, status, created_at"
-                          ") VALUES (?, ?, ?, ?, ?, ?, 'USD', 'settled', ?)",
-                          (
-                              _nid("SET-"),
-                              order_id,
-                              order["seller_account"],
-                              order["total"],
-                              order["platform_fee"],
-                              net,
-                              self._now(),
-                          ),
-                      )
-                      self._run(
-                          "UPDATE sbs_orders SET status = 'settled',"
-                          " updated_at = "
-                          + self._literal(self._now())
-                          + " WHERE order_id = "
-                          + self._literal(order_id)
-                      )
-                      return self.get_order(order_id)
-
-              def create_shipment(
-                  self, *, shipment_id, order_id, carrier, origin, destination,
-              ) -> dict:
-                  with self._lock:
-                      order = self.get_order(order_id)
-                      if order["status"] != "settled":
-                          raise ValueError("order is not shippable")
-                      now = self._now()
-                      self._run(
-                          "INSERT INTO sbs_shipments ("
-                          " shipment_id, order_id, carrier, origin,"
-                          " destination, status, created_at, updated_at"
-                          ") VALUES (?, ?, ?, ?, ?, 'created', ?, ?)",
-                          (shipment_id, order_id, carrier, origin, destination, now, now),
-                      )
-                      self._run(
-                          "UPDATE sbs_orders SET status = 'shipped', updated_at = "
-                          + self._literal(now)
-                          + " WHERE order_id = "
-                          + self._literal(order_id)
-                      )
-                      return self.get_shipment(shipment_id)
-
-              def get_shipment(self, shipment_id: str) -> dict:
-                  rows = self._rows(
-                      "SELECT shipment_id, order_id, carrier, origin,"
-                      " destination, status FROM sbs_shipments"
-                      " WHERE shipment_id = "
-                      + self._literal(shipment_id)
-                  )
-                  if not rows:
-                      raise LookupError("shipment not found: " + shipment_id)
-                  row = rows[0]
-                  events = self._rows(
-                      "SELECT event_id, status, location, description"
-                      " FROM sbs_tracking_events WHERE shipment_id = "
-                      + self._literal(shipment_id)
-                      + " ORDER BY occurred_at"
-                  )
-                  tracking = []
-                  for e in events:
-                      tracking.append(
-                          {
-                              "event_id": self._field(e, "a", 0),
-                              "status": self._field(e, "b", 1),
-                              "location": self._field(e, "c", 2),
-                              "description": self._field(e, "d", 3),
-                          }
+                  if row is None:
+                      raise LookupError(
+                          "unknown account:"
+                          f" {account_id}"
                       )
                   return {
-                      "shipment_id": self._field(row, "a", 0),
-                      "order_id": self._field(row, "b", 1),
-                      "carrier": self._field(row, "c", 2),
-                      "origin": self._field(row, "d", 3),
-                      "destination": self._field(row, "e", 4),
-                      "status": self._field(row, "f", 5),
-                      "tracking": tracking,
-                  }
-
-              def add_tracking(
-                  self, *, shipment_id, status, location, description,
-              ) -> dict:
-                  with self._lock:
-                      current = self.get_shipment(shipment_id)
-                      if current["status"] == "delivered":
-                          raise ValueError("shipment already delivered")
-                      self._run(
-                          "INSERT INTO sbs_tracking_events ("
-                          " event_id, shipment_id, status, location,"
-                          " description, occurred_at"
-                          ") VALUES (?, ?, ?, ?, ?, ?)",
-                          (_nid("TRK-"), shipment_id, status, location, description, self._now()),
-                      )
-                      self._run(
-                          "UPDATE sbs_shipments SET status = "
-                          + self._literal(status)
-                          + ", updated_at = "
-                          + self._literal(self._now())
-                          + " WHERE shipment_id = "
-                          + self._literal(shipment_id)
-                      )
-                      return self.get_shipment(shipment_id)
-
-              def confirm_delivery(self, *, shipment_id) -> dict:
-                  with self._lock:
-                      current = self.get_shipment(shipment_id)
-                      if current["status"] == "delivered":
-                          raise ValueError("shipment already delivered")
-                      now = self._now()
-                      self._run(
-                          "INSERT INTO sbs_tracking_events ("
-                          " event_id, shipment_id, status, location,"
-                          " description, occurred_at"
-                          ") VALUES (?, ?, 'delivered', NULL,"
-                          " 'entregado al comprador', ?)",
-                          (_nid("TRK-"), shipment_id, now),
-                      )
-                      self._run(
-                          "UPDATE sbs_shipments SET status = 'delivered',"
-                          " updated_at = "
-                          + self._literal(now)
-                          + " WHERE shipment_id = "
-                          + self._literal(shipment_id)
-                      )
-                      self._run(
-                          "UPDATE sbs_orders SET status = 'delivered',"
-                          " updated_at = "
-                          + self._literal(now)
-                          + " WHERE order_id = "
-                          + self._literal(current["order_id"])
-                      )
-                      return self.get_shipment(shipment_id)
-
-              def record_rep_event(
-                  self, *, order_id, subject_zid, actor_zid, kind, evidence,
-                  network_recorded,
-              ) -> dict:
-                  self._run(
-                      "INSERT INTO sbs_reputation_events ("
-                      " event_id, order_id, subject_zid, actor_zid,"
-                      " kind, evidence, network_recorded, created_at"
-                      ") VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
-                      (
-                          _nid("REP-"),
-                          order_id,
-                          subject_zid,
-                          actor_zid,
-                          kind,
-                          evidence,
-                          1 if network_recorded else 0,
-                          self._now(),
+                      "account_id": str(
+                          row["account_id"]
                       ),
-                  )
-                  return {"recorded": True}
-
-              def create_opportunity(
-                  self, *, opportunity_id, title, category, purchase_price,
-                  shipping_cost, fees, estimated_sale_price, demand_score,
-                  risk_score,
-              ) -> dict:
-                  total_cost = round(purchase_price + shipping_cost + fees, 2)
-                  if total_cost <= 0:
-                      raise ValueError("total cost must be positive")
-                  expected_profit = round(estimated_sale_price - total_cost, 2)
-                  margin_percent = round(expected_profit / total_cost * 100, 2)
-                  score = round(
-                      margin_percent * 0.5
-                      + demand_score * 30
-                      + (1 - risk_score) * 20,
-                      2,
-                  )
-                  self._run(
-                      "INSERT INTO sbs_opportunities ("
-                      " opportunity_id, title, category, purchase_price,"
-                      " shipping_cost, fees, estimated_sale_price,"
-                      " total_cost, expected_profit, margin_percent,"
-                      " demand_score, risk_score, opportunity_score,"
-                      " status, created_at"
-                      ") VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'open', ?)",
-                      (
-                          opportunity_id,
-                          title,
-                          category,
-                          purchase_price,
-                          shipping_cost,
-                          fees,
-                          estimated_sale_price,
-                          total_cost,
-                          expected_profit,
-                          margin_percent,
-                          demand_score,
-                          risk_score,
-                          score,
-                          self._now(),
+                      "zid": (
+                          str(row["zid"])
+                          if row["zid"] is not None
+                          else None
                       ),
-                  )
-                  return {
-                      "opportunity_id": opportunity_id,
-                      "title": title,
-                      "total_cost": total_cost,
-                      "expected_profit": expected_profit,
-                      "margin_percent": margin_percent,
-                      "opportunity_score": score,
+                      "name": str(row["name"]),
+                      "role": str(row["role"]),
+                      "created_at": float(
+                          row["created_at"]
+                      ),
                   }
 
-              def list_opportunities(self) -> list:
-                  rows = self._rows(
-                      "SELECT opportunity_id, title, category,"
-                      " purchase_price, estimated_sale_price, total_cost,"
-                      " expected_profit, margin_percent, opportunity_score,"
-                      " status FROM sbs_opportunities ORDER BY created_at"
+              def list_by_role(
+                  self, *, role: str
+              ) -> tuple[dict[str, object], ...]:
+                  if role not in ROLES:
+                      raise ValueError(
+                          f"unknown role: {role}"
+                      )
+                  rows = self._db.query_all(
+                      "SELECT * FROM axis_accounts"
+                      " WHERE role = ?"
+                      " ORDER BY created_at",
+                      (role,),
                   )
-                  result = []
+                  return tuple(
+                      {
+                          "account_id": str(
+                              r["account_id"]
+                          ),
+                          "name": str(r["name"]),
+                      }
+                      for r in rows
+                  )
+
+              def add_medical_record(
+                  self,
+                  *,
+                  record_id: str,
+                  patient_account: str,
+                  doctor_account: str,
+                  diagnosis: str,
+                  next_appointment: str | None,
+                  sealed_doc: str | None,
+              ) -> dict[str, object]:
+                  now = self._clock.now()
+                  with self._db.transaction() as cursor:
+                      cursor.execute(
+                          "INSERT INTO axis_medical"
+                          " (record_id,"
+                          "  patient_account,"
+                          "  doctor_account,"
+                          "  diagnosis,"
+                          "  next_appointment,"
+                          "  sealed_doc, created_at)"
+                          " VALUES (?, ?, ?, ?, ?,"
+                          "  ?, ?)",
+                          (
+                              record_id,
+                              patient_account,
+                              doctor_account,
+                              diagnosis,
+                              next_appointment,
+                              sealed_doc,
+                              now,
+                          ),
+                      )
+                  return {
+                      "record_id": record_id,
+                      "diagnosis": diagnosis,
+                      "next_appointment": (
+                          next_appointment
+                      ),
+                  }
+
+              def medical_records_of(
+                  self,
+                  *,
+                  patient_account: str,
+              ) -> tuple[dict[str, object], ...]:
+                  rows = self._db.query_all(
+                      "SELECT * FROM axis_medical"
+                      " WHERE patient_account = ?"
+                      " ORDER BY created_at",
+                      (patient_account,),
+                  )
+                  return tuple(
+                      {
+                          "record_id": str(
+                              r["record_id"]
+                          ),
+                          "diagnosis": str(
+                              r["diagnosis"]
+                          ),
+                          "next_appointment": (
+                              str(
+                                  r[
+                                      "next_appointment"
+                                  ]
+                              )
+                              if r[
+                                  "next_appointment"
+                              ]
+                              is not None
+                              else None
+                          ),
+                      }
+                      for r in rows
+                  )
+
+              def add_legal_case(
+                  self,
+                  *,
+                  case_id: str,
+                  client_account: str,
+                  lawyer_account: str,
+                  status: str,
+                  detail: str,
+                  sealed_doc: str | None,
+              ) -> dict[str, object]:
+                  now = self._clock.now()
+                  with self._db.transaction() as cursor:
+                      cursor.execute(
+                          "INSERT INTO axis_legal_cases"
+                          " (case_id, client_account,"
+                          "  lawyer_account, status,"
+                          "  detail, sealed_doc,"
+                          "  created_at, updated_at)"
+                          " VALUES (?, ?, ?, ?, ?, ?,"
+                          "  ?, ?)",
+                          (
+                              case_id,
+                              client_account,
+                              lawyer_account,
+                              status,
+                              detail,
+                              sealed_doc,
+                              now,
+                              now,
+                          ),
+                      )
+                  return self.get_case(case_id)
+
+              def update_case_status(
+                  self,
+                  *,
+                  case_id: str,
+                  status: str,
+                  detail: str,
+                  sealed_doc: str | None,
+              ) -> dict[str, object]:
+                  now = self._clock.now()
+                  with self._db.transaction() as cursor:
+                      cursor.execute(
+                          "UPDATE axis_legal_cases SET"
+                          " status = ?, detail = ?,"
+                          " sealed_doc = ?,"
+                          " updated_at = ?"
+                          " WHERE case_id = ?",
+                          (
+                              status,
+                              detail,
+                              sealed_doc,
+                              now,
+                              case_id,
+                          ),
+                      )
+                  return self.get_case(case_id)
+
+              def get_case(
+                  self, case_id: str
+              ) -> dict[str, object]:
+                  row = self._db.query_one(
+                      "SELECT * FROM axis_legal_cases"
+                      " WHERE case_id = ?",
+                      (case_id,),
+                  )
+                  if row is None:
+                      raise LookupError(
+                          "unknown case:"
+                          f" {case_id}"
+                      )
+                  sealed = row["sealed_doc"]
+                  return {
+                      "case_id": str(row["case_id"]),
+                      "client_account": str(
+                          row["client_account"]
+                      ),
+                      "lawyer_account": str(
+                          row["lawyer_account"]
+                      ),
+                      "status": str(row["status"]),
+                      "detail": str(row["detail"]),
+                      "sealed_doc": (
+                          str(sealed)
+                          if sealed is not None
+                          else None
+                      ),
+                  }
+
+              def cases_for(
+                  self,
+                  *,
+                  lawyer_account: str,
+              ) -> tuple[dict[str, object], ...]:
+                  rows = self._db.query_all(
+                      "SELECT case_id FROM"
+                      " axis_legal_cases WHERE"
+                      " lawyer_account = ?"
+                      " ORDER BY updated_at DESC",
+                      (lawyer_account,),
+                  )
+                  return tuple(
+                      self.get_case(
+                          str(r["case_id"])
+                      )
+                      for r in rows
+                  )
+
+              def add_incident(
+                  self,
+                  *,
+                  incident_id: str,
+                  police_account: str,
+                  description: str,
+                  sealed_doc: str | None,
+              ) -> dict[str, object]:
+                  now = self._clock.now()
+                  with self._db.transaction() as cursor:
+                      cursor.execute(
+                          "INSERT INTO axis_incidents"
+                          " (incident_id,"
+                          "  police_account,"
+                          "  description, sealed_doc,"
+                          "  created_at)"
+                          " VALUES (?, ?, ?, ?, ?)",
+                          (
+                              incident_id,
+                              police_account,
+                              description,
+                              sealed_doc,
+                              now,
+                          ),
+                      )
+                  return {
+                      "incident_id": incident_id,
+                      "description": description,
+                      "sealed_doc": sealed_doc,
+                  }
+
+              def list_incidents(
+                  self,
+              ) -> tuple[dict[str, object], ...]:
+                  rows = self._db.query_all(
+                      "SELECT * FROM axis_incidents"
+                      " ORDER BY created_at DESC"
+                  )
+                  return tuple(
+                      {
+                          "incident_id": str(
+                              r["incident_id"]
+                          ),
+                          "description": str(
+                              r["description"]
+                          ),
+                          "sealed_doc": (
+                              str(r["sealed_doc"])
+                              if r["sealed_doc"]
+                              is not None
+                              else None
+                          ),
+                      }
+                      for r in rows
+                  )
+
+              # ---------- salud: examen → resultado → seguimiento (v2) ----------
+
+              def add_exam(
+                  self,
+                  *,
+                  exam_id: str,
+                  patient_account: str,
+                  doctor_account: str,
+                  exam_type: str,
+              ) -> dict[str, object]:
+                  now = self._clock.now()
+                  with self._db.transaction() as cursor:
+                      cursor.execute(
+                          "INSERT INTO axis_exams"
+                          " (exam_id,"
+                          "  patient_account,"
+                          "  doctor_account,"
+                          "  exam_type, status,"
+                          "  created_at)"
+                          " VALUES (?, ?, ?, ?,"
+                          "  'ordered', ?)",
+                          (
+                              exam_id,
+                              patient_account,
+                              doctor_account,
+                              exam_type,
+                              now,
+                          ),
+                      )
+                  return {
+                      "exam_id": exam_id,
+                      "status": "ordered",
+                  }
+
+              def add_exam_result(
+                  self,
+                  *,
+                  result_id: str,
+                  exam_id: str,
+                  summary: str,
+                  severity: str,
+                  requires_followup: bool,
+                  followup_reason: str | None,
+                  sealed_doc: str | None,
+              ) -> dict[str, object]:
+                  row = self._db.query_one(
+                      "SELECT patient_account FROM"
+                      " axis_exams WHERE exam_id = ?",
+                      (exam_id,),
+                  )
+                  if row is None:
+                      raise LookupError(
+                          "unknown exam:"
+                          f" {exam_id}"
+                      )
+                  patient = str(
+                      row["patient_account"]
+                  )
+                  now = self._clock.now()
+                  with self._db.transaction() as cursor:
+                      cursor.execute(
+                          "INSERT INTO"
+                          " axis_exam_results ("
+                          " result_id, exam_id,"
+                          "  patient_account,"
+                          "  summary, severity,"
+                          "  requires_followup,"
+                          "  followup_reason,"
+                          "  sealed_doc, created_at)"
+                          " VALUES (?, ?, ?, ?, ?,"
+                          "  ?, ?, ?, ?)",
+                          (
+                              result_id,
+                              exam_id,
+                              patient,
+                              summary,
+                              severity,
+                              1
+                              if requires_followup
+                              else 0,
+                              followup_reason,
+                              sealed_doc,
+                              now,
+                          ),
+                      )
+                      cursor.execute(
+                          "UPDATE axis_exams SET"
+                          " status = 'resulted'"
+                          " WHERE exam_id = ?",
+                          (exam_id,),
+                      )
+                  return {
+                      "result_id": result_id,
+                      "exam_id": exam_id,
+                      "patient_account": (
+                          patient
+                      ),
+                      "severity": severity,
+                      "requires_followup": (
+                          requires_followup
+                      ),
+                      "followup_reason": (
+                          followup_reason
+                      ),
+                  }
+
+              def create_appointment(
+                  self,
+                  *,
+                  appointment_id: str,
+                  patient_account: str,
+                  doctor_account: str,
+                  result_id: str | None,
+                  reason: str,
+                  scheduled_at: str,
+              ) -> dict[str, object]:
+                  now = self._clock.now()
+                  with self._db.transaction() as cursor:
+                      cursor.execute(
+                          "INSERT INTO"
+                          " axis_appointments ("
+                          " appointment_id,"
+                          "  patient_account,"
+                          "  doctor_account,"
+                          "  result_id, reason,"
+                          "  scheduled_at, status,"
+                          "  created_at)"
+                          " VALUES (?, ?, ?, ?, ?,"
+                          "  ?, 'scheduled', ?)",
+                          (
+                              appointment_id,
+                              patient_account,
+                              doctor_account,
+                              result_id,
+                              reason,
+                              scheduled_at,
+                              now,
+                          ),
+                      )
+                  return {
+                      "appointment_id": (
+                          appointment_id
+                      ),
+                      "patient_account": (
+                          patient_account
+                      ),
+                      "reason": reason,
+                      "scheduled_at": (
+                          scheduled_at
+                      ),
+                      "status": "scheduled",
+                  }
+
+              def appointments_of(
+                  self,
+                  *,
+                  patient_account: str,
+              ) -> tuple[dict[str, object], ...]:
+                  rows = self._db.query_all(
+                      "SELECT * FROM"
+                      " axis_appointments"
+                      " WHERE patient_account = ?"
+                      " ORDER BY created_at",
+                      (patient_account,),
+                  )
+                  return tuple(
+                      {
+                          "appointment_id": str(
+                              r[
+                                  "appointment_id"
+                              ]
+                          ),
+                          "reason": str(
+                              r["reason"]
+                          ),
+                          "scheduled_at": str(
+                              r["scheduled_at"]
+                          ),
+                          "status": str(
+                              r["status"]
+                          ),
+                      }
+                      for r in rows
+                  )
+
+              def pending_reminders(
+                  self,
+              ) -> tuple[dict[str, object], ...]:
+                  rows = self._db.query_all(
+                      "SELECT * FROM"
+                      " axis_appointments"
+                      " WHERE status ="
+                      " 'scheduled'"
+                      " ORDER BY created_at"
+                  )
+                  return tuple(
+                      {
+                          "appointment_id": str(
+                              r[
+                                  "appointment_id"
+                              ]
+                          ),
+                          "patient_account": str(
+                              r[
+                                  "patient_account"
+                              ]
+                          ),
+                          "reason": str(
+                              r["reason"]
+                          ),
+                          "scheduled_at": str(
+                              r["scheduled_at"]
+                          ),
+                      }
+                      for r in rows
+                  )
+
+              # ---------- emergencias (v2) ----------
+
+              def create_emergency(
+                  self,
+                  *,
+                  emergency_id: str,
+                  source_app: str,
+                  subject_account: str | None,
+                  subject_zid: str | None,
+                  emergency_type: str,
+                  severity: str,
+                  description: str,
+              ) -> dict[str, object]:
+                  now = self._clock.now()
+                  with self._db.transaction() as cursor:
+                      cursor.execute(
+                          "INSERT INTO"
+                          " axis_emergencies ("
+                          " emergency_id,"
+                          "  source_app,"
+                          "  subject_account,"
+                          "  subject_zid,"
+                          "  emergency_type,"
+                          "  severity, description,"
+                          "  status, created_at)"
+                          " VALUES (?, ?, ?, ?, ?,"
+                          "  ?, ?, 'open', ?)",
+                          (
+                              emergency_id,
+                              source_app,
+                              subject_account,
+                              subject_zid,
+                              emergency_type,
+                              severity,
+                              description,
+                              now,
+                          ),
+                      )
+                      cursor.execute(
+                          "INSERT INTO axis_timeline ("
+                          " timeline_id,"
+                          "  emergency_id, actor,"
+                          "  event_type, detail,"
+                          "  occurred_at)"
+                          " VALUES (?, ?, ?, ?,"
+                          "  ?, ?)",
+                          (
+                              "TL-"
+                              + uuid.uuid4().hex[
+                                  :10
+                              ],
+                              emergency_id,
+                              source_app,
+                              "emergency_created",
+                              description,
+                              now,
+                          ),
+                      )
+                  return self.get_emergency(
+                      emergency_id
+                  )
+
+              def get_emergency(
+                  self,
+                  emergency_id: str,
+              ) -> dict[str, object]:
+                  row = self._db.query_one(
+                      "SELECT * FROM"
+                      " axis_emergencies WHERE"
+                      " emergency_id = ?",
+                      (emergency_id,),
+                  )
+                  if row is None:
+                      raise LookupError(
+                          "unknown emergency:"
+                          f" {emergency_id}"
+                      )
+                  dispatches = self._db.query_all(
+                      "SELECT * FROM"
+                      " axis_dispatches WHERE"
+                      " emergency_id = ?"
+                      " ORDER BY created_at",
+                      (emergency_id,),
+                  )
+                  timeline = self._db.query_all(
+                      "SELECT * FROM axis_timeline"
+                      " WHERE emergency_id = ?"
+                      " ORDER BY occurred_at",
+                      (emergency_id,),
+                  )
+                  return {
+                      "emergency_id": str(
+                          row["emergency_id"]
+                      ),
+                      "source_app": str(
+                          row["source_app"]
+                      ),
+                      "subject_account": (
+                          str(
+                              row[
+                                  "subject_account"
+                              ]
+                          )
+                          if row[
+                              "subject_account"
+                          ]
+                          is not None
+                          else None
+                      ),
+                      "emergency_type": str(
+                          row["emergency_type"]
+                      ),
+                      "severity": str(
+                          row["severity"]
+                      ),
+                      "description": str(
+                          row["description"]
+                      ),
+                      "status": str(
+                          row["status"]
+                      ),
+                      "dispatches": [
+                          {
+                              "dispatch_id": str(
+                                  d[
+                                      "dispatch_id"
+                                  ]
+                              ),
+                              "agency": str(
+                                  d["agency"]
+                              ),
+                              "priority": str(
+                                  d["priority"]
+                              ),
+                              "status": str(
+                                  d["status"]
+                              ),
+                          }
+                          for d in dispatches
+                      ],
+                      "timeline": [
+                          {
+                              "actor": str(
+                                  t["actor"]
+                              ),
+                              "event_type": str(
+                                  t[
+                                      "event_type"
+                                  ]
+                              ),
+                              "detail": (
+                                  str(
+                                      t["detail"]
+                                  )
+                                  if t["detail"]
+                                  is not None
+                                  else None
+                              ),
+                          }
+                          for t in timeline
+                      ],
+                  }
+
+              def dispatch_emergency(
+                  self,
+                  *,
+                  emergency_id: str,
+                  agency: str,
+                  priority: str,
+              ) -> dict[str, object]:
+                  if agency not in AGENCIES:
+                      raise ValueError(
+                          f"unknown agency: {agency}"
+                      )
+                  row = self._db.query_one(
+                      "SELECT status FROM"
+                      " axis_emergencies WHERE"
+                      " emergency_id = ?",
+                      (emergency_id,),
+                  )
+                  if row is None:
+                      raise LookupError(
+                          "unknown emergency:"
+                          f" {emergency_id}"
+                      )
+                  if str(row["status"]) == (
+                      "resolved"
+                  ):
+                      raise ValueError(
+                          "emergency already"
+                          " resolved"
+                      )
+                  now = self._clock.now()
+                  with self._db.transaction() as cursor:
+                      cursor.execute(
+                          "INSERT INTO"
+                          " axis_dispatches ("
+                          " dispatch_id,"
+                          "  emergency_id, agency,"
+                          "  priority, status,"
+                          "  created_at)"
+                          " VALUES (?, ?, ?, ?,"
+                          "  'dispatched', ?)",
+                          (
+                              "DSP-"
+                              + uuid.uuid4().hex[
+                                  :10
+                              ],
+                              emergency_id,
+                              agency,
+                              priority,
+                              now,
+                          ),
+                      )
+                      cursor.execute(
+                          "UPDATE"
+                          " axis_emergencies SET"
+                          " status = 'dispatched'"
+                          " WHERE emergency_id = ?",
+                          (emergency_id,),
+                      )
+                      cursor.execute(
+                          "INSERT INTO axis_timeline ("
+                          " timeline_id,"
+                          "  emergency_id, actor,"
+                          "  event_type, detail,"
+                          "  occurred_at)"
+                          " VALUES (?, ?, ?, ?,"
+                          "  ?, ?)",
+                          (
+                              "TL-"
+                              + uuid.uuid4().hex[
+                                  :10
+                              ],
+                              emergency_id,
+                              "axis",
+                              "dispatched",
+                              agency
+                              + " ("
+                              + priority
+                              + ")",
+                              now,
+                          ),
+                      )
+                  return self.get_emergency(
+                      emergency_id
+                  )
+
+              def resolve_emergency(
+                  self,
+                  *,
+                  emergency_id: str,
+              ) -> dict[str, object]:
+                  now = self._clock.now()
+                  with self._db.transaction() as cursor:
+                      cursor.execute(
+                          "UPDATE"
+                          " axis_emergencies SET"
+                          " status = 'resolved',"
+                          " resolved_at = ?"
+                          " WHERE emergency_id = ?",
+                          (now, emergency_id),
+                      )
+                      cursor.execute(
+                          "INSERT INTO axis_timeline ("
+                          " timeline_id,"
+                          "  emergency_id, actor,"
+                          "  event_type, detail,"
+                          "  occurred_at)"
+                          " VALUES (?, ?, ?, ?,"
+                          "  ?, ?)",
+                          (
+                              "TL-"
+                              + uuid.uuid4().hex[
+                                  :10
+                              ],
+                              emergency_id,
+                              "axis",
+                              "resolved",
+                              None,
+                              now,
+                          ),
+                      )
+                  return self.get_emergency(
+                      emergency_id
+                  )
+
+              def list_open_emergencies(
+                  self,
+              ) -> tuple[dict[str, object], ...]:
+                  rows = self._db.query_all(
+                      "SELECT emergency_id FROM"
+                      " axis_emergencies WHERE"
+                      " status != 'resolved'"
+                      " ORDER BY created_at"
+                  )
+                  return tuple(
+                      self.get_emergency(
+                          str(r["emergency_id"])
+                      )
+                      for r in rows
+                  )
+
+              # ---------- cadena de custodia (v2) ----------
+
+              def add_custody_event(
+                  self,
+                  *,
+                  evidence_id: str,
+                  actor_zid: str,
+                  action: str,
+                  document_id: str | None,
+              ) -> dict[str, object]:
+                  now = self._clock.now()
+                  last = self._db.query_one(
+                      "SELECT event_hash FROM"
+                      " axis_evidence_chain WHERE"
+                      " evidence_id = ?"
+                      " ORDER BY occurred_at"
+                      " DESC LIMIT 1",
+                      (evidence_id,),
+                  )
+                  if last is None:
+                      previous_hash = "GENESIS"
+                  else:
+                      previous_hash = str(
+                          last["event_hash"]
+                      )
+                  metadata_hash = hashlib.sha256(
+                      (
+                          evidence_id
+                          + actor_zid
+                          + action
+                      ).encode("utf-8")
+                  ).hexdigest()
+                  raw = (
+                      evidence_id
+                      + "|"
+                      + previous_hash
+                      + "|"
+                      + actor_zid
+                      + "|"
+                      + action
+                      + "|"
+                      + str(now)
+                      + "|"
+                      + metadata_hash
+                  )
+                  event_hash = hashlib.sha256(
+                      raw.encode("utf-8")
+                  ).hexdigest()
+                  with self._db.transaction() as cursor:
+                      cursor.execute(
+                          "INSERT INTO"
+                          " axis_evidence_chain ("
+                          " custody_id,"
+                          "  evidence_id,"
+                          "  previous_hash,"
+                          "  event_hash, actor_zid,"
+                          "  action, document_id,"
+                          "  occurred_at)"
+                          " VALUES (?, ?, ?, ?, ?,"
+                          "  ?, ?, ?)",
+                          (
+                              "CUS-"
+                              + uuid.uuid4().hex[
+                                  :10
+                              ],
+                              evidence_id,
+                              previous_hash,
+                              event_hash,
+                              actor_zid,
+                              action,
+                              document_id,
+                              now,
+                          ),
+                      )
+                  return {
+                      "evidence_id": evidence_id,
+                      "action": action,
+                      "actor_zid": actor_zid,
+                      "event_hash": event_hash,
+                      "previous_hash": (
+                          previous_hash
+                      ),
+                  }
+
+              def verify_custody_chain(
+                  self,
+                  *,
+                  evidence_id: str,
+              ) -> bool:
+                  rows = self._db.query_all(
+                      "SELECT * FROM"
+                      " axis_evidence_chain WHERE"
+                      " evidence_id = ?"
+                      " ORDER BY occurred_at",
+                      (evidence_id,),
+                  )
+                  previous = "GENESIS"
                   for row in rows:
-                      result.append(
-                          {
-                              "opportunity_id": self._field(row, "a", 0),
-                              "title": self._field(row, "b", 1),
-                              "category": self._field(row, "c", 2),
-                              "purchase_price": self._field(row, "d", 3),
-                              "estimated_sale_price": self._field(row, "e", 4),
-                              "total_cost": self._field(row, "f", 5),
-                              "expected_profit": self._field(row, "g", 6),
-                              "margin_percent": self._field(row, "h", 7),
-                              "opportunity_score": self._field(row, "i", 8),
-                              "status": self._field(row, "j", 9),
-                          }
+                      metadata_hash = (
+                          hashlib.sha256(
+                              (
+                                  str(
+                                      row[
+                                          "evidence_id"
+                                      ]
+                                  )
+                                  + str(
+                                      row[
+                                          "actor_zid"
+                                      ]
+                                  )
+                                  + str(
+                                      row["action"]
+                                  )
+                              ).encode("utf-8")
+                          ).hexdigest()
                       )
-                  return result
+                      raw = (
+                          str(row["evidence_id"])
+                          + "|"
+                          + str(row["previous_hash"])
+                          + "|"
+                          + str(row["actor_zid"])
+                          + "|"
+                          + str(row["action"])
+                          + "|"
+                          + str(row["occurred_at"])
+                          + "|"
+                          + metadata_hash
+                      )
+                      expected = hashlib.sha256(
+                          raw.encode("utf-8")
+                      ).hexdigest()
+                      if (
+                          str(row["event_hash"])
+                          != expected
+                          or str(
+                              row["previous_hash"]
+                          )
+                          != previous
+                      ):
+                          return False
+                      previous = str(
+                          row["event_hash"]
+                      )
+                  return True
 
-              def summary(self) -> dict:
-                  orders = self._rows("SELECT COUNT(*) FROM sbs_orders")
-                  delivered = self._rows(
-                      "SELECT COUNT(*) FROM sbs_orders WHERE status = 'delivered'"
+              def emergency_summary(
+                  self,
+              ) -> dict[str, object]:
+                  open_rows = self._db.query_all(
+                      "SELECT emergency_id FROM"
+                      " axis_emergencies WHERE"
+                      " status != 'resolved'"
                   )
-                  opps = self._rows("SELECT COUNT(*) FROM sbs_opportunities")
+                  resolved = self._db.query_one(
+                      "SELECT COUNT(*) AS n FROM"
+                      " axis_emergencies WHERE"
+                      " status = 'resolved'"
+                  )
                   return {
-                      "orders_total": int(self._field(orders[0], "c", 0) or 0) if orders else 0,
-                      "orders_delivered": int(self._field(delivered[0], "c", 0) or 0) if delivered else 0,
-                      "opportunities": int(self._field(opps[0], "c", 0) or 0) if opps else 0,
+                      "open_emergencies": len(
+                          open_rows
+                      ),
+                      "resolved_emergencies": (
+                          int(resolved["n"])
+                          if resolved is not None
+                          else 0
+                      ),
                   }
           PYEOF
-          python -m py_compile apps/subastas/infrastructure/persistence/subastas_commerce.py
-          echo "commerce layer added"
+          python -m py_compile apps/axis/infrastructure/persistence/axis_store.py
+          echo "store v2 written"
 
-      - name: ADD server patches (canonical register + trust inside new methods)
+      - name: ADD server patches (insert-only, multi-line anchors)
         run: |
           set -euo pipefail
           PYTHONPATH="$PWD" python - <<'PYEOF'
           from pathlib import Path
 
-          path = Path("apps/subastas/server.py")
+          path = Path("apps/axis/server.py")
           source = path.read_text(encoding="utf-8")
 
           def apply(text, old, new, label):
@@ -732,348 +1383,317 @@ jobs:
               return text.replace(old, new, 1)
 
           IMPORT_ANCHOR = "\n".join([
-              "from apps.subastas.infrastructure.persistence.subastas_store import (",
-              "    SubastasStore,",
-              "    new_bid_id,",
-              "    new_listing_id,",
-              ")",
+              "from apps.axis.services.axis_link import AxisLink",
           ])
           IMPORT_NEW = "\n".join([
               IMPORT_ANCHOR,
-              "from apps.subastas.infrastructure.persistence.subastas_commerce import (",
-              "    CommerceStore,",
-              "    _nid,",
-              ")",
-              "import base64 as _b64",
+              "from apps.axis.services.axis_link_ext import AxisLinkExt",
+              "import uuid as _uuid",
           ])
 
           GET_ANCHOR = "\n".join([
-              '            if path == (',
-              '                "/subastas/api/summary"',
-              '            ):',
+              '        if s[0] == "paciente":',
           ])
           GET_ROUTES = "\n".join([
-              '            if path.startswith("/subastas/api/listings/"):',
-              '                listing = self.commerce.get_listing_full(',
-              '                    path[len("/subastas/api/listings/"):]',
-              '                )',
-              '                if listing is None:',
-              '                    self._send_json(',
-              '                        200,',
-              '                        {"ok": False, "error": "unknown listing"},',
-              '                    )',
-              '                    return',
-              '                self._send_json(200, {"ok": True, "data": listing})',
-              '                return',
-              '            if path == "/subastas/api/opportunities":',
-              '                self._send_json(',
-              '                    200,',
-              '                    {',
-              '                        "ok": True,',
-              '                        "data": {',
-              '                            "opportunities": self.commerce.list_opportunities()',
-              '                        },',
-              '                    },',
-              '                )',
-              '                return',
-              '            if path == "/subastas/revision":',
-              '                self._send_html(200, self._revision_html())',
-              '                return',
-              '            if path.startswith("/subastas/api/orders/"):',
-              '                self._send_json(',
-              '                    200,',
-              '                    {"ok": True, "data": self.commerce.get_order(',
-              '                        path[len("/subastas/api/orders/"):]',
-              '                    )},',
-              '                )',
-              '                return',
-              '            if path.startswith("/subastas/api/shipments/"):',
-              '                self._send_json(',
-              '                    200,',
-              '                    {"ok": True, "data": self.commerce.get_shipment(',
-              '                        path[len("/subastas/api/shipments/"):]',
-              '                    )},',
-              '                )',
-              '                return',
+              '        if s[0] == "emergencias":',
+              '            self._screen_emergencias()',
+              '            return',
               GET_ANCHOR,
           ])
 
           POST_ANCHOR = "\n".join([
-              '            if path == (',
-              '                "/subastas/close"',
-              '            ):',
+              '        if s == ["incident"]:',
           ])
           POST_ROUTES = "\n".join([
-              '            if path == "/subastas/api/orders":',
-              '                self._create_order_json()',
-              '                return',
-              '            if path == "/subastas/api/reputation/mutual":',
-              '                self._mutual_reputation_json()',
-              '                return',
-              '            if path == "/subastas/api/radar/scan":',
-              '                self._radar_scan_json()',
-              '                return',
-              '            if path.startswith("/subastas/api/orders/"):',
-              '                parts = path[len("/subastas/api/orders/"):].split("/")',
-              '                self._order_action(',
-              '                    parts[0],',
-              '                    parts[1] if len(parts) > 1 else "",',
-              '                )',
-              '                return',
-              '            if path.startswith("/subastas/api/shipments/"):',
-              '                parts = path[len("/subastas/api/shipments/"):].split("/")',
-              '                self._shipment_action(',
-              '                    parts[0],',
-              '                    parts[1] if len(parts) > 1 else "",',
+              '        if s == ["exam"]:',
+              '            self._exam_form()',
+              '            return',
+              '        if s == ["exam-result"]:',
+              '            self._exam_result_form()',
+              '            return',
+              '        if s == ["api", "emergencies"]:',
+              '            self._emergency_create()',
+              '            return',
+              '        if s == ["api", "emergencies", "resolve"]:',
+              '            self._emergency_resolve()',
+              '            return',
+              '        if s[0] == "api" and len(s) > 2 and s[1] == "emergencies":',
+              '            if s[2] == "dispatch":',
+              '                self._emergency_dispatch(',
+              '                    s[3] if len(s) > 3 else ""',
               '                )',
               '                return',
               POST_ANCHOR,
           ])
 
           METHODS = "\n".join([
-              '    def _ensure_trusted_zid(self, account_id: str) -> str:',
-              '        """Canonical identity + trust via net_client',
-              '        (the exact pattern proven by MPE and SEMILLA).',
-              '        Falls back to stored ZID only if network down."""',
-              '        ok, data, _err = self.net_client.post(',
-              '            "/identity/register",',
-              '            {',
-              '                "kind": "person",',
-              '                "display_name": account_id,',
-              '                "actor": "subastas",',
-              '            },',
-              '        )',
-              '        zid = None',
-              '        if ok and data:',
-              '            found = _find_value(data, ("zid",))',
-              '            if isinstance(found, str) and found.startswith("ZID-"):',
-              '                zid = found',
-              '        if zid is None:',
-              '            existing = self.commerce.account_zid(account_id)',
-              '            if existing:',
-              '                return existing',
-              '            raise ValueError(',
-              '                "no network ZID available for " + account_id',
-              '            )',
-              '        try:',
-              '            self.net_client.post(',
-              '                "/trust/complete",',
-              '                {"zid": zid, "actor": "subastas"},',
-              '            )',
-              '        except Exception:',
-              '            pass',
-              '        return zid',
-              '',
-              '    def _create_order_json(self) -> None:',
-              '        doc = self._read_json()',
-              '        if doc is None:',
-              '            self._send_json(400, {"ok": False, "error": "invalid JSON"})',
-              '            return',
-              '        source = str(doc.get("source", "direct"))',
-              '        if source == "auction":',
-              '            self.commerce.persist_winner(',
-              '                listing_id=str(doc.get("listing_id", ""))',
-              '            )',
-              '        order = self.commerce.create_order(',
-              '            order_id=_nid("ORD-"),',
-              '            listing_id=str(doc.get("listing_id", "")),',
-              '            buyer_account=str(doc.get("buyer_account", "")),',
-              '            source=source,',
-              '        )',
-              '        self._send_json(201, {"ok": True, "data": order})',
-              '',
-              '    def _order_action(self, order_id: str, action: str) -> None:',
-              '        doc = self._read_json() or {}',
-              '        if action == "pay":',
-              '            order = self.commerce.pay_order(',
-              '                order_id=order_id,',
-              '                provider=str(doc.get("provider", "wallet")),',
-              '            )',
-              '            self._send_json(200, {"ok": True, "data": order})',
-              '            return',
-              '        if action == "settle":',
-              '            order = self.commerce.settle_order(order_id=order_id)',
-              '            self._send_json(200, {"ok": True, "data": order})',
-              '            return',
-              '        if action == "ship":',
-              '            self.commerce.create_shipment(',
-              '                shipment_id=_nid("SHP-"),',
-              '                order_id=order_id,',
-              '                carrier=str(doc.get("carrier", "zyra-express")),',
-              '                origin=str(doc.get("origin", "SV")),',
-              '                destination=str(doc.get("destination", "SV")),',
-              '            )',
-              '            self._send_json(',
-              '                200,',
-              '                {"ok": True, "data": self.commerce.get_order(order_id)},',
-              '            )',
-              '            return',
-              '        self._send_json(',
-              '            400,',
-              '            {"ok": False, "error": "unknown order action: " + action},',
+              '    def _ext(self) -> AxisLinkExt:',
+              '        return AxisLinkExt(',
+              '            self._client_of_link()',
               '        )',
               '',
-              '    def _shipment_action(self, shipment_id: str, action: str) -> None:',
-              '        doc = self._read_json() or {}',
-              '        if action == "track":',
-              '            shipment = self.commerce.add_tracking(',
-              '                shipment_id=shipment_id,',
-              '                status=str(doc.get("status", "in_transit")),',
-              '                location=str(doc.get("location", "")),',
-              '                description=str(doc.get("description", "")),',
-              '            )',
-              '            self._send_json(200, {"ok": True, "data": shipment})',
-              '            return',
-              '        if action == "deliver":',
-              '            shipment = self.commerce.confirm_delivery(',
-              '                shipment_id=shipment_id,',
-              '            )',
-              '            self._send_json(200, {"ok": True, "data": shipment})',
-              '            return',
-              '        self._send_json(',
-              '            400,',
-              '            {"ok": False, "error": "unknown shipment action: " + action},',
+              '    def _client_of_link(self):',
+              '        link = type(self).link',
+              '        return getattr(link, "_client")',
+              '',
+              '    def _ensure_trusted(self, name: str) -> str:',
+              '        return self._ext().ensure_trusted_person(',
+              '            name',
               '        )',
               '',
-              '    def _mutual_reputation_json(self) -> None:',
-              '        doc = self._read_json()',
-              '        if doc is None:',
-              '            self._send_json(400, {"ok": False, "error": "invalid JSON"})',
-              '            return',
-              '        order_id = str(doc.get("order_id", ""))',
-              '        buyer_account = str(doc.get("buyer_account", ""))',
-              '        seller_account = str(doc.get("seller_account", ""))',
-              '        evidence = str(',
-              '            doc.get("evidence", "")',
-              '            or "transaccion completada en SUBASTAS"',
+              '    def _exam_form(self) -> None:',
+              '        store = type(self).store',
+              '        doc = self._read_form()',
+              '        patient_account = self._req(',
+              '            doc, "patient_account"',
               '        )',
-              '        order = self.commerce.get_order(order_id)',
-              '        seller_zid = self._ensure_trusted_zid(seller_account)',
-              '        buyer_zid = self._ensure_trusted_zid(buyer_account)',
-              '        evidence_b64 = _b64.b64encode(',
-              '            evidence.encode("utf-8")',
-              '        ).decode("ascii")',
-              '',
-              '        def _net(path: str, payload: dict) -> tuple:',
-              '            try:',
-              '                ok, data, err = self.net_client.post(',
-              '                    path, payload',
-              '                )',
-              '                return (bool(ok), str(err or ""))',
-              '            except Exception as exc:',
-              '                return (False, str(exc))',
-              '',
-              '        rep_b2s, err_b2s = _net(',
-              '            "/reputation/record",',
-              '            {',
-              '                "subject_zid": seller_zid,',
-              '                "actor_zid": buyer_zid,',
-              '                "kind": "positive",',
-              '                "evidence_b64": evidence_b64,',
-              '            },',
+              '        doctor_account = self._req(',
+              '            doc, "doctor_account"',
               '        )',
-              '        rep_s2b, err_s2b = _net(',
-              '            "/reputation/record",',
-              '            {',
-              '                "subject_zid": buyer_zid,',
-              '                "actor_zid": seller_zid,',
-              '                "kind": "positive",',
-              '                "evidence_b64": evidence_b64,',
-              '            },',
+              '        exam_type = self._req(doc, "exam_type")',
+              '        exam_id = "EXM-" + _uuid.uuid4().hex[:10]',
+              '        row = store.add_exam(',
+              '            exam_id=exam_id,',
+              '            patient_account=patient_account,',
+              '            doctor_account=doctor_account,',
+              '            exam_type=exam_type,',
               '        )',
-              '        self.commerce.record_rep_event(',
-              '            order_id=order_id,',
-              '            subject_zid=seller_zid,',
-              '            actor_zid=buyer_zid,',
-              '            kind="positive",',
-              '            evidence=evidence,',
-              '            network_recorded=rep_b2s,',
-              '        )',
-              '        self.commerce.record_rep_event(',
-              '            order_id=order_id,',
-              '            subject_zid=buyer_zid,',
-              '            actor_zid=seller_zid,',
-              '            kind="positive",',
-              '            evidence=evidence,',
-              '            network_recorded=rep_s2b,',
-              '        )',
-              '        hist_s, err_hs = _net(',
-              '            "/history/append",',
-              '            {',
-              '                "zid": seller_zid,',
-              '                "entry_type": "asset",',
-              '                "actor_app": "subastas",',
-              '                "payload": {',
-              '                    "event": "venta completada",',
-              '                    "detail": "orden " + order_id,',
-              '                },',
-              '            },',
-              '        )',
-              '        hist_b, err_hb = _net(',
-              '            "/history/append",',
-              '            {',
-              '                "zid": buyer_zid,',
-              '                "entry_type": "asset",',
-              '                "actor_app": "subastas",',
-              '                "payload": {',
-              '                    "event": "compra completada",',
-              '                    "detail": "orden " + order_id,',
-              '                },',
-              '            },',
-              '        )',
-              '        self._send_json(',
+              '        self._html(',
               '            200,',
-              '            {',
-              '                "ok": True,',
-              '                "data": {',
-              '                    "order_id": order_id,',
-              '                    "buyer_to_seller_network": rep_b2s,',
-              '                    "seller_to_buyer_network": rep_s2b,',
-              '                    "history_seller_recorded": hist_s,',
-              '                    "history_buyer_recorded": hist_b,',
-              '                    "errors": {',
-              '                        "rep_b2s": err_b2s,',
-              '                        "rep_s2b": err_s2b,',
-              '                        "hist_s": err_hs,',
-              '                        "hist_b": err_hb,',
+              '            _page(',
+              '                "Examen ordenado",',
+              '                "<h1>Examen ordenado</h1>"',
+              '                "<p>" + str(row["exam_id"])',
+              '                + " (" + exam_type + ")</p>"',
+              '                "<a href=\'/axis/medico/"',
+              '                + doctor_account',
+              '                + "\'><button>Volver</button></a>"',
+              '            ),',
+              '        )',
+              '',
+              '    def _exam_result_form(self) -> None:',
+              '        store = type(self).store',
+              '        ext = self._ext()',
+              '        doc = self._read_form()',
+              '        exam_id = self._req(doc, "exam_id")',
+              '        doctor_account = self._req(',
+              '            doc, "doctor_account"',
+              '        )',
+              '        summary = self._req(doc, "summary")',
+              '        severity = self._req(doc, "severity")',
+              '        requires = (',
+              '            str(doc.get("requires_followup", ""))',
+              '            in ("1", "true", "si", "on")',
+              '        )',
+              '        reason = doc.get("followup_reason")',
+              '        reason = (',
+              '            str(reason) if reason is not None else None',
+              '        )',
+              '        patient = store.get_account(',
+              '            self._exam_patient(exam_id)',
+              '        )',
+              '        zid = patient.get("zid")',
+              '        sealed_doc = None',
+              '        if zid is not None:',
+              '            ok, doc_id = ext.seal_evidence_canonical(',
+              '                owner_zid=str(zid),',
+              '                title="Resultado " + exam_id,',
+              '                content=summary,',
+              '            )',
+              '            if ok and doc_id:',
+              '                sealed_doc = doc_id',
+              '                ext.append_history(',
+              '                    zid=str(zid),',
+              '                    event="resultado_examen",',
+              '                    detail=exam_id + ": " + severity,',
+              '                )',
+              '        result = store.add_exam_result(',
+              '            result_id="RES-" + _uuid.uuid4().hex[:10],',
+              '            exam_id=exam_id,',
+              '            summary=summary,',
+              '            severity=severity,',
+              '            requires_followup=requires,',
+              '            followup_reason=reason,',
+              '            sealed_doc=sealed_doc,',
+              '        )',
+              '        appointment = None',
+              '        if requires:',
+              '            scheduled = str(',
+              '                doc.get("scheduled_at", "por programar")',
+              '            )',
+              '            appointment = store.create_appointment(',
+              '                appointment_id="APT-"',
+              '                + _uuid.uuid4().hex[:10],',
+              '                patient_account=result[',
+              '                    "patient_account"',
+              '                ],',
+              '                doctor_account=doctor_account,',
+              '                result_id=result["result_id"],',
+              '                reason=reason or "seguimiento de resultado",',
+              '                scheduled_at=scheduled,',
+              '            )',
+              '        cita = (',
+              '            appointment["scheduled_at"]',
+              '            if appointment',
+              '            else "no requiere seguimiento"',
+              '        )',
+              '        self._html(',
+              '            200,',
+              '            _page(',
+              '                "Resultado registrado",',
+              '                "<h1>Resultado (sellado en la Red)</h1>"',
+              '                "<p>Severidad: " + severity + "</p>"',
+              '                "<p>Requiere seguimiento: "',
+              '                + str(requires) + "</p>"',
+              '                "<p>Cita automatica: " + cita + "</p>"',
+              '                "<p>Paciente sera recordado.</p>"',
+              '                "<a href=\'/axis/medico/"',
+              '                + doctor_account',
+              '                + "\'><button>Volver</button></a>"',
+              '            ),',
+              '        )',
+              '',
+              '    def _exam_patient(self, exam_id: str) -> str:',
+              '        store = type(self).store',
+              '        exams = store._db.query_one(',
+              '            "SELECT patient_account FROM axis_exams"',
+              '            " WHERE exam_id = ?",',
+              '            (exam_id,),',
+              '        )',
+              '        if exams is None:',
+              '            raise LookupError("unknown exam: " + exam_id)',
+              '        return str(exams["patient_account"])',
+              '',
+              '    def _emergency_create(self) -> None:',
+              '        store = type(self).store',
+              '        ext = self._ext()',
+              '        doc = self._read_json()',
+              '        if doc is None:',
+              '            self._send(',
+              '                400,',
+              '                {',
+              '                    "ok": False,',
+              '                    "error": {',
+              '                        "type": "invalid_request",',
+              '                        "message": "invalid JSON",',
               '                    },',
               '                },',
-              '            },',
+              '            )',
+              '            return',
+              '        emergency_type = self._req(doc, "emergency_type")',
+              '        severity = self._req(doc, "severity")',
+              '        description = self._req(doc, "description")',
+              '        subject_account = doc.get("subject_account")',
+              '        subject_zid = None',
+              '        subject_account_str = None',
+              '        if subject_account is not None:',
+              '            try:',
+              '                account = store.get_account(',
+              '                    str(subject_account),',
+              '                )',
+              '                subject_account_str = str(',
+              '                    account["account_id"]',
+              '                )',
+              '                if account.get("zid") is None:',
+              '                    subject_zid = ext.ensure_trusted_person(',
+              '                        str(account["name"]),',
+              '                    )',
+              '                    store._db.execute(',
+              '                        "UPDATE axis_accounts SET zid = ?"',
+              '                        " WHERE account_id = ?" + "",',
+              '                    ) if False else None',
+              '                else:',
+              '                    subject_zid = str(account["zid"])',
+              '            except LookupError:',
+              '                subject_account_str = None',
+              '        emergency = store.create_emergency(',
+              '            emergency_id="EMG-"',
+              '            + _uuid.uuid4().hex[:10],',
+              '            source_app=str(',
+              '                doc.get("source_app", "manual")',
+              '            ),',
+              '            subject_account=subject_account_str,',
+              '            subject_zid=subject_zid,',
+              '            emergency_type=emergency_type,',
+              '            severity=severity,',
+              '            description=description,',
               '        )',
+              '        self._send(201, {"ok": True, "data": emergency})',
               '',
-              '    def _radar_scan_json(self) -> None:',
+              '    def _emergency_dispatch(self, emergency_id: str) -> None:',
+              '        store = type(self).store',
               '        doc = self._read_json()',
               '        if doc is None:',
-              '            self._send_json(400, {"ok": False, "error": "invalid JSON"})',
-              '            return',
-              '        purchase = float(doc.get("purchase_price", 0))',
-              '        sale = float(doc.get("estimated_sale_price", 0))',
-              '        if purchase <= 0 or sale <= 0:',
-              '            raise ValueError(',
-              '                "purchase_price and estimated_sale_price must be positive"',
+              '            self._send(',
+              '                400,',
+              '                {',
+              '                    "ok": False,',
+              '                    "error": {',
+              '                        "type": "invalid_request",',
+              '                        "message": "invalid JSON",',
+              '                    },',
+              '                },',
               '            )',
-              '        opportunity = self.commerce.create_opportunity(',
-              '            opportunity_id=_nid("OPP-"),',
-              '            title=str(doc.get("title", "oportunidad")),',
-              '            category=str(doc.get("category", "general")),',
-              '            purchase_price=purchase,',
-              '            shipping_cost=float(doc.get("shipping_cost", 0)),',
-              '            fees=float(doc.get("fees", 0)),',
-              '            estimated_sale_price=sale,',
-              '            demand_score=float(doc.get("demand_score", 0.5)),',
-              '            risk_score=float(doc.get("risk_score", 0.5)),',
+              '            return',
+              '        agency = self._req(doc, "agency")',
+              '        priority = str(doc.get("priority", "alta"))',
+              '        emergency = store.dispatch_emergency(',
+              '            emergency_id=emergency_id,',
+              '            agency=agency,',
+              '            priority=priority,',
               '        )',
-              '        self._send_json(201, {"ok": True, "data": opportunity})',
+              '        self._send(200, {"ok": True, "data": emergency})',
               '',
-              '    def _revision_html(self) -> str:',
-              '        summary = self.commerce.summary()',
-              '        return (',
-              '            "<html><body><h1>Revision SUBASTAS</h1>"',
-              '            "<p>ordenes: " + str(summary["orders_total"]) + "</p>"',
-              '            "<p>entregadas: " + str(summary["orders_delivered"]) + "</p>"',
-              '            "<p>oportunidades radar: " + str(summary["opportunities"]) + "</p>"',
-              '            "<a href=\'/subastas\'>Inicio</a>"',
-              '            "</body></html>"',
+              '    def _emergency_resolve(self) -> None:',
+              '        store = type(self).store',
+              '        doc = self._read_json()',
+              '        if doc is None:',
+              '            self._send(',
+              '                400,',
+              '                {',
+              '                    "ok": False,',
+              '                    "error": {',
+              '                        "type": "invalid_request",',
+              '                        "message": "invalid JSON",',
+              '                    },',
+              '                },',
+              '            )',
+              '            return',
+              '        emergency = store.resolve_emergency(',
+              '            emergency_id=self._req(doc, "emergency_id"),',
+              '        )',
+              '        self._send(200, {"ok": True, "data": emergency})',
+              '',
+              '    def _screen_emergencias(self) -> None:',
+              '        store = type(self).store',
+              '        open_emergencies = store.list_open_emergencies()',
+              '        items = ""',
+              '        for e in open_emergencies:',
+              '            agencies = ", ".join(',
+              '                str(d["agency"])',
+              '                for d in e["dispatches"]',
+              '            )',
+              '            items = (',
+              '                items',
+              '                + "<li>- " + e["emergency_id"]',
+              '                + " | " + e["emergency_type"]',
+              '                + " | " + e["severity"]',
+              '                + " | " + e["status"]',
+              '                + " | recursos: "',
+              '                + (agencies or "sin despachar")',
+              '                + "</li>"',
+              '            )',
+              '        if not items:',
+              '            items = "<li>Sin emergencias abiertas</li>"',
+              '        body = (',
+              '            "<h1>Centro de Emergencias</h1>"',
+              '            "<h2>Abiertas</h2><ul>" + items + "</ul>"',
+              '            "<a href=\'/axis\'><button class=\'gray\'>',
+              '            " Inicio</button></a>"',
+              '        )',
+              '        self._html(',
+              '            200,',
+              '            _page("AXIS - Emergencias", body),',
               '        )',
               '',
           ])
@@ -1083,79 +1703,18 @@ jobs:
           source = apply(source, POST_ANCHOR, POST_ROUTES, "post-routes")
           source = apply(
               source,
-              '    def _home(self) -> str:',
-              METHODS + "\n" + '    def _home(self) -> str:',
+              '    def _home(self) -> None:',
+              METHODS + "\n" + '    def _home(self) -> None:',
               "methods",
           )
 
           path.write_text(source, encoding="utf-8")
           print("ALL 4 ADD-PATCHES APPLIED")
           PYEOF
-          python -m py_compile apps/subastas/server.py
+          python -m py_compile apps/axis/server.py
           echo "server patched and compiles"
 
-      - name: Bind commerce into serve_subastas
-        run: |
-          set -euo pipefail
-          PYTHONPATH="$PWD" python - <<'PYEOF'
-          from pathlib import Path
-
-          path = Path("apps/subastas/server.py")
-          source = path.read_text(encoding="utf-8")
-
-          def apply(text, old, new, label):
-              count = text.count(old)
-              if count != 1:
-                  raise SystemExit("PATCH FAIL " + label + " count=" + str(count))
-              return text.replace(old, new, 1)
-
-          OLD = "\n".join([
-              'def serve_subastas(',
-              '    store: SubastasStore,',
-              '    client: object,',
-              '    *,',
-              '    host: str = "127.0.0.1",',
-              '    port: int = 0,',
-              ') -> ThreadingHTTPServer:',
-              '    handler = type(',
-              '        "BoundSubastasHandler",',
-              '        (SubastasApiHandler,),',
-              '        {',
-              '            "store": store,',
-              '            "net_client": client,',
-              '        },',
-              '    )',
-          ])
-
-          NEW = "\n".join([
-              'def serve_subastas(',
-              '    store: SubastasStore,',
-              '    client: object,',
-              '    *,',
-              '    host: str = "127.0.0.1",',
-              '    port: int = 0,',
-              ') -> ThreadingHTTPServer:',
-              '    handler = type(',
-              '        "BoundSubastasHandler",',
-              '        (SubastasApiHandler,),',
-              '        {',
-              '            "store": store,',
-              '            "net_client": client,',
-              '            "commerce": CommerceStore(',
-              '                store._db, store._clock',
-              '            ),',
-              '        },',
-              '    )',
-          ])
-
-          source = apply(source, OLD, NEW, "serve-bind")
-          path.write_text(source, encoding="utf-8")
-          print("SERVE BIND APPLIED")
-          PYEOF
-          python -m py_compile apps/subastas/server.py
-          echo "bind applied and compiles"
-
-      - name: Internal probe (SQLiteAdapter - same as real tests)
+      - name: Internal probe (followup + emergency + custody on SQLiteAdapter)
         run: |
           set -euo pipefail
           PYTHONPATH="$PWD" python - <<'PYEOF'
@@ -1165,108 +1724,137 @@ jobs:
           from shared_engines.common.clocks import FrozenClock
           from shared_engines.storage.database import SQLiteAdapter
 
-          from apps.subastas.infrastructure.persistence.subastas_store import SubastasStore
-          from apps.subastas.infrastructure.persistence.subastas_commerce import CommerceStore
+          from apps.axis.infrastructure.persistence.axis_store import AxisStore
 
           tmp = Path(tempfile.mkdtemp())
           db = SQLiteAdapter(tmp / "probe.db")
           clock = FrozenClock()
-          store = SubastasStore(db, clock)
-          commerce = CommerceStore(db, clock)
-          store.add_account(account_id="SBS-a", zid="ZID-a", name="A")
-          store.add_account(account_id="SBS-b", zid="ZID-b", name="B")
-          store.add_listing(
-              listing_id="LST-1",
-              seller_account="SBS-a",
-              seller_zid="ZID-a",
-              title="t",
-              description="d",
-              base_price=100.0,
-              document_id="DOC-x",
+          store = AxisStore(db, clock)
+          store.add_account(
+              account_id="AX-doc",
+              zid=None,
+              name="Dr",
+              role="medico",
           )
-          store.place_bid(
-              bid_id="BID-1",
-              listing_id="LST-1",
-              bidder_account="SBS-b",
-              amount=650.0,
+          store.add_account(
+              account_id="AX-pat",
+              zid=None,
+              name="Maria",
+              role="paciente",
           )
-          closed = store.close_listing(listing_id="LST-1", seller_account="SBS-a")
-          assert closed["winner_account"] == "SBS-b"
-          persisted = commerce.persist_winner(listing_id="LST-1")
-          assert persisted["winner_account"] == "SBS-b"
-          full = commerce.get_listing_full("LST-1")
-          assert full["winner_account"] == "SBS-b"
-          assert full["final_price"] == 650.0
-          assert full["closed_at"] is not None
-          order = commerce.create_order(
-              order_id="ORD-1",
-              listing_id="LST-1",
-              buyer_account="SBS-b",
-              source="auction",
+          exam = store.add_exam(
+              exam_id="EXM-1",
+              patient_account="AX-pat",
+              doctor_account="AX-doc",
+              exam_type="sangre",
           )
-          assert order["subtotal"] == 650.0
-          assert order["platform_fee"] == 32.5
-          paid = commerce.pay_order(order_id="ORD-1", provider="wallet")
-          assert paid["status"] == "paid"
+          assert exam["status"] == "ordered"
+          result = store.add_exam_result(
+              result_id="RES-1",
+              exam_id="EXM-1",
+              summary="anemia detectada",
+              severity="media",
+              requires_followup=True,
+              followup_reason="control en 2 semanas",
+              sealed_doc="DOC-1",
+          )
+          assert result["requires_followup"] is True
+          appointment = store.create_appointment(
+              appointment_id="APT-1",
+              patient_account="AX-pat",
+              doctor_account="AX-doc",
+              result_id="RES-1",
+              reason="control en 2 semanas",
+              scheduled_at="lunes 9am",
+          )
+          assert appointment["status"] == "scheduled"
+          reminders = store.pending_reminders()
+          assert len(reminders) == 1
+          assert reminders[0]["patient_account"] == "AX-pat"
+          records = store.medical_records_of(
+              patient_account="AX-pat"
+          )
+          assert isinstance(records, tuple)
+          emergency = store.create_emergency(
+              emergency_id="EMG-1",
+              source_app="semilla",
+              subject_account="AX-pat",
+              subject_zid=None,
+              emergency_type="emergencia_medica",
+              severity="critica",
+              description="alumno enfermo detectado por IA-Tutor",
+          )
+          assert emergency["status"] == "open"
+          assert len(emergency["timeline"]) == 1
+          dispatched = store.dispatch_emergency(
+              emergency_id="EMG-1",
+              agency="ambulancia",
+              priority="critica",
+          )
+          assert dispatched["status"] == "dispatched"
+          assert len(dispatched["dispatches"]) == 1
+          assert dispatched["dispatches"][0]["agency"] == "ambulancia"
           try:
-              commerce.pay_order(order_id="ORD-1", provider="wallet")
-              raise AssertionError("double pay must fail")
+              store.dispatch_emergency(
+                  emergency_id="EMG-1",
+                  agency="policia",
+                  priority="alta",
+              )
           except ValueError:
               pass
-          settled = commerce.settle_order(order_id="ORD-1")
-          assert settled["settlement"]["net_amount"] == 617.5
-          shipment = commerce.create_shipment(
-              shipment_id="SHP-1",
-              order_id="ORD-1",
-              carrier="zyra-express",
-              origin="San Salvador",
-              destination="Santa Ana",
+          dispatched = store.dispatch_emergency(
+              emergency_id="EMG-1",
+              agency="hospital",
+              priority="alta",
           )
-          assert shipment["status"] == "created"
-          tracked = commerce.add_tracking(
-              shipment_id="SHP-1",
-              status="in_transit",
-              location="Ruta 1",
-              description="en camino",
+          assert len(dispatched["dispatches"]) == 2
+          resolved = store.resolve_emergency(emergency_id="EMG-1")
+          assert resolved["status"] == "resolved"
+          try:
+              store.dispatch_emergency(
+                  emergency_id="EMG-1",
+                  agency="policia",
+                  priority="alta",
+              )
+              raise AssertionError("resolved must reject dispatch")
+          except ValueError:
+              pass
+          assert len(store.list_open_emergencies()) == 0
+          custody1 = store.add_custody_event(
+              evidence_id="EV-1",
+              actor_zid="ZID-pol",
+              action="captured",
+              document_id="DOC-2",
           )
-          assert tracked["status"] == "in_transit"
-          delivered = commerce.confirm_delivery(shipment_id="SHP-1")
-          assert delivered["status"] == "delivered"
-          assert commerce.get_order("ORD-1")["status"] == "delivered"
-          opp = commerce.create_opportunity(
-              opportunity_id="OPP-1",
-              title="Moto",
-              category="vehiculos",
-              purchase_price=100.0,
-              shipping_cost=10.0,
-              fees=5.0,
-              estimated_sale_price=200.0,
-              demand_score=0.8,
-              risk_score=0.2,
+          assert custody1["previous_hash"] == "GENESIS"
+          custody2 = store.add_custody_event(
+              evidence_id="EV-1",
+              actor_zid="ZID-pol",
+              action="transferred",
+              document_id="DOC-2",
           )
-          assert opp["margin_percent"] == 73.91
-          assert opp["opportunity_score"] == 76.95
-          summary = commerce.summary()
-          assert summary["orders_total"] == 1
-          assert summary["orders_delivered"] == 1
-          assert summary["opportunities"] == 1
-          print("PROBE OK")
+          assert custody2["previous_hash"] == custody1["event_hash"]
+          assert store.verify_custody_chain(evidence_id="EV-1") is True
+          summary = store.emergency_summary()
+          assert summary["open_emergencies"] == 0
+          assert summary["resolved_emergencies"] == 1
+          print("PROBE OK: followup + emergency + custody")
           db.close()
           PYEOF
 
-      - name: Write commerce e2e tests (canonical register + diagnostic asserts)
+      - name: Write axis e2e tests (new file - old tests untouched)
         run: |
           set -euo pipefail
-          cat > apps/subastas/tests/test_subastas_commerce_e2e.py <<'PYEOF'
-          """SUBASTAS commerce e2e ADD-ONLY - canonical app
-          registration (like MPE), trust, winner persisted,
-          order, payment, commission, settlement, shipment,
-          tracking, delivery, mutual reputation on network,
-          history by ZID, direct purchase, radar VIP,
-          offline resilience."""
+          cat > apps/axis/tests/test_axis_emergencias_e2e.py <<'PYEOF'
+          """AXIS emergencias e2e ADD-ONLY - health exam with
+          automatic followup appointment, emergency created
+          (like a SEMILLA critical alert), coordinated dispatch
+          to agencies, resolve with full timeline, evidence
+          custody chain; original tests untouched."""
           from __future__ import annotations
 
           import json
+          import re
           import socket
           import threading
           from pathlib import Path
@@ -1282,9 +1870,9 @@ jobs:
           from shared_engines.storage.database import SQLiteAdapter
           from shared_engines.verification.signatures import Ed25519Signer
 
-          from apps.subastas.infrastructure.network.network_client import NetworkClient
-          from apps.subastas.infrastructure.persistence.subastas_store import SubastasStore
-          from apps.subastas.server import serve_subastas
+          from apps.axis.infrastructure.network.network_client import NetworkClient
+          from apps.axis.infrastructure.persistence.axis_store import AxisStore
+          from apps.axis.server import serve_axis
 
 
           class _Eco:
@@ -1315,37 +1903,23 @@ jobs:
                       f"{self.net_server.server_address[1]}"
                   )
                   self.client = NetworkClient(self.net_base, max_retries=1)
-                  self.sbs_db = SQLiteAdapter(tmp_path / "sbs.db")
-                  self.store = SubastasStore(self.sbs_db, FrozenClock())
-                  self.sbs_server = serve_subastas(self.store, self.client)
+                  self.axis_db = SQLiteAdapter(tmp_path / "axis.db")
+                  self.store = AxisStore(self.axis_db, FrozenClock())
+                  self.axis_server = serve_axis(self.store, self.client)
                   threading.Thread(
-                      target=self.sbs_server.serve_forever, daemon=True
+                      target=self.axis_server.serve_forever, daemon=True
                   ).start()
-                  self.sbs_base = (
+                  self.axis_base = (
                       "http://127.0.0.1:"
-                      f"{self.sbs_server.bound_port}"
-                  )
-
-              def register_app_canonical(self) -> None:
-                  ok, data, err = self.client.post(
-                      "/apps/register",
-                      {
-                          "app_id": "subastas",
-                          "display_name": "SUBASTAS",
-                          "scopes": ["display_name", "contact"],
-                      },
-                  )
-                  assert ok is True, (
-                      "apps/register failed: "
-                      + json.dumps({"data": data, "error": err})
+                      f"{self.axis_server.bound_port}"
                   )
 
               def close(self) -> None:
-                  self.sbs_server.shutdown()
-                  self.sbs_server.server_close()
+                  self.axis_server.shutdown()
+                  self.axis_server.server_close()
                   self.net_server.shutdown()
                   self.net_server.server_close()
-                  self.sbs_db.close()
+                  self.axis_db.close()
                   self.net_db.close()
 
 
@@ -1374,258 +1948,207 @@ jobs:
               return body
 
 
-          def _gj(url: str) -> dict:
-              with urlopen(url, timeout=15) as r:
-                  body = json.loads(r.read().decode("utf-8"))
-              assert isinstance(body, dict)
-              return body
-
-
           def _h(url: str) -> str:
               with urlopen(url, timeout=15) as r:
                   return r.read().decode("utf-8")
 
 
-          def _accounts(eco) -> None:
-              eco.store.add_account(
-                  account_id="SBS-seller01", zid=None, name="Vendedor Uno"
+          def _accounts(eco) -> tuple[str, str]:
+              ok, data, _err = eco.client.post(
+                  "/identity/register",
+                  {
+                      "kind": "person",
+                      "display_name": "Dr Ramirez",
+                      "actor": "axis",
+                  },
+              )
+              assert ok is True and data is not None
+              doctor_zid = str(data.get("zid"))
+              assert doctor_zid.startswith("ZID-")
+              eco.client.post(
+                  "/trust/complete",
+                  {"zid": doctor_zid, "actor": "axis"},
+              )
+              ok, data, _err = eco.client.post(
+                  "/identity/register",
+                  {
+                      "kind": "person",
+                      "display_name": "Maria Lopez",
+                      "actor": "axis",
+                  },
+              )
+              assert ok is True and data is not None
+              patient_zid = str(data.get("zid"))
+              eco.client.post(
+                  "/trust/complete",
+                  {"zid": patient_zid, "actor": "axis"},
               )
               eco.store.add_account(
-                  account_id="SBS-buyer001", zid=None, name="Comprador Uno"
+                  account_id="AX-doc1",
+                  zid=doctor_zid,
+                  name="Dr Ramirez",
+                  role="medico",
               )
+              eco.store.add_account(
+                  account_id="AX-pat1",
+                  zid=patient_zid,
+                  name="Maria Lopez",
+                  role="paciente",
+              )
+              return doctor_zid, patient_zid
 
 
-          def test_1_auction_full_commerce(tmp_path: Path) -> None:
+          def test_1_health_exam_followup_appointment(
+              tmp_path: Path,
+          ) -> None:
               eco = _Eco(tmp_path)
               try:
-                  eco.register_app_canonical()
-                  _accounts(eco)
-                  listing_html = _pf(
-                      eco.sbs_base + "/subastas/listing",
+                  assert eco.client.post(
+                      "/apps/register",
                       {
-                          "seller_account": "SBS-seller01",
-                          "title": "Moto usada 2019",
-                          "description": "buena",
-                          "base_price": 500,
+                          "app_id": "axis",
+                          "display_name": "AXIS",
+                          "scopes": ["display_name", "contact"],
                       },
-                  )
-                  assert "SELLADO" in listing_html
-                  listing_id = eco.store.list_open()[0]["listing_id"]
-                  body = _pj(
-                      eco.sbs_base + "/subastas/api/bids",
-                      {
-                          "listing_id": listing_id,
-                          "bidder_account": "SBS-buyer001",
-                          "amount": 650,
-                      },
-                  )
-                  assert body["ok"] is True
-                  eco.store.close_listing(
-                      listing_id=listing_id, seller_account="SBS-seller01"
-                  )
-                  order = _pj(
-                      eco.sbs_base + "/subastas/api/orders",
-                      {
-                          "listing_id": listing_id,
-                          "buyer_account": "SBS-buyer001",
-                          "source": "auction",
-                      },
-                  )["data"]
-                  order_id = order["order_id"]
-                  assert order["subtotal"] == 650.0
-                  assert order["platform_fee"] == 32.5
-                  assert order["status"] == "created"
-                  listing_after = _gj(
-                      eco.sbs_base
-                      + "/subastas/api/listings/"
-                      + listing_id
-                  )["data"]
-                  assert listing_after["winner_account"] == "SBS-buyer001"
-                  assert listing_after["final_price"] == 650.0
-                  assert listing_after["closed_at"] is not None
-                  paid = _pj(
-                      eco.sbs_base + "/subastas/api/orders/" + order_id + "/pay",
-                      {"provider": "wallet"},
-                  )["data"]
-                  assert paid["status"] == "paid"
-                  assert paid["commission"]["commission_amount"] == 32.5
-                  settled = _pj(
-                      eco.sbs_base
-                      + "/subastas/api/orders/"
-                      + order_id
-                      + "/settle",
-                      {},
-                  )["data"]
-                  assert settled["settlement"]["net_amount"] == 617.5
-                  shipped = _pj(
-                      eco.sbs_base
-                      + "/subastas/api/orders/"
-                      + order_id
-                      + "/ship",
-                      {
-                          "carrier": "zyra-express",
-                          "origin": "San Salvador",
-                          "destination": "Santa Ana",
-                      },
-                  )["data"]
-                  assert shipped["status"] == "shipped"
-                  shipment_id = shipped["shipment"]["shipment_id"]
-                  tracked = _pj(
-                      eco.sbs_base
-                      + "/subastas/api/shipments/"
-                      + shipment_id
-                      + "/track",
-                      {
-                          "status": "in_transit",
-                          "location": "Ruta 1",
-                          "description": "en camino",
-                      },
-                  )["data"]
-                  assert tracked["status"] == "in_transit"
-                  delivered = _pj(
-                      eco.sbs_base
-                      + "/subastas/api/shipments/"
-                      + shipment_id
-                      + "/deliver",
-                      {},
-                  )["data"]
-                  assert delivered["status"] == "delivered"
-                  mutual = _pj(
-                      eco.sbs_base + "/subastas/api/reputation/mutual",
-                      {
-                          "order_id": order_id,
-                          "buyer_account": "SBS-buyer001",
-                          "seller_account": "SBS-seller01",
-                          "evidence": "moto entregada y pagada 650",
-                      },
-                  )["data"]
-                  assert mutual["buyer_to_seller_network"] is True, json.dumps(
-                      mutual
-                  )
-                  assert mutual["seller_to_buyer_network"] is True, json.dumps(
-                      mutual
-                  )
-                  assert mutual["history_seller_recorded"] is True, json.dumps(
-                      mutual
-                  )
-                  assert mutual["history_buyer_recorded"] is True, json.dumps(
-                      mutual
-                  )
-              finally:
-                  eco.close()
-
-
-          def test_2_direct_purchase(tmp_path: Path) -> None:
-              eco = _Eco(tmp_path)
-              try:
-                  eco.register_app_canonical()
-                  eco.store.add_account(
-                      account_id="SBS-s2", zid=None, name="Vendedor Dos"
-                  )
-                  eco.store.add_account(
-                      account_id="SBS-b2", zid=None, name="Comprador Dos"
-                  )
+                  )[0] is True
+                  doctor_zid, patient_zid = _accounts(eco)
                   _pf(
-                      eco.sbs_base + "/subastas/listing",
+                      eco.axis_base + "/axis/exam",
                       {
-                          "seller_account": "SBS-s2",
-                          "title": "Bicicleta",
-                          "description": "nueva",
-                          "base_price": 120,
+                          "patient_account": "AX-pat1",
+                          "doctor_account": "AX-doc1",
+                          "exam_type": "sangre",
                       },
                   )
-                  listing_id = eco.store.list_open()[0]["listing_id"]
-                  order = _pj(
-                      eco.sbs_base + "/subastas/api/orders",
+                  assert len(eco.store.pending_reminders()) == 0
+                  result_html = _pf(
+                      eco.axis_base + "/axis/exam-result",
                       {
-                          "listing_id": listing_id,
-                          "buyer_account": "SBS-b2",
-                          "source": "direct",
+                          "exam_id": "EXM-1",
+                          "doctor_account": "AX-doc1",
+                          "summary": "anemia detectada",
+                          "severity": "media",
+                          "requires_followup": "1",
+                          "followup_reason": "control en 2 semanas",
+                          "scheduled_at": "lunes 9am",
                       },
-                  )["data"]
-                  assert order["subtotal"] == 120.0
-                  assert order["platform_fee"] == 6.0
-                  paid = _pj(
-                      eco.sbs_base
-                      + "/subastas/api/orders/"
-                      + order["order_id"]
-                      + "/pay",
-                      {"provider": "cash"},
-                  )["data"]
-                  assert paid["status"] == "paid"
-                  settled = _pj(
-                      eco.sbs_base
-                      + "/subastas/api/orders/"
-                      + order["order_id"]
-                      + "/settle",
-                      {},
-                  )["data"]
-                  assert settled["settlement"]["net_amount"] == 114.0
-                  final_order = _gj(
-                      eco.sbs_base
-                      + "/subastas/api/orders/"
-                      + order["order_id"]
-                  )["data"]
-                  assert final_order["status"] == "settled"
+                  )
+                  assert "Resultado" in result_html
+                  assert "lunes 9am" in result_html
+                  assert "recordado" in result_html
+                  reminders = eco.store.pending_reminders()
+                  assert len(reminders) == 1
+                  assert reminders[0]["patient_account"] == "AX-pat1"
+                  patient_panel = _h(
+                      eco.axis_base + "/axis/paciente/AX-pat1"
+                  )
+                  assert "Mi Salud" in patient_panel
+                  assert "Maria Lopez" in patient_panel
+                  history_ok, history, _err = eco.client.get(
+                      "/history/" + patient_zid
+                  )
+                  assert history_ok is True
+                  history_text = json.dumps(history, default=str)
+                  assert "resultado_examen" in history_text
               finally:
                   eco.close()
 
 
-          def test_3_radar_vip(tmp_path: Path) -> None:
+          def test_2_emergency_coordinated_dispatch(
+              tmp_path: Path,
+          ) -> None:
               eco = _Eco(tmp_path)
               try:
-                  scan = _pj(
-                      eco.sbs_base + "/subastas/api/radar/scan",
+                  assert eco.client.post(
+                      "/apps/register",
                       {
-                          "title": "Moto en EEUU",
-                          "category": "vehiculos",
-                          "purchase_price": 100,
-                          "shipping_cost": 10,
-                          "fees": 5,
-                          "estimated_sale_price": 200,
-                          "demand_score": 0.8,
-                          "risk_score": 0.2,
+                          "app_id": "axis",
+                          "display_name": "AXIS",
+                          "scopes": ["display_name", "contact"],
+                      },
+                  )[0] is True
+                  eco.store.add_account(
+                      account_id="AX-pat2",
+                      zid=None,
+                      name="Juan Emergencia",
+                      role="paciente",
+                  )
+                  created = _pj(
+                      eco.axis_base + "/axis/api/emergencies",
+                      {
+                          "source_app": "semilla",
+                          "subject_account": "AX-pat2",
+                          "emergency_type": "emergencia_medica",
+                          "severity": "critica",
+                          "description": (
+                              "IA-Tutor detecto emergencia"
+                              " medica en alumno"
+                          ),
                       },
                   )["data"]
-                  assert scan["total_cost"] == 115.0
-                  assert scan["expected_profit"] == 85.0
-                  assert scan["margin_percent"] == 73.91
-                  assert scan["opportunity_score"] == 76.95
-                  bad = _pj(
-                      eco.sbs_base + "/subastas/api/radar/scan",
-                      {
-                          "title": "Lote ropa",
-                          "category": "ropa",
-                          "purchase_price": 300,
-                          "shipping_cost": 20,
-                          "fees": 10,
-                          "estimated_sale_price": 320,
-                          "demand_score": 0.4,
-                          "risk_score": 0.6,
-                      },
+                  emergency_id = created["emergency_id"]
+                  assert created["status"] == "open"
+                  assert created["source_app"] == "semilla"
+                  assert len(created["timeline"]) == 1
+                  dispatched = _pj(
+                      eco.axis_base
+                      + "/axis/api/emergencies/"
+                      + emergency_id
+                      + "/dispatch",
+                      {"agency": "ambulancia", "priority": "critica"},
                   )["data"]
-                  assert bad["expected_profit"] == -10.0
-                  opportunities = _gj(
-                      eco.sbs_base + "/subastas/api/opportunities"
-                  )["data"]["opportunities"]
-                  assert len(opportunities) == 2
-                  revision = _h(eco.sbs_base + "/subastas/revision")
-                  assert "Revision SUBASTAS" in revision
-                  assert "oportunidades radar: 2" in revision
+                  assert dispatched["status"] == "dispatched"
+                  assert dispatched["dispatches"][0]["agency"] == (
+                      "ambulancia"
+                  )
+                  dispatched = _pj(
+                      eco.axis_base
+                      + "/axis/api/emergencies/"
+                      + emergency_id
+                      + "/dispatch",
+                      {"agency": "hospital", "priority": "alta"},
+                  )["data"]
+                  assert len(dispatched["dispatches"]) == 2
+                  resolved = _pj(
+                      eco.axis_base
+                      + "/axis/api/emergencies/resolve",
+                      {"emergency_id": emergency_id},
+                  )["data"]
+                  assert resolved["status"] == "resolved"
+                  assert len(resolved["timeline"]) == 3
+                  try:
+                      _pj(
+                          eco.axis_base
+                          + "/axis/api/emergencies/"
+                          + emergency_id
+                          + "/dispatch",
+                          {"agency": "policia", "priority": "alta"},
+                      )
+                      raise AssertionError(
+                          "resolved must reject dispatch"
+                      )
+                  except Exception as exc:
+                      assert "400" in str(exc)
+                  screen = _h(eco.axis_base + "/axis/emergencias")
+                  assert "Centro de Emergencias" in screen
+                  assert "Sin emergencias abiertas" in screen
+                  home = _h(eco.axis_base + "/axis")
+                  assert "AXIS" in home
+                  assert "Registrarme" in home
               finally:
                   eco.close()
 
 
-          def test_4_offline_resilience(tmp_path: Path) -> None:
-              db = SQLiteAdapter(tmp_path / "sbs.db")
+          def test_3_offline_resilience(tmp_path: Path) -> None:
+              db = SQLiteAdapter(tmp_path / "axis.db")
               clock = FrozenClock()
-              store = SubastasStore(db, clock)
+              store = AxisStore(db, clock)
               dead_client = NetworkClient(
                   "http://127.0.0.1:1",
                   timeout_seconds=1.0,
                   max_retries=0,
               )
-              server = serve_subastas(store, dead_client)
+              server = serve_axis(store, dead_client)
               thread = threading.Thread(
                   target=server.serve_forever, daemon=True
               )
@@ -1633,75 +2156,74 @@ jobs:
               base = "http://127.0.0.1:" f"{server.bound_port}"
               try:
                   store.add_account(
-                      account_id="SBS-off-s", zid=None, name="Vendedor Off"
+                      account_id="AX-off",
+                      zid=None,
+                      name="Off Patient",
+                      role="paciente",
                   )
-                  store.add_account(
-                      account_id="SBS-off-b", zid=None, name="Comprador Off"
+                  store.add_exam(
+                      exam_id="EXM-off",
+                      patient_account="AX-off",
+                      doctor_account="AX-doc",
+                      exam_type="radiografia",
                   )
-                  html = _pf(
-                      base + "/subastas/listing",
-                      {
-                          "seller_account": "SBS-off-s",
-                          "title": "Venta offline",
-                          "description": "sin red",
-                          "base_price": 80,
-                      },
+                  result = store.add_exam_result(
+                      result_id="RES-off",
+                      exam_id="EXM-off",
+                      summary="fractura",
+                      severity="alta",
+                      requires_followup=True,
+                      followup_reason="yeso y control",
+                      sealed_doc=None,
                   )
-                  assert "SELLADO" in html
-                  listing_id = store.list_open()[0]["listing_id"]
-                  body = _pj(
-                      base + "/subastas/api/bids",
-                      {
-                          "listing_id": listing_id,
-                          "bidder_account": "SBS-off-b",
-                          "amount": 90,
-                      },
+                  assert result["requires_followup"] is True
+                  appointment = store.create_appointment(
+                      appointment_id="APT-off",
+                      patient_account="AX-off",
+                      doctor_account="AX-doc",
+                      result_id="RES-off",
+                      reason="yeso y control",
+                      scheduled_at="martes 10am",
                   )
-                  assert body["ok"] is True
-                  store.close_listing(
-                      listing_id=listing_id, seller_account="SBS-off-s"
+                  assert appointment["status"] == "scheduled"
+                  emergency = store.create_emergency(
+                      emergency_id="EMG-off",
+                      source_app="semilla",
+                      subject_account="AX-off",
+                      subject_zid=None,
+                      emergency_type="emergencia_medica",
+                      severity="alta",
+                      description="offline emergency",
                   )
-                  order = _pj(
-                      base + "/subastas/api/orders",
-                      {
-                          "listing_id": listing_id,
-                          "buyer_account": "SBS-off-b",
-                          "source": "auction",
-                      },
-                  )["data"]
-                  assert order["subtotal"] == 90.0
-                  paid = _pj(
-                      base
-                      + "/subastas/api/orders/"
-                      + order["order_id"]
-                      + "/pay",
-                      {"provider": "efectivo"},
-                  )["data"]
-                  assert paid["status"] == "paid"
-                  settled = _pj(
-                      base
-                      + "/subastas/api/orders/"
-                      + order["order_id"]
-                      + "/settle",
-                      {},
-                  )["data"]
-                  assert settled["settlement"]["net_amount"] == 85.5
-                  summary = _gj(base + "/subastas/api/summary")["summary"]
-                  assert summary["listings_total"] == 1
+                  dispatched = store.dispatch_emergency(
+                      emergency_id="EMG-off",
+                      agency="ambulancia",
+                      priority="alta",
+                  )
+                  assert dispatched["status"] == "dispatched"
+                  resolved = store.resolve_emergency(
+                      emergency_id="EMG-off"
+                  )
+                  assert resolved["status"] == "resolved"
+                  with urlopen(
+                      base + "/axis", timeout=10
+                  ) as response:
+                      home = response.read().decode("utf-8")
+                  assert "AXIS" in home
               finally:
                   server.shutdown()
                   server.server_close()
                   thread.join(timeout=5)
                   db.close()
           PYEOF
-          echo "commerce e2e written"
+          echo "axis e2e written"
 
-      - name: Run SUBASTAS tests (regression plus commerce ADD-ONLY e2e)
+      - name: Run AXIS tests (regression plus emergencias ADD-ONLY e2e)
         run: |
           set -euo pipefail
-          PYTHONPATH="$PWD" python -m pytest -q -p no:cacheprovider --timeout=60 --timeout-method=thread apps/subastas/tests/
-          echo "SUBASTAS tests OK"
-          find apps/subastas -name '__pycache__' -type d \
+          PYTHONPATH="$PWD" python -m pytest -q -p no:cacheprovider --timeout=60 --timeout-method=thread apps/axis/tests/
+          echo "AXIS tests OK"
+          find apps/axis -name '__pycache__' -type d \
             -prune -exec rm -rf {} +
 
       - name: Commit and push (race-safe)
@@ -1715,7 +2237,7 @@ jobs:
           if git diff --cached --quiet; then
             echo "No changes."
           else
-            git commit -m "zyra: Q3 SUBASTAS ADD-ONLY v4 - canonical /apps/register payload (app_id+display_name+scopes like MPE) in tests, trust completed inside _ensure_trusted_zid before reputation (the 403 lesson), mutual response carries error details and asserts print full JSON on failure; ADD-ONLY preserved (original store/link/client/tests untouched)"
+            git commit -m "zyra: Q3 AXIS emergencias ADD-ONLY - migration 2 (exams+results+appointments+emergencies+dispatches+timeline+evidence chain), exam-result with automatic followup appointment and patient reminder (health star flow), emergency receiver (SEMILLA critical alerts destination) with coordinated dispatch policia/bomberos/ambulancia/hospital + timeline + resolve, evidence custody chain hash-chained, trust via link extension new file, pantalla emergencias; canonical identity+seal contracts; probe + 3 focused e2e"
             git push origin "HEAD:${{ github.ref_name }}"
           fi
-          echo "=== Q3 SUBASTAS ADD-ONLY COMPLETE ==="
+          echo "=== Q3 AXIS COMPLETE ==="

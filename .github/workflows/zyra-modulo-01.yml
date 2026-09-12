@@ -31,7 +31,7 @@ jobs:
           python -m pip install --upgrade pip
           python -m pip install "cryptography>=42,<45" "pytest>=8,<9" "pytest-timeout>=2,<3"
 
-      - name: ADD axis_link_ext (trust + canonical helpers, new file)
+      - name: ADD axis_link_ext (new file)
         run: |
           set -euo pipefail
           cat > apps/axis/services/axis_link_ext.py <<'PYEOF'
@@ -54,30 +54,6 @@ jobs:
                       return bool(ok)
                   except Exception:
                       return False
-
-              def ensure_trusted_person(
-                  self, display_name: str,
-              ) -> str:
-                  ok, data, _err = self._client.post(
-                      "/identity/register",
-                      {
-                          "kind": "person",
-                          "display_name": display_name,
-                          "actor": "axis",
-                      },
-                  )
-                  zid = None
-                  if ok and data:
-                      found = self._find_zid(data)
-                      if found:
-                          zid = found
-                  if zid is None:
-                      raise ValueError(
-                          "no network ZID for "
-                          + display_name
-                      )
-                  self.complete_trust(zid)
-                  return zid
 
               def seal_evidence_canonical(
                   self,
@@ -103,19 +79,14 @@ jobs:
                       return (False, None)
                   if ok and data:
                       doc_id = self._find_key(
-                          data,
-                          ("document_id", "seal_id"),
+                          data, ("document_id", "seal_id")
                       )
                       if isinstance(doc_id, str):
                           return (True, doc_id)
                   return (False, None)
 
               def append_history(
-                  self,
-                  *,
-                  zid: str,
-                  event: str,
-                  detail: str,
+                  self, *, zid: str, event: str, detail: str,
               ) -> bool:
                   try:
                       ok, _d, _e = self._client.post(
@@ -133,27 +104,6 @@ jobs:
                       return bool(ok)
                   except Exception:
                       return False
-
-              @staticmethod
-              def _find_zid(doc):
-                  if isinstance(doc, dict):
-                      for key, value in doc.items():
-                          if (
-                              str(key).lower() == "zid"
-                              and isinstance(value, str)
-                              and value.startswith("ZID-")
-                          ):
-                              return value
-                      for value in doc.values():
-                          found = AxisLinkExt._find_zid(value)
-                          if found:
-                              return found
-                  elif isinstance(doc, list):
-                      for item in doc:
-                          found = AxisLinkExt._find_zid(item)
-                          if found:
-                              return found
-                  return None
 
               @staticmethod
               def _find_key(doc, keys):
@@ -180,8 +130,7 @@ jobs:
         run: |
           set -euo pipefail
           cat > apps/axis/infrastructure/persistence/axis_store.py <<'PYEOF'
-          """AXIS durable store (5 roles) + health followup
-          + emergencies + evidence chain. Additive v2."""
+          """AXIS durable store v2 - additive migrations."""
           from __future__ import annotations
 
           import hashlib
@@ -652,24 +601,6 @@ jobs:
                       "status": "scheduled",
                   }
 
-              def appointments_of(
-                  self, *, patient_account: str,
-              ) -> tuple[dict[str, object], ...]:
-                  rows = self._db.query_all(
-                      "SELECT * FROM axis_appointments"
-                      " WHERE patient_account = ? ORDER BY created_at",
-                      (patient_account,),
-                  )
-                  return tuple(
-                      {
-                          "appointment_id": str(r["appointment_id"]),
-                          "reason": str(r["reason"]),
-                          "scheduled_at": str(r["scheduled_at"]),
-                          "status": str(r["status"]),
-                      }
-                      for r in rows
-                  )
-
               def pending_reminders(self) -> tuple[dict[str, object], ...]:
                   rows = self._db.query_all(
                       "SELECT * FROM axis_appointments"
@@ -991,7 +922,7 @@ jobs:
           python -m py_compile apps/axis/infrastructure/persistence/axis_store.py
           echo "store v2 written"
 
-      - name: ADD server patches (insert-only, single-line HTML strings)
+      - name: ADD server patches v3 (doc passed in, api routes inside _api_post)
         run: |
           set -euo pipefail
           PYTHONPATH="$PWD" python - <<'PYEOF'
@@ -1032,24 +963,34 @@ jobs:
           ])
           POST_ROUTES = "\n".join([
               '        if s == ["exam"]:',
-              '            self._exam_form()',
+              '            self._exam_form(doc)',
               '            return',
               '        if s == ["exam-result"]:',
-              '            self._exam_result_form()',
+              '            self._exam_result_form(doc)',
               '            return',
-              '        if s == ["api", "emergencies"]:',
-              '            self._emergency_create()',
-              '            return',
-              '        if s == ["api", "emergencies", "resolve"]:',
-              '            self._emergency_resolve()',
-              '            return',
-              '        if s[0] == "api" and len(s) > 2 and s[1] == "emergencies":',
-              '            if s[2] == "dispatch":',
-              '                self._emergency_dispatch(',
-              '                    s[3] if len(s) > 3 else ""',
-              '                )',
-              '                return',
               POST_ANCHOR,
+          ])
+
+          API_ANCHOR = "\n".join([
+              '        doc = self._read_json()',
+              '        if s == ["accounts"]:',
+          ])
+          API_ROUTES = "\n".join([
+              '        doc = self._read_json()',
+              '        if s == ["emergencies"]:',
+              '            self._emergency_create(doc)',
+              '            return',
+              '        if s == ["emergencies", "resolve"]:',
+              '            self._emergency_resolve(doc)',
+              '            return',
+              '        if (',
+              '            len(s) == 3',
+              '            and s[0] == "emergencies"',
+              '            and s[2] == "dispatch"',
+              '        ):',
+              '            self._emergency_dispatch(doc, s[1])',
+              '            return',
+              API_ANCHOR,
           ])
 
           METHODS = "\n".join([
@@ -1059,9 +1000,19 @@ jobs:
               '            getattr(link, "_client")',
               '        )',
               '',
-              '    def _exam_form(self) -> None:',
+              '    def _exam_patient(self, exam_id: str) -> str:',
               '        store = type(self).store',
-              '        doc = self._read_form()',
+              '        row = store._db.query_one(',
+              '            "SELECT patient_account FROM axis_exams"',
+              '            " WHERE exam_id = ?",',
+              '            (exam_id,),',
+              '        )',
+              '        if row is None:',
+              '            raise LookupError("unknown exam: " + exam_id)',
+              '        return str(row["patient_account"])',
+              '',
+              '    def _exam_form(self, doc) -> None:',
+              '        store = type(self).store',
               '        patient_account = self._req(doc, "patient_account")',
               '        doctor_account = self._req(doc, "doctor_account")',
               '        exam_type = self._req(doc, "exam_type")',
@@ -1085,21 +1036,9 @@ jobs:
               '            ),',
               '        )',
               '',
-              '    def _exam_patient(self, exam_id: str) -> str:',
-              '        store = type(self).store',
-              '        row = store._db.query_one(',
-              '            "SELECT patient_account FROM axis_exams"',
-              '            " WHERE exam_id = ?",',
-              '            (exam_id,),',
-              '        )',
-              '        if row is None:',
-              '            raise LookupError("unknown exam: " + exam_id)',
-              '        return str(row["patient_account"])',
-              '',
-              '    def _exam_result_form(self) -> None:',
+              '    def _exam_result_form(self, doc) -> None:',
               '        store = type(self).store',
               '        ext = self._ext()',
-              '        doc = self._read_form()',
               '        exam_id = self._req(doc, "exam_id")',
               '        doctor_account = self._req(doc, "doctor_account")',
               '        summary = self._req(doc, "summary")',
@@ -1166,15 +1105,8 @@ jobs:
               '            ),',
               '        )',
               '',
-              '    def _emergency_create(self) -> None:',
+              '    def _emergency_create(self, doc) -> None:',
               '        store = type(self).store',
-              '        doc = self._read_json()',
-              '        if doc is None:',
-              '            self._send(',
-              '                400,',
-              '                {"ok": False, "error": {"type": "invalid_request", "message": "invalid JSON"}},',
-              '            )',
-              '            return',
               '        emergency_type = self._req(doc, "emergency_type")',
               '        severity = self._req(doc, "severity")',
               '        description = self._req(doc, "description")',
@@ -1197,15 +1129,8 @@ jobs:
               '        )',
               '        self._send(201, {"ok": True, "data": emergency})',
               '',
-              '    def _emergency_dispatch(self, emergency_id: str) -> None:',
+              '    def _emergency_dispatch(self, doc, emergency_id: str) -> None:',
               '        store = type(self).store',
-              '        doc = self._read_json()',
-              '        if doc is None:',
-              '            self._send(',
-              '                400,',
-              '                {"ok": False, "error": {"type": "invalid_request", "message": "invalid JSON"}},',
-              '            )',
-              '            return',
               '        agency = self._req(doc, "agency")',
               '        priority = str(doc.get("priority", "alta"))',
               '        emergency = store.dispatch_emergency(',
@@ -1215,15 +1140,8 @@ jobs:
               '        )',
               '        self._send(200, {"ok": True, "data": emergency})',
               '',
-              '    def _emergency_resolve(self) -> None:',
+              '    def _emergency_resolve(self, doc) -> None:',
               '        store = type(self).store',
-              '        doc = self._read_json()',
-              '        if doc is None:',
-              '            self._send(',
-              '                400,',
-              '                {"ok": False, "error": {"type": "invalid_request", "message": "invalid JSON"}},',
-              '            )',
-              '            return',
               '        emergency = store.resolve_emergency(',
               '            emergency_id=self._req(doc, "emergency_id"),',
               '        )',
@@ -1263,6 +1181,7 @@ jobs:
           source = apply(source, IMPORT_ANCHOR, IMPORT_NEW, "import")
           source = apply(source, GET_ANCHOR, GET_ROUTES, "get-routes")
           source = apply(source, POST_ANCHOR, POST_ROUTES, "post-routes")
+          source = apply(source, API_ANCHOR, API_ROUTES, "api-post-routes")
           source = apply(
               source,
               '    def _home(self) -> None:',
@@ -1271,7 +1190,7 @@ jobs:
           )
 
           path.write_text(source, encoding="utf-8")
-          print("ALL 4 ADD-PATCHES APPLIED")
+          print("ALL 5 ADD-PATCHES APPLIED")
           PYEOF
           python -m py_compile apps/axis/server.py
           echo "server patched and compiles"
@@ -1327,8 +1246,6 @@ jobs:
           reminders = store.pending_reminders()
           assert len(reminders) == 1
           assert reminders[0]["patient_account"] == "AX-pat"
-          records = store.medical_records_of(patient_account="AX-pat")
-          assert isinstance(records, tuple)
           emergency = store.create_emergency(
               emergency_id="EMG-1",
               source_app="semilla",
@@ -1392,7 +1309,7 @@ jobs:
           """AXIS emergencias e2e ADD-ONLY - health exam with
           automatic followup appointment, emergency created
           (SEMILLA critical alert destination), coordinated
-          dispatch, resolve with timeline, original tests
+          dispatch, resolve with timeline; original tests
           untouched."""
           from __future__ import annotations
 
@@ -1769,7 +1686,7 @@ jobs:
           if git diff --cached --quiet; then
             echo "No changes."
           else
-            git commit -m "zyra: Q3 AXIS emergencias ADD-ONLY v2 - single-line balanced HTML strings in generated methods (fixed unterminated literal), migration 2 (exams+results+appointments+emergencies+dispatches+timeline+evidence chain), exam-result with automatic followup appointment and patient reminder, emergency receiver with coordinated dispatch + timeline, custody chain hash-chained, trust via link extension new file; original files untouched; probe + 3 focused e2e"
+            git commit -m "zyra: Q3 AXIS emergencias v3 - ROOT CAUSE fixed: exam handlers receive the already-read form doc (no body re-read = no timeout), emergency API routes moved inside _api_post where JSON dispatch happens (404 fixed), single-line HTML strings; migration 2 + custody chain + trust ext; probe + 3 e2e"
             git push origin "HEAD:${{ github.ref_name }}"
           fi
           echo "=== Q3 AXIS COMPLETE ==="

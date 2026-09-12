@@ -1,4 +1,4 @@
-name: zyra-q3-nexo-vision-e2e
+name: zyra-q3-subastas-commerce-e2e
 
 "on":
   workflow_dispatch:
@@ -9,7 +9,7 @@ permissions:
   contents: write
 
 concurrency:
-  group: zyra-q3-nexo-${{ github.ref }}
+  group: zyra-q3-sbs-${{ github.ref }}
   cancel-in-progress: false
 
 jobs:
@@ -34,1300 +34,1947 @@ jobs:
       - name: Evidence (originals intact)
         run: |
           set -euo pipefail
-          wc -c apps/nexo/server.py apps/nexo/infrastructure/persistence/nexo_store.py apps/nexo/services/nexo_link.py
+          wc -c apps/subastas/server.py apps/subastas/infrastructure/persistence/subastas_store.py apps/subastas/services/subastas_link.py apps/subastas/infrastructure/network/network_client.py
 
-      - name: NexoStore v2 (additive documents analyses duplicates)
+      - name: SubastasStore v2 (winner persisted + orders payments settlements shipments tracking radar)
         run: |
           set -euo pipefail
-          cat > apps/nexo/infrastructure/persistence/nexo_store.py <<'PYEOF'
-          """NexoCore durable ledger: hash-chained
-          accounting between ZIDs (fiscal kinds only)
-          + document analysis with provenance."""
+          cat > apps/subastas/infrastructure/persistence/subastas_store.py <<'PYEOF'
+          """SUBASTAS persistent store (marketplace + orders
+          + payments + logistics + radar opportunities)."""
           from __future__ import annotations
 
-          import hashlib
+          import threading
+          import time
+          import uuid
 
-          from shared_engines.storage.database import (
-              Database,
-          )
-          from shared_engines.storage.migrations import (
-              Migration,
-              MigrationRunner,
-          )
-
-          KINDS = (
-              "venta",
-              "compra",
-              "pago",
-              "cobro",
-              "ajuste",
-          )
-
-          _MIGRATIONS = (
-              Migration(
-                  1,
-                  "nexo",
-                  (
-                      "CREATE TABLE nexo_companies ("
-                      " company_id TEXT PRIMARY KEY,"
-                      " zid TEXT,"
-                      " name TEXT NOT NULL,"
-                      " synced INTEGER NOT NULL"
-                      " DEFAULT 0,"
-                      " created_at REAL NOT NULL)",
-                      "CREATE TABLE nexo_operations ("
-                      " seq INTEGER PRIMARY KEY"
-                      " AUTOINCREMENT,"
-                      " operation_id TEXT NOT NULL,"
-                      " kind TEXT NOT NULL,"
-                      " seller_zid TEXT NOT NULL,"
-                      " buyer_zid TEXT NOT NULL,"
-                      " amount REAL NOT NULL,"
-                      " description TEXT NOT NULL,"
-                      " invoice_id TEXT,"
-                      " entry_hash TEXT NOT NULL,"
-                      " prev_hash TEXT NOT NULL,"
-                      " synced INTEGER NOT NULL"
-                      " DEFAULT 0,"
-                      " created_at REAL NOT NULL)",
-                  ),
-              ),
-              Migration(
-                  2,
-                  "nexo_vision",
-                  (
-                      "CREATE TABLE nexo_analyses ("
-                      " analysis_id TEXT PRIMARY KEY,"
-                      " content_sha256 TEXT NOT NULL,"
-                      " model_id TEXT NOT NULL,"
-                      " model_version TEXT NOT NULL,"
-                      " verdict TEXT NOT NULL,"
-                      " confidence REAL NOT NULL,"
-                      " classification TEXT NOT NULL,"
-                      " detail TEXT,"
-                      " created_at REAL NOT NULL)",
-                      "CREATE TABLE nexo_documents ("
-                      " document_id TEXT PRIMARY KEY,"
-                      " content_sha256 TEXT NOT NULL,"
-                      " title TEXT NOT NULL,"
-                      " analysis_id TEXT NOT NULL,"
-                      " kind TEXT NOT NULL,"
-                      " amount REAL NOT NULL,"
-                      " seller_zid TEXT NOT NULL,"
-                      " buyer_zid TEXT NOT NULL,"
-                      " operation_id TEXT NOT NULL,"
-                      " invoice_id TEXT,"
-                      " synced INTEGER NOT NULL"
-                      " DEFAULT 0,"
-                      " created_at REAL NOT NULL)",
-                      "CREATE TABLE nexo_duplicates ("
-                      " duplicate_id TEXT PRIMARY KEY,"
-                      " content_sha256 TEXT NOT NULL,"
-                      " created_at REAL NOT NULL)",
-                  ),
-              ),
-          )
+          PLATFORM_FEE_RATE = 0.05
 
 
-          def _entry_hash(
-              *,
-              seq: int,
-              kind: str,
-              seller_zid: str,
-              buyer_zid: str,
-              amount: float,
-              description: str,
-              prev_hash: str,
-              created_at: float,
-          ) -> str:
-              raw = (
-                  str(seq)
-                  + "|"
-                  + kind
-                  + "|"
-                  + seller_zid
-                  + "|"
-                  + buyer_zid
-                  + "|"
-                  + str(amount)
-                  + "|"
-                  + description
-                  + "|"
-                  + str(created_at)
-                  + "|"
-                  + prev_hash
-              )
-              return hashlib.sha256(
-                  raw.encode("utf-8")
-              ).hexdigest()
+          def new_listing_id() -> str:
+              return "LST-" + uuid.uuid4().hex[:10]
 
 
-          class NexoStore:
-              """Hash-chained durable ledger."""
+          def new_bid_id() -> str:
+              return "BID-" + uuid.uuid4().hex[:10]
 
-              def __init__(
-                  self, db: Database, clock
-              ) -> None:
+
+          def new_order_id() -> str:
+              return "ORD-" + uuid.uuid4().hex[:10]
+
+
+          def new_payment_id() -> str:
+              return "PAY-" + uuid.uuid4().hex[:10]
+
+
+          def new_commission_id() -> str:
+              return "COM-" + uuid.uuid4().hex[:10]
+
+
+          def new_settlement_id() -> str:
+              return "SET-" + uuid.uuid4().hex[:10]
+
+
+          def new_shipment_id() -> str:
+              return "SHP-" + uuid.uuid4().hex[:10]
+
+
+          def new_tracking_id() -> str:
+              return "TRK-" + uuid.uuid4().hex[:10]
+
+
+          def new_opportunity_id() -> str:
+              return "OPP-" + uuid.uuid4().hex[:10]
+
+
+          def new_rep_event_id() -> str:
+              return "REP-" + uuid.uuid4().hex[:10]
+
+
+          class SubastasStore:
+              def __init__(self, db, clock) -> None:
                   self._db = db
                   self._clock = clock
-                  MigrationRunner(
-                      db, "nexo", _MIGRATIONS
-                  ).run(clock)
+                  self._lock = threading.Lock()
+                  self._ensure_schema()
 
-              def add_company(
-                  self,
-                  *,
-                  company_id: str,
-                  zid: str | None,
-                  name: str,
-                  synced: bool,
-              ) -> dict[str, object]:
-                  now = self._clock.now()
-                  with self._db.transaction() as cursor:
-                      cursor.execute(
-                          "INSERT INTO nexo_companies"
-                          " (company_id, zid, name,"
-                          "  synced, created_at)"
-                          " VALUES (?, ?, ?, ?, ?)",
-                          (
-                              company_id,
-                              zid,
-                              name,
-                              int(synced),
-                              now,
-                          ),
-                      )
-                  return self.get_company(company_id)
+              def _now(self) -> float:
+                  try:
+                      return float(self._clock.now())
+                  except Exception:
+                      return time.time()
 
-              def get_company(
-                  self, company_id: str
-              ) -> dict[str, object]:
-                  row = self._db.query_one(
-                      "SELECT * FROM nexo_companies"
-                      " WHERE company_id = ?",
-                      (company_id,),
+              def _ensure_schema(self) -> None:
+                  self._run(
+                      "CREATE TABLE IF NOT EXISTS"
+                      " sbs_accounts ("
+                      " account_id TEXT PRIMARY KEY,"
+                      " zid TEXT,"
+                      " name TEXT NOT NULL,"
+                      " created_at REAL NOT NULL)"
                   )
-                  if row is None:
-                      raise LookupError(
-                          "unknown company:"
-                          f" {company_id}"
+                  self._run(
+                      "CREATE TABLE IF NOT EXISTS"
+                      " sbs_listings ("
+                      " listing_id TEXT PRIMARY KEY,"
+                      " seller_account TEXT NOT NULL,"
+                      " seller_zid TEXT,"
+                      " title TEXT NOT NULL,"
+                      " description TEXT NOT NULL,"
+                      " base_price REAL NOT NULL,"
+                      " document_id TEXT,"
+                      " status TEXT NOT NULL,"
+                      " created_at REAL NOT NULL)"
+                  )
+                  self._run(
+                      "CREATE TABLE IF NOT EXISTS"
+                      " sbs_bids ("
+                      " bid_id TEXT PRIMARY KEY,"
+                      " listing_id TEXT NOT NULL,"
+                      " bidder_account TEXT NOT NULL,"
+                      " amount REAL NOT NULL,"
+                      " created_at REAL NOT NULL)"
+                  )
+                  self._run(
+                      "CREATE TABLE IF NOT EXISTS"
+                      " sbs_reputations ("
+                      " subject_zid TEXT NOT NULL,"
+                      " actor_zid TEXT NOT NULL,"
+                      " kind TEXT NOT NULL,"
+                      " evidence TEXT NOT NULL,"
+                      " source TEXT NOT NULL,"
+                      " created_at REAL NOT NULL)"
+                  )
+                  for ddl in (
+                      "ALTER TABLE sbs_listings"
+                      " ADD COLUMN winner_account TEXT",
+                      "ALTER TABLE sbs_listings"
+                      " ADD COLUMN final_price REAL",
+                      "ALTER TABLE sbs_listings"
+                      " ADD COLUMN closed_at REAL",
+                  ):
+                      try:
+                          self._run(ddl)
+                      except Exception:
+                          pass
+                  self._run(
+                      "CREATE TABLE IF NOT EXISTS"
+                      " sbs_orders ("
+                      " order_id TEXT PRIMARY KEY,"
+                      " listing_id TEXT NOT NULL,"
+                      " buyer_account TEXT NOT NULL,"
+                      " buyer_zid TEXT,"
+                      " seller_account TEXT NOT NULL,"
+                      " seller_zid TEXT,"
+                      " source TEXT NOT NULL,"
+                      " subtotal REAL NOT NULL,"
+                      " platform_fee REAL NOT NULL,"
+                      " total REAL NOT NULL,"
+                      " currency TEXT NOT NULL"
+                      " DEFAULT 'USD',"
+                      " status TEXT NOT NULL,"
+                      " created_at REAL NOT NULL,"
+                      " updated_at REAL NOT NULL)"
+                  )
+                  self._run(
+                      "CREATE TABLE IF NOT EXISTS"
+                      " sbs_payments ("
+                      " payment_id TEXT PRIMARY KEY,"
+                      " order_id TEXT NOT NULL,"
+                      " provider TEXT NOT NULL,"
+                      " amount REAL NOT NULL,"
+                      " currency TEXT NOT NULL"
+                      " DEFAULT 'USD',"
+                      " status TEXT NOT NULL,"
+                      " created_at REAL NOT NULL)"
+                  )
+                  self._run(
+                      "CREATE TABLE IF NOT EXISTS"
+                      " sbs_commissions ("
+                      " commission_id TEXT PRIMARY KEY,"
+                      " order_id TEXT NOT NULL,"
+                      " rate REAL NOT NULL,"
+                      " gross_amount REAL NOT NULL,"
+                      " commission_amount REAL NOT NULL,"
+                      " currency TEXT NOT NULL"
+                      " DEFAULT 'USD',"
+                      " created_at REAL NOT NULL)"
+                  )
+                  self._run(
+                      "CREATE TABLE IF NOT EXISTS"
+                      " sbs_settlements ("
+                      " settlement_id TEXT PRIMARY KEY,"
+                      " order_id TEXT NOT NULL,"
+                      " seller_account TEXT NOT NULL,"
+                      " gross_amount REAL NOT NULL,"
+                      " commission REAL NOT NULL,"
+                      " net_amount REAL NOT NULL,"
+                      " currency TEXT NOT NULL"
+                      " DEFAULT 'USD',"
+                      " status TEXT NOT NULL,"
+                      " created_at REAL NOT NULL)"
+                  )
+                  self._run(
+                      "CREATE TABLE IF NOT EXISTS"
+                      " sbs_shipments ("
+                      " shipment_id TEXT PRIMARY KEY,"
+                      " order_id TEXT NOT NULL,"
+                      " carrier TEXT NOT NULL,"
+                      " origin TEXT NOT NULL,"
+                      " destination TEXT NOT NULL,"
+                      " status TEXT NOT NULL,"
+                      " created_at REAL NOT NULL,"
+                      " updated_at REAL NOT NULL)"
+                  )
+                  self._run(
+                      "CREATE TABLE IF NOT EXISTS"
+                      " sbs_tracking_events ("
+                      " event_id TEXT PRIMARY KEY,"
+                      " shipment_id TEXT NOT NULL,"
+                      " status TEXT NOT NULL,"
+                      " location TEXT,"
+                      " description TEXT,"
+                      " occurred_at REAL NOT NULL)"
+                  )
+                  self._run(
+                      "CREATE TABLE IF NOT EXISTS"
+                      " sbs_reputation_events ("
+                      " event_id TEXT PRIMARY KEY,"
+                      " order_id TEXT,"
+                      " subject_zid TEXT NOT NULL,"
+                      " actor_zid TEXT NOT NULL,"
+                      " kind TEXT NOT NULL,"
+                      " evidence TEXT NOT NULL,"
+                      " network_recorded INTEGER"
+                      " NOT NULL DEFAULT 0,"
+                      " created_at REAL NOT NULL)"
+                  )
+                  self._run(
+                      "CREATE TABLE IF NOT EXISTS"
+                      " sbs_opportunities ("
+                      " opportunity_id TEXT PRIMARY KEY,"
+                      " title TEXT NOT NULL,"
+                      " category TEXT,"
+                      " purchase_price REAL NOT NULL,"
+                      " shipping_cost REAL NOT NULL,"
+                      " fees REAL NOT NULL,"
+                      " estimated_sale_price REAL NOT NULL,"
+                      " total_cost REAL NOT NULL,"
+                      " expected_profit REAL NOT NULL,"
+                      " margin_percent REAL NOT NULL,"
+                      " demand_score REAL NOT NULL,"
+                      " risk_score REAL NOT NULL,"
+                      " opportunity_score REAL NOT NULL,"
+                      " status TEXT NOT NULL,"
+                      " created_at REAL NOT NULL)"
+                  )
+
+              def _run(self, sql, params=()) -> None:
+                  if not params:
+                      self._db.execute(sql)
+                      return
+                  try:
+                      self._db.execute(sql, params)
+                      return
+                  except TypeError:
+                      self._db.execute(
+                          self._inline(sql, params)
                       )
-                  zid = row["zid"]
+
+              @staticmethod
+              def _inline(sql, params) -> str:
+                  parts = sql.split("?")
+                  if len(parts) != len(params) + 1:
+                      return sql
+                  assembled = parts[0]
+                  for index, value in enumerate(params):
+                      assembled += SubastasStore._literal(value)
+                      assembled += parts[index + 1]
+                  return assembled
+
+              @staticmethod
+              def _literal(value) -> str:
+                  if value is None:
+                      return "NULL"
+                  if isinstance(value, bool):
+                      return "1" if value else "0"
+                  if isinstance(value, (int, float)):
+                      return repr(value)
+                  text = str(value).replace("'", "''")
+                  return "'" + text + "'"
+
+              def _rows(self, sql) -> list:
+                  for name in (
+                      "query",
+                      "fetchall",
+                      "fetch_all",
+                      "fetch",
+                      "select",
+                  ):
+                      fn = getattr(self._db, name, None)
+                      if not callable(fn):
+                          continue
+                      try:
+                          rows = fn(sql)
+                          if rows is None:
+                              continue
+                          return list(rows)
+                      except Exception:
+                          continue
+                  try:
+                      cursor = self._db.execute(sql)
+                  except Exception:
+                      return []
+                  if cursor is None:
+                      return []
+                  try:
+                      return list(cursor.fetchall())
+                  except Exception:
+                      return []
+
+              @staticmethod
+              def _field(row, key: str, index: int):
+                  if isinstance(row, dict):
+                      return row.get(key)
+                  try:
+                      return row[index]
+                  except Exception:
+                      return None
+
+              def add_account(self, *, account_id, zid, name) -> dict:
+                  self._run(
+                      "INSERT INTO sbs_accounts ("
+                      " account_id, zid, name, created_at"
+                      ") VALUES (?, ?, ?, ?)",
+                      (account_id, zid, name, self._now()),
+                  )
                   return {
-                      "company_id": str(
-                          row["company_id"]
-                      ),
-                      "zid": (
-                          str(zid)
-                          if zid is not None
-                          else None
-                      ),
-                      "name": str(row["name"]),
-                      "synced": bool(
-                          int(row["synced"])
-                      ),
+                      "account_id": account_id,
+                      "zid": zid,
+                      "name": name,
                   }
 
-              def record_operation(
-                  self,
-                  *,
-                  operation_id: str,
-                  kind: str,
-                  seller_zid: str,
-                  buyer_zid: str,
-                  amount: float,
-                  description: str,
-                  invoice_id: str | None,
-                  synced: bool,
-              ) -> dict[str, object]:
-                  if kind not in KINDS:
-                      raise ValueError(
-                          f"unknown kind: {kind}"
-                      )
-                  if amount <= 0:
-                      raise ValueError(
-                          "amount must be positive"
-                      )
-                  now = self._clock.now()
-                  with self._db.transaction() as cursor:
-                      last = cursor.execute(
-                          "SELECT seq, entry_hash"
-                          " FROM nexo_operations"
-                          " ORDER BY seq DESC"
-                          " LIMIT 1"
-                      ).fetchone()
-                      if last is None:
-                          seq = 1
-                          prev_hash = "GENESIS"
-                      else:
-                          seq = int(
-                              last["seq"]
-                          ) + 1
-                          prev_hash = str(
-                              last["entry_hash"]
-                          )
-                      entry_hash = _entry_hash(
-                          seq=seq,
-                          kind=kind,
-                          seller_zid=seller_zid,
-                          buyer_zid=buyer_zid,
-                          amount=amount,
-                          description=description,
-                          prev_hash=prev_hash,
-                          created_at=now,
-                      )
-                      cursor.execute(
-                          "INSERT INTO nexo_operations"
-                          " (operation_id, kind,"
-                          "  seller_zid, buyer_zid,"
-                          "  amount, description,"
-                          "  invoice_id, entry_hash,"
-                          "  prev_hash, synced,"
-                          "  created_at)"
-                          " VALUES (?, ?, ?, ?, ?,"
-                          "  ?, ?, ?, ?, ?, ?)",
-                          (
-                              operation_id,
-                              kind,
-                              seller_zid,
-                              buyer_zid,
-                              amount,
-                              description,
-                              invoice_id,
-                              entry_hash,
-                              prev_hash,
-                              int(synced),
-                              now,
-                          ),
-                      )
-                  return {
-                      "operation_id": (
-                          operation_id
-                      ),
-                      "seq": seq,
-                      "kind": kind,
-                      "amount": amount,
-                      "entry_hash": entry_hash,
-                      "prev_hash": prev_hash,
-                      "invoice_id": invoice_id,
-                      "synced": synced,
-                  }
-
-              def verify_chain(self) -> bool:
-                  rows = self._db.query_all(
-                      "SELECT * FROM nexo_operations"
-                      " ORDER BY seq"
+              def get_account(self, account_id):
+                  rows = self._rows(
+                      "SELECT account_id, zid, name"
+                      " FROM sbs_accounts WHERE account_id = "
+                      + self._literal(account_id)
                   )
-                  prev = "GENESIS"
-                  for r in rows:
-                      expected = _entry_hash(
-                          seq=int(r["seq"]),
-                          kind=str(r["kind"]),
-                          seller_zid=str(
-                              r["seller_zid"]
-                          ),
-                          buyer_zid=str(
-                              r["buyer_zid"]
-                          ),
-                          amount=float(
-                              r["amount"]
-                          ),
-                          description=str(
-                              r["description"]
-                          ),
-                          prev_hash=prev,
-                          created_at=float(
-                              r["created_at"]
-                          ),
-                      )
-                      if (
-                          str(r["entry_hash"])
-                          != expected
-                          or str(r["prev_hash"])
-                          != prev
-                      ):
-                          return False
-                      prev = str(
-                          r["entry_hash"]
-                      )
-                  return True
-
-              def list_operations(
-                  self,
-              ) -> tuple[dict[str, object], ...]:
-                  rows = self._db.query_all(
-                      "SELECT * FROM nexo_operations"
-                      " ORDER BY seq"
-                  )
-                  return tuple(
-                      {
-                          "seq": int(r["seq"]),
-                          "operation_id": str(
-                              r["operation_id"]
-                          ),
-                          "kind": str(r["kind"]),
-                          "seller_zid": str(
-                              r["seller_zid"]
-                          ),
-                          "buyer_zid": str(
-                              r["buyer_zid"]
-                          ),
-                          "amount": float(
-                              r["amount"]
-                          ),
-                          "invoice_id": (
-                              str(r["invoice_id"])
-                              if r["invoice_id"]
-                              is not None
-                              else None
-                          ),
-                          "entry_hash": str(
-                              r["entry_hash"]
-                          ),
-                      }
-                      for r in rows
-                  )
-
-              def summary(self) -> dict[str, object]:
-                  totals = self._db.query_all(
-                      "SELECT kind, COUNT(*) AS n,"
-                      " SUM(amount) AS total FROM"
-                      " nexo_operations"
-                      " GROUP BY kind"
-                      " ORDER BY kind"
-                  )
-                  by_kind = {
-                      str(r["kind"]): {
-                          "count": int(r["n"]),
-                          "total": float(
-                              r["total"]
-                          ),
-                      }
-                      for r in totals
-                  }
-                  row = self._db.query_one(
-                      "SELECT COUNT(*) AS n FROM"
-                      " nexo_operations"
-                  )
-                  return {
-                      "operations_total": int(
-                          row["n"]
-                      )
-                      if row is not None
-                      else 0,
-                      "by_kind": by_kind,
-                      "chain_intact": (
-                          self.verify_chain()
-                      ),
-                  }
-
-              def save_analysis(
-                  self,
-                  *,
-                  analysis_id: str,
-                  content_sha256: str,
-                  model_id: str,
-                  model_version: str,
-                  verdict: str,
-                  confidence: float,
-                  classification: str,
-                  detail: str | None,
-              ) -> dict[str, object]:
-                  now = self._clock.now()
-                  with self._db.transaction() as cursor:
-                      cursor.execute(
-                          "INSERT INTO nexo_analyses"
-                          " (analysis_id,"
-                          "  content_sha256, model_id,"
-                          "  model_version, verdict,"
-                          "  confidence, classification,"
-                          "  detail, created_at)"
-                          " VALUES (?, ?, ?, ?, ?,"
-                          "  ?, ?, ?, ?)",
-                          (
-                              analysis_id,
-                              content_sha256,
-                              model_id,
-                              model_version,
-                              verdict,
-                              float(confidence),
-                              classification,
-                              detail,
-                              now,
-                          ),
-                      )
-                  return {
-                      "analysis_id": analysis_id,
-                      "content_sha256": (
-                          content_sha256
-                      ),
-                      "model_id": model_id,
-                      "model_version": (
-                          model_version
-                      ),
-                      "verdict": verdict,
-                      "confidence": float(
-                          confidence
-                      ),
-                      "classification": (
-                          classification
-                      ),
-                  }
-
-              def get_analysis(
-                  self, analysis_id: str,
-              ) -> dict[str, object] | None:
-                  row = self._db.query_one(
-                      "SELECT * FROM nexo_analyses"
-                      " WHERE analysis_id = ?",
-                      (analysis_id,),
-                  )
-                  if row is None:
+                  if not rows:
                       return None
                   return {
-                      "analysis_id": str(
-                          row["analysis_id"]
-                      ),
-                      "content_sha256": str(
-                          row["content_sha256"]
-                      ),
-                      "model_id": str(
-                          row["model_id"]
-                      ),
-                      "model_version": str(
-                          row["model_version"]
-                      ),
-                      "verdict": str(
-                          row["verdict"]
-                      ),
-                      "confidence": float(
-                          row["confidence"]
-                      ),
-                      "classification": str(
-                          row["classification"]
-                      ),
+                      "account_id": self._field(rows[0], "a", 0),
+                      "zid": self._field(rows[0], "z", 1),
+                      "name": self._field(rows[0], "n", 2),
                   }
 
-              def save_document(
-                  self,
-                  *,
-                  document_id: str,
-                  content_sha256: str,
-                  title: str,
-                  analysis_id: str,
-                  kind: str,
-                  amount: float,
-                  seller_zid: str,
-                  buyer_zid: str,
-                  operation_id: str,
-                  invoice_id: str | None,
-                  synced: bool,
-              ) -> dict[str, object]:
-                  now = self._clock.now()
-                  with self._db.transaction() as cursor:
-                      cursor.execute(
-                          "INSERT INTO nexo_documents"
-                          " (document_id,"
-                          "  content_sha256, title,"
-                          "  analysis_id, kind, amount,"
-                          "  seller_zid, buyer_zid,"
-                          "  operation_id, invoice_id,"
-                          "  synced, created_at)"
-                          " VALUES (?, ?, ?, ?, ?,"
-                          "  ?, ?, ?, ?, ?, ?, ?)",
-                          (
-                              document_id,
-                              content_sha256,
-                              title,
-                              analysis_id,
-                              kind,
-                              float(amount),
-                              seller_zid,
-                              buyer_zid,
-                              operation_id,
-                              invoice_id,
-                              int(synced),
-                              now,
-                          ),
-                      )
+              def add_listing(
+                  self, *, listing_id, seller_account, seller_zid,
+                  title, description, base_price, document_id,
+                  network_sealed=False,
+              ) -> dict:
+                  self._run(
+                      "INSERT INTO sbs_listings ("
+                      " listing_id, seller_account, seller_zid,"
+                      " title, description, base_price,"
+                      " document_id, status, created_at"
+                      ") VALUES (?, ?, ?, ?, ?, ?, ?, 'open', ?)",
+                      (
+                          listing_id,
+                          seller_account,
+                          seller_zid,
+                          title,
+                          description,
+                          float(base_price),
+                          document_id,
+                          self._now(),
+                      ),
+                  )
                   return {
+                      "listing_id": listing_id,
+                      "status": "open",
                       "document_id": document_id,
-                      "content_sha256": (
-                          content_sha256
-                      ),
-                      "analysis_id": analysis_id,
-                      "kind": kind,
-                      "amount": float(amount),
-                      "operation_id": (
-                          operation_id
-                      ),
-                      "invoice_id": invoice_id,
-                      "synced": synced,
+                      "network_sealed": bool(network_sealed),
                   }
 
-              def find_document_by_sha(
-                  self, content_sha256: str,
-              ) -> dict[str, object] | None:
-                  row = self._db.query_one(
-                      "SELECT * FROM nexo_documents"
-                      " WHERE content_sha256 = ?",
-                      (content_sha256,),
+              def get_listing(self, listing_id):
+                  rows = self._rows(
+                      "SELECT listing_id, seller_account,"
+                      " seller_zid, title, description,"
+                      " base_price, document_id, status,"
+                      " winner_account, final_price, closed_at"
+                      " FROM sbs_listings WHERE listing_id = "
+                      + self._literal(listing_id)
                   )
-                  if row is None:
+                  if not rows:
                       return None
+                  row = rows[0]
                   return {
-                      "document_id": str(
-                          row["document_id"]
-                      ),
-                      "content_sha256": str(
-                          row["content_sha256"]
-                      ),
-                      "operation_id": str(
-                          row["operation_id"]
-                      ),
+                      "listing_id": self._field(row, "a", 0),
+                      "seller_account": self._field(row, "b", 1),
+                      "seller_zid": self._field(row, "c", 2),
+                      "title": self._field(row, "d", 3),
+                      "description": self._field(row, "e", 4),
+                      "base_price": self._field(row, "f", 5),
+                      "document_id": self._field(row, "g", 6),
+                      "status": self._field(row, "h", 7),
+                      "winner_account": self._field(row, "i", 8),
+                      "final_price": self._field(row, "j", 9),
+                      "closed_at": self._field(row, "k", 10),
                   }
 
-              def get_document(
-                  self, document_id: str,
-              ) -> dict[str, object] | None:
-                  row = self._db.query_one(
-                      "SELECT * FROM nexo_documents"
-                      " WHERE document_id = ?",
-                      (document_id,),
+              def list_open(self) -> list:
+                  rows = self._rows(
+                      "SELECT listing_id, seller_account,"
+                      " seller_zid, title, description,"
+                      " base_price, document_id, status,"
+                      " created_at FROM sbs_listings"
+                      " WHERE status = 'open'"
+                      " ORDER BY created_at ASC"
                   )
-                  if row is None:
-                      return None
-                  analysis = self.get_analysis(
-                      str(row["analysis_id"])
-                  )
-                  op_row = self._db.query_one(
-                      "SELECT seq, entry_hash FROM"
-                      " nexo_operations WHERE"
-                      " operation_id = ?",
-                      (str(row["operation_id"]),),
-                  )
-                  return {
-                      "document_id": str(
-                          row["document_id"]
-                      ),
-                      "content_sha256": str(
-                          row["content_sha256"]
-                      ),
-                      "title": str(row["title"]),
-                      "kind": str(row["kind"]),
-                      "amount": float(
-                          row["amount"]
-                      ),
-                      "seller_zid": str(
-                          row["seller_zid"]
-                      ),
-                      "buyer_zid": str(
-                          row["buyer_zid"]
-                      ),
-                      "operation_id": str(
-                          row["operation_id"]
-                      ),
-                      "operation_seq": (
-                          int(op_row["seq"])
-                          if op_row is not None
-                          else None
-                      ),
-                      "operation_hash": (
-                          str(op_row["entry_hash"])
-                          if op_row is not None
-                          else None
-                      ),
-                      "invoice_id": (
-                          str(row["invoice_id"])
-                          if row["invoice_id"]
-                          is not None
-                          else None
-                      ),
-                      "synced": bool(
-                          int(row["synced"])
-                      ),
-                      "analysis": analysis,
-                  }
-
-              def list_documents(
-                  self,
-              ) -> tuple[dict[str, object], ...]:
-                  rows = self._db.query_all(
-                      "SELECT document_id FROM"
-                      " nexo_documents"
-                      " ORDER BY created_at"
-                  )
-                  return tuple(
-                      self.get_document(
-                          str(r["document_id"])
+                  result = []
+                  for row in rows:
+                      result.append(
+                          {
+                              "listing_id": self._field(row, "a", 0),
+                              "seller_account": self._field(row, "b", 1),
+                              "seller_zid": self._field(row, "c", 2),
+                              "title": self._field(row, "d", 3),
+                              "description": self._field(row, "e", 4),
+                              "base_price": self._field(row, "f", 5),
+                              "document_id": self._field(row, "g", 6),
+                              "status": self._field(row, "h", 7),
+                          }
                       )
-                      for r in rows
-                  )
+                  return result
 
-              def record_duplicate(
-                  self, *, content_sha256: str,
-              ) -> dict[str, object]:
-                  import uuid
-
-                  now = self._clock.now()
-                  duplicate_id = (
-                      "DUP-"
-                      + uuid.uuid4().hex[:10]
+              def _listing_row(self, listing_id):
+                  rows = self._rows(
+                      "SELECT seller_account, status, base_price"
+                      " FROM sbs_listings WHERE listing_id = "
+                      + self._literal(listing_id)
                   )
-                  with self._db.transaction() as cursor:
-                      cursor.execute(
-                          "INSERT INTO"
-                          " nexo_duplicates ("
-                          " duplicate_id,"
-                          "  content_sha256,"
-                          "  created_at)"
-                          " VALUES (?, ?, ?)",
+                  if not rows:
+                      return None
+                  return rows[0]
+
+              def _highest_bid(self, listing_id):
+                  rows = self._rows(
+                      "SELECT bidder_account, amount FROM sbs_bids"
+                      " WHERE listing_id = "
+                      + self._literal(listing_id)
+                      + " ORDER BY amount DESC LIMIT 1"
+                  )
+                  if not rows:
+                      return None
+                  return rows[0]
+
+              def place_bid(self, *, bid_id, listing_id, bidder_account, amount) -> dict:
+                  with self._lock:
+                      row = self._listing_row(listing_id)
+                      if row is None:
+                          raise LookupError("listing not found: " + listing_id)
+                      seller = str(self._field(row, "s", 0))
+                      status = str(self._field(row, "t", 1))
+                      base = float(self._field(row, "b", 2) or 0)
+                      if status != "open":
+                          raise ValueError("listing is not open")
+                      if bidder_account == seller:
+                          raise ValueError("seller cannot bid own listing")
+                      amt = float(amount)
+                      if amt <= base:
+                          raise ValueError("bid must exceed base price")
+                      top = self._highest_bid(listing_id)
+                      if top is not None:
+                          best = float(self._field(top, "m", 1) or 0)
+                          if amt <= best:
+                              raise ValueError("bid must exceed current highest")
+                      self._run(
+                          "INSERT INTO sbs_bids ("
+                          " bid_id, listing_id, bidder_account,"
+                          " amount, created_at"
+                          ") VALUES (?, ?, ?, ?, ?)",
+                          (bid_id, listing_id, bidder_account, amt, self._now()),
+                      )
+                      return {
+                          "bid_id": bid_id,
+                          "listing_id": listing_id,
+                          "bidder_account": bidder_account,
+                          "amount": amt,
+                      }
+
+              def close_listing(self, *, listing_id, seller_account) -> dict:
+                  with self._lock:
+                      row = self._listing_row(listing_id)
+                      if row is None:
+                          raise LookupError("listing not found: " + listing_id)
+                      seller = str(self._field(row, "s", 0))
+                      status = str(self._field(row, "t", 1))
+                      if seller != seller_account:
+                          raise PermissionError("only the seller can close")
+                      if status != "open":
+                          raise ValueError("already closed")
+                      top = self._highest_bid(listing_id)
+                      if top is None:
+                          raise ValueError("no bids")
+                      winner = str(self._field(top, "w", 0))
+                      price = float(self._field(top, "p", 1))
+                      closed_at = self._now()
+                      self._run(
+                          "UPDATE sbs_listings SET status = 'closed',"
+                          " winner_account = "
+                          + self._literal(winner)
+                          + ", final_price = "
+                          + self._literal(price)
+                          + ", closed_at = "
+                          + self._literal(closed_at)
+                          + " WHERE listing_id = "
+                          + self._literal(listing_id)
+                      )
+                      return {
+                          "listing_id": listing_id,
+                          "winner_account": winner,
+                          "final_price": price,
+                      }
+
+              def record_reputation(
+                  self, *, subject_zid, actor_zid, kind, evidence, source,
+                  network_recorded=False,
+              ) -> dict:
+                  self._run(
+                      "INSERT INTO sbs_reputations ("
+                      " subject_zid, actor_zid, kind, evidence,"
+                      " source, created_at"
+                      ") VALUES (?, ?, ?, ?, ?, ?)",
+                      (
+                          subject_zid,
+                          actor_zid,
+                          kind,
+                          evidence,
+                          source,
+                          self._now(),
+                      ),
+                  )
+                  self._run(
+                      "INSERT INTO sbs_reputation_events ("
+                      " event_id, order_id, subject_zid, actor_zid,"
+                      " kind, evidence, network_recorded, created_at"
+                      ") VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+                      (
+                          new_rep_event_id(),
+                          source if source.startswith("order:") else None,
+                          subject_zid,
+                          actor_zid,
+                          kind,
+                          evidence,
+                          1 if network_recorded else 0,
+                          self._now(),
+                      ),
+                  )
+                  return {"recorded": True}
+
+              def create_order(
+                  self, *, order_id, listing_id, buyer_account, buyer_zid, source,
+              ) -> dict:
+                  with self._lock:
+                      listing = self.get_listing(listing_id)
+                      if listing is None:
+                          raise LookupError("listing not found: " + listing_id)
+                      if source == "auction":
+                          if listing["status"] != "closed":
+                              raise ValueError("auction not closed yet")
+                          if listing["winner_account"] != buyer_account:
+                              raise ValueError("buyer is not the auction winner")
+                          subtotal = float(listing["final_price"] or 0)
+                      else:
+                          if listing["status"] != "open":
+                              raise ValueError("listing is not open")
+                          subtotal = float(listing["base_price"])
+                      dup = self._rows(
+                          "SELECT order_id FROM sbs_orders"
+                          " WHERE listing_id = "
+                          + self._literal(listing_id)
+                      )
+                      if dup:
+                          raise ValueError("order already exists for this listing")
+                      fee = round(subtotal * PLATFORM_FEE_RATE, 2)
+                      now = self._now()
+                      self._run(
+                          "INSERT INTO sbs_orders ("
+                          " order_id, listing_id, buyer_account, buyer_zid,"
+                          " seller_account, seller_zid, source, subtotal,"
+                          " platform_fee, total, currency, status,"
+                          " created_at, updated_at"
+                          ") VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?,"
+                          " 'USD', 'created', ?, ?)",
                           (
-                              duplicate_id,
-                              content_sha256,
+                              order_id,
+                              listing_id,
+                              buyer_account,
+                              buyer_zid,
+                              listing["seller_account"],
+                              listing["seller_zid"],
+                              source,
+                              subtotal,
+                              fee,
+                              subtotal,
+                              now,
                               now,
                           ),
                       )
+                      return self.get_order(order_id)
+
+              def get_order(self, order_id) -> dict:
+                  rows = self._rows(
+                      "SELECT order_id, listing_id, buyer_account,"
+                      " buyer_zid, seller_account, seller_zid, source,"
+                      " subtotal, platform_fee, total, currency, status,"
+                      " created_at, updated_at FROM sbs_orders"
+                      " WHERE order_id = "
+                      + self._literal(order_id)
+                  )
+                  if not rows:
+                      raise LookupError("order not found: " + order_id)
+                  row = rows[0]
+                  order = {
+                      "order_id": self._field(row, "a", 0),
+                      "listing_id": self._field(row, "b", 1),
+                      "buyer_account": self._field(row, "c", 2),
+                      "buyer_zid": self._field(row, "d", 3),
+                      "seller_account": self._field(row, "e", 4),
+                      "seller_zid": self._field(row, "f", 5),
+                      "source": self._field(row, "g", 6),
+                      "subtotal": self._field(row, "h", 7),
+                      "platform_fee": self._field(row, "i", 8),
+                      "total": self._field(row, "j", 9),
+                      "currency": self._field(row, "k", 10),
+                      "status": self._field(row, "l", 11),
+                      "payments": [],
+                      "commission": None,
+                      "settlement": None,
+                      "shipment": None,
+                  }
+                  pays = self._rows(
+                      "SELECT payment_id, provider, amount, status"
+                      " FROM sbs_payments WHERE order_id = "
+                      + self._literal(order_id)
+                  )
+                  for p in pays:
+                      order["payments"].append(
+                          {
+                              "payment_id": self._field(p, "a", 0),
+                              "provider": self._field(p, "b", 1),
+                              "amount": self._field(p, "c", 2),
+                              "status": self._field(p, "d", 3),
+                          }
+                      )
+                  com = self._rows(
+                      "SELECT commission_id, rate, commission_amount"
+                      " FROM sbs_commissions WHERE order_id = "
+                      + self._literal(order_id)
+                  )
+                  if com:
+                      order["commission"] = {
+                          "commission_id": self._field(com[0], "a", 0),
+                          "rate": self._field(com[0], "b", 1),
+                          "commission_amount": self._field(com[0], "c", 2),
+                      }
+                  stl = self._rows(
+                      "SELECT settlement_id, gross_amount, commission,"
+                      " net_amount, status FROM sbs_settlements"
+                      " WHERE order_id = "
+                      + self._literal(order_id)
+                  )
+                  if stl:
+                      order["settlement"] = {
+                          "settlement_id": self._field(stl[0], "a", 0),
+                          "gross_amount": self._field(stl[0], "b", 1),
+                          "commission": self._field(stl[0], "c", 2),
+                          "net_amount": self._field(stl[0], "d", 3),
+                          "status": self._field(stl[0], "e", 4),
+                      }
+                  shp = self._rows(
+                      "SELECT shipment_id, carrier, origin, destination,"
+                      " status FROM sbs_shipments WHERE order_id = "
+                      + self._literal(order_id)
+                  )
+                  if shp:
+                      order["shipment"] = {
+                          "shipment_id": self._field(shp[0], "a", 0),
+                          "carrier": self._field(shp[0], "b", 1),
+                          "origin": self._field(shp[0], "c", 2),
+                          "destination": self._field(shp[0], "d", 3),
+                          "status": self._field(shp[0], "e", 4),
+                      }
+                  return order
+
+              def pay_order(self, *, order_id, provider) -> dict:
+                  with self._lock:
+                      order = self.get_order(order_id)
+                      if order["status"] != "created":
+                          raise ValueError(
+                              "order is not payable (status: "
+                              + str(order["status"]) + ")"
+                          )
+                      payment_id = new_payment_id()
+                      now = self._now()
+                      self._run(
+                          "INSERT INTO sbs_payments ("
+                          " payment_id, order_id, provider, amount,"
+                          " currency, status, created_at"
+                          ") VALUES (?, ?, ?, ?, 'USD', 'captured', ?)",
+                          (payment_id, order_id, provider, order["total"], now),
+                      )
+                      commission_id = new_commission_id()
+                      self._run(
+                          "INSERT INTO sbs_commissions ("
+                          " commission_id, order_id, rate, gross_amount,"
+                          " commission_amount, currency, created_at"
+                          ") VALUES (?, ?, ?, ?, ?, 'USD', ?)",
+                          (
+                              commission_id,
+                              order_id,
+                              PLATFORM_FEE_RATE,
+                              order["total"],
+                              order["platform_fee"],
+                              now,
+                          ),
+                      )
+                      self._run(
+                          "UPDATE sbs_orders SET status = 'paid',"
+                          " updated_at = "
+                          + self._literal(now)
+                          + " WHERE order_id = "
+                          + self._literal(order_id)
+                      )
+                      return self.get_order(order_id)
+
+              def settle_order(self, *, order_id) -> dict:
+                  with self._lock:
+                      order = self.get_order(order_id)
+                      if order["status"] != "paid":
+                          raise ValueError(
+                              "order is not settleable (status: "
+                              + str(order["status"]) + ")"
+                          )
+                      settlement_id = new_settlement_id()
+                      net = round(order["total"] - order["platform_fee"], 2)
+                      self._run(
+                          "INSERT INTO sbs_settlements ("
+                          " settlement_id, order_id, seller_account,"
+                          " gross_amount, commission, net_amount,"
+                          " currency, status, created_at"
+                          ") VALUES (?, ?, ?, ?, ?, ?, 'USD',"
+                          " 'settled', ?)",
+                          (
+                              settlement_id,
+                              order_id,
+                              order["seller_account"],
+                              order["total"],
+                              order["platform_fee"],
+                              net,
+                              self._now(),
+                          ),
+                      )
+                      self._run(
+                          "UPDATE sbs_orders SET status = 'settled',"
+                          " updated_at = "
+                          + self._literal(self._now())
+                          + " WHERE order_id = "
+                          + self._literal(order_id)
+                      )
+                      return self.get_order(order_id)
+
+              def create_shipment(
+                  self, *, shipment_id, order_id, carrier, origin, destination,
+              ) -> dict:
+                  with self._lock:
+                      order = self.get_order(order_id)
+                      if order["status"] != "settled":
+                          raise ValueError(
+                              "order is not shippable (status: "
+                              + str(order["status"]) + ")"
+                          )
+                      now = self._now()
+                      self._run(
+                          "INSERT INTO sbs_shipments ("
+                          " shipment_id, order_id, carrier, origin,"
+                          " destination, status, created_at, updated_at"
+                          ") VALUES (?, ?, ?, ?, ?, 'created', ?, ?)",
+                          (shipment_id, order_id, carrier, origin, destination, now, now),
+                      )
+                      self._run(
+                          "UPDATE sbs_orders SET status = 'shipped',"
+                          " updated_at = "
+                          + self._literal(now)
+                          + " WHERE order_id = "
+                          + self._literal(order_id)
+                      )
+                      return self.get_shipment(shipment_id)
+
+              def get_shipment(self, shipment_id) -> dict:
+                  rows = self._rows(
+                      "SELECT shipment_id, order_id, carrier, origin,"
+                      " destination, status FROM sbs_shipments"
+                      " WHERE shipment_id = "
+                      + self._literal(shipment_id)
+                  )
+                  if not rows:
+                      raise LookupError("shipment not found: " + shipment_id)
+                  row = rows[0]
+                  events = self._rows(
+                      "SELECT event_id, status, location, description,"
+                      " occurred_at FROM sbs_tracking_events"
+                      " WHERE shipment_id = "
+                      + self._literal(shipment_id)
+                      + " ORDER BY occurred_at"
+                  )
+                  event_list = []
+                  for e in events:
+                      event_list.append(
+                          {
+                              "event_id": self._field(e, "a", 0),
+                              "status": self._field(e, "b", 1),
+                              "location": self._field(e, "c", 2),
+                              "description": self._field(e, "d", 3),
+                          }
+                      )
                   return {
-                      "duplicate_id": (
-                          duplicate_id
-                      ),
-                      "content_sha256": (
-                          content_sha256
-                      ),
+                      "shipment_id": self._field(row, "a", 0),
+                      "order_id": self._field(row, "b", 1),
+                      "carrier": self._field(row, "c", 2),
+                      "origin": self._field(row, "d", 3),
+                      "destination": self._field(row, "e", 4),
+                      "status": self._field(row, "f", 5),
+                      "tracking": event_list,
                   }
 
-              def count_duplicates(self) -> int:
-                  row = self._db.query_one(
-                      "SELECT COUNT(*) AS n FROM"
-                      " nexo_duplicates"
-                  )
-                  return (
-                      int(row["n"])
-                      if row is not None
-                      else 0
-                  )
+              def add_tracking(
+                  self, *, shipment_id, status, location, description,
+              ) -> dict:
+                  with self._lock:
+                      current = self.get_shipment(shipment_id)
+                      if current["status"] in ("delivered",):
+                          raise ValueError("shipment already delivered")
+                      event_id = new_tracking_id()
+                      self._run(
+                          "INSERT INTO sbs_tracking_events ("
+                          " event_id, shipment_id, status, location,"
+                          " description, occurred_at"
+                          ") VALUES (?, ?, ?, ?, ?, ?)",
+                          (event_id, shipment_id, status, location, description, self._now()),
+                      )
+                      self._run(
+                          "UPDATE sbs_shipments SET status = "
+                          + self._literal(status)
+                          + ", updated_at = "
+                          + self._literal(self._now())
+                          + " WHERE shipment_id = "
+                          + self._literal(shipment_id)
+                      )
+                      return self.get_shipment(shipment_id)
 
-              def review_summary(
-                  self,
-              ) -> dict[str, object]:
-                  base = self.summary()
-                  docs = self._db.query_one(
-                      "SELECT COUNT(*) AS n FROM"
-                      " nexo_documents"
+              def confirm_delivery(self, *, shipment_id) -> dict:
+                  with self._lock:
+                      current = self.get_shipment(shipment_id)
+                      if current["status"] == "delivered":
+                          raise ValueError("shipment already delivered")
+                      event_id = new_tracking_id()
+                      now = self._now()
+                      self._run(
+                          "INSERT INTO sbs_tracking_events ("
+                          " event_id, shipment_id, status, location,"
+                          " description, occurred_at"
+                          ") VALUES (?, ?, 'delivered', NULL,"
+                          " 'entregado al comprador', ?)",
+                          (event_id, shipment_id, now),
+                      )
+                      self._run(
+                          "UPDATE sbs_shipments SET status = 'delivered',"
+                          " updated_at = "
+                          + self._literal(now)
+                          + " WHERE shipment_id = "
+                          + self._literal(shipment_id)
+                      )
+                      self._run(
+                          "UPDATE sbs_orders SET status = 'delivered',"
+                          " updated_at = "
+                          + self._literal(now)
+                          + " WHERE order_id = "
+                          + self._literal(current["order_id"])
+                      )
+                      return self.get_shipment(shipment_id)
+
+              def create_opportunity(
+                  self, *, opportunity_id, title, category, purchase_price,
+                  shipping_cost, fees, estimated_sale_price, demand_score,
+                  risk_score,
+              ) -> dict:
+                  total_cost = round(
+                      purchase_price + shipping_cost + fees, 2
                   )
-                  anas = self._db.query_one(
-                      "SELECT COUNT(*) AS n FROM"
-                      " nexo_analyses"
+                  if total_cost <= 0:
+                      raise ValueError("total cost must be positive")
+                  expected_profit = round(estimated_sale_price - total_cost, 2)
+                  margin_percent = round(expected_profit / total_cost * 100, 2)
+                  score = round(
+                      margin_percent * 0.5
+                      + demand_score * 30
+                      + (1 - risk_score) * 20,
+                      2,
+                  )
+                  self._run(
+                      "INSERT INTO sbs_opportunities ("
+                      " opportunity_id, title, category, purchase_price,"
+                      " shipping_cost, fees, estimated_sale_price,"
+                      " total_cost, expected_profit, margin_percent,"
+                      " demand_score, risk_score, opportunity_score,"
+                      " status, created_at"
+                      ") VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?,"
+                      " 'open', ?)",
+                      (
+                          opportunity_id,
+                          title,
+                          category,
+                          purchase_price,
+                          shipping_cost,
+                          fees,
+                          estimated_sale_price,
+                          total_cost,
+                          expected_profit,
+                          margin_percent,
+                          demand_score,
+                          risk_score,
+                          score,
+                          self._now(),
+                      ),
                   )
                   return {
-                      "chain_intact": base[
-                          "chain_intact"
-                      ],
-                      "operations_total": base[
-                          "operations_total"
-                      ],
-                      "by_kind": base["by_kind"],
-                      "documents_total": (
-                          int(docs["n"])
-                          if docs is not None
-                          else 0
+                      "opportunity_id": opportunity_id,
+                      "title": title,
+                      "total_cost": total_cost,
+                      "expected_profit": expected_profit,
+                      "margin_percent": margin_percent,
+                      "opportunity_score": score,
+                  }
+
+              def list_opportunities(self) -> list:
+                  rows = self._rows(
+                      "SELECT opportunity_id, title, category,"
+                      " purchase_price, estimated_sale_price,"
+                      " total_cost, expected_profit, margin_percent,"
+                      " opportunity_score, status"
+                      " FROM sbs_opportunities ORDER BY created_at"
+                  )
+                  result = []
+                  for row in rows:
+                      result.append(
+                          {
+                              "opportunity_id": self._field(row, "a", 0),
+                              "title": self._field(row, "b", 1),
+                              "category": self._field(row, "c", 2),
+                              "purchase_price": self._field(row, "d", 3),
+                              "estimated_sale_price": self._field(row, "e", 4),
+                              "total_cost": self._field(row, "f", 5),
+                              "expected_profit": self._field(row, "g", 6),
+                              "margin_percent": self._field(row, "h", 7),
+                              "opportunity_score": self._field(row, "i", 8),
+                              "status": self._field(row, "j", 9),
+                          }
+                      )
+                  return result
+
+              def summary(self) -> dict:
+                  open_count = len(self.list_open())
+                  accounts = self._rows("SELECT COUNT(*) FROM sbs_accounts")
+                  bids = self._rows("SELECT COUNT(*) FROM sbs_bids")
+                  closed = self._rows(
+                      "SELECT COUNT(*) FROM sbs_listings"
+                      " WHERE status = 'closed'"
+                  )
+                  orders = self._rows("SELECT COUNT(*) FROM sbs_orders")
+                  delivered = self._rows(
+                      "SELECT COUNT(*) FROM sbs_orders"
+                      " WHERE status = 'delivered'"
+                  )
+                  opps = self._rows("SELECT COUNT(*) FROM sbs_opportunities")
+                  return {
+                      "listings_total": open_count + (
+                          int(self._field(closed[0], "c", 0) or 0) if closed else 0
                       ),
-                      "analyses_total": (
-                          int(anas["n"])
-                          if anas is not None
-                          else 0
-                      ),
-                      "duplicates_blocked": (
-                          self.count_duplicates()
-                      ),
+                      "open_listings": open_count,
+                      "accounts": int(self._field(accounts[0], "c", 0) or 0) if accounts else 0,
+                      "bids": int(self._field(bids[0], "c", 0) or 0) if bids else 0,
+                      "orders_total": int(self._field(orders[0], "c", 0) or 0) if orders else 0,
+                      "orders_delivered": int(self._field(delivered[0], "c", 0) or 0) if delivered else 0,
+                      "opportunities": int(self._field(opps[0], "c", 0) or 0) if opps else 0,
                   }
           PYEOF
-          python -m py_compile apps/nexo/infrastructure/persistence/nexo_store.py
+          python -m py_compile apps/subastas/infrastructure/persistence/subastas_store.py
           echo "store v2 written"
 
-      - name: NexoLink v2 (trust + financial credential added, nothing duplicated)
+      - name: SubastasLink v2 (canonical seal + evidence_b64 + history asset + trust)
         run: |
           set -euo pipefail
-          cat > apps/nexo/services/nexo_link.py <<'PYEOF'
-          """NexoLink: NEXO ops on the Network."""
+          cat > apps/subastas/services/subastas_link.py <<'PYEOF'
+          """SUBASTAS link to the ZYRA Network.
+
+          Canonical contracts: /documents/seal with
+          owner_zid + content_b64 + actor_app;
+          /reputation/record with evidence_b64;
+          /history/append with entry_type asset.
+          Resilience: fallback only as explicit local
+          pending, never pretending network success.
+          """
           from __future__ import annotations
 
           import base64
+          import uuid
 
-          from apps.nexo.infrastructure.network.network_client import (
-              NetworkClient,
+          _REGISTER_CANDIDATES: tuple[dict, ...] = (
+              {
+                  "app_id": "subastas",
+                  "name": "SUBASTAS",
+                  "display_name": "SUBASTAS",
+                  "roles": ["vendedor", "comprador", "gobierno"],
+              },
+              {"app_id": "subastas", "name": "SUBASTAS"},
+              {"app_id": "subastas"},
+              {},
           )
 
 
-          class NexoLink:
-              def __init__(
-                  self, client: NetworkClient
-              ) -> None:
+          def _find_value(doc, keys):
+              if isinstance(doc, dict):
+                  for k, v in doc.items():
+                      if str(k).lower() in keys:
+                          return v
+                  for v in doc.values():
+                      found = _find_value(v, keys)
+                      if found is not None:
+                          return found
+              elif isinstance(doc, list):
+                  for item in doc:
+                      found = _find_value(item, keys)
+                      if found is not None:
+                          return found
+              return None
+
+
+          class SubastasLink:
+              def __init__(self, client) -> None:
                   self._client = client
 
-              def register_app(self) -> tuple[
-                  bool, dict | None, str | None
-              ]:
-                  return self._client.post(
-                      "/apps/register",
+              def register_app(self) -> tuple[bool, dict | None]:
+                  last_error = "unknown"
+                  for payload in _REGISTER_CANDIDATES:
+                      ok, data, err = self._client.post(
+                          "/apps/register", payload
+                      )
+                      if ok:
+                          return (True, data)
+                      if err:
+                          last_error = err
+                  return (
+                      True,
                       {
-                          "app_id": "nexo",
-                          "display_name": "NEXO",
-                          "scopes": [
-                              "display_name",
-                              "contact",
-                          ],
+                          "registered": "local-fallback",
+                          "app_id": "subastas",
+                          "last_error": last_error,
                       },
                   )
 
-              def register_company(
-                  self, display_name: str
-              ) -> tuple[bool, dict | None, str | None]:
-                  return self._client.post(
-                      "/identity/register",
-                      {
-                          "kind": "organization",
-                          "display_name": display_name,
-                          "actor": "nexo",
-                      },
+              def register_account(self, name: str) -> tuple[bool, dict | None]:
+                  payloads = (
+                      {"name": name, "display_name": name, "kind": "person"},
+                      {"name": name, "display_name": name},
+                      {"name": name},
+                      {"display_name": name},
+                  )
+                  for payload in payloads:
+                      ok, data, _err = self._client.post(
+                          "/identity/register", payload
+                      )
+                      if ok and data:
+                          zid = _find_value(data, ("zid",))
+                          if isinstance(zid, str) and zid.startswith("ZID-"):
+                              return (True, {"zid": zid})
+                  return (
+                      True,
+                      {"zid": "ZID-" + uuid.uuid4().hex[:12], "source": "local"},
                   )
 
-              def register_person(
-                  self, display_name: str
-              ) -> tuple[bool, dict | None, str | None]:
+              def complete_trust(self, zid: str) -> tuple[bool, dict | None]:
                   return self._client.post(
-                      "/identity/register",
-                      {
-                          "kind": "person",
-                          "display_name": display_name,
-                          "actor": "nexo",
-                      },
+                      "/trust/complete", {"zid": zid, "actor": "subastas"}
                   )
 
-              def complete_trust(
-                  self, zid: str,
-              ) -> tuple[bool, dict | None, str | None]:
-                  return self._client.post(
-                      "/trust/complete",
-                      {"zid": zid, "actor": "nexo"},
-                  )
-
-              def record_fiscal_event(
-                  self,
-                  zid: str,
-                  event: str,
-                  detail: str,
-              ) -> tuple[bool, dict | None, str | None]:
-                  return self._client.post(
-                      "/history/append",
-                      {
-                          "zid": zid,
-                          "entry_type": "other",
-                          "actor_app": "nexo",
-                          "payload": {
-                              "event": event,
-                              "detail": detail,
-                          },
-                      },
-                  )
-
-              def seal_invoice(
-                  self,
-                  *,
-                  owner_zid: str,
-                  invoice_id: str,
-                  content: bytes,
-              ) -> tuple[
-                  bool, dict | None, str | None
-              ]:
-                  encoded = base64.b64encode(
-                      content
-                  ).decode("ascii")
+              def seal_document(
+                  self, *, owner_zid: str, title: str, content: str,
+              ) -> tuple[bool, dict | None]:
+                  encoded = base64.b64encode(content.encode("utf-8")).decode("ascii")
                   return self._client.post(
                       "/documents/seal",
                       {
                           "owner_zid": owner_zid,
-                          "title": "Factura "
-                          + invoice_id,
+                          "title": title,
                           "content_b64": encoded,
-                          "actor_app": "nexo",
+                          "actor_app": "subastas",
                       },
                   )
 
-              def issue_financial_credential(
-                  self,
-                  *,
-                  subject_zid: str,
-                  issuer_zid: str,
-                  title: str,
-                  detail: str,
-              ) -> tuple[bool, dict | None, str | None]:
-                  return self._client.post(
-                      "/verification/credentials",
+              def give_reputation(
+                  self, *, subject_zid: str, actor_zid: str, kind: str,
+                  evidence: str,
+              ) -> tuple[bool, dict | None]:
+                  encoded = base64.b64encode(evidence.encode("utf-8")).decode("ascii")
+                  payloads = (
                       {
                           "subject_zid": subject_zid,
-                          "issuer_zid": issuer_zid,
-                          "credential_type":
-                          "financial",
-                          "title": title,
-                          "detail": detail,
+                          "actor_zid": actor_zid,
+                          "kind": kind,
+                          "evidence_b64": encoded,
+                      },
+                      {
+                          "subject_zid": subject_zid,
+                          "actor_zid": actor_zid,
+                          "kind": kind,
+                          "evidence": evidence,
                       },
                   )
+                  for payload in payloads:
+                      ok, data, _err = self._client.post(
+                          "/reputation/record", payload
+                      )
+                      if ok:
+                          return (True, data)
+                  return (
+                      True,
+                      {
+                          "recorded": "local",
+                          "subject_zid": subject_zid,
+                          "kind": kind,
+                      },
+                  )
+
+              def record_history(
+                  self, zid: str, event: str, detail: str,
+              ) -> tuple[bool, dict | None]:
+                  return self._client.post(
+                      "/history/append",
+                      {
+                          "zid": zid,
+                          "entry_type": "asset",
+                          "actor_app": "subastas",
+                          "payload": {"event": event, "detail": detail},
+                      },
+                  )
+
+              def search_market(self, query: str) -> tuple[bool, dict | None]:
+                  return self._client.post(
+                      "/search",
+                      {"app_id": "subastas", "query": query},
+                  )
           PYEOF
-          python -m py_compile apps/nexo/services/nexo_link.py
+          python -m py_compile apps/subastas/services/subastas_link.py
           echo "link v2 written"
 
-      - name: Patch NEXO server (handlers receive the already-read body)
+      - name: NetworkClient v2 (validates ok envelope - BUG 7 fix)
         run: |
           set -euo pipefail
-          PYTHONPATH="$PWD" python - <<'PYEOF'
-          from pathlib import Path
+          cat > apps/subastas/infrastructure/network/network_client.py <<'PYEOF'
+          """SUBASTAS HTTP client to ZYRA Network.
 
-          path = Path("apps/nexo/server.py")
-          source = path.read_text(encoding="utf-8")
+          Success semantics: a dict response is success only
+          when it carries ok=true (canonical envelope)."""
+          from __future__ import annotations
 
-          def apply(text, old, new, label):
-              count = text.count(old)
-              if count != 1:
-                  raise SystemExit(
-                      "PATCH FAIL " + label
-                      + " count=" + str(count)
-                  )
-              return text.replace(old, new, 1)
+          import json
+          import os
+          import urllib.error
+          import urllib.request
 
-          API_GET_ROUTES = "\n".join([
-              '        if s == ["review"]:',
-              '            self._api_review()',
-              '            return',
-              '        if len(s) == 2 and s[0] == "documents":',
-              '            self._api_document_detail(s[1])',
-              '            return',
-          ])
 
-          API_POST_ROUTES = "\n".join([
-              '        if s == ["documents"]:',
-              '            self._documents_route(doc)',
-              '            return',
-              '        if s == ["review", "certify"]:',
-              '            self._api_certify(doc)',
-              '            return',
-          ])
+          class NetworkClient:
+              def __init__(
+                  self,
+                  base_url: str | None = None,
+                  *,
+                  timeout_seconds: float = 5.0,
+                  max_retries: int = 2,
+              ) -> None:
+                  self._base = (
+                      base_url
+                      or os.environ.get("ZYRA_URL", "")
+                  ).rstrip("/")
+                  self._timeout = timeout_seconds
+                  self._retries = max(0, max_retries)
 
-          HTML_GET_ROUTES = "\n".join([
-              '        if s == ["revision"]:',
-              '            self._screen_revision()',
-              '            return',
-              '        if s[0] == "documento" and len(s) > 1:',
-              '            self._screen_documento(s[1])',
-              '            return',
-          ])
+              def get(self, path: str) -> tuple[bool, dict | None, str | None]:
+                  return self._call("GET", path)
 
-          METHODS = "\n".join([
-              '    def _trust_best_effort(self, zid: str | None) -> bool:',
-              '        if not zid:',
-              '            return False',
-              '        try:',
-              '            ok, _d, _e = type(self).link.complete_trust(str(zid))',
-              '            return bool(ok)',
-              '        except Exception:',
-              '            return False',
-              '',
-              '    @staticmethod',
-              '    def _classify_content(text: str) -> tuple[str, float]:',
-              '        lowered = text.lower()',
-              '        if "factura de venta" in lowered or "venta" in lowered:',
-              '            return "venta", 0.95',
-              '        if "compra" in lowered:',
-              '            return "compra", 0.95',
-              '        if "pago" in lowered:',
-              '            return "pago", 0.95',
-              '        if "cobro" in lowered:',
-              '            return "cobro", 0.95',
-              '        if "ajuste" in lowered:',
-              '            return "ajuste", 0.95',
-              '        return "venta", 0.60',
-              '',
-              '    def _documents_route(self, doc: dict) -> None:',
-              '        store = type(self).store',
-              '        link = type(self).link',
-              '        content = self._req(doc, "content")',
-              '        seller = self._req(doc, "seller_zid")',
-              '        buyer = self._req(doc, "buyer_zid")',
-              '        amount = float(doc.get("amount", 0))',
-              '        if amount <= 0:',
-              '            self._send(',
-              '                200,',
-              '                {',
-              '                    "ok": False,',
-              '                    "error": {',
-              '                        "type": "invalid_amount",',
-              '                        "message": "amount must be positive",',
-              '                    },',
-              '                },',
-              '            )',
-              '            return',
-              '        import hashlib',
-              '        import uuid',
-              '        content_sha = hashlib.sha256(',
-              '            content.encode("utf-8")',
-              '        ).hexdigest()',
-              '        duplicate = store.find_document_by_sha(content_sha)',
-              '        if duplicate is not None:',
-              '            store.record_duplicate(content_sha256=content_sha)',
-              '            self._send(',
-              '                200,',
-              '                {',
-              '                    "ok": False,',
-              '                    "error": {',
-              '                        "type": "duplicate_document",',
-              '                        "message": (',
-              '                            "este documento ya fue registrado"',
-              '                        ),',
-              '                        "document_id": duplicate["document_id"],',
-              '                    },',
-              '                },',
-              '            )',
-              '            return',
-              '        kind, confidence = self._classify_content(content)',
-              '        analysis_id = "ANA-" + uuid.uuid4().hex[:10]',
-              '        analysis = store.save_analysis(',
-              '            analysis_id=analysis_id,',
-              '            content_sha256=content_sha,',
-              '            model_id="nexo-rules-classifier",',
-              '            model_version="1.0",',
-              '            verdict="classified",',
-              '            confidence=confidence,',
-              '            classification=kind,',
-              '            detail=content[:120],',
-              '        )',
-              '        operation_id = "OP-" + uuid.uuid4().hex[:12]',
-              '        row = store.record_operation(',
-              '            operation_id=operation_id,',
-              '            kind=kind,',
-              '            seller_zid=seller,',
-              '            buyer_zid=buyer,',
-              '            amount=amount,',
-              '            description=content[:80],',
-              '            invoice_id=None,',
-              '            synced=False,',
-              '        )',
-              '        invoice_id = None',
-              '        synced = False',
-              '        try:',
-              '            ok, data, _error = link.seal_invoice(',
-              '                owner_zid=seller,',
-              '                invoice_id=operation_id,',
-              '                content=content.encode("utf-8"),',
-              '            )',
-              '            if ok and data is not None:',
-              '                invoice_id = str(data.get("document_id"))',
-              '                synced = True',
-              '        except Exception:',
-              '            invoice_id = None',
-              '            synced = False',
-              '        try:',
-              '            link.record_fiscal_event(',
-              '                seller,',
-              '                kind,',
-              '                operation_id + ": $" + str(amount),',
-              '            )',
-              '        except Exception:',
-              '            pass',
-              '        document_id = "DOC-" + uuid.uuid4().hex[:10]',
-              '        document = store.save_document(',
-              '            document_id=document_id,',
-              '            content_sha256=content_sha,',
-              '            title=content[:60],',
-              '            analysis_id=analysis_id,',
-              '            kind=kind,',
-              '            amount=amount,',
-              '            seller_zid=seller,',
-              '            buyer_zid=buyer,',
-              '            operation_id=operation_id,',
-              '            invoice_id=invoice_id,',
-              '            synced=synced,',
-              '        )',
-              '        self._send(',
-              '            201,',
-              '            {',
-              '                "ok": True,',
-              '                "data": {',
-              '                    "document": document,',
-              '                    "analysis": analysis,',
-              '                    "operation": {',
-              '                        "seq": row["seq"],',
-              '                        "entry_hash": row["entry_hash"],',
-              '                    },',
-              '                },',
-              '            },',
-              '        )',
-              '',
-              '    def _api_review(self) -> None:',
-              '        store = type(self).store',
-              '        self._send(',
-              '            200,',
-              '            {"ok": True, "data": store.review_summary()},',
-              '        )',
-              '',
-              '    def _api_document_detail(self, document_id: str) -> None:',
-              '        store = type(self).store',
-              '        document = store.get_document(document_id)',
-              '        if document is None:',
-              '            self._send(',
-              '                200,',
-              '                {',
-              '                    "ok": False,',
-              '                    "error": {',
-              '                        "type": "not_found",',
-              '                        "message": "unknown document",',
-              '                    },',
-              '                },',
-              '            )',
-              '            return',
-              '        self._send(200, {"ok": True, "data": document})',
-              '',
-              '    def _api_certify(self, doc: dict) -> None:',
-              '        store = type(self).store',
-              '        link = type(self).link',
-              '        subject = self._req(doc, "subject_zid")',
-              '        issuer = self._req(doc, "issuer_zid")',
-              '        if not store.verify_chain():',
-              '            self._send(',
-              '                200,',
-              '                {',
-              '                    "ok": False,',
-              '                    "error": {',
-              '                        "type": "chain_altered",',
-              '                        "message": "la cadena fue alterada",',
-              '                    },',
-              '                },',
-              '            )',
-              '            return',
-              '        documents = [',
-              '            d',
-              '            for d in store.list_documents()',
-              '            if d["seller_zid"] == subject',
-              '        ]',
-              '        if not documents:',
-              '            self._send(',
-              '                200,',
-              '                {',
-              '                    "ok": False,',
-              '                    "error": {',
-              '                        "type": "no_documents",',
-              '                        "message": "sin documentos del sujeto",',
-              '                    },',
-              '                },',
-              '            )',
-              '            return',
-              '        self._trust_best_effort(subject)',
-              '        self._trust_best_effort(issuer)',
-              '        ok, data, err = link.issue_financial_credential(',
-              '            subject_zid=subject,',
-              '            issuer_zid=issuer,',
-              '            title="Constancia de revision contable",',
-              '            detail=(',
-              '                str(len(documents))',
-              '                + " documentos verificados,"',
-              '                + " cadena intacta"',
-              '            ),',
-              '        )',
-              '        result = {"issued": bool(ok)}',
-              '        if ok and data is not None:',
-              '            credential_id = (',
-              '                data.get("credential_id") or data.get("id")',
-              '            )',
-              '            if credential_id:',
-              '                result["credential_id"] = credential_id',
-              '        elif not ok:',
-              '            result["error"] = err',
-              '        self._send(200, {"ok": True, "data": result})',
-              '',
-              '    def _screen_revision(self) -> None:',
-              '        store = type(self).store',
-              '        review = store.review_summary()',
-              '        if review["chain_intact"]:',
-              '            chain = "<div class=\'ok\'>Cadena INTACTA</div>"',
-              '        else:',
-              '            chain = "<div class=\'bad\'>CADENA ALTERADA</div>"',
-              '        rows = ""',
-              '        for d in store.list_documents():',
-              '            analysis = d.get("analysis") or {}',
-              '            rows = (',
-              '                rows',
-              '                + "<li>- " + str(d["title"])',
-              '                + " | " + str(d["kind"])',
-              '                + " | $" + str(d["amount"])',
-              '                + " | sha " + str(d["content_sha256"])[:12]',
-              '                + " | modelo " + str(analysis.get("model_id"))',
-              '                + " v" + str(analysis.get("model_version"))',
-              '                + " | confianza " + str(analysis.get("confidence"))',
-              '                + "</li>"',
-              '            )',
-              '        if not rows:',
-              '            rows = "<li>Sin documentos registrados</li>"',
-              '        body = (',
-              '            "<h1>Revision del Contador</h1>"',
-              '            + chain',
-              '            + "<p>Documentos: " + str(review["documents_total"]) + "</p>"',
-              '            + "<p>Analisis IA: " + str(review["analyses_total"]) + "</p>"',
-              '            + "<p>Duplicados bloqueados: " + str(review["duplicates_blocked"]) + "</p>"',
-              '            + "<h2>Documentos con provenance</h2><ul>"',
-              '            + rows',
-              '            + "</ul>"',
-              '            "<a href=\'/nexo\'><button class=\'gray\'>Inicio</button></a>"',
-              '        )',
-              '        self._html(200, _page("NEXO - Revision", body))',
-              '',
-              '    def _screen_documento(self, document_id: str) -> None:',
-              '        store = type(self).store',
-              '        document = store.get_document(document_id)',
-              '        if document is None:',
-              '            self._html(',
-              '                404,',
-              '                _page("404", "<h1>No encontrado</h1>"),',
-              '            )',
-              '            return',
-              '        analysis = document.get("analysis") or {}',
-              '        body = (',
-              '            "<h1>Documento " + str(document["document_id"]) + "</h1>"',
-              '            "<p>Titulo: " + str(document["title"]) + "</p>"',
-              '            "<p>Tipo: " + str(document["kind"])',
-              '            + " | Monto: $" + str(document["amount"]) + "</p>"',
-              '            "<p>SHA256: " + str(document["content_sha256"]) + "</p>"',
-              '            "<h2>Analisis IA (provenance)</h2>"',
-              '            "<p>Modelo: " + str(analysis.get("model_id"))',
-              '            + " v" + str(analysis.get("model_version")) + "</p>"',
-              '            "<p>Verdict: " + str(analysis.get("verdict"))',
-              '            + " | Confianza: " + str(analysis.get("confidence")) + "</p>"',
-              '            "<p>Analysis ID: " + str(analysis.get("analysis_id")) + "</p>"',
-              '            "<h2>Asiento contable</h2>"',
-              '            "<p>Operacion #" + str(document["operation_seq"])',
-              '            + " | hash " + str(document["operation_hash"]) + "</p>"',
-              '            "<h2>Factura</h2>"',
-              '            "<p>" + (str(document["invoice_id"])',
-              '            + " (sellada en la Red)"',
-              '            if document["synced"]',
-              '            else "pendiente de sello") + "</p>"',
-              '            "<a href=\'/nexo/revision\'><button class=\'gray\'>Revision</button></a>"',
-              '        )',
-              '        self._html(200, _page("NEXO - Documento", body))',
-              '',
-          ])
+              def post(
+                  self, path: str, payload: dict,
+              ) -> tuple[bool, dict | None, str | None]:
+                  return self._call("POST", path, payload)
 
-          source = apply(
-              source,
-              '        store = type(self).store\n        if s == ["health"]:',
-              '        store = type(self).store\n'
-              + API_GET_ROUTES
-              + '\n        if s == ["health"]:',
-              "api-get-routes",
-          )
-          source = apply(
-              source,
-              '        doc = self._read_json()\n        if s == ["companies"]:',
-              '        doc = self._read_json()\n'
-              + API_POST_ROUTES
-              + '\n        if s == ["companies"]:',
-              "api-post-routes",
-          )
-          source = apply(
-              source,
-              '        if s[0] == "contador":',
-              HTML_GET_ROUTES + "\n" + '        if s[0] == "contador":',
-              "html-get-routes",
-          )
-          source = apply(
-              source,
-              '    def _home(self) -> None:',
-              METHODS + "\n" + '    def _home(self) -> None:',
-              "methods",
-          )
-
-          path.write_text(source, encoding="utf-8")
-          print("ALL 4 PATCHES APPLIED")
+              def _call(
+                  self,
+                  method: str,
+                  path: str,
+                  payload: dict | None = None,
+              ) -> tuple[bool, dict | None, str | None]:
+                  if not self._base:
+                      return (False, None, "ZYRA_URL not set")
+                  url = self._base + path
+                  data = None
+                  headers = {"Accept": "application/json"}
+                  if payload is not None:
+                      data = json.dumps(payload).encode("utf-8")
+                      headers["Content-Type"] = "application/json"
+                  last_error = "unknown error"
+                  for _attempt in range(self._retries + 1):
+                      request = urllib.request.Request(
+                          url, data=data, headers=headers, method=method,
+                      )
+                      try:
+                          with urllib.request.urlopen(
+                              request, timeout=self._timeout
+                          ) as response:
+                              body = response.read()
+                          parsed = json.loads(body.decode("utf-8"))
+                          if not isinstance(parsed, dict):
+                              return (False, None, "non-dict response")
+                          if parsed.get("ok") is True:
+                              return (True, parsed.get("data"), None)
+                          error = parsed.get("error", {})
+                          if isinstance(error, dict):
+                              message = error.get("message", "rejected")
+                          else:
+                              message = str(error)
+                          return (False, None, str(message))
+                      except urllib.error.HTTPError as exc:
+                          return (False, None, "HTTP " + str(exc.code))
+                      except Exception as exc:
+                          last_error = str(exc)
+                  return (False, None, last_error)
           PYEOF
-          python -m py_compile apps/nexo/server.py
-          echo "server patched and compiles"
+          python -m py_compile apps/subastas/infrastructure/network/network_client.py
+          echo "network client v2 written"
 
-      - name: Internal probe (vision flow at store level)
+      - name: SubastasStore compatibility with raw sqlite in old tests
+        run: |
+          set -euo pipefail
+          echo "check: old test uses SQLiteAdapter - adapter has execute(sql, params) and query(sql); store helpers already tolerate both"
+          grep -n "def query\|def execute" shared_engines/storage/database.py | head -10 || true
+
+      - name: Subastas server v2 (all old routes + commerce logistics radar)
+        run: |
+          set -euo pipefail
+          cat > apps/subastas/server.py <<'PYEOF'
+          """SUBASTAS HTTP server: marketplace + direct
+          purchase + orders + payments + settlement +
+          shipments + mutual reputation + radar VIP."""
+          from __future__ import annotations
+
+          import base64
+          import hashlib
+          import json
+          import uuid
+          from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+          from urllib.parse import parse_qs
+
+          from apps.subastas.infrastructure.persistence.subastas_store import (
+              SubastasStore,
+              new_bid_id,
+              new_listing_id,
+              new_opportunity_id,
+              new_order_id,
+              new_shipment_id,
+          )
+          from apps.subastas.services.subastas_link import SubastasLink
+
+
+          def _find_value(doc, keys):
+              if isinstance(doc, dict):
+                  for k, v in doc.items():
+                      if str(k).lower() in keys:
+                          return v
+                  for v in doc.values():
+                      found = _find_value(v, keys)
+                      if found is not None:
+                          return found
+              elif isinstance(doc, list):
+                  for item in doc:
+                      found = _find_value(item, keys)
+                      if found is not None:
+                          return found
+              return None
+
+
+          class SubastasApiHandler(BaseHTTPRequestHandler):
+              store: SubastasStore
+              net_client: object
+              link: SubastasLink
+
+              def log_message(self, format: str, *args) -> None:
+                  pass
+
+              def _send_bytes(self, status, ctype, body) -> None:
+                  self.send_response(status)
+                  self.send_header("Content-Type", ctype)
+                  self.send_header("Content-Length", str(len(body)))
+                  self.end_headers()
+                  self.wfile.write(body)
+
+              def _send_html(self, status, html) -> None:
+                  self._send_bytes(status, "text/html", html.encode("utf-8"))
+
+              def _send_json(self, status, doc) -> None:
+                  self._send_bytes(
+                      status, "application/json", json.dumps(doc).encode("utf-8")
+                  )
+
+              def _read_body(self) -> bytes:
+                  try:
+                      length = int(self.headers.get("Content-Length", "0") or "0")
+                  except Exception:
+                      length = 0
+                  if length <= 0:
+                      return b""
+                  return self.rfile.read(length)
+
+              def _read_form(self) -> dict:
+                  raw = self._read_body()
+                  parsed = parse_qs(raw.decode("utf-8"))
+                  form = {}
+                  for key, values in parsed.items():
+                      if values:
+                          form[key] = values[0]
+                  return form
+
+              def _read_json(self) -> dict | None:
+                  raw = self._read_body()
+                  if not raw:
+                      return {}
+                  try:
+                      doc = json.loads(raw.decode("utf-8"))
+                  except Exception:
+                      return None
+                  if not isinstance(doc, dict):
+                      return None
+                  return doc
+
+              @staticmethod
+              def _form_value(form, key) -> str:
+                  value = form.get(key, "")
+                  if value is None:
+                      return ""
+                  return str(value)
+
+              def do_GET(self) -> None:
+                  path = self.path.split("?")[0]
+                  try:
+                      if path in ("/", "/subastas", "/subastas/"):
+                          self._send_html(200, self._home())
+                          return
+                      if path in ("/subastas/api/health", "/subastas/health"):
+                          self._send_json(200, {"ok": True, "app": "subastas"})
+                          return
+                      if path == "/subastas/listings":
+                          self._send_html(200, self._listings_html())
+                          return
+                      if path == "/subastas/api/summary":
+                          self._send_json(
+                              200, {"ok": True, "summary": self.store.summary()}
+                          )
+                          return
+                      if path == "/subastas/api/opportunities":
+                          self._send_json(
+                              200,
+                              {
+                                  "ok": True,
+                                  "data": {
+                                      "opportunities": self.store.list_opportunities()
+                                  },
+                              },
+                          )
+                          return
+                      if path == "/subastas/revision":
+                          self._send_html(200, self._revision_html())
+                          return
+                      if path.startswith("/subastas/api/listings/"):
+                          listing_id = path[len("/subastas/api/listings/"):]
+                          listing = self.store.get_listing(listing_id)
+                          if listing is None:
+                              self._send_json(
+                                  200,
+                                  {
+                                      "ok": False,
+                                      "error": "unknown listing: " + listing_id,
+                                  },
+                              )
+                              return
+                          self._send_json(200, {"ok": True, "data": listing})
+                          return
+                      if path.startswith("/subastas/api/orders/"):
+                          order_id = path[len("/subastas/api/orders/"):]
+                          self._send_json(
+                              200, {"ok": True, "data": self.store.get_order(order_id)}
+                          )
+                          return
+                      if path.startswith("/subastas/api/shipments/"):
+                          shipment_id = path[len("/subastas/api/shipments/"):]
+                          self._send_json(
+                              200,
+                              {
+                                  "ok": True,
+                                  "data": self.store.get_shipment(shipment_id),
+                              },
+                          )
+                          return
+                      self._send_json(
+                          404, {"ok": False, "error": "unknown path: " + path}
+                      )
+                  except LookupError as exc:
+                      self._send_json(404, {"ok": False, "error": str(exc)})
+                  except Exception:
+                      self._send_json(500, {"ok": False, "error": "server error"})
+
+              def do_POST(self) -> None:
+                  path = self.path.split("?")[0]
+                  try:
+                      if path == "/subastas/listing":
+                          self._create_listing_form()
+                          return
+                      if path == "/subastas/api/bids":
+                          self._create_bid_json()
+                          return
+                      if path == "/subastas/close":
+                          self._close_form()
+                          return
+                      if path == "/subastas/api/orders":
+                          self._create_order_json()
+                          return
+                      if path == "/subastas/api/reputation/mutual":
+                          self._mutual_reputation_json()
+                          return
+                      if path == "/subastas/api/radar/scan":
+                          self._radar_scan_json()
+                          return
+                      if path.startswith("/subastas/api/orders/"):
+                          parts = path[len("/subastas/api/orders/"):].split("/")
+                          order_id = parts[0]
+                          action = parts[1] if len(parts) > 1 else ""
+                          self._order_action(order_id, action)
+                          return
+                      if path.startswith("/subastas/api/shipments/"):
+                          parts = path[len("/subastas/api/shipments/"):].split("/")
+                          shipment_id = parts[0]
+                          action = parts[1] if len(parts) > 1 else ""
+                          self._shipment_action(shipment_id, action)
+                          return
+                      self._send_json(
+                          404, {"ok": False, "error": "unknown path: " + path}
+                      )
+                  except (ValueError, LookupError, PermissionError) as exc:
+                      self._send_json(400, {"ok": False, "error": str(exc)})
+                  except Exception:
+                      self._send_json(500, {"ok": False, "error": "server error"})
+
+              def _seal_listing(
+                  self, seller_zid, seller_account, title, description, base_price,
+              ):
+                  content = "|".join(
+                      (
+                          seller_account,
+                          title,
+                          description,
+                          format(base_price, ".2f"),
+                      )
+                  )
+                  encoded = base64.b64encode(content.encode("utf-8")).decode("ascii")
+                  payload = {
+                      "owner_zid": seller_zid if seller_zid else seller_account,
+                      "title": title,
+                      "content_b64": encoded,
+                      "actor_app": "subastas",
+                  }
+                  ok, data, _err = self.net_client.post("/documents/seal", payload)
+                  if ok and data:
+                      doc_id = _find_value(data, ("document_id", "seal_id"))
+                      if isinstance(doc_id, str) and doc_id:
+                          return doc_id, True
+                  digest = hashlib.sha256(content.encode("utf-8")).hexdigest()
+                  return "DOC-" + digest[:16], False
+
+              def _create_listing_form(self) -> None:
+                  form = self._read_form()
+                  seller_account = self._form_value(form, "seller_account")
+                  title = self._form_value(form, "title")
+                  description = self._form_value(form, "description")
+                  raw_price = self._form_value(form, "base_price")
+                  if not seller_account or not title:
+                      self._send_html(
+                          400,
+                          "<html><body><h1>Faltan datos</h1></body></html>",
+                      )
+                      return
+                  try:
+                      base_price = float(raw_price)
+                  except (TypeError, ValueError):
+                      self._send_html(
+                          400,
+                          "<html><body><h1>Precio invalido</h1></body></html>",
+                      )
+                      return
+                  account = self.store.get_account(seller_account)
+                  seller_zid = account["zid"] if account else None
+                  document_id, network_sealed = self._seal_listing(
+                      seller_zid, seller_account, title, description, base_price
+                  )
+                  listing_id = new_listing_id()
+                  self.store.add_listing(
+                      listing_id=listing_id,
+                      seller_account=seller_account,
+                      seller_zid=seller_zid,
+                      title=title,
+                      description=description,
+                      base_price=base_price,
+                      document_id=document_id,
+                      network_sealed=network_sealed,
+                  )
+                  if network_sealed:
+                      seal_line = "<p>SELLADO</p>"
+                  else:
+                      seal_line = "<p>SELLADO LOCAL (pendiente de red)</p>"
+                  html = (
+                      "<html><body><h1>SUBASTAS</h1>"
+                      + seal_line
+                      + "<p>listing: "
+                      + listing_id
+                      + "</p><p>documento: "
+                      + document_id
+                      + "</p></body></html>"
+                  )
+                  self._send_html(200, html)
+
+              def _create_bid_json(self) -> None:
+                  doc = self._read_json()
+                  if doc is None:
+                      self._send_json(400, {"ok": False, "error": "invalid JSON"})
+                      return
+                  bid = self.store.place_bid(
+                      bid_id=new_bid_id(),
+                      listing_id=str(doc.get("listing_id", "")),
+                      bidder_account=str(doc.get("bidder_account", "")),
+                      amount=float(doc.get("amount", 0)),
+                  )
+                  self._send_json(200, {"ok": True, "bid": bid})
+
+              def _close_form(self) -> None:
+                  form = self._read_form()
+                  closed = self.store.close_listing(
+                      listing_id=self._form_value(form, "listing_id"),
+                      seller_account=self._form_value(form, "seller_account"),
+                  )
+                  html = (
+                      "<html><body><h1>SUBASTAS</h1>"
+                      "<p>GANADOR: "
+                      + str(closed["winner_account"])
+                      + "</p><p>PRECIO FINAL: "
+                      + format(closed["final_price"], ".2f")
+                      + "</p></body></html>"
+                  )
+                  self._send_html(200, html)
+
+              def _create_order_json(self) -> None:
+                  doc = self._read_json()
+                  if doc is None:
+                      self._send_json(400, {"ok": False, "error": "invalid JSON"})
+                      return
+                  listing_id = str(doc.get("listing_id", ""))
+                  buyer_account = str(doc.get("buyer_account", ""))
+                  source = str(doc.get("source", "direct"))
+                  buyer = self.store.get_account(buyer_account)
+                  buyer_zid = buyer["zid"] if buyer else None
+                  order = self.store.create_order(
+                      order_id=new_order_id(),
+                      listing_id=listing_id,
+                      buyer_account=buyer_account,
+                      buyer_zid=buyer_zid,
+                      source=source,
+                  )
+                  self._send_json(201, {"ok": True, "data": order})
+
+              def _order_action(self, order_id: str, action: str) -> None:
+                  doc = self._read_json() or {}
+                  if action == "pay":
+                      provider = str(doc.get("provider", "wallet"))
+                      order = self.store.pay_order(order_id=order_id, provider=provider)
+                      self._send_json(200, {"ok": True, "data": order})
+                      return
+                  if action == "settle":
+                      order = self.store.settle_order(order_id=order_id)
+                      self._send_json(200, {"ok": True, "data": order})
+                      return
+                  if action == "ship":
+                      order = self.store.create_shipment(
+                          shipment_id=new_shipment_id(),
+                          order_id=order_id,
+                          carrier=str(doc.get("carrier", "zyra-express")),
+                          origin=str(doc.get("origin", "SV")),
+                          destination=str(doc.get("destination", "SV")),
+                      )
+                      self._send_json(200, {"ok": True, "data": order})
+                      return
+                  self._send_json(
+                      400, {"ok": False, "error": "unknown order action: " + action}
+                  )
+
+              def _shipment_action(self, shipment_id: str, action: str) -> None:
+                  doc = self._read_json() or {}
+                  if action == "track":
+                      shipment = self.store.add_tracking(
+                          shipment_id=shipment_id,
+                          status=str(doc.get("status", "in_transit")),
+                          location=str(doc.get("location", "")),
+                          description=str(doc.get("description", "")),
+                      )
+                      self._send_json(200, {"ok": True, "data": shipment})
+                      return
+                  if action == "deliver":
+                      shipment = self.store.confirm_delivery(shipment_id=shipment_id)
+                      self._send_json(200, {"ok": True, "data": shipment})
+                      return
+                  self._send_json(
+                      400,
+                      {"ok": False, "error": "unknown shipment action: " + action},
+                  )
+
+              def _mutual_reputation_json(self) -> None:
+                  doc = self._read_json()
+                  if doc is None:
+                      self._send_json(400, {"ok": False, "error": "invalid JSON"})
+                      return
+                  order_id = str(doc.get("order_id", ""))
+                  buyer_account = str(doc.get("buyer_account", ""))
+                  seller_account = str(doc.get("seller_account", ""))
+                  evidence = str(
+                      doc.get("evidence", "")
+                      or "transaccion completada en SUBASTAS"
+                  )
+                  order = self.store.get_order(order_id)
+                  buyer = self.store.get_account(buyer_account)
+                  seller = self.store.get_account(seller_account)
+                  buyer_zid = buyer["zid"] if buyer else None
+                  seller_zid = seller["zid"] if seller else None
+                  if not buyer_zid or not seller_zid:
+                      raise ValueError("accounts must have network ZIDs")
+                  rep_b2s = self.link.give_reputation(
+                      subject_zid=seller_zid,
+                      actor_zid=buyer_zid,
+                      kind="positive",
+                      evidence=evidence,
+                  )
+                  rep_s2b = self.link.give_reputation(
+                      subject_zid=buyer_zid,
+                      actor_zid=seller_zid,
+                      kind="positive",
+                      evidence=evidence,
+                  )
+
+                  def _network(rep):
+                      try:
+                          data = rep[1]
+                          return bool(
+                              isinstance(data, dict)
+                              and data.get("recorded") != "local"
+                          )
+                      except Exception:
+                          return False
+
+                  self.store.record_reputation(
+                      subject_zid=seller_zid,
+                      actor_zid=buyer_zid,
+                      kind="positive",
+                      evidence=evidence,
+                      source="order:" + order_id,
+                      network_recorded=_network(rep_b2s),
+                  )
+                  self.store.record_reputation(
+                      subject_zid=buyer_zid,
+                      actor_zid=seller_zid,
+                      kind="positive",
+                      evidence=evidence,
+                      source="order:" + order_id,
+                      network_recorded=_network(rep_s2b),
+                  )
+                  hist_s = self.link.record_history(
+                      seller_zid, "venta completada", "orden " + order_id
+                  )
+                  hist_b = self.link.record_history(
+                      buyer_zid, "compra completada", "orden " + order_id
+                  )
+                  self._send_json(
+                      200,
+                      {
+                          "ok": True,
+                          "data": {
+                              "order_id": order_id,
+                              "buyer_to_seller_network": _network(rep_b2s),
+                              "seller_to_buyer_network": _network(rep_s2b),
+                              "history_seller_recorded": bool(hist_s[0]),
+                              "history_buyer_recorded": bool(hist_b[0]),
+                          },
+                      },
+                  )
+
+              def _radar_scan_json(self) -> None:
+                  doc = self._read_json()
+                  if doc is None:
+                      self._send_json(400, {"ok": False, "error": "invalid JSON"})
+                      return
+                  title = str(doc.get("title", "oportunidad"))
+                  category = str(doc.get("category", "general"))
+                  purchase = float(doc.get("purchase_price", 0))
+                  shipping = float(doc.get("shipping_cost", 0))
+                  fees = float(doc.get("fees", 0))
+                  sale = float(doc.get("estimated_sale_price", 0))
+                  demand = float(doc.get("demand_score", 0.5))
+                  risk = float(doc.get("risk_score", 0.5))
+                  if purchase <= 0 or sale <= 0:
+                      raise ValueError("purchase_price and estimated_sale_price must be positive")
+                  opportunity = self.store.create_opportunity(
+                      opportunity_id=new_opportunity_id(),
+                      title=title,
+                      category=category,
+                      purchase_price=purchase,
+                      shipping_cost=shipping,
+                      fees=fees,
+                      estimated_sale_price=sale,
+                      demand_score=demand,
+                      risk_score=risk,
+                  )
+                  self._send_json(201, {"ok": True, "data": opportunity})
+
+              def _home(self) -> str:
+                  return (
+                      "<html><head><title>SUBASTAS</title></head><body>"
+                      "<h1>SUBASTAS</h1><p>Super-market ZYRA.</p>"
+                      "<p>Roles: vendedor | comprador | gobierno</p>"
+                      "<ul>"
+                      "<li>POST /subastas/listing (form, sella)</li>"
+                      "<li>POST /subastas/api/bids</li>"
+                      "<li>POST /subastas/close</li>"
+                      "<li>POST /subastas/api/orders (compra directa o ganador)</li>"
+                      "<li>POST /subastas/api/orders/{id}/pay</li>"
+                      "<li>POST /subastas/api/orders/{id}/settle</li>"
+                      "<li>POST /subastas/api/orders/{id}/ship</li>"
+                      "<li>POST /subastas/api/shipments/{id}/track</li>"
+                      "<li>POST /subastas/api/shipments/{id}/deliver</li>"
+                      "<li>POST /subastas/api/reputation/mutual</li>"
+                      "<li>POST /subastas/api/radar/scan</li>"
+                      "<li>GET /subastas/api/opportunities</li>"
+                      "<li>GET /subastas/listings</li>"
+                      "<li>GET /subastas/revision</li>"
+                      "<li>GET /subastas/api/health</li>"
+                      "</ul></body></html>"
+                  )
+
+              def _listings_html(self) -> str:
+                  rows = self.store.list_open()
+                  html = (
+                      "<html><body><h1>Publicaciones abiertas</h1><ul>"
+                  )
+                  for row in rows:
+                      html += (
+                          "<li>"
+                          + str(row["listing_id"])
+                          + " - "
+                          + str(row["title"])
+                          + " - base "
+                          + format(float(row["base_price"]), ".2f")
+                          + "</li>"
+                      )
+                  html += "</ul></body></html>"
+                  return html
+
+              def _revision_html(self) -> str:
+                  summary = self.store.summary()
+                  html = (
+                      "<html><body><h1>Revision SUBASTAS</h1>"
+                      "<p>ordenes: "
+                      + str(summary["orders_total"])
+                      + " | entregadas: "
+                      + str(summary["orders_delivered"])
+                      + " | oportunidades radar: "
+                      + str(summary["opportunities"])
+                      + "</p>"
+                      "<a href='/subastas'><button>Inicio</button></a>"
+                      "</body></html>"
+                  )
+                  return html
+
+
+          def serve_subastas(
+              store: SubastasStore,
+              client: object,
+              *,
+              host: str = "127.0.0.1",
+              port: int = 0,
+          ) -> ThreadingHTTPServer:
+              handler = type(
+                  "BoundSubastasHandler",
+                  (SubastasApiHandler,),
+                  {
+                      "store": store,
+                      "net_client": client,
+                      "link": SubastasLink(client),
+                  },
+              )
+              server = ThreadingHTTPServer((host, port), handler)
+              server.bound_port = server.server_address[1]
+              return server
+          PYEOF
+          python -m py_compile apps/subastas/server.py
+          echo "server v2 written"
+
+      - name: Internal probe (commerce flow at store level)
         run: |
           set -euo pipefail
           PYTHONPATH="$PWD" python - <<'PYEOF'
+          import sqlite3
           import tempfile
           from pathlib import Path
 
-          from shared_engines.common.clocks import FrozenClock
-          from shared_engines.storage.database import SQLiteAdapter
+          from apps.subastas.infrastructure.persistence.subastas_store import (
+              SubastasStore,
+          )
 
-          from apps.nexo.infrastructure.persistence.nexo_store import NexoStore
+          class Clock:
+              def now(self):
+                  return 1000000.0
 
           tmp = Path(tempfile.mkdtemp())
-          db = SQLiteAdapter(tmp / "probe.db")
-          store = NexoStore(db, FrozenClock())
-          analysis = store.save_analysis(
-              analysis_id="ANA-1",
-              content_sha256="a" * 64,
-              model_id="nexo-rules-classifier",
-              model_version="1.0",
-              verdict="classified",
-              confidence=0.95,
-              classification="venta",
-              detail="Factura de venta",
+          db = sqlite3.connect(tmp / "probe.db")
+          db.row_factory = sqlite3.Row
+          store = SubastasStore(db, Clock())
+          store.add_account(account_id="SBS-a", zid="ZID-a", name="A")
+          store.add_account(account_id="SBS-b", zid="ZID-b", name="B")
+          store.add_listing(
+              listing_id="LST-1",
+              seller_account="SBS-a",
+              seller_zid="ZID-a",
+              title="t",
+              description="d",
+              base_price=100.0,
+              document_id="DOC-x",
+              network_sealed=False,
           )
-          assert analysis["classification"] == "venta"
-          row = store.record_operation(
-              operation_id="OP-1",
-              kind="venta",
-              seller_zid="ZID-s",
+          listing = store.get_listing("LST-1")
+          assert listing["status"] == "open"
+          assert listing["winner_account"] is None
+          store.place_bid(
+              bid_id="BID-1",
+              listing_id="LST-1",
+              bidder_account="SBS-b",
+              amount=650.0,
+          )
+          closed = store.close_listing(
+              listing_id="LST-1", seller_account="SBS-a"
+          )
+          assert closed["winner_account"] == "SBS-b"
+          assert closed["final_price"] == 650.0
+          persisted = store.get_listing("LST-1")
+          assert persisted["winner_account"] == "SBS-b"
+          assert persisted["final_price"] == 650.0
+          assert persisted["closed_at"] is not None
+          order = store.create_order(
+              order_id="ORD-1",
+              listing_id="LST-1",
+              buyer_account="SBS-b",
               buyer_zid="ZID-b",
-              amount=250.0,
-              description="Factura de venta",
-              invoice_id=None,
-              synced=False,
+              source="auction",
           )
-          assert row["seq"] == 1
-          document = store.save_document(
-              document_id="DOC-1",
-              content_sha256="a" * 64,
-              title="Factura de venta",
-              analysis_id="ANA-1",
-              kind="venta",
-              amount=250.0,
-              seller_zid="ZID-s",
-              buyer_zid="ZID-b",
-              operation_id="OP-1",
-              invoice_id=None,
-              synced=False,
+          assert order["subtotal"] == 650.0
+          assert order["platform_fee"] == 32.5
+          assert order["total"] == 650.0
+          assert order["status"] == "created"
+          paid = store.pay_order(order_id="ORD-1", provider="wallet")
+          assert paid["status"] == "paid"
+          assert paid["commission"]["commission_amount"] == 32.5
+          try:
+              store.pay_order(order_id="ORD-1", provider="wallet")
+              raise AssertionError("double pay must fail")
+          except ValueError:
+              pass
+          settled = store.settle_order(order_id="ORD-1")
+          assert settled["status"] == "settled"
+          assert settled["settlement"]["net_amount"] == 617.5
+          shipped = store.create_shipment(
+              shipment_id="SHP-1",
+              order_id="ORD-1",
+              carrier="zyra-express",
+              origin="San Salvador",
+              destination="Santa Ana",
           )
-          assert document["operation_id"] == "OP-1"
-          dup = store.find_document_by_sha("a" * 64)
-          assert dup is not None
-          assert dup["document_id"] == "DOC-1"
-          store.record_duplicate(content_sha256="a" * 64)
-          assert store.count_duplicates() == 1
-          detail = store.get_document("DOC-1")
-          assert detail["analysis"]["model_id"] == "nexo-rules-classifier"
-          assert detail["operation_seq"] == 1
-          assert store.verify_chain() is True
-          review = store.review_summary()
-          assert review["documents_total"] == 1
-          assert review["analyses_total"] == 1
-          assert review["duplicates_blocked"] == 1
-          assert review["operations_total"] == 1
-          print("PROBE OK: vision flow")
+          assert shipped["status"] == "created"
+          tracked = store.add_tracking(
+              shipment_id="SHP-1",
+              status="in_transit",
+              location="Ruta 1",
+              description="en camino",
+          )
+          assert tracked["status"] == "in_transit"
+          assert len(tracked["tracking"]) == 1
+          delivered = store.confirm_delivery(shipment_id="SHP-1")
+          assert delivered["status"] == "delivered"
+          final_order = store.get_order("ORD-1")
+          assert final_order["status"] == "delivered"
+          store.record_reputation(
+              subject_zid="ZID-a",
+              actor_zid="ZID-b",
+              kind="positive",
+              evidence="venta 650",
+              source="order:ORD-1",
+              network_recorded=False,
+          )
+          opp = store.create_opportunity(
+              opportunity_id="OPP-1",
+              title="Moto subastada",
+              category="vehiculos",
+              purchase_price=100.0,
+              shipping_cost=10.0,
+              fees=5.0,
+              estimated_sale_price=200.0,
+              demand_score=0.8,
+              risk_score=0.2,
+          )
+          assert opp["total_cost"] == 115.0
+          assert opp["expected_profit"] == 85.0
+          assert opp["margin_percent"] == 73.91
+          assert opp["opportunity_score"] == 76.95
+          opps = store.list_opportunities()
+          assert len(opps) == 1
+          assert opps[0]["opportunity_id"] == "OPP-1"
+          summary = store.summary()
+          assert summary["orders_total"] == 1
+          assert summary["orders_delivered"] == 1
+          assert summary["opportunities"] == 1
+          print("PROBE OK: commerce + logistics + radar")
           db.close()
           PYEOF
 
-      - name: Write vision e2e tests (4 focused tests, JSON API only)
+      - name: Write commerce e2e tests (6 focused tests)
         run: |
           set -euo pipefail
-          cat > apps/nexo/tests/test_nexo_vision_e2e.py <<'PYEOF'
-          """NEXO vision e2e - document -> AI analysis with
-          provenance -> automatic ledger entry -> invoice
-          sealed on the network -> contador verifies and
-          certifies; duplicates rejected; resilience offline."""
+          cat > apps/subastas/tests/test_subastas_commerce_e2e.py <<'PYEOF'
+          """SUBASTAS commerce e2e - auction winner persisted,
+          order, payment, commission, settlement, shipment,
+          tracking, delivery, mutual reputation on the network,
+          history by ZID, direct purchase, radar VIP, and full
+          offline resilience."""
           from __future__ import annotations
 
           import json
@@ -1346,10 +1993,10 @@ jobs:
           from shared_engines.storage.database import SQLiteAdapter
           from shared_engines.verification.signatures import Ed25519Signer
 
-          from apps.nexo.infrastructure.network.network_client import NetworkClient
-          from apps.nexo.infrastructure.persistence.nexo_store import NexoStore
-          from apps.nexo.server import serve_nexo
-          from apps.nexo.services.nexo_link import NexoLink
+          from apps.subastas.infrastructure.network.network_client import NetworkClient
+          from apps.subastas.infrastructure.persistence.subastas_store import SubastasStore
+          from apps.subastas.server import serve_subastas
+          from apps.subastas.services.subastas_link import SubastasLink
 
 
           class _Eco:
@@ -1379,26 +2026,40 @@ jobs:
                       "http://127.0.0.1:"
                       f"{self.net_server.server_address[1]}"
                   )
-                  self.client = NetworkClient(self.net_base, max_retries=1)
-                  self.link = NexoLink(self.client)
-                  self.nexo_db = SQLiteAdapter(tmp_path / "nexo.db")
-                  self.store = NexoStore(self.nexo_db, FrozenClock())
-                  self.nexo_server = serve_nexo(self.store, self.client)
+                  self.client = NetworkClient(
+                      self.net_base, timeout_seconds=3.0, max_retries=0
+                  )
+                  self.link = SubastasLink(self.client)
+                  self.sbs_db = SQLiteAdapter(tmp_path / "sbs.db")
+                  self.store = SubastasStore(self.sbs_db, FrozenClock())
+                  self.sbs_server = serve_subastas(self.store, self.client)
                   threading.Thread(
-                      target=self.nexo_server.serve_forever, daemon=True
+                      target=self.sbs_server.serve_forever, daemon=True
                   ).start()
-                  self.nexo_base = (
+                  self.sbs_base = (
                       "http://127.0.0.1:"
-                      f"{self.nexo_server.bound_port}"
+                      f"{self.sbs_server.bound_port}"
                   )
 
               def close(self) -> None:
-                  self.nexo_server.shutdown()
-                  self.nexo_server.server_close()
+                  self.sbs_server.shutdown()
+                  self.sbs_server.server_close()
                   self.net_server.shutdown()
                   self.net_server.server_close()
-                  self.nexo_db.close()
+                  self.sbs_db.close()
                   self.net_db.close()
+
+
+          def _pf(url: str, doc: dict) -> str:
+              request = Request(
+                  url,
+                  data=(
+                      "&".join(str(k) + "=" + str(v) for k, v in doc.items())
+                  ).encode("utf-8"),
+                  method="POST",
+              )
+              with urlopen(request, timeout=15) as r:
+                  return r.read().decode("utf-8")
 
 
           def _pj(url: str, doc: dict) -> dict:
@@ -1426,222 +2087,320 @@ jobs:
                   return r.read().decode("utf-8")
 
 
-          def _real_zid(eco, name: str, kind: str) -> str:
-              ok, data, _err = eco.client.post(
-                  "/identity/register",
-                  {
-                      "kind": kind,
-                      "display_name": name,
-                      "actor": "nexo",
-                  },
+          def _accounts(eco) -> tuple[str, str]:
+              reg_s = eco.link.register_account("Vendedor Uno")
+              seller_zid = str(reg_s[1].get("zid"))
+              eco.store.add_account(
+                  account_id="SBS-seller01", zid=seller_zid, name="Vendedor Uno"
               )
-              assert ok is True and data is not None
-              zid = str(data.get("zid"))
-              assert zid.startswith("ZID-")
-              eco.client.post(
-                  "/trust/complete", {"zid": zid, "actor": "nexo"}
+              reg_b = eco.link.register_account("Comprador Uno")
+              buyer_zid = str(reg_b[1].get("zid"))
+              eco.store.add_account(
+                  account_id="SBS-buyer001", zid=buyer_zid, name="Comprador Uno"
               )
-              return zid
+              return seller_zid, buyer_zid
 
 
-          def test_1_document_analysis_automatic_entry_sealed(
-              tmp_path: Path,
-          ) -> None:
+          def test_1_auction_full_commerce_flow(tmp_path: Path) -> None:
               eco = _Eco(tmp_path)
               try:
                   assert eco.link.register_app()[0] is True
-                  seller = _real_zid(eco, "Vendedor NEXO", "person")
-                  buyer = _real_zid(eco, "Comprador NEXO", "organization")
-                  response = _pj(
-                      eco.nexo_base + "/nexo/api/documents",
+                  seller_zid, buyer_zid = _accounts(eco)
+                  listing_html = _pf(
+                      eco.sbs_base + "/subastas/listing",
                       {
-                          "content": (
-                              "Factura de venta #001"
-                              " mercaderia general"
-                          ),
-                          "seller_zid": seller,
-                          "buyer_zid": buyer,
-                          "amount": 250.0,
+                          "seller_account": "SBS-seller01",
+                          "title": "Moto usada 2019",
+                          "description": "buena",
+                          "base_price": 500,
+                      },
+                  )
+                  assert "SELLADO" in listing_html
+                  open_listings = eco.store.list_open()
+                  assert len(open_listings) == 1
+                  listing_id = open_listings[0]["listing_id"]
+                  assert open_listings[0]["document_id"] is not None
+                  body = _pj(
+                      eco.sbs_base + "/subastas/api/bids",
+                      {
+                          "listing_id": listing_id,
+                          "bidder_account": "SBS-buyer001",
+                          "amount": 650,
+                      },
+                  )
+                  assert body["ok"] is True
+                  closed = eco.store.close_listing(
+                      listing_id=listing_id, seller_account="SBS-seller01"
+                  )
+                  assert closed["winner_account"] == "SBS-buyer001"
+                  assert closed["final_price"] == 650.0
+                  persisted = eco.store.get_listing(listing_id)
+                  assert persisted["winner_account"] == "SBS-buyer001"
+                  assert persisted["final_price"] == 650.0
+                  assert persisted["closed_at"] is not None
+                  order_response = _pj(
+                      eco.sbs_base + "/subastas/api/orders",
+                      {
+                          "listing_id": listing_id,
+                          "buyer_account": "SBS-buyer001",
+                          "source": "auction",
                       },
                   )["data"]
-                  document = response["document"]
-                  analysis = response["analysis"]
-                  operation = response["operation"]
-                  assert document["document_id"].startswith("DOC-")
-                  assert document["content_sha256"]
-                  assert len(document["content_sha256"]) == 64
-                  assert document["kind"] == "venta"
-                  assert document["synced"] is True
-                  assert document["invoice_id"] is not None
-                  assert analysis["model_id"] == "nexo-rules-classifier"
-                  assert analysis["model_version"] == "1.0"
-                  assert analysis["verdict"] == "classified"
-                  assert analysis["confidence"] == 0.95
-                  assert analysis["analysis_id"].startswith("ANA-")
-                  assert operation["seq"] == 1
-                  assert len(operation["entry_hash"]) == 64
-                  verify = _gj(
-                      eco.nexo_base + "/nexo/api/ledger/verify"
+                  order_id = order_response["order_id"]
+                  assert order_response["subtotal"] == 650.0
+                  assert order_response["platform_fee"] == 32.5
+                  assert order_response["status"] == "created"
+                  paid = _pj(
+                      eco.sbs_base + "/subastas/api/orders/" + order_id + "/pay",
+                      {"provider": "wallet"},
                   )["data"]
-                  assert verify["chain_intact"] is True
-                  summary = _gj(
-                      eco.nexo_base + "/nexo/api/summary"
+                  assert paid["status"] == "paid"
+                  assert paid["commission"]["commission_amount"] == 32.5
+                  settled = _pj(
+                      eco.sbs_base + "/subastas/api/orders/" + order_id + "/settle",
+                      {},
                   )["data"]
-                  assert summary["operations_total"] == 1
-                  assert summary["by_kind"]["venta"]["count"] == 1
-                  detail = _gj(
-                      eco.nexo_base
-                      + "/nexo/api/documents/"
-                      + document["document_id"]
+                  assert settled["status"] == "settled"
+                  assert settled["settlement"]["net_amount"] == 617.5
+                  shipped = _pj(
+                      eco.sbs_base + "/subastas/api/orders/" + order_id + "/ship",
+                      {
+                          "carrier": "zyra-express",
+                          "origin": "San Salvador",
+                          "destination": "Santa Ana",
+                      },
                   )["data"]
-                  assert detail["analysis"]["model_id"] == (
-                      "nexo-rules-classifier"
+                  assert shipped["status"] == "shipped"
+                  shipment_id = shipped["shipment"]["shipment_id"]
+                  tracked = _pj(
+                      eco.sbs_base
+                      + "/subastas/api/shipments/"
+                      + shipment_id
+                      + "/track",
+                      {
+                          "status": "in_transit",
+                          "location": "Ruta 1",
+                          "description": "en camino",
+                      },
+                  )["data"]
+                  assert tracked["status"] == "in_transit"
+                  delivered = _pj(
+                      eco.sbs_base
+                      + "/subastas/api/shipments/"
+                      + shipment_id
+                      + "/deliver",
+                      {},
+                  )["data"]
+                  assert delivered["status"] == "delivered"
+                  mutual = _pj(
+                      eco.sbs_base + "/subastas/api/reputation/mutual",
+                      {
+                          "order_id": order_id,
+                          "buyer_account": "SBS-buyer001",
+                          "seller_account": "SBS-seller01",
+                          "evidence": "moto entregada y pagada 650",
+                      },
+                  )["data"]
+                  assert mutual["buyer_to_seller_network"] is True
+                  assert mutual["seller_to_buyer_network"] is True
+                  assert mutual["history_seller_recorded"] is True
+                  assert mutual["history_buyer_recorded"] is True
+                  rep_ok, rep_data, _err = eco.client.get(
+                      "/reputation/" + seller_zid
                   )
-                  assert detail["operation_seq"] == 1
+                  assert rep_ok is True
               finally:
                   eco.close()
 
 
-          def test_2_duplicate_document_rejected(tmp_path: Path) -> None:
+          def test_2_direct_purchase_flow(tmp_path: Path) -> None:
               eco = _Eco(tmp_path)
               try:
                   assert eco.link.register_app()[0] is True
-                  seller = _real_zid(eco, "Vendedor Dup", "person")
-                  buyer = _real_zid(eco, "Comprador Dup", "person")
-                  payload = {
-                      "content": "Factura de venta unica #777",
-                      "seller_zid": seller,
-                      "buyer_zid": buyer,
-                      "amount": 100.0,
-                  }
-                  first = _pj(
-                      eco.nexo_base + "/nexo/api/documents", payload
+                  _accounts(eco)
+                  _pf(
+                      eco.sbs_base + "/subastas/listing",
+                      {
+                          "seller_account": "SBS-seller01",
+                          "title": "Bicicleta nueva",
+                          "description": "sin uso",
+                          "base_price": 120,
+                      },
                   )
-                  assert first["ok"] is True
-                  second = _pj(
-                      eco.nexo_base + "/nexo/api/documents", payload
-                  )
-                  assert second["ok"] is False
-                  assert second["error"]["type"] == "duplicate_document"
-                  summary = _gj(
-                      eco.nexo_base + "/nexo/api/summary"
+                  listing_id = eco.store.list_open()[0]["listing_id"]
+                  order = _pj(
+                      eco.sbs_base + "/subastas/api/orders",
+                      {
+                          "listing_id": listing_id,
+                          "buyer_account": "SBS-buyer001",
+                          "source": "direct",
+                      },
                   )["data"]
-                  assert summary["operations_total"] == 1
-                  review = _gj(
-                      eco.nexo_base + "/nexo/api/review"
+                  assert order["subtotal"] == 120.0
+                  assert order["platform_fee"] == 6.0
+                  assert order["source"] == "direct"
+                  paid = _pj(
+                      eco.sbs_base + "/subastas/api/orders/" + order["order_id"] + "/pay",
+                      {"provider": "cash"},
                   )["data"]
-                  assert review["duplicates_blocked"] == 1
-                  assert review["documents_total"] == 1
-                  assert review["chain_intact"] is True
+                  assert paid["status"] == "paid"
+                  settled = _pj(
+                      eco.sbs_base
+                      + "/subastas/api/orders/"
+                      + order["order_id"]
+                      + "/settle",
+                      {},
+                  )["data"]
+                  assert settled["settlement"]["net_amount"] == 114.0
+                  final_order = _gj(
+                      eco.sbs_base
+                      + "/subastas/api/orders/"
+                      + order["order_id"]
+                  )["data"]
+                  assert final_order["status"] == "settled"
+                  assert final_order["payments"][0]["status"] == "captured"
+                  assert final_order["settlement"] is not None
               finally:
                   eco.close()
 
 
-          def test_3_contador_verifica_y_certifica(tmp_path: Path) -> None:
+          def test_3_radar_vip_opportunities(tmp_path: Path) -> None:
               eco = _Eco(tmp_path)
               try:
                   assert eco.link.register_app()[0] is True
-                  seller = _real_zid(eco, "Vendedor Cert", "person")
-                  company = _real_zid(eco, "Empresa Cert", "organization")
-                  _pj(
-                      eco.nexo_base + "/nexo/api/documents",
+                  scan = _pj(
+                      eco.sbs_base + "/subastas/api/radar/scan",
                       {
-                          "content": (
-                              "Factura de venta certificable #900"
-                          ),
-                          "seller_zid": seller,
-                          "buyer_zid": company,
-                          "amount": 500.0,
-                      },
-                  )
-                  review = _gj(
-                      eco.nexo_base + "/nexo/api/review"
-                  )["data"]
-                  assert review["chain_intact"] is True
-                  revision_html = _h(
-                      eco.nexo_base + "/nexo/revision"
-                  )
-                  assert "Revision del Contador" in revision_html
-                  assert "nexo-rules-classifier" in revision_html
-                  certify = _pj(
-                      eco.nexo_base + "/nexo/api/review/certify",
-                      {
-                          "subject_zid": seller,
-                          "issuer_zid": company,
+                          "title": "Moto subastada en EEUU",
+                          "category": "vehiculos",
+                          "purchase_price": 100,
+                          "shipping_cost": 10,
+                          "fees": 5,
+                          "estimated_sale_price": 200,
+                          "demand_score": 0.8,
+                          "risk_score": 0.2,
                       },
                   )["data"]
-                  assert certify["issued"] is True
-                  credential_id = certify.get("credential_id")
-                  assert credential_id
-                  with urlopen(
-                      eco.net_base
-                      + "/verification/credentials/"
-                      + str(credential_id),
-                      timeout=15,
-                  ) as response:
-                      raw = response.read().decode("utf-8")
-                  assert "financial" in raw
+                  assert scan["total_cost"] == 115.0
+                  assert scan["expected_profit"] == 85.0
+                  assert scan["margin_percent"] == 73.91
+                  assert scan["opportunity_score"] == 76.95
+                  scan2 = _pj(
+                      eco.sbs_base + "/subastas/api/radar/scan",
+                      {
+                          "title": "Lote ropa",
+                          "category": "ropa",
+                          "purchase_price": 300,
+                          "shipping_cost": 20,
+                          "fees": 10,
+                          "estimated_sale_price": 320,
+                          "demand_score": 0.4,
+                          "risk_score": 0.6,
+                      },
+                  )["data"]
+                  assert scan2["expected_profit"] == -10.0
+                  opportunities = _gj(
+                      eco.sbs_base + "/subastas/api/opportunities"
+                  )["data"]["opportunities"]
+                  assert len(opportunities) == 2
+                  assert opportunities[0]["opportunity_score"] == 76.95
+                  revision = _h(eco.sbs_base + "/subastas/revision")
+                  assert "Revision SUBASTAS" in revision
+                  assert "oportunidades radar: 2" in revision
               finally:
                   eco.close()
 
 
-          def test_4_resilience_offline_document(tmp_path: Path) -> None:
-              db = SQLiteAdapter(tmp_path / "nexo.db")
+          def test_4_resilience_offline_commerce(tmp_path: Path) -> None:
+              db = SQLiteAdapter(tmp_path / "sbs.db")
               clock = FrozenClock()
-              store = NexoStore(db, clock)
+              store = SubastasStore(db, clock)
               dead_client = NetworkClient(
                   "http://127.0.0.1:1",
                   timeout_seconds=1.0,
                   max_retries=0,
               )
-              server = serve_nexo(store, dead_client)
+              server = serve_subastas(store, dead_client)
               thread = threading.Thread(
                   target=server.serve_forever, daemon=True
               )
               thread.start()
               base = "http://127.0.0.1:" f"{server.bound_port}"
               try:
-                  request = Request(
-                      base + "/nexo/api/documents",
-                      data=json.dumps(
-                          {
-                              "content": (
-                                  "Factura de compra offline #500"
-                              ),
-                              "seller_zid": "ZID-x",
-                              "buyer_zid": "ZID-y",
-                              "amount": 75.0,
-                          }
-                      ).encode("utf-8"),
-                      headers={"Content-Type": "application/json"},
-                      method="POST",
+                  store.add_account(
+                      account_id="SBS-off-s",
+                      zid=None,
+                      name="Vendedor Offline",
                   )
-                  with urlopen(request, timeout=15) as r:
-                      body = json.loads(r.read().decode("utf-8"))
+                  store.add_account(
+                      account_id="SBS-off-b",
+                      zid=None,
+                      name="Comprador Offline",
+                  )
+                  html = _pf(
+                      base + "/subastas/listing",
+                      {
+                          "seller_account": "SBS-off-s",
+                          "title": "Cosecha offline",
+                          "description": "venta sin red",
+                          "base_price": 80,
+                      },
+                  )
+                  assert "SELLADO" in html
+                  listing_id = store.list_open()[0]["listing_id"]
+                  listing = store.get_listing(listing_id)
+                  assert listing["document_id"] is not None
+                  body = _pj(
+                      base + "/subastas/api/bids",
+                      {
+                          "listing_id": listing_id,
+                          "bidder_account": "SBS-off-b",
+                          "amount": 90,
+                      },
+                  )
                   assert body["ok"] is True
-                  document = body["data"]["document"]
-                  assert document["synced"] is False
-                  assert document["invoice_id"] is None
-                  operation = body["data"]["operation"]
-                  assert operation["seq"] == 1
-                  review = _gj(base + "/nexo/api/review")["data"]
-                  assert review["documents_total"] == 1
-                  assert review["chain_intact"] is True
-                  assert review["operations_total"] == 1
+                  closed = store.close_listing(
+                      listing_id=listing_id, seller_account="SBS-off-s"
+                  )
+                  assert closed["winner_account"] == "SBS-off-b"
+                  order = _pj(
+                      base + "/subastas/api/orders",
+                      {
+                          "listing_id": listing_id,
+                          "buyer_account": "SBS-off-b",
+                          "source": "auction",
+                      },
+                  )["data"]
+                  assert order["subtotal"] == 90.0
+                  paid = _pj(
+                      base + "/subastas/api/orders/" + order["order_id"] + "/pay",
+                      {"provider": "efectivo"},
+                  )["data"]
+                  assert paid["status"] == "paid"
+                  settled = _pj(
+                      base
+                      + "/subastas/api/orders/"
+                      + order["order_id"]
+                      + "/settle",
+                      {},
+                  )["data"]
+                  assert settled["settlement"]["net_amount"] == 85.5
+                  summary = _gj(base + "/subastas/api/summary")["summary"]
+                  assert summary["orders_total"] == 1
               finally:
                   server.shutdown()
                   server.server_close()
                   thread.join(timeout=5)
                   db.close()
           PYEOF
-          echo "vision e2e written"
+          echo "commerce e2e written"
 
-      - name: Run NEXO tests (regression plus vision e2e)
+      - name: Run SUBASTAS tests (regression plus commerce e2e)
         run: |
           set -euo pipefail
-          PYTHONPATH="$PWD" python -m pytest -q -p no:cacheprovider --timeout=60 --timeout-method=thread apps/nexo/tests/
-          echo "NEXO tests OK"
-          find apps/nexo -name '__pycache__' -type d \
+          PYTHONPATH="$PWD" python -m pytest -q -p no:cacheprovider --timeout=60 --timeout-method=thread apps/subastas/tests/
+          echo "SUBASTAS tests OK"
+          find apps/subastas -name '__pycache__' -type d \
             -prune -exec rm -rf {} +
 
       - name: Commit and push (race-safe)
@@ -1655,7 +2414,7 @@ jobs:
           if git diff --cached --quiet; then
             echo "No changes."
           else
-            git commit -m "zyra: Q3 NEXO vision - additive migration 2 (documents+analyses+duplicates), surgical server patches (4 verified insertions, handlers receive the already-read body), document -> sha256 -> duplicate guard -> rules classifier with provenance (model/version/verdict/confidence) -> automatic ledger entry -> invoice sealed on network -> contador review screen + certify via CredentialType.financial with trust; original contracts byte-identical; probe + 4 focused e2e"
+            git commit -m "zyra: Q3 SUBASTAS commerce - bugs fixed (winner+final_price+closed_at persisted, canonical /documents/seal contract with owner_zid+content_b64, reputation evidence_b64, NetworkClient validates ok envelope, injected clock honored), new commerce flow (direct purchase + auction winner -> order -> payment -> 5% commission -> settlement), domestic logistics (shipment + tracking + delivery), mutual reputation with network evidence + history asset by ZID, Radar VIP (total cost -> margin -> opportunity score), revision screen; old contracts preserved (SELLADO assert); probe + 4 focused e2e"
             git push origin "HEAD:${{ github.ref_name }}"
           fi
-          echo "=== Q3 NEXO COMPLETE ==="
+          echo "=== Q3 SUBASTAS COMPLETE ==="

@@ -31,12 +31,7 @@ jobs:
           python -m pip install --upgrade pip
           python -m pip install "cryptography>=42,<45" "pytest>=8,<9" "pytest-timeout>=2,<3"
 
-      - name: Evidence (originals intact)
-        run: |
-          set -euo pipefail
-          wc -c apps/subastas/server.py apps/subastas/infrastructure/persistence/subastas_store.py apps/subastas/services/subastas_link.py apps/subastas/infrastructure/network/network_client.py
-
-      - name: SubastasStore v2 (winner persisted + orders payments settlements shipments tracking radar)
+      - name: SubastasStore v2
         run: |
           set -euo pipefail
           cat > apps/subastas/infrastructure/persistence/subastas_store.py <<'PYEOF'
@@ -1013,7 +1008,7 @@ jobs:
           python -m py_compile apps/subastas/infrastructure/persistence/subastas_store.py
           echo "store v2 written"
 
-      - name: SubastasLink v2 (canonical seal + evidence_b64 + history asset + trust)
+      - name: SubastasLink v2 (canonical contracts)
         run: |
           set -euo pipefail
           cat > apps/subastas/services/subastas_link.py <<'PYEOF'
@@ -1024,8 +1019,7 @@ jobs:
           /reputation/record with evidence_b64;
           /history/append with entry_type asset.
           Resilience: fallback only as explicit local
-          pending, never pretending network success.
-          """
+          pending, never pretending network success."""
           from __future__ import annotations
 
           import base64
@@ -1179,7 +1173,7 @@ jobs:
           python -m py_compile apps/subastas/services/subastas_link.py
           echo "link v2 written"
 
-      - name: NetworkClient v2 (validates ok envelope - BUG 7 fix)
+      - name: NetworkClient v2 (validates ok envelope)
         run: |
           set -euo pipefail
           cat > apps/subastas/infrastructure/network/network_client.py <<'PYEOF'
@@ -1262,13 +1256,7 @@ jobs:
           python -m py_compile apps/subastas/infrastructure/network/network_client.py
           echo "network client v2 written"
 
-      - name: SubastasStore compatibility with raw sqlite in old tests
-        run: |
-          set -euo pipefail
-          echo "check: old test uses SQLiteAdapter - adapter has execute(sql, params) and query(sql); store helpers already tolerate both"
-          grep -n "def query\|def execute" shared_engines/storage/database.py | head -10 || true
-
-      - name: Subastas server v2 (all old routes + commerce logistics radar)
+      - name: Subastas server v2 (ship action returns the ORDER - fix)
         run: |
           set -euo pipefail
           cat > apps/subastas/server.py <<'PYEOF'
@@ -1619,13 +1607,14 @@ jobs:
                       self._send_json(200, {"ok": True, "data": order})
                       return
                   if action == "ship":
-                      order = self.store.create_shipment(
+                      self.store.create_shipment(
                           shipment_id=new_shipment_id(),
                           order_id=order_id,
                           carrier=str(doc.get("carrier", "zyra-express")),
                           origin=str(doc.get("origin", "SV")),
                           destination=str(doc.get("destination", "SV")),
                       )
+                      order = self.store.get_order(order_id)
                       self._send_json(200, {"ok": True, "data": order})
                       return
                   self._send_json(
@@ -1664,13 +1653,25 @@ jobs:
                       doc.get("evidence", "")
                       or "transaccion completada en SUBASTAS"
                   )
-                  order = self.store.get_order(order_id)
+                  self.store.get_order(order_id)
                   buyer = self.store.get_account(buyer_account)
                   seller = self.store.get_account(seller_account)
                   buyer_zid = buyer["zid"] if buyer else None
                   seller_zid = seller["zid"] if seller else None
                   if not buyer_zid or not seller_zid:
                       raise ValueError("accounts must have network ZIDs")
+
+                  def _network(rep) -> bool:
+                      try:
+                          if not rep[0]:
+                              return False
+                          data = rep[1]
+                          if isinstance(data, dict) and data.get("recorded") == "local":
+                              return False
+                          return True
+                      except Exception:
+                          return False
+
                   rep_b2s = self.link.give_reputation(
                       subject_zid=seller_zid,
                       actor_zid=buyer_zid,
@@ -1683,17 +1684,6 @@ jobs:
                       kind="positive",
                       evidence=evidence,
                   )
-
-                  def _network(rep):
-                      try:
-                          data = rep[1]
-                          return bool(
-                              isinstance(data, dict)
-                              and data.get("recorded") != "local"
-                          )
-                      except Exception:
-                          return False
-
                   self.store.record_reputation(
                       subject_zid=seller_zid,
                       actor_zid=buyer_zid,
@@ -1744,7 +1734,9 @@ jobs:
                   demand = float(doc.get("demand_score", 0.5))
                   risk = float(doc.get("risk_score", 0.5))
                   if purchase <= 0 or sale <= 0:
-                      raise ValueError("purchase_price and estimated_sale_price must be positive")
+                      raise ValueError(
+                          "purchase_price and estimated_sale_price must be positive"
+                      )
                   opportunity = self.store.create_opportunity(
                       opportunity_id=new_opportunity_id(),
                       title=title,
@@ -1912,14 +1904,17 @@ jobs:
           settled = store.settle_order(order_id="ORD-1")
           assert settled["status"] == "settled"
           assert settled["settlement"]["net_amount"] == 617.5
-          shipped = store.create_shipment(
+          shipment = store.create_shipment(
               shipment_id="SHP-1",
               order_id="ORD-1",
               carrier="zyra-express",
               origin="San Salvador",
               destination="Santa Ana",
           )
-          assert shipped["status"] == "created"
+          assert shipment["status"] == "created"
+          final_order = store.get_order("ORD-1")
+          assert final_order["status"] == "shipped"
+          assert final_order["shipment"]["shipment_id"] == "SHP-1"
           tracked = store.add_tracking(
               shipment_id="SHP-1",
               status="in_transit",
@@ -2240,7 +2235,10 @@ jobs:
                   assert order["platform_fee"] == 6.0
                   assert order["source"] == "direct"
                   paid = _pj(
-                      eco.sbs_base + "/subastas/api/orders/" + order["order_id"] + "/pay",
+                      eco.sbs_base
+                      + "/subastas/api/orders/"
+                      + order["order_id"]
+                      + "/pay",
                       {"provider": "cash"},
                   )["data"]
                   assert paid["status"] == "paid"
@@ -2414,7 +2412,7 @@ jobs:
           if git diff --cached --quiet; then
             echo "No changes."
           else
-            git commit -m "zyra: Q3 SUBASTAS commerce - bugs fixed (winner+final_price+closed_at persisted, canonical /documents/seal contract with owner_zid+content_b64, reputation evidence_b64, NetworkClient validates ok envelope, injected clock honored), new commerce flow (direct purchase + auction winner -> order -> payment -> 5% commission -> settlement), domestic logistics (shipment + tracking + delivery), mutual reputation with network evidence + history asset by ZID, Radar VIP (total cost -> margin -> opportunity score), revision screen; old contracts preserved (SELLADO assert); probe + 4 focused e2e"
+            git commit -m "zyra: Q3 SUBASTAS commerce v2 - ship action returns the ORDER (with embedded shipment) matching the contract, network detection robust to any ok envelope, winner+final_price+closed_at persisted, canonical seal and reputation contracts, direct purchase, payments+commission+settlement, shipments+tracking+delivery, mutual reputation+history by ZID, Radar VIP; probe + 4 focused e2e"
             git push origin "HEAD:${{ github.ref_name }}"
           fi
           echo "=== Q3 SUBASTAS COMPLETE ==="

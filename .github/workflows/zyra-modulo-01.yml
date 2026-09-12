@@ -1008,18 +1008,17 @@ jobs:
           python -m py_compile apps/subastas/infrastructure/persistence/subastas_store.py
           echo "store v2 written"
 
-      - name: SubastasLink v2 (canonical contracts)
+      - name: SubastasLink v3 (canonical identity payload FIRST - real network ZIDs)
         run: |
           set -euo pipefail
           cat > apps/subastas/services/subastas_link.py <<'PYEOF'
           """SUBASTAS link to the ZYRA Network.
 
-          Canonical contracts: /documents/seal with
-          owner_zid + content_b64 + actor_app;
-          /reputation/record with evidence_b64;
-          /history/append with entry_type asset.
-          Resilience: fallback only as explicit local
-          pending, never pretending network success."""
+          Canonical contracts: /identity/register with
+          kind + display_name + actor (same as MPE/SEMILLA);
+          /documents/seal with owner_zid + content_b64 +
+          actor_app; /reputation/record with evidence_b64;
+          /history/append with entry_type asset."""
           from __future__ import annotations
 
           import base64
@@ -1080,10 +1079,19 @@ jobs:
 
               def register_account(self, name: str) -> tuple[bool, dict | None]:
                   payloads = (
-                      {"name": name, "display_name": name, "kind": "person"},
+                      {
+                          "kind": "person",
+                          "display_name": name,
+                          "actor": "subastas",
+                      },
+                      {"kind": "person", "display_name": name},
+                      {
+                          "name": name,
+                          "display_name": name,
+                          "kind": "person",
+                      },
                       {"name": name, "display_name": name},
                       {"name": name},
-                      {"display_name": name},
                   )
                   for payload in payloads:
                       ok, data, _err = self._client.post(
@@ -1171,7 +1179,7 @@ jobs:
                   )
           PYEOF
           python -m py_compile apps/subastas/services/subastas_link.py
-          echo "link v2 written"
+          echo "link v3 written"
 
       - name: NetworkClient v2 (validates ok envelope)
         run: |
@@ -1256,7 +1264,7 @@ jobs:
           python -m py_compile apps/subastas/infrastructure/network/network_client.py
           echo "network client v2 written"
 
-      - name: Subastas server v2 (ship action returns the ORDER - fix)
+      - name: Subastas server v2 (trust before mutual reputation)
         run: |
           set -euo pipefail
           cat > apps/subastas/server.py <<'PYEOF'
@@ -1359,6 +1367,15 @@ jobs:
                   if value is None:
                       return ""
                   return str(value)
+
+              def _trust_best_effort(self, zid) -> bool:
+                  if not zid:
+                      return False
+                  try:
+                      ok, _d, _e = self.link.complete_trust(str(zid))
+                      return bool(ok)
+                  except Exception:
+                      return False
 
               def do_GET(self) -> None:
                   path = self.path.split("?")[0]
@@ -1660,6 +1677,8 @@ jobs:
                   seller_zid = seller["zid"] if seller else None
                   if not buyer_zid or not seller_zid:
                       raise ValueError("accounts must have network ZIDs")
+                  self._trust_best_effort(buyer_zid)
+                  self._trust_best_effort(seller_zid)
 
                   def _network(rep) -> bool:
                       try:
@@ -1832,132 +1851,76 @@ jobs:
           python -m py_compile apps/subastas/server.py
           echo "server v2 written"
 
-      - name: Internal probe (commerce flow at store level)
+      - name: Identity probe (register + reputation on REAL network ZIDs)
         run: |
           set -euo pipefail
           PYTHONPATH="$PWD" python - <<'PYEOF'
-          import sqlite3
+          import json
+          import re
           import tempfile
+          import threading
           from pathlib import Path
+          from urllib.request import Request, urlopen
 
-          from apps.subastas.infrastructure.persistence.subastas_store import (
-              SubastasStore,
-          )
+          from shared_engines.common.clocks import FrozenClock
+          from shared_engines.runtime.capabilities import ZyraCapabilities
+          from shared_engines.runtime.combined_api import serve_combined
+          from shared_engines.runtime.config import RuntimeConfig
+          from shared_engines.runtime.kernel import ZyraKernel
+          from shared_engines.storage.database import SQLiteAdapter
+          from shared_engines.verification.signatures import Ed25519Signer
 
-          class Clock:
-              def now(self):
-                  return 1000000.0
+          from apps.subastas.infrastructure.network.network_client import NetworkClient
+          from apps.subastas.services.subastas_link import SubastasLink
 
           tmp = Path(tempfile.mkdtemp())
-          db = sqlite3.connect(tmp / "probe.db")
-          db.row_factory = sqlite3.Row
-          store = SubastasStore(db, Clock())
-          store.add_account(account_id="SBS-a", zid="ZID-a", name="A")
-          store.add_account(account_id="SBS-b", zid="ZID-b", name="B")
-          store.add_listing(
-              listing_id="LST-1",
-              seller_account="SBS-a",
-              seller_zid="ZID-a",
-              title="t",
-              description="d",
-              base_price=100.0,
-              document_id="DOC-x",
-              network_sealed=False,
+          db = SQLiteAdapter(tmp / "net.db")
+          signer, _ = Ed25519Signer.generate()
+          kernel = ZyraKernel(
+              db=db,
+              clock=FrozenClock(),
+              signer=signer,
+              config=RuntimeConfig(host="127.0.0.1", port=0, api_token=None),
           )
-          listing = store.get_listing("LST-1")
-          assert listing["status"] == "open"
-          assert listing["winner_account"] is None
-          store.place_bid(
-              bid_id="BID-1",
-              listing_id="LST-1",
-              bidder_account="SBS-b",
-              amount=650.0,
+          kernel.bootstrap_root()
+          caps = ZyraCapabilities(
+              db,
+              FrozenClock(),
+              identity=kernel.identity,
+              signer=signer,
           )
-          closed = store.close_listing(
-              listing_id="LST-1", seller_account="SBS-a"
+          server = serve_combined(kernel, caps, host="127.0.0.1", port=0)
+          threading.Thread(target=server.serve_forever, daemon=True).start()
+          base = "http://127.0.0.1:" + str(server.server_address[1])
+          client = NetworkClient(base, timeout_seconds=3.0, max_retries=0)
+          link = SubastasLink(client)
+          ok, data = link.register_app()
+          assert ok is True
+          ok, data = link.register_account("Probe Seller")
+          assert ok is True
+          zid = str(data.get("zid"))
+          assert zid.startswith("ZID-")
+          assert data.get("source") != "local", (
+              "identity fell back to local: " + json.dumps(data)
           )
-          assert closed["winner_account"] == "SBS-b"
-          assert closed["final_price"] == 650.0
-          persisted = store.get_listing("LST-1")
-          assert persisted["winner_account"] == "SBS-b"
-          assert persisted["final_price"] == 650.0
-          assert persisted["closed_at"] is not None
-          order = store.create_order(
-              order_id="ORD-1",
-              listing_id="LST-1",
-              buyer_account="SBS-b",
-              buyer_zid="ZID-b",
-              source="auction",
-          )
-          assert order["subtotal"] == 650.0
-          assert order["platform_fee"] == 32.5
-          assert order["total"] == 650.0
-          assert order["status"] == "created"
-          paid = store.pay_order(order_id="ORD-1", provider="wallet")
-          assert paid["status"] == "paid"
-          assert paid["commission"]["commission_amount"] == 32.5
-          try:
-              store.pay_order(order_id="ORD-1", provider="wallet")
-              raise AssertionError("double pay must fail")
-          except ValueError:
-              pass
-          settled = store.settle_order(order_id="ORD-1")
-          assert settled["status"] == "settled"
-          assert settled["settlement"]["net_amount"] == 617.5
-          shipment = store.create_shipment(
-              shipment_id="SHP-1",
-              order_id="ORD-1",
-              carrier="zyra-express",
-              origin="San Salvador",
-              destination="Santa Ana",
-          )
-          assert shipment["status"] == "created"
-          final_order = store.get_order("ORD-1")
-          assert final_order["status"] == "shipped"
-          assert final_order["shipment"]["shipment_id"] == "SHP-1"
-          tracked = store.add_tracking(
-              shipment_id="SHP-1",
-              status="in_transit",
-              location="Ruta 1",
-              description="en camino",
-          )
-          assert tracked["status"] == "in_transit"
-          assert len(tracked["tracking"]) == 1
-          delivered = store.confirm_delivery(shipment_id="SHP-1")
-          assert delivered["status"] == "delivered"
-          final_order = store.get_order("ORD-1")
-          assert final_order["status"] == "delivered"
-          store.record_reputation(
-              subject_zid="ZID-a",
-              actor_zid="ZID-b",
+          t_ok, _t = link.complete_trust(zid)
+          print("trust ok:", t_ok)
+          r_ok, r_data = link.give_reputation(
+              subject_zid=zid,
+              actor_zid=zid,
               kind="positive",
-              evidence="venta 650",
-              source="order:ORD-1",
-              network_recorded=False,
+              evidence="probe evidence",
           )
-          opp = store.create_opportunity(
-              opportunity_id="OPP-1",
-              title="Moto subastada",
-              category="vehiculos",
-              purchase_price=100.0,
-              shipping_cost=10.0,
-              fees=5.0,
-              estimated_sale_price=200.0,
-              demand_score=0.8,
-              risk_score=0.2,
+          assert r_ok is True
+          assert isinstance(r_data, dict)
+          assert r_data.get("recorded") != "local", (
+              "reputation fell back to local: " + json.dumps(r_data)
           )
-          assert opp["total_cost"] == 115.0
-          assert opp["expected_profit"] == 85.0
-          assert opp["margin_percent"] == 73.91
-          assert opp["opportunity_score"] == 76.95
-          opps = store.list_opportunities()
-          assert len(opps) == 1
-          assert opps[0]["opportunity_id"] == "OPP-1"
-          summary = store.summary()
-          assert summary["orders_total"] == 1
-          assert summary["orders_delivered"] == 1
-          assert summary["opportunities"] == 1
-          print("PROBE OK: commerce + logistics + radar")
+          h_ok, _h = link.record_history(zid, "probe", "history probe")
+          assert h_ok is True
+          print("IDENTITY PROBE OK: real network ZID + reputation + history")
+          server.shutdown()
+          server.server_close()
           db.close()
           PYEOF
 
@@ -2085,11 +2048,17 @@ jobs:
           def _accounts(eco) -> tuple[str, str]:
               reg_s = eco.link.register_account("Vendedor Uno")
               seller_zid = str(reg_s[1].get("zid"))
+              assert reg_s[1].get("source") != "local", (
+                  "seller identity fell back to local"
+              )
               eco.store.add_account(
                   account_id="SBS-seller01", zid=seller_zid, name="Vendedor Uno"
               )
               reg_b = eco.link.register_account("Comprador Uno")
               buyer_zid = str(reg_b[1].get("zid"))
+              assert reg_b[1].get("source") != "local", (
+                  "buyer identity fell back to local"
+              )
               eco.store.add_account(
                   account_id="SBS-buyer001", zid=buyer_zid, name="Comprador Uno"
               )
@@ -2412,7 +2381,7 @@ jobs:
           if git diff --cached --quiet; then
             echo "No changes."
           else
-            git commit -m "zyra: Q3 SUBASTAS commerce v2 - ship action returns the ORDER (with embedded shipment) matching the contract, network detection robust to any ok envelope, winner+final_price+closed_at persisted, canonical seal and reputation contracts, direct purchase, payments+commission+settlement, shipments+tracking+delivery, mutual reputation+history by ZID, Radar VIP; probe + 4 focused e2e"
+            git commit -m "zyra: Q3 SUBASTAS commerce v3 - ROOT CAUSE fixed: identity registration now uses canonical payload (kind+display_name+actor like MPE/SEMILLA) so accounts get REAL network ZIDs instead of local fallbacks, trust completed before mutual reputation, identity probe guards against local fallback; commerce flow (order/pay/commission/settle/ship/track/deliver), mutual reputation+history by ZID on network, Radar VIP"
             git push origin "HEAD:${{ github.ref_name }}"
           fi
           echo "=== Q3 SUBASTAS COMPLETE ==="

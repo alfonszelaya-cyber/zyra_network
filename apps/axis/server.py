@@ -17,6 +17,8 @@ from apps.axis.infrastructure.network.network_client import (
     NetworkClient,
 )
 from apps.axis.services.axis_link import AxisLink
+from apps.axis.services.axis_link_ext import AxisLinkExt
+import uuid as _uuid
 
 _CSS = (
     "body{font-family:system-ui,sans-serif;"
@@ -133,6 +135,9 @@ class AxisApiHandler(
         store = type(self).store
         if not s or s == ["home"]:
             self._home()
+            return
+        if s[0] == "emergencias":
+            self._screen_emergencias()
             return
         if s[0] == "paciente":
             self._screen_patient(s)
@@ -405,6 +410,12 @@ class AxisApiHandler(
                 ),
             )
             return
+        if s == ["exam"]:
+            self._exam_form(doc)
+            return
+        if s == ["exam-result"]:
+            self._exam_result_form(doc)
+            return
         if s == ["incident"]:
             police_account = self._req(
                 doc, "police_account"
@@ -575,6 +586,20 @@ class AxisApiHandler(
     ) -> None:
         store = type(self).store
         doc = self._read_json()
+        if s == ["emergencies"]:
+            self._emergency_create(doc)
+            return
+        if s == ["emergencies", "resolve"]:
+            self._emergency_resolve(doc)
+            return
+        if (
+            len(s) == 3
+            and s[0] == "emergencies"
+            and s[2] == "dispatch"
+        ):
+            self._emergency_dispatch(doc, s[1])
+            return
+        doc = self._read_json()
         if s == ["accounts"]:
             account_id = (
                 "AX-"
@@ -604,6 +629,188 @@ class AxisApiHandler(
                     "unknown api route",
                 },
             },
+        )
+
+    def _ext(self) -> AxisLinkExt:
+        link = type(self).link
+        return AxisLinkExt(
+            getattr(link, "_client")
+        )
+
+    def _exam_patient(self, exam_id: str) -> str:
+        store = type(self).store
+        row = store._db.query_one(
+            "SELECT patient_account FROM axis_exams"
+            " WHERE exam_id = ?",
+            (exam_id,),
+        )
+        if row is None:
+            raise LookupError("unknown exam: " + exam_id)
+        return str(row["patient_account"])
+
+    def _exam_form(self, doc) -> None:
+        store = type(self).store
+        patient_account = self._req(doc, "patient_account")
+        doctor_account = self._req(doc, "doctor_account")
+        exam_type = self._req(doc, "exam_type")
+        exam_id = "EXM-" + _uuid.uuid4().hex[:10]
+        row = store.add_exam(
+            exam_id=exam_id,
+            patient_account=patient_account,
+            doctor_account=doctor_account,
+            exam_type=exam_type,
+        )
+        self._html(
+            200,
+            _page(
+                "Examen ordenado",
+                "<h1>Examen ordenado</h1>"
+                "<p>" + str(row["exam_id"])
+                + " (" + exam_type + ")</p>"
+                "<a href='/axis/medico/"
+                + doctor_account
+                + "'><button>Volver</button></a>"
+            ),
+        )
+
+    def _exam_result_form(self, doc) -> None:
+        store = type(self).store
+        ext = self._ext()
+        exam_id = self._req(doc, "exam_id")
+        doctor_account = self._req(doc, "doctor_account")
+        summary = self._req(doc, "summary")
+        severity = self._req(doc, "severity")
+        requires = (
+            str(doc.get("requires_followup", ""))
+            in ("1", "true", "si", "on")
+        )
+        reason = doc.get("followup_reason")
+        reason = (
+            str(reason) if reason is not None else None
+        )
+        patient_account = self._exam_patient(exam_id)
+        patient = store.get_account(patient_account)
+        zid = patient.get("zid")
+        sealed_doc = None
+        if zid is not None:
+            ok, doc_id = ext.seal_evidence_canonical(
+                owner_zid=str(zid),
+                title="Resultado " + exam_id,
+                content=summary,
+            )
+            if ok and doc_id:
+                sealed_doc = doc_id
+                ext.append_history(
+                    zid=str(zid),
+                    event="resultado_examen",
+                    detail=exam_id + ": " + severity,
+                )
+        result = store.add_exam_result(
+            result_id="RES-" + _uuid.uuid4().hex[:10],
+            exam_id=exam_id,
+            summary=summary,
+            severity=severity,
+            requires_followup=requires,
+            followup_reason=reason,
+            sealed_doc=sealed_doc,
+        )
+        cita = "no requiere seguimiento"
+        if requires:
+            appointment = store.create_appointment(
+                appointment_id="APT-" + _uuid.uuid4().hex[:10],
+                patient_account=patient_account,
+                doctor_account=doctor_account,
+                result_id=result["result_id"],
+                reason=reason or "seguimiento de resultado",
+                scheduled_at=str(
+                    doc.get("scheduled_at", "por programar")
+                ),
+            )
+            cita = appointment["scheduled_at"]
+        self._html(
+            200,
+            _page(
+                "Resultado registrado",
+                "<h1>Resultado (sellado en la Red)</h1>"
+                "<p>Severidad: " + severity + "</p>"
+                "<p>Requiere seguimiento: " + str(requires) + "</p>"
+                "<p>Cita automatica: " + cita + "</p>"
+                "<p>El paciente sera recordado.</p>"
+                "<a href='/axis/medico/"
+                + doctor_account
+                + "'><button>Volver</button></a>"
+            ),
+        )
+
+    def _emergency_create(self, doc) -> None:
+        store = type(self).store
+        emergency_type = self._req(doc, "emergency_type")
+        severity = self._req(doc, "severity")
+        description = self._req(doc, "description")
+        subject_account = doc.get("subject_account")
+        subject_account_str = None
+        if subject_account is not None:
+            try:
+                account = store.get_account(str(subject_account))
+                subject_account_str = str(account["account_id"])
+            except LookupError:
+                subject_account_str = None
+        emergency = store.create_emergency(
+            emergency_id="EMG-" + _uuid.uuid4().hex[:10],
+            source_app=str(doc.get("source_app", "manual")),
+            subject_account=subject_account_str,
+            subject_zid=None,
+            emergency_type=emergency_type,
+            severity=severity,
+            description=description,
+        )
+        self._send(201, {"ok": True, "data": emergency})
+
+    def _emergency_dispatch(self, doc, emergency_id: str) -> None:
+        store = type(self).store
+        agency = self._req(doc, "agency")
+        priority = str(doc.get("priority", "alta"))
+        emergency = store.dispatch_emergency(
+            emergency_id=emergency_id,
+            agency=agency,
+            priority=priority,
+        )
+        self._send(200, {"ok": True, "data": emergency})
+
+    def _emergency_resolve(self, doc) -> None:
+        store = type(self).store
+        emergency = store.resolve_emergency(
+            emergency_id=self._req(doc, "emergency_id"),
+        )
+        self._send(200, {"ok": True, "data": emergency})
+
+    def _screen_emergencias(self) -> None:
+        store = type(self).store
+        open_emergencies = store.list_open_emergencies()
+        items = ""
+        for e in open_emergencies:
+            agencies = ", ".join(
+                str(d["agency"]) for d in e["dispatches"]
+            )
+            items = (
+                items
+                + "<li>- " + e["emergency_id"]
+                + " | " + e["emergency_type"]
+                + " | " + e["severity"]
+                + " | " + e["status"]
+                + " | recursos: " + (agencies or "sin despachar")
+                + "</li>"
+            )
+        if not items:
+            items = "<li>Sin emergencias abiertas</li>"
+        body = (
+            "<h1>Centro de Emergencias</h1>"
+            "<h2>Abiertas</h2><ul>" + items + "</ul>"
+            "<a href='/axis'><button class='gray'>Inicio</button></a>"
+        )
+        self._html(
+            200,
+            _page("AXIS - Emergencias", body),
         )
 
     def _home(self) -> None:

@@ -19,6 +19,10 @@ from apps.ciclo_digital.infrastructure.network.network_client import (
 from apps.ciclo_digital.services.ciclo_link import (
     CicloLink,
 )
+from apps.ciclo_digital.services.ciclo_link_ext import (
+    CicloLinkExt,
+)
+import uuid as _uuid
 
 _CSS = (
     "body{font-family:system-ui,sans-serif;"
@@ -142,6 +146,15 @@ class CicloApiHandler(
         if not s or s == ["home"]:
             self._home()
             return
+        if s[0] == "arqueologia" and len(s) == 2:
+            self._screen_archaeology(s[1])
+            return
+        if s == ["global"]:
+            self._send(
+                200,
+                {"ok": True, "data": self.store.global_recycling_stats()},
+            )
+            return
         if (
             s[0] == "balance"
             and len(s) == 2
@@ -206,6 +219,18 @@ class CicloApiHandler(
         store = type(self).store
         link = type(self).link
         doc = self._read_form()
+        if s == ["arch-case"]:
+            self._arch_case_form(doc)
+            return
+        if s == ["arch-finding"]:
+            self._arch_finding_form(doc)
+            return
+        if s == ["arch-reconstruct"]:
+            self._arch_reconstruct_form(doc)
+            return
+        if s == ["arch-seal"]:
+            self._arch_seal_form(doc)
+            return
         if s == ["recycle"]:
             owner_zid = self._req(
                 doc, "owner_zid"
@@ -509,6 +534,22 @@ class CicloApiHandler(
     ) -> None:
         store = type(self).store
         doc = self._read_json()
+        if s == ["recycling", "global"]:
+            self._api_global_recycling(doc)
+            return
+        if s == ["archaeology", "cases"]:
+            self._api_arch_case(doc)
+            return
+        if s == ["archaeology", "findings"]:
+            self._api_arch_finding(doc)
+            return
+        if s == ["archaeology", "reconstruct"]:
+            self._api_arch_reconstruct(doc)
+            return
+        if s == ["recycling", "value"]:
+            self._api_value(doc)
+            return
+        doc = self._read_json()
         if s == ["recycled"]:
             item_id = (
                 "REC-"
@@ -552,6 +593,266 @@ class CicloApiHandler(
                 },
             },
         )
+
+    def _ext(self) -> CicloLinkExt:
+        link = type(self).link
+        return CicloLinkExt(
+            getattr(link, "_client")
+        )
+
+    def _api_global_recycling(self, doc) -> None:
+        store = type(self).store
+        ext = self._ext()
+        source_app = self._req(doc, "source_app")
+        owner_zid = self._req(doc, "owner_zid")
+        description = self._req(doc, "description")
+        category = self._req(doc, "category")
+        condition = str(doc.get("condition", "bueno"))
+        event = store.add_global_recycling(
+            event_id="GLB-" + _uuid.uuid4().hex[:10],
+            source_app=source_app,
+            owner_zid=owner_zid,
+            description=description,
+            category=category,
+            condition_state=condition,
+            document_id=None,
+        )
+        tokens_ok = False
+        try:
+            ok, _data = ext.earn_tokens(
+                subject_zid=owner_zid,
+                activity="reciclaje",
+                ref_id=event["event_id"],
+            )
+            tokens_ok = bool(ok)
+        except Exception:
+            tokens_ok = False
+        self._send(
+            201,
+            {
+                "ok": True,
+                "data": {
+                    "event_id": event["event_id"],
+                    "source_app": event["source_app"],
+                    "reward_tokens": event["reward_tokens"],
+                    "network_tokens": tokens_ok,
+                },
+            },
+        )
+
+    def _api_arch_case(self, doc) -> None:
+        store = type(self).store
+        case = store.create_arch_case(
+            case_id="ARC-" + _uuid.uuid4().hex[:10],
+            owner_zid=self._req(doc, "owner_zid"),
+            title=self._req(doc, "title"),
+            description=self._req(doc, "description"),
+        )
+        self._send(201, {"ok": True, "data": case})
+
+    def _api_arch_finding(self, doc) -> None:
+        store = type(self).store
+        finding = store.add_finding(
+            finding_id="FND-" + _uuid.uuid4().hex[:10],
+            case_id=self._req(doc, "case_id"),
+            source=self._req(doc, "source"),
+            title=self._req(doc, "title"),
+            content=self._req(doc, "content"),
+            certainty=self._req(doc, "certainty"),
+            reason=doc.get("reason"),
+            document_id=None,
+        )
+        self._send(201, {"ok": True, "data": finding})
+
+    def _api_arch_reconstruct(self, doc) -> None:
+        store = type(self).store
+        reconstruction = store.add_reconstruction(
+            reconstruction_id="RCN-" + _uuid.uuid4().hex[:10],
+            case_id=self._req(doc, "case_id"),
+            title=self._req(doc, "title"),
+            description=self._req(doc, "description"),
+            basis=self._req(doc, "basis"),
+            certainty=self._req(doc, "certainty"),
+        )
+        self._send(201, {"ok": True, "data": reconstruction})
+
+    def _api_value(self, doc) -> None:
+        store = type(self).store
+        item_id = self._req(doc, "item_id")
+        category = self._req(doc, "category")
+        condition = self._req(doc, "condition")
+        valuation = store.add_valuation(
+            valuation_id="VAL-" + _uuid.uuid4().hex[:10],
+            item_id=item_id,
+            category=category,
+            condition=condition,
+        )
+        owner_zid = doc.get("owner_zid")
+        if owner_zid is not None:
+            ext = self._ext()
+            ok, _data = ext.earn_tokens(
+                subject_zid=str(owner_zid),
+                activity="reciclaje",
+                ref_id=item_id,
+            )
+            valuation["network_tokens"] = bool(ok)
+        self._send(201, {"ok": True, "data": valuation})
+
+    def _arch_case_form(self, doc) -> None:
+        store = type(self).store
+        owner_zid = self._req(doc, "owner_zid")
+        title = self._req(doc, "title")
+        description = self._req(doc, "description")
+        case_id = "ARC-" + _uuid.uuid4().hex[:10]
+        store.create_arch_case(
+            case_id=case_id,
+            owner_zid=owner_zid,
+            title=title,
+            description=description,
+        )
+        link_line = "<a href='/ciclo/arqueologia/" + case_id + "'><button>Abrir expediente</button></a>"
+        self._html(
+            200,
+            _page(
+                "Expediente creado",
+                "<h1>Expediente arqueologico</h1>"
+                "<p>" + case_id + "</p>"
+                + link_line
+            ),
+        )
+
+    def _arch_finding_form(self, doc) -> None:
+        store = type(self).store
+        ext = self._ext()
+        case_id = self._req(doc, "case_id")
+        source = self._req(doc, "source")
+        title = self._req(doc, "title")
+        content = self._req(doc, "content")
+        certainty = self._req(doc, "certainty")
+        case = store.get_arch_case(case_id)
+        document_id = None
+        if case["owner_zid"]:
+            ok, doc_id = ext.seal_document(
+                owner_zid=case["owner_zid"],
+                title="Hallazgo " + title,
+                content=content,
+            )
+            if ok and doc_id:
+                document_id = doc_id
+        finding = store.add_finding(
+            finding_id="FND-" + _uuid.uuid4().hex[:10],
+            case_id=case_id,
+            source=source,
+            title=title,
+            content=content,
+            certainty=certainty,
+            reason=None,
+            document_id=document_id,
+        )
+        back_line = "<a href='/ciclo/arqueologia/" + case_id + "'><button>Volver al expediente</button></a>"
+        self._html(
+            200,
+            _page(
+                "Hallazgo registrado",
+                "<h1>Hallazgo registrado</h1>"
+                "<p>Certeza: " + certainty + "</p>"
+                "<p>Hash: " + finding["content_hash"] + "</p>"
+                + back_line
+            ),
+        )
+
+    def _arch_reconstruct_form(self, doc) -> None:
+        store = type(self).store
+        case_id = self._req(doc, "case_id")
+        title = self._req(doc, "title")
+        description = self._req(doc, "description")
+        basis = self._req(doc, "basis")
+        certainty = self._req(doc, "certainty")
+        store.add_reconstruction(
+            reconstruction_id="RCN-" + _uuid.uuid4().hex[:10],
+            case_id=case_id,
+            title=title,
+            description=description,
+            basis=basis,
+            certainty=certainty,
+        )
+        back_line = "<a href='/ciclo/arqueologia/" + case_id + "'><button>Volver al expediente</button></a>"
+        self._html(
+            200,
+            _page(
+                "Reconstruccion registrada",
+                "<h1>Reconstruccion registrada</h1>"
+                "<p>Certeza: " + certainty + "</p>"
+                + back_line
+            ),
+        )
+
+    def _arch_seal_form(self, doc) -> None:
+        store = type(self).store
+        ext = self._ext()
+        case_id = self._req(doc, "case_id")
+        case = store.get_arch_case(case_id)
+        findings = store.list_findings(case_id=case_id)
+        content = (
+            "EXPEDIENTE " + case_id
+            + " | " + case["title"]
+            + " | hallazgos: " + str(len(findings))
+        )
+        sealed_doc = None
+        if case["owner_zid"]:
+            ok, doc_id = ext.seal_document(
+                owner_zid=case["owner_zid"],
+                title="Expediente " + case_id,
+                content=content,
+            )
+            if ok and doc_id:
+                sealed_doc = doc_id
+        case = store.seal_arch_case(
+            case_id=case_id,
+            sealed_doc=sealed_doc or "local-pending",
+        )
+        self._html(
+            200,
+            _page(
+                "Expediente sellado",
+                "<h1>Expediente sellado</h1>"
+                "<p>Documento: " + str(sealed_doc or "pendiente") + "</p>"
+                "<a href='/ciclo'><button>Inicio</button></a>"
+            ),
+        )
+
+    def _screen_archaeology(self, case_id: str) -> None:
+        store = type(self).store
+        case = store.get_arch_case(case_id)
+        findings_html = ""
+        for f in case["findings"]:
+            findings_html = (
+                findings_html
+                + "<li>- " + f["title"]
+                + " [" + f["certainty"] + "]</li>"
+            )
+        if not findings_html:
+            findings_html = "<li>Sin hallazgos aun</li>"
+        recon_html = ""
+        for r in case["reconstructions"]:
+            recon_html = (
+                recon_html
+                + "<li>- " + r["title"]
+                + " [" + r["certainty"] + "]</li>"
+            )
+        if not recon_html:
+            recon_html = "<li>Sin reconstrucciones aun</li>"
+        back_line = "<a href='/ciclo'><button class='gray'>Inicio</button></a>"
+        body = (
+            "<h1>Expediente " + case_id + "</h1>"
+            "<p>" + case["title"] + " | " + case["status"] + "</p>"
+            "<h2>Hallazgos (certeza)</h2><ul>"
+            + findings_html + "</ul>"
+            "<h2>Reconstrucciones</h2><ul>"
+            + recon_html + "</ul>"
+            + back_line
+        )
+        self._html(200, _page("CICLO - Expediente", body))
 
     def _home(self) -> None:
         body = (

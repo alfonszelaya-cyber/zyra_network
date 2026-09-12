@@ -31,11 +31,6 @@ jobs:
           python -m pip install --upgrade pip
           python -m pip install "cryptography>=42,<45" "pytest>=8,<9" "pytest-timeout>=2,<3"
 
-      - name: Evidence (before)
-        run: |
-          set -euo pipefail
-          wc -c apps/subastas/server.py apps/subastas/infrastructure/persistence/subastas_store.py
-
       - name: ADD CommerceStore (new file - original store untouched)
         run: |
           set -euo pipefail
@@ -719,7 +714,7 @@ jobs:
           python -m py_compile apps/subastas/infrastructure/persistence/subastas_commerce.py
           echo "commerce layer added (original store untouched)"
 
-      - name: ADD server patches (multi-line anchors matching real file)
+      - name: ADD server patches (multi-line anchors + net_client contracts in new methods)
         run: |
           set -euo pipefail
           PYTHONPATH="$PWD" python - <<'PYEOF'
@@ -749,7 +744,7 @@ jobs:
               "    CommerceStore,",
               "    _nid,",
               ")",
-              "from apps.subastas.services.subastas_link import SubastasLink",
+              "import base64 as _b64",
           ])
 
           GET_ANCHOR = "\n".join([
@@ -836,6 +831,27 @@ jobs:
           ])
 
           METHODS = "\n".join([
+              '    def _ensure_real_zid(self, account_id: str) -> str:',
+              '        """Canonical identity via net_client (same',
+              '        contract proven by MPE/SEMILLA). Falls back',
+              '        to stored ZID only if the network is down."""',
+              '        existing = self.commerce.account_zid(account_id)',
+              '        ok, data, _err = self.net_client.post(',
+              '            "/identity/register",',
+              '            {',
+              '                "kind": "person",',
+              '                "display_name": account_id,',
+              '                "actor": "subastas",',
+              '            },',
+              '        )',
+              '        if ok and data:',
+              '            zid = _find_value(data, ("zid",))',
+              '            if isinstance(zid, str) and zid.startswith("ZID-"):',
+              '                return zid',
+              '        if existing:',
+              '            return existing',
+              '        raise ValueError("no network ZID available for " + account_id)',
+              '',
               '    def _create_order_json(self) -> None:',
               '        doc = self._read_json()',
               '        if doc is None:',
@@ -920,41 +936,46 @@ jobs:
               '            or "transaccion completada en SUBASTAS"',
               '        )',
               '        order = self.commerce.get_order(order_id)',
-              '        buyer_zid = self.commerce.account_zid(buyer_account)',
-              '        seller_zid = self.commerce.account_zid(seller_account)',
-              '        if not buyer_zid or not seller_zid:',
-              '            raise ValueError("accounts must have network ZIDs")',
+              '        seller_zid = self._ensure_real_zid(seller_account)',
+              '        buyer_zid = self._ensure_real_zid(buyer_account)',
+              '        evidence_b64 = _b64.b64encode(',
+              '            evidence.encode("utf-8")',
+              '        ).decode("ascii")',
               '',
-              '        def _network(rep) -> bool:',
+              '        def _network_call(path: str, payload: dict) -> bool:',
               '            try:',
-              '                if not rep[0]:',
-              '                    return False',
-              '                data = rep[1]',
-              '                if isinstance(data, dict) and data.get("recorded") == "local":',
-              '                    return False',
-              '                return True',
+              '                ok, _data, _err = self.net_client.post(',
+              '                    path, payload',
+              '                )',
+              '                return bool(ok)',
               '            except Exception:',
               '                return False',
               '',
-              '        rep_b2s = self.link.give_reputation(',
+              '        rep_b2s = _network_call(',
+              '            "/reputation/record",',
+              '            {',
+              '                "subject_zid": seller_zid,',
+              '                "actor_zid": buyer_zid,',
+              '                "kind": "positive",',
+              '                "evidence_b64": evidence_b64,',
+              '            },',
+              '        )',
+              '        rep_s2b = _network_call(',
+              '            "/reputation/record",',
+              '            {',
+              '                "subject_zid": buyer_zid,',
+              '                "actor_zid": seller_zid,',
+              '                "kind": "positive",',
+              '                "evidence_b64": evidence_b64,',
+              '            },',
+              '        )',
+              '        self.commerce.record_rep_event(',
+              '            order_id=order_id,',
               '            subject_zid=seller_zid,',
               '            actor_zid=buyer_zid,',
               '            kind="positive",',
               '            evidence=evidence,',
-              '        )',
-              '        rep_s2b = self.link.give_reputation(',
-              '            subject_zid=buyer_zid,',
-              '            actor_zid=seller_zid,',
-              '            kind="positive",',
-              '            evidence=evidence,',
-              '        )',
-              '        self.commerce.record_rep_event(',
-              '            order_id=order_id,',
-              '            subject_zid=seller_zid,',
-              '            actor_zid=buyer_zid,',
-              '            kind="positive",',
-              '            evidence=evidence,',
-              '            network_recorded=_network(rep_b2s),',
+              '            network_recorded=rep_b2s,',
               '        )',
               '        self.commerce.record_rep_event(',
               '            order_id=order_id,',
@@ -962,13 +983,31 @@ jobs:
               '            actor_zid=seller_zid,',
               '            kind="positive",',
               '            evidence=evidence,',
-              '            network_recorded=_network(rep_s2b),',
+              '            network_recorded=rep_s2b,',
               '        )',
-              '        hist_s = self.link.record_history(',
-              '            seller_zid, "venta completada", "orden " + order_id',
+              '        hist_s = _network_call(',
+              '            "/history/append",',
+              '            {',
+              '                "zid": seller_zid,',
+              '                "entry_type": "asset",',
+              '                "actor_app": "subastas",',
+              '                "payload": {',
+              '                    "event": "venta completada",',
+              '                    "detail": "orden " + order_id,',
+              '                },',
+              '            },',
               '        )',
-              '        hist_b = self.link.record_history(',
-              '            buyer_zid, "compra completada", "orden " + order_id',
+              '        hist_b = _network_call(',
+              '            "/history/append",',
+              '            {',
+              '                "zid": buyer_zid,',
+              '                "entry_type": "asset",',
+              '                "actor_app": "subastas",',
+              '                "payload": {',
+              '                    "event": "compra completada",',
+              '                    "detail": "orden " + order_id,',
+              '                },',
+              '            },',
               '        )',
               '        self._send_json(',
               '            200,',
@@ -976,10 +1015,10 @@ jobs:
               '                "ok": True,',
               '                "data": {',
               '                    "order_id": order_id,',
-              '                    "buyer_to_seller_network": _network(rep_b2s),',
-              '                    "seller_to_buyer_network": _network(rep_s2b),',
-              '                    "history_seller_recorded": bool(hist_s[0]),',
-              '                    "history_buyer_recorded": bool(hist_b[0]),',
+              '                    "buyer_to_seller_network": rep_b2s,',
+              '                    "seller_to_buyer_network": rep_s2b,',
+              '                    "history_seller_recorded": hist_s,',
+              '                    "history_buyer_recorded": hist_b,',
               '                },',
               '            },',
               '        )',
@@ -1022,18 +1061,8 @@ jobs:
           ])
 
           source = apply(source, IMPORT_ANCHOR, IMPORT_NEW, "import")
-          source = apply(
-              source,
-              GET_ANCHOR,
-              GET_ROUTES,
-              "get-routes",
-          )
-          source = apply(
-              source,
-              POST_ANCHOR,
-              POST_ROUTES,
-              "post-routes",
-          )
+          source = apply(source, GET_ANCHOR, GET_ROUTES, "get-routes")
+          source = apply(source, POST_ANCHOR, POST_ROUTES, "post-routes")
           source = apply(
               source,
               '    def _home(self) -> str:',
@@ -1097,7 +1126,6 @@ jobs:
               '            "commerce": CommerceStore(',
               '                store._db, store._clock',
               '            ),',
-              '            "link": SubastasLink(client),',
               '        },',
               '    )',
           ])
@@ -1109,26 +1137,24 @@ jobs:
           python -m py_compile apps/subastas/server.py
           echo "bind applied and compiles"
 
-      - name: Internal probe (commerce ADD-ONLY layer)
+      - name: Internal probe (SQLiteAdapter - same as real tests)
         run: |
           set -euo pipefail
           PYTHONPATH="$PWD" python - <<'PYEOF'
-          import sqlite3
           import tempfile
           from pathlib import Path
+
+          from shared_engines.common.clocks import FrozenClock
+          from shared_engines.storage.database import SQLiteAdapter
 
           from apps.subastas.infrastructure.persistence.subastas_store import SubastasStore
           from apps.subastas.infrastructure.persistence.subastas_commerce import CommerceStore
 
-          class Clock:
-              def now(self):
-                  return 1000000.0
-
           tmp = Path(tempfile.mkdtemp())
-          db = sqlite3.connect(tmp / "probe.db")
-          db.row_factory = sqlite3.Row
-          store = SubastasStore(db, Clock())
-          commerce = CommerceStore(db, Clock())
+          db = SQLiteAdapter(tmp / "probe.db")
+          clock = FrozenClock()
+          store = SubastasStore(db, clock)
+          commerce = CommerceStore(db, clock)
           store.add_account(account_id="SBS-a", zid="ZID-a", name="A")
           store.add_account(account_id="SBS-b", zid="ZID-b", name="B")
           store.add_listing(
@@ -1206,7 +1232,7 @@ jobs:
           assert summary["orders_total"] == 1
           assert summary["orders_delivered"] == 1
           assert summary["opportunities"] == 1
-          print("PROBE OK: ADD-ONLY commerce layer")
+          print("PROBE OK: ADD-ONLY commerce layer on SQLiteAdapter")
           db.close()
           PYEOF
 
@@ -1216,8 +1242,9 @@ jobs:
           cat > apps/subastas/tests/test_subastas_commerce_e2e.py <<'PYEOF'
           """SUBASTAS commerce e2e ADD-ONLY - winner persisted,
           order, payment, commission, settlement, shipment,
-          tracking, delivery, mutual reputation, radar VIP,
-          offline resilience. Original routes/tests untouched."""
+          tracking, delivery, mutual reputation on the network
+          (canonical contracts), radar VIP, offline resilience.
+          Original routes and tests untouched."""
           from __future__ import annotations
 
           import json
@@ -1239,7 +1266,6 @@ jobs:
           from apps.subastas.infrastructure.network.network_client import NetworkClient
           from apps.subastas.infrastructure.persistence.subastas_store import SubastasStore
           from apps.subastas.server import serve_subastas
-          from apps.subastas.services.subastas_link import SubastasLink
 
 
           class _Eco:
@@ -1270,7 +1296,6 @@ jobs:
                       f"{self.net_server.server_address[1]}"
                   )
                   self.client = NetworkClient(self.net_base, max_retries=1)
-                  self.link = SubastasLink(self.client)
                   self.sbs_db = SQLiteAdapter(tmp_path / "sbs.db")
                   self.store = SubastasStore(self.sbs_db, FrozenClock())
                   self.sbs_server = serve_subastas(self.store, self.client)
@@ -1329,22 +1354,20 @@ jobs:
 
 
           def _accounts(eco) -> None:
-              reg_s = eco.link.register_account("Vendedor Uno")
-              seller_zid = str(reg_s[1].get("zid"))
               eco.store.add_account(
-                  account_id="SBS-seller01", zid=seller_zid, name="Vendedor Uno"
+                  account_id="SBS-seller01", zid=None, name="Vendedor Uno"
               )
-              reg_b = eco.link.register_account("Comprador Uno")
-              buyer_zid = str(reg_b[1].get("zid"))
               eco.store.add_account(
-                  account_id="SBS-buyer001", zid=buyer_zid, name="Comprador Uno"
+                  account_id="SBS-buyer001", zid=None, name="Comprador Uno"
               )
 
 
           def test_1_auction_full_commerce(tmp_path: Path) -> None:
               eco = _Eco(tmp_path)
               try:
-                  assert eco.link.register_app()[0] is True
+                  assert eco.client.post(
+                      "/apps/register", {"app_id": "subastas"}
+                  )[0] is True
                   _accounts(eco)
                   listing_html = _pf(
                       eco.sbs_base + "/subastas/listing",
@@ -1446,9 +1469,10 @@ jobs:
                           "evidence": "moto entregada y pagada 650",
                       },
                   )["data"]
-                  assert mutual["order_id"] == order_id
-                  assert "buyer_to_seller_network" in mutual
-                  assert "history_seller_recorded" in mutual
+                  assert mutual["buyer_to_seller_network"] is True
+                  assert mutual["seller_to_buyer_network"] is True
+                  assert mutual["history_seller_recorded"] is True
+                  assert mutual["history_buyer_recorded"] is True
               finally:
                   eco.close()
 
@@ -1456,9 +1480,9 @@ jobs:
           def test_2_direct_purchase(tmp_path: Path) -> None:
               eco = _Eco(tmp_path)
               try:
-                  assert eco.link.register_app()[0] is True
-                  eco.link.register_account("Vendedor Dos")
-                  eco.link.register_account("Comprador Dos")
+                  assert eco.client.post(
+                      "/apps/register", {"app_id": "subastas"}
+                  )[0] is True
                   eco.store.add_account(
                       account_id="SBS-s2", zid=None, name="Vendedor Dos"
                   )
@@ -1514,7 +1538,6 @@ jobs:
           def test_3_radar_vip(tmp_path: Path) -> None:
               eco = _Eco(tmp_path)
               try:
-                  assert eco.link.register_app()[0] is True
                   scan = _pj(
                       eco.sbs_base + "/subastas/api/radar/scan",
                       {
@@ -1656,7 +1679,7 @@ jobs:
           if git diff --cached --quiet; then
             echo "No changes."
           else
-            git commit -m "zyra: Q3 SUBASTAS ADD-ONLY v2 - anchors corrected to the real multi-line route format (count=0 fixed), CommerceStore as new file (original store/link/client/tests untouched), 4 verified insert-patches + serve bind, winner persistence additive, orders/payments/commission/settlement, shipments/tracking/delivery, mutual reputation+history by ZID, Radar VIP; probe + 4 new e2e"
+            git commit -m "zyra: Q3 SUBASTAS ADD-ONLY v3 - root cause fixed: mutual reputation no longer depends on link methods it lacks (record_history/give_reputation canonical), instead uses net_client directly with canonical contracts proven by MPE/SEMILLA (identity kind+display_name+actor, reputation evidence_b64, history entry_type asset), _ensure_real_zid registers real network ZIDs; probe now uses SQLiteAdapter (same as real tests); original store/link/client/tests untouched"
             git push origin "HEAD:${{ github.ref_name }}"
           fi
           echo "=== Q3 SUBASTAS ADD-ONLY COMPLETE ==="

@@ -1,4 +1,4 @@
-name: zyra-q3-axis-emergencias-e2e
+name: zyra-q3-ciclo-archaeology-e2e
 
 "on":
   workflow_dispatch:
@@ -9,7 +9,7 @@ permissions:
   contents: write
 
 concurrency:
-  group: zyra-q3-axis-${{ github.ref }}
+  group: zyra-q3-ciclo-${{ github.ref }}
   cancel-in-progress: false
 
 jobs:
@@ -31,17 +31,22 @@ jobs:
           python -m pip install --upgrade pip
           python -m pip install "cryptography>=42,<45" "pytest>=8,<9" "pytest-timeout>=2,<3"
 
-      - name: ADD axis_link_ext (new file)
+      - name: Evidence (before)
         run: |
           set -euo pipefail
-          cat > apps/axis/services/axis_link_ext.py <<'PYEOF'
-          """AXIS link extension - ADD-ONLY module."""
+          wc -c apps/ciclo_digital/server.py apps/ciclo_digital/infrastructure/persistence/ciclo_store.py apps/ciclo_digital/services/ciclo_link.py
+
+      - name: ADD ciclo_link_ext (new file - original link untouched)
+        run: |
+          set -euo pipefail
+          cat > apps/ciclo_digital/services/ciclo_link_ext.py <<'PYEOF'
+          """CICLO link extension - ADD-ONLY module."""
           from __future__ import annotations
 
           import base64
 
 
-          class AxisLinkExt:
+          class CicloLinkExt:
               def __init__(self, client) -> None:
                   self._client = client
 
@@ -49,13 +54,38 @@ jobs:
                   try:
                       ok, _d, _e = self._client.post(
                           "/trust/complete",
-                          {"zid": zid, "actor": "axis"},
+                          {"zid": zid, "actor": "ciclo"},
                       )
                       return bool(ok)
                   except Exception:
                       return False
 
-              def seal_evidence_canonical(
+              def ensure_trusted_person(
+                  self, display_name: str,
+              ) -> str:
+                  ok, data, _err = self._client.post(
+                      "/identity/register",
+                      {
+                          "kind": "person",
+                          "display_name": display_name,
+                          "actor": "ciclo",
+                      },
+                  )
+                  zid = None
+                  if ok and data:
+                      found = self._find_key(data, ("zid",))
+                      if isinstance(found, str) and found.startswith(
+                          "ZID-"
+                      ):
+                          zid = found
+                  if zid is None:
+                      raise ValueError(
+                          "no network ZID for " + display_name
+                      )
+                  self.complete_trust(zid)
+                  return zid
+
+              def seal_document(
                   self,
                   *,
                   owner_zid: str,
@@ -72,7 +102,7 @@ jobs:
                               "owner_zid": owner_zid,
                               "title": title,
                               "content_b64": encoded,
-                              "actor_app": "axis",
+                              "actor_app": "ciclo",
                           },
                       )
                   except Exception:
@@ -93,8 +123,8 @@ jobs:
                           "/history/append",
                           {
                               "zid": zid,
-                              "entry_type": "health",
-                              "actor_app": "axis",
+                              "entry_type": "asset",
+                              "actor_app": "ciclo",
                               "payload": {
                                   "event": event,
                                   "detail": detail,
@@ -105,6 +135,23 @@ jobs:
                   except Exception:
                       return False
 
+              def earn_tokens(
+                  self, *, subject_zid: str, activity: str, ref_id: str,
+              ) -> tuple[bool, dict | None]:
+                  try:
+                      ok, data, _err = self._client.post(
+                          "/tokens/earn",
+                          {
+                              "subject_zid": subject_zid,
+                              "activity": activity,
+                              "ref_type": "reciclaje",
+                              "ref_id": ref_id,
+                          },
+                      )
+                      return (bool(ok), data)
+                  except Exception:
+                      return (False, None)
+
               @staticmethod
               def _find_key(doc, keys):
                   if isinstance(doc, dict):
@@ -112,823 +159,645 @@ jobs:
                           if str(key).lower() in keys:
                               return value
                       for value in doc.values():
-                          found = AxisLinkExt._find_key(value, keys)
+                          found = CicloLinkExt._find_key(value, keys)
                           if found is not None:
                               return found
                   elif isinstance(doc, list):
                       for item in doc:
-                          found = AxisLinkExt._find_key(item, keys)
+                          found = CicloLinkExt._find_key(item, keys)
                           if found is not None:
                               return found
                   return None
           PYEOF
-          touch apps/axis/services/__init__.py
-          python -m py_compile apps/axis/services/axis_link_ext.py
+          touch apps/ciclo_digital/services/__init__.py
+          python -m py_compile apps/ciclo_digital/services/ciclo_link_ext.py
           echo "link extension added"
 
-      - name: ADD AxisStore v2 (migration 2)
+      - name: ADD CicloStore v2 (migration 2 - archaeology + valuation)
         run: |
           set -euo pipefail
-          cat > apps/axis/infrastructure/persistence/axis_store.py <<'PYEOF'
-          """AXIS durable store v2 - additive migrations."""
+          cat > apps/ciclo_digital/infrastructure/persistence/ciclo_store.py <<'PYEOF'
+          """CICLO-DIGITAL durable store v2 - additive
+          migrations: archaeology cases, findings with
+          certainty classification, reconstructions,
+          recycling valuations and rewards."""
           from __future__ import annotations
 
-          import hashlib
           import uuid
 
-          from shared_engines.storage.database import Database
+          from shared_engines.storage.database import (
+              Database,
+          )
           from shared_engines.storage.migrations import (
               Migration,
               MigrationRunner,
           )
 
-          ROLES = (
-              "paciente",
-              "medico",
-              "abogado",
-              "policia",
-              "gobierno",
-          )
-
           _MIGRATIONS = (
               Migration(
                   1,
-                  "axis",
+                  "ciclo",
                   (
-                      "CREATE TABLE axis_accounts ("
-                      " account_id TEXT PRIMARY KEY,"
-                      " zid TEXT,"
-                      " name TEXT NOT NULL,"
-                      " role TEXT NOT NULL,"
-                      " created_at REAL NOT NULL)",
-                      "CREATE TABLE axis_medical ("
-                      " record_id TEXT PRIMARY KEY,"
-                      " patient_account TEXT NOT NULL,"
-                      " doctor_account TEXT NOT NULL,"
-                      " diagnosis TEXT NOT NULL,"
-                      " next_appointment TEXT,"
-                      " sealed_doc TEXT,"
-                      " created_at REAL NOT NULL)",
-                      "CREATE TABLE axis_legal_cases ("
-                      " case_id TEXT PRIMARY KEY,"
-                      " client_account TEXT NOT NULL,"
-                      " lawyer_account TEXT NOT NULL,"
-                      " status TEXT NOT NULL,"
-                      " detail TEXT NOT NULL,"
-                      " sealed_doc TEXT,"
-                      " created_at REAL NOT NULL,"
-                      " updated_at REAL NOT NULL)",
-                      "CREATE TABLE axis_incidents ("
-                      " incident_id TEXT PRIMARY KEY,"
-                      " police_account TEXT NOT NULL,"
+                      "CREATE TABLE ciclo_recycled ("
+                      " item_id TEXT PRIMARY KEY,"
+                      " owner_zid TEXT NOT NULL,"
                       " description TEXT NOT NULL,"
-                      " sealed_doc TEXT,"
+                      " data_hash TEXT NOT NULL,"
+                      " token_amount INTEGER NOT"
+                      " NULL DEFAULT 0,"
+                      " document_id TEXT,"
+                      " synced INTEGER NOT NULL"
+                      " DEFAULT 0,"
+                      " created_at REAL NOT NULL)",
+                      "CREATE TABLE ciclo_exports ("
+                      " export_id TEXT PRIMARY KEY,"
+                      " subject_zid TEXT NOT NULL,"
+                      " bundle_id TEXT NOT NULL,"
+                      " purpose TEXT NOT NULL,"
                       " created_at REAL NOT NULL)",
                   ),
               ),
               Migration(
                   2,
-                  "axis_emergencias",
+                  "ciclo_archaeology",
                   (
-                      "CREATE TABLE axis_exams ("
-                      " exam_id TEXT PRIMARY KEY,"
-                      " patient_account TEXT NOT NULL,"
-                      " doctor_account TEXT NOT NULL,"
-                      " exam_type TEXT NOT NULL,"
-                      " status TEXT NOT NULL,"
-                      " created_at REAL NOT NULL)",
-                      "CREATE TABLE axis_exam_results ("
-                      " result_id TEXT PRIMARY KEY,"
-                      " exam_id TEXT NOT NULL,"
-                      " patient_account TEXT NOT NULL,"
-                      " summary TEXT NOT NULL,"
-                      " severity TEXT NOT NULL,"
-                      " requires_followup INTEGER NOT NULL,"
-                      " followup_reason TEXT,"
-                      " sealed_doc TEXT,"
-                      " created_at REAL NOT NULL)",
-                      "CREATE TABLE axis_appointments ("
-                      " appointment_id TEXT PRIMARY KEY,"
-                      " patient_account TEXT NOT NULL,"
-                      " doctor_account TEXT NOT NULL,"
-                      " result_id TEXT,"
-                      " reason TEXT NOT NULL,"
-                      " scheduled_at TEXT NOT NULL,"
-                      " status TEXT NOT NULL,"
-                      " created_at REAL NOT NULL)",
-                      "CREATE TABLE axis_emergencies ("
-                      " emergency_id TEXT PRIMARY KEY,"
-                      " source_app TEXT NOT NULL,"
-                      " subject_account TEXT,"
-                      " subject_zid TEXT,"
-                      " emergency_type TEXT NOT NULL,"
-                      " severity TEXT NOT NULL,"
+                      "CREATE TABLE ciclo_arch_cases ("
+                      " case_id TEXT PRIMARY KEY,"
+                      " owner_zid TEXT NOT NULL,"
+                      " title TEXT NOT NULL,"
                       " description TEXT NOT NULL,"
                       " status TEXT NOT NULL,"
+                      " sealed_doc TEXT,"
                       " created_at REAL NOT NULL,"
-                      " resolved_at REAL)",
-                      "CREATE TABLE axis_dispatches ("
-                      " dispatch_id TEXT PRIMARY KEY,"
-                      " emergency_id TEXT NOT NULL,"
-                      " agency TEXT NOT NULL,"
-                      " priority TEXT NOT NULL,"
-                      " status TEXT NOT NULL,"
-                      " created_at REAL NOT NULL,"
-                      " acknowledged_at REAL,"
-                      " arrived_at REAL)",
-                      "CREATE TABLE axis_timeline ("
-                      " timeline_id TEXT PRIMARY KEY,"
-                      " emergency_id TEXT NOT NULL,"
-                      " actor TEXT NOT NULL,"
-                      " event_type TEXT NOT NULL,"
-                      " detail TEXT,"
-                      " occurred_at REAL NOT NULL)",
-                      "CREATE TABLE axis_evidence_chain ("
-                      " custody_id TEXT PRIMARY KEY,"
-                      " evidence_id TEXT NOT NULL,"
-                      " previous_hash TEXT NOT NULL,"
-                      " event_hash TEXT NOT NULL,"
-                      " actor_zid TEXT NOT NULL,"
-                      " action TEXT NOT NULL,"
+                      " updated_at REAL NOT NULL)",
+                      "CREATE TABLE ciclo_findings ("
+                      " finding_id TEXT PRIMARY KEY,"
+                      " case_id TEXT NOT NULL,"
+                      " source TEXT NOT NULL,"
+                      " title TEXT NOT NULL,"
+                      " content TEXT NOT NULL,"
+                      " content_hash TEXT NOT NULL,"
+                      " certainty TEXT NOT NULL,"
+                      " reason TEXT,"
                       " document_id TEXT,"
-                      " occurred_at REAL NOT NULL)",
+                      " created_at REAL NOT NULL)",
+                      "CREATE TABLE ciclo_reconstructions ("
+                      " reconstruction_id TEXT PRIMARY KEY,"
+                      " case_id TEXT NOT NULL,"
+                      " title TEXT NOT NULL,"
+                      " description TEXT NOT NULL,"
+                      " basis TEXT NOT NULL,"
+                      " certainty TEXT NOT NULL,"
+                      " created_at REAL NOT NULL)",
+                      "CREATE TABLE ciclo_valuations ("
+                      " valuation_id TEXT PRIMARY KEY,"
+                      " item_id TEXT NOT NULL,"
+                      " category TEXT NOT NULL,"
+                      " condition TEXT NOT NULL,"
+                      " estimated_value REAL NOT NULL,"
+                      " reward_tokens INTEGER NOT NULL,"
+                      " created_at REAL NOT NULL)",
                   ),
               ),
           )
 
-          AGENCIES = (
-              "policia",
-              "bomberos",
-              "ambulancia",
-              "hospital",
+          CERTAINTY_LEVELS = (
+              "evidencia_encontrada",
+              "evidencia_verificada",
+              "reconstruccion",
+              "inferencia",
+              "incertidumbre",
+          )
+
+          CATEGORIES = (
+              "foto",
+              "video",
+              "documento",
+              "datos",
+              "otro",
           )
 
 
-          class AxisStore:
-              """Durable state for AXIS."""
-
-              def __init__(self, db: Database, clock) -> None:
+          class CicloStore:
+              def __init__(
+                  self, db: Database, clock
+              ) -> None:
                   self._db = db
                   self._clock = clock
-                  MigrationRunner(db, "axis", _MIGRATIONS).run(clock)
+                  MigrationRunner(
+                      db, "ciclo", _MIGRATIONS
+                  ).run(clock)
 
-              def add_account(
-                  self, *, account_id: str, zid: str | None, name: str, role: str,
+              def add_recycled(
+                  self,
+                  *,
+                  item_id: str,
+                  owner_zid: str,
+                  description: str,
+                  data_hash: str,
+                  token_amount: int,
+                  document_id: str | None,
+                  synced: bool,
               ) -> dict[str, object]:
-                  if role not in ROLES:
-                      raise ValueError(f"unknown role: {role}")
                   now = self._clock.now()
                   with self._db.transaction() as cursor:
                       cursor.execute(
-                          "INSERT INTO axis_accounts"
-                          " (account_id, zid, name, role, created_at)"
-                          " VALUES (?, ?, ?, ?, ?)",
-                          (account_id, zid, name, role, now),
+                          "INSERT INTO ciclo_recycled"
+                          " (item_id, owner_zid,"
+                          "  description, data_hash,"
+                          "  token_amount,"
+                          "  document_id, synced,"
+                          "  created_at)"
+                          " VALUES (?, ?, ?, ?, ?, ?,"
+                          "  ?, ?)",
+                          (
+                              item_id,
+                              owner_zid,
+                              description,
+                              data_hash,
+                              token_amount,
+                              document_id,
+                              int(synced),
+                              now,
+                          ),
                       )
-                  return self.get_account(account_id)
+                  return self.get_recycled(item_id)
 
-              def get_account(self, account_id: str) -> dict[str, object]:
+              def get_recycled(
+                  self, item_id: str
+              ) -> dict[str, object]:
                   row = self._db.query_one(
-                      "SELECT * FROM axis_accounts WHERE account_id = ?",
-                      (account_id,),
+                      "SELECT * FROM ciclo_recycled"
+                      " WHERE item_id = ?",
+                      (item_id,),
                   )
                   if row is None:
-                      raise LookupError(f"unknown account: {account_id}")
+                      raise LookupError(
+                          "unknown recycled item:"
+                          f" {item_id}"
+                      )
+                  doc = row["document_id"]
                   return {
-                      "account_id": str(row["account_id"]),
-                      "zid": (
-                          str(row["zid"]) if row["zid"] is not None else None
+                      "item_id": str(
+                          row["item_id"]
                       ),
-                      "name": str(row["name"]),
-                      "role": str(row["role"]),
-                      "created_at": float(row["created_at"]),
+                      "owner_zid": str(
+                          row["owner_zid"]
+                      ),
+                      "description": str(
+                          row["description"]
+                      ),
+                      "data_hash": str(
+                          row["data_hash"]
+                      ),
+                      "token_amount": int(
+                          row["token_amount"]
+                      ),
+                      "document_id": (
+                          str(doc)
+                          if doc is not None
+                          else None
+                      ),
+                      "synced": bool(
+                          int(row["synced"])
+                      ),
                   }
 
-              def list_by_role(
-                  self, *, role: str,
+              def list_recycled(
+                  self, *, owner_zid: str
               ) -> tuple[dict[str, object], ...]:
-                  if role not in ROLES:
-                      raise ValueError(f"unknown role: {role}")
                   rows = self._db.query_all(
-                      "SELECT * FROM axis_accounts WHERE role = ?"
+                      "SELECT * FROM ciclo_recycled"
+                      " WHERE owner_zid = ?"
                       " ORDER BY created_at",
-                      (role,),
+                      (owner_zid,),
                   )
                   return tuple(
-                      {
-                          "account_id": str(r["account_id"]),
-                          "name": str(r["name"]),
-                      }
+                      self.get_recycled(
+                          str(r["item_id"])
+                      )
                       for r in rows
                   )
 
-              def add_medical_record(
+              def record_export(
                   self,
                   *,
-                  record_id: str,
-                  patient_account: str,
-                  doctor_account: str,
-                  diagnosis: str,
-                  next_appointment: str | None,
-                  sealed_doc: str | None,
+                  export_id: str,
+                  subject_zid: str,
+                  bundle_id: str,
+                  purpose: str,
               ) -> dict[str, object]:
                   now = self._clock.now()
                   with self._db.transaction() as cursor:
                       cursor.execute(
-                          "INSERT INTO axis_medical"
-                          " (record_id, patient_account, doctor_account,"
-                          "  diagnosis, next_appointment, sealed_doc, created_at)"
-                          " VALUES (?, ?, ?, ?, ?, ?, ?)",
+                          "INSERT INTO ciclo_exports"
+                          " (export_id, subject_zid,"
+                          "  bundle_id, purpose,"
+                          "  created_at)"
+                          " VALUES (?, ?, ?, ?, ?)",
                           (
-                              record_id,
-                              patient_account,
-                              doctor_account,
-                              diagnosis,
-                              next_appointment,
-                              sealed_doc,
+                              export_id,
+                              subject_zid,
+                              bundle_id,
+                              purpose,
                               now,
                           ),
                       )
                   return {
-                      "record_id": record_id,
-                      "diagnosis": diagnosis,
-                      "next_appointment": next_appointment,
+                      "export_id": export_id,
+                      "subject_zid": subject_zid,
+                      "bundle_id": bundle_id,
+                      "purpose": purpose,
                   }
 
-              def medical_records_of(
-                  self, *, patient_account: str,
-              ) -> tuple[dict[str, object], ...]:
-                  rows = self._db.query_all(
-                      "SELECT * FROM axis_medical"
-                      " WHERE patient_account = ? ORDER BY created_at",
-                      (patient_account,),
-                  )
-                  return tuple(
-                      {
-                          "record_id": str(r["record_id"]),
-                          "diagnosis": str(r["diagnosis"]),
-                          "next_appointment": (
-                              str(r["next_appointment"])
-                              if r["next_appointment"] is not None
-                              else None
-                          ),
-                      }
-                      for r in rows
-                  )
+              # ---------- arqueologia (v2) ----------
 
-              def add_legal_case(
+              def create_arch_case(
                   self,
                   *,
                   case_id: str,
-                  client_account: str,
-                  lawyer_account: str,
-                  status: str,
-                  detail: str,
-                  sealed_doc: str | None,
+                  owner_zid: str,
+                  title: str,
+                  description: str,
               ) -> dict[str, object]:
                   now = self._clock.now()
                   with self._db.transaction() as cursor:
                       cursor.execute(
-                          "INSERT INTO axis_legal_cases"
-                          " (case_id, client_account, lawyer_account,"
-                          "  status, detail, sealed_doc, created_at, updated_at)"
-                          " VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+                          "INSERT INTO ciclo_arch_cases ("
+                          " case_id, owner_zid, title,"
+                          "  description, status,"
+                          "  created_at, updated_at)"
+                          " VALUES (?, ?, ?, ?,"
+                          "  'open', ?, ?)",
                           (
                               case_id,
-                              client_account,
-                              lawyer_account,
-                              status,
-                              detail,
-                              sealed_doc,
+                              owner_zid,
+                              title,
+                              description,
                               now,
                               now,
                           ),
                       )
-                  return self.get_case(case_id)
+                  return self.get_arch_case(case_id)
 
-              def update_case_status(
-                  self,
-                  *,
-                  case_id: str,
-                  status: str,
-                  detail: str,
-                  sealed_doc: str | None,
+              def get_arch_case(
+                  self, case_id: str,
               ) -> dict[str, object]:
-                  now = self._clock.now()
-                  with self._db.transaction() as cursor:
-                      cursor.execute(
-                          "UPDATE axis_legal_cases SET"
-                          " status = ?, detail = ?, sealed_doc = ?,"
-                          " updated_at = ? WHERE case_id = ?",
-                          (status, detail, sealed_doc, now, case_id),
-                      )
-                  return self.get_case(case_id)
-
-              def get_case(self, case_id: str) -> dict[str, object]:
                   row = self._db.query_one(
-                      "SELECT * FROM axis_legal_cases WHERE case_id = ?",
+                      "SELECT * FROM"
+                      " ciclo_arch_cases WHERE"
+                      " case_id = ?",
                       (case_id,),
                   )
                   if row is None:
-                      raise LookupError(f"unknown case: {case_id}")
-                  sealed = row["sealed_doc"]
-                  return {
-                      "case_id": str(row["case_id"]),
-                      "client_account": str(row["client_account"]),
-                      "lawyer_account": str(row["lawyer_account"]),
-                      "status": str(row["status"]),
-                      "detail": str(row["detail"]),
-                      "sealed_doc": (
-                          str(sealed) if sealed is not None else None
-                      ),
-                  }
-
-              def cases_for(
-                  self, *, lawyer_account: str,
-              ) -> tuple[dict[str, object], ...]:
-                  rows = self._db.query_all(
-                      "SELECT case_id FROM axis_legal_cases"
-                      " WHERE lawyer_account = ? ORDER BY updated_at DESC",
-                      (lawyer_account,),
-                  )
-                  return tuple(
-                      self.get_case(str(r["case_id"])) for r in rows
-                  )
-
-              def add_incident(
-                  self,
-                  *,
-                  incident_id: str,
-                  police_account: str,
-                  description: str,
-                  sealed_doc: str | None,
-              ) -> dict[str, object]:
-                  now = self._clock.now()
-                  with self._db.transaction() as cursor:
-                      cursor.execute(
-                          "INSERT INTO axis_incidents"
-                          " (incident_id, police_account, description,"
-                          "  sealed_doc, created_at)"
-                          " VALUES (?, ?, ?, ?, ?)",
-                          (incident_id, police_account, description, sealed_doc, now),
+                      raise LookupError(
+                          "unknown archaeology"
+                          f" case: {case_id}"
                       )
-                  return {
-                      "incident_id": incident_id,
-                      "description": description,
-                      "sealed_doc": sealed_doc,
-                  }
-
-              def list_incidents(self) -> tuple[dict[str, object], ...]:
-                  rows = self._db.query_all(
-                      "SELECT * FROM axis_incidents ORDER BY created_at DESC"
-                  )
-                  return tuple(
-                      {
-                          "incident_id": str(r["incident_id"]),
-                          "description": str(r["description"]),
-                          "sealed_doc": (
-                              str(r["sealed_doc"])
-                              if r["sealed_doc"] is not None
-                              else None
-                          ),
-                      }
-                      for r in rows
-                  )
-
-              def add_exam(
-                  self,
-                  *,
-                  exam_id: str,
-                  patient_account: str,
-                  doctor_account: str,
-                  exam_type: str,
-              ) -> dict[str, object]:
-                  now = self._clock.now()
-                  with self._db.transaction() as cursor:
-                      cursor.execute(
-                          "INSERT INTO axis_exams"
-                          " (exam_id, patient_account, doctor_account,"
-                          "  exam_type, status, created_at)"
-                          " VALUES (?, ?, ?, ?, 'ordered', ?)",
-                          (exam_id, patient_account, doctor_account, exam_type, now),
-                      )
-                  return {"exam_id": exam_id, "status": "ordered"}
-
-              def add_exam_result(
-                  self,
-                  *,
-                  result_id: str,
-                  exam_id: str,
-                  summary: str,
-                  severity: str,
-                  requires_followup: bool,
-                  followup_reason: str | None,
-                  sealed_doc: str | None,
-              ) -> dict[str, object]:
-                  row = self._db.query_one(
-                      "SELECT patient_account FROM axis_exams WHERE exam_id = ?",
-                      (exam_id,),
-                  )
-                  if row is None:
-                      raise LookupError(f"unknown exam: {exam_id}")
-                  patient = str(row["patient_account"])
-                  now = self._clock.now()
-                  with self._db.transaction() as cursor:
-                      cursor.execute(
-                          "INSERT INTO axis_exam_results"
-                          " (result_id, exam_id, patient_account, summary,"
-                          "  severity, requires_followup, followup_reason,"
-                          "  sealed_doc, created_at)"
-                          " VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
-                          (
-                              result_id,
-                              exam_id,
-                              patient,
-                              summary,
-                              severity,
-                              1 if requires_followup else 0,
-                              followup_reason,
-                              sealed_doc,
-                              now,
-                          ),
-                      )
-                      cursor.execute(
-                          "UPDATE axis_exams SET status = 'resulted'"
-                          " WHERE exam_id = ?",
-                          (exam_id,),
-                      )
-                  return {
-                      "result_id": result_id,
-                      "exam_id": exam_id,
-                      "patient_account": patient,
-                      "severity": severity,
-                      "requires_followup": requires_followup,
-                      "followup_reason": followup_reason,
-                  }
-
-              def create_appointment(
-                  self,
-                  *,
-                  appointment_id: str,
-                  patient_account: str,
-                  doctor_account: str,
-                  result_id: str | None,
-                  reason: str,
-                  scheduled_at: str,
-              ) -> dict[str, object]:
-                  now = self._clock.now()
-                  with self._db.transaction() as cursor:
-                      cursor.execute(
-                          "INSERT INTO axis_appointments"
-                          " (appointment_id, patient_account, doctor_account,"
-                          "  result_id, reason, scheduled_at, status, created_at)"
-                          " VALUES (?, ?, ?, ?, ?, ?, 'scheduled', ?)",
-                          (
-                              appointment_id,
-                              patient_account,
-                              doctor_account,
-                              result_id,
-                              reason,
-                              scheduled_at,
-                              now,
-                          ),
-                      )
-                  return {
-                      "appointment_id": appointment_id,
-                      "patient_account": patient_account,
-                      "reason": reason,
-                      "scheduled_at": scheduled_at,
-                      "status": "scheduled",
-                  }
-
-              def pending_reminders(self) -> tuple[dict[str, object], ...]:
-                  rows = self._db.query_all(
-                      "SELECT * FROM axis_appointments"
-                      " WHERE status = 'scheduled' ORDER BY created_at"
-                  )
-                  return tuple(
-                      {
-                          "appointment_id": str(r["appointment_id"]),
-                          "patient_account": str(r["patient_account"]),
-                          "reason": str(r["reason"]),
-                          "scheduled_at": str(r["scheduled_at"]),
-                      }
-                      for r in rows
-                  )
-
-              def create_emergency(
-                  self,
-                  *,
-                  emergency_id: str,
-                  source_app: str,
-                  subject_account: str | None,
-                  subject_zid: str | None,
-                  emergency_type: str,
-                  severity: str,
-                  description: str,
-              ) -> dict[str, object]:
-                  now = self._clock.now()
-                  with self._db.transaction() as cursor:
-                      cursor.execute(
-                          "INSERT INTO axis_emergencies"
-                          " (emergency_id, source_app, subject_account,"
-                          "  subject_zid, emergency_type, severity,"
-                          "  description, status, created_at)"
-                          " VALUES (?, ?, ?, ?, ?, ?, ?, 'open', ?)",
-                          (
-                              emergency_id,
-                              source_app,
-                              subject_account,
-                              subject_zid,
-                              emergency_type,
-                              severity,
-                              description,
-                              now,
-                          ),
-                      )
-                      cursor.execute(
-                          "INSERT INTO axis_timeline"
-                          " (timeline_id, emergency_id, actor, event_type,"
-                          "  detail, occurred_at)"
-                          " VALUES (?, ?, ?, ?, ?, ?)",
-                          (
-                              "TL-" + uuid.uuid4().hex[:10],
-                              emergency_id,
-                              source_app,
-                              "emergency_created",
-                              description,
-                              now,
-                          ),
-                      )
-                  return self.get_emergency(emergency_id)
-
-              def get_emergency(self, emergency_id: str) -> dict[str, object]:
-                  row = self._db.query_one(
-                      "SELECT * FROM axis_emergencies WHERE emergency_id = ?",
-                      (emergency_id,),
-                  )
-                  if row is None:
-                      raise LookupError(f"unknown emergency: {emergency_id}")
-                  dispatches = self._db.query_all(
-                      "SELECT * FROM axis_dispatches WHERE emergency_id = ?"
+                  findings = self._db.query_all(
+                      "SELECT * FROM ciclo_findings"
+                      " WHERE case_id = ?"
                       " ORDER BY created_at",
-                      (emergency_id,),
+                      (case_id,),
                   )
-                  timeline = self._db.query_all(
-                      "SELECT * FROM axis_timeline WHERE emergency_id = ?"
-                      " ORDER BY occurred_at",
-                      (emergency_id,),
+                  reconstructions = (
+                      self._db.query_all(
+                          "SELECT * FROM"
+                          " ciclo_reconstructions"
+                          " WHERE case_id = ?"
+                          " ORDER BY created_at",
+                          (case_id,),
+                      )
                   )
                   return {
-                      "emergency_id": str(row["emergency_id"]),
-                      "source_app": str(row["source_app"]),
-                      "subject_account": (
-                          str(row["subject_account"])
-                          if row["subject_account"] is not None
+                      "case_id": str(
+                          row["case_id"]
+                      ),
+                      "owner_zid": str(
+                          row["owner_zid"]
+                      ),
+                      "title": str(row["title"]),
+                      "description": str(
+                          row["description"]
+                      ),
+                      "status": str(row["status"]),
+                      "sealed_doc": (
+                          str(row["sealed_doc"])
+                          if row["sealed_doc"]
+                          is not None
                           else None
                       ),
-                      "emergency_type": str(row["emergency_type"]),
-                      "severity": str(row["severity"]),
-                      "description": str(row["description"]),
-                      "status": str(row["status"]),
-                      "dispatches": [
+                      "findings": [
                           {
-                              "dispatch_id": str(d["dispatch_id"]),
-                              "agency": str(d["agency"]),
-                              "priority": str(d["priority"]),
-                              "status": str(d["status"]),
-                          }
-                          for d in dispatches
-                      ],
-                      "timeline": [
-                          {
-                              "actor": str(t["actor"]),
-                              "event_type": str(t["event_type"]),
-                              "detail": (
-                                  str(t["detail"])
-                                  if t["detail"] is not None
-                                  else None
+                              "finding_id": str(
+                                  f[
+                                      "finding_id"
+                                  ]
+                              ),
+                              "title": str(
+                                  f["title"]
+                              ),
+                              "certainty": str(
+                                  f["certainty"]
+                              ),
+                              "content_hash": str(
+                                  f[
+                                      "content_hash"
+                                  ]
                               ),
                           }
-                          for t in timeline
+                          for f in findings
+                      ],
+                      "reconstructions": [
+                          {
+                              "reconstruction_id": str(
+                                  r[
+                                      "reconstruction_id"
+                                  ]
+                              ),
+                              "title": str(
+                                  r["title"]
+                              ),
+                              "certainty": str(
+                                  r["certainty"]
+                              ),
+                          }
+                          for r in reconstructions
                       ],
                   }
 
-              def dispatch_emergency(
-                  self, *, emergency_id: str, agency: str, priority: str,
-              ) -> dict[str, object]:
-                  if agency not in AGENCIES:
-                      raise ValueError(f"unknown agency: {agency}")
-                  row = self._db.query_one(
-                      "SELECT status FROM axis_emergencies"
-                      " WHERE emergency_id = ?",
-                      (emergency_id,),
-                  )
-                  if row is None:
-                      raise LookupError(f"unknown emergency: {emergency_id}")
-                  if str(row["status"]) == "resolved":
-                      raise ValueError("emergency already resolved")
-                  now = self._clock.now()
-                  with self._db.transaction() as cursor:
-                      cursor.execute(
-                          "INSERT INTO axis_dispatches"
-                          " (dispatch_id, emergency_id, agency, priority,"
-                          "  status, created_at)"
-                          " VALUES (?, ?, ?, ?, 'dispatched', ?)",
-                          (
-                              "DSP-" + uuid.uuid4().hex[:10],
-                              emergency_id,
-                              agency,
-                              priority,
-                              now,
-                          ),
-                      )
-                      cursor.execute(
-                          "UPDATE axis_emergencies SET status = 'dispatched'"
-                          " WHERE emergency_id = ?",
-                          (emergency_id,),
-                      )
-                      cursor.execute(
-                          "INSERT INTO axis_timeline"
-                          " (timeline_id, emergency_id, actor, event_type,"
-                          "  detail, occurred_at)"
-                          " VALUES (?, ?, ?, ?, ?, ?)",
-                          (
-                              "TL-" + uuid.uuid4().hex[:10],
-                              emergency_id,
-                              "axis",
-                              "dispatched",
-                              agency + " (" + priority + ")",
-                              now,
-                          ),
-                      )
-                  return self.get_emergency(emergency_id)
-
-              def resolve_emergency(self, *, emergency_id: str) -> dict[str, object]:
-                  now = self._clock.now()
-                  with self._db.transaction() as cursor:
-                      cursor.execute(
-                          "UPDATE axis_emergencies SET status = 'resolved',"
-                          " resolved_at = ? WHERE emergency_id = ?",
-                          (now, emergency_id),
-                      )
-                      cursor.execute(
-                          "INSERT INTO axis_timeline"
-                          " (timeline_id, emergency_id, actor, event_type,"
-                          "  detail, occurred_at)"
-                          " VALUES (?, ?, ?, ?, ?, ?)",
-                          (
-                              "TL-" + uuid.uuid4().hex[:10],
-                              emergency_id,
-                              "axis",
-                              "resolved",
-                              None,
-                              now,
-                          ),
-                      )
-                  return self.get_emergency(emergency_id)
-
-              def list_open_emergencies(
-                  self,
-              ) -> tuple[dict[str, object], ...]:
-                  rows = self._db.query_all(
-                      "SELECT emergency_id FROM axis_emergencies"
-                      " WHERE status != 'resolved' ORDER BY created_at"
-                  )
-                  return tuple(
-                      self.get_emergency(str(r["emergency_id"]))
-                      for r in rows
-                  )
-
-              def add_custody_event(
+              def add_finding(
                   self,
                   *,
-                  evidence_id: str,
-                  actor_zid: str,
-                  action: str,
+                  finding_id: str,
+                  case_id: str,
+                  source: str,
+                  title: str,
+                  content: str,
+                  certainty: str,
+                  reason: str | None,
                   document_id: str | None,
               ) -> dict[str, object]:
+                  if certainty not in (
+                      CERTAINTY_LEVELS
+                  ):
+                      raise ValueError(
+                          f"unknown certainty:"
+                          f" {certainty}"
+                      )
+                  row = self._db.query_one(
+                      "SELECT case_id FROM"
+                      " ciclo_arch_cases WHERE"
+                      " case_id = ?",
+                      (case_id,),
+                  )
+                  if row is None:
+                      raise LookupError(
+                          "unknown archaeology"
+                          f" case: {case_id}"
+                      )
+                  import hashlib
+
+                  content_hash = (
+                      hashlib.sha256(
+                          content.encode(
+                              "utf-8"
+                          )
+                      ).hexdigest()
+                  )
                   now = self._clock.now()
-                  last = self._db.query_one(
-                      "SELECT event_hash FROM axis_evidence_chain"
-                      " WHERE evidence_id = ?"
-                      " ORDER BY occurred_at DESC LIMIT 1",
-                      (evidence_id,),
-                  )
-                  if last is None:
-                      previous_hash = "GENESIS"
-                  else:
-                      previous_hash = str(last["event_hash"])
-                  metadata_hash = hashlib.sha256(
-                      (evidence_id + actor_zid + action).encode("utf-8")
-                  ).hexdigest()
-                  raw = (
-                      evidence_id
-                      + "|"
-                      + previous_hash
-                      + "|"
-                      + actor_zid
-                      + "|"
-                      + action
-                      + "|"
-                      + str(now)
-                      + "|"
-                      + metadata_hash
-                  )
-                  event_hash = hashlib.sha256(
-                      raw.encode("utf-8")
-                  ).hexdigest()
                   with self._db.transaction() as cursor:
                       cursor.execute(
-                          "INSERT INTO axis_evidence_chain"
-                          " (custody_id, evidence_id, previous_hash,"
-                          "  event_hash, actor_zid, action, document_id,"
-                          "  occurred_at)"
-                          " VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+                          "INSERT INTO"
+                          " ciclo_findings ("
+                          " finding_id, case_id,"
+                          "  source, title,"
+                          "  content,"
+                          "  content_hash,"
+                          "  certainty, reason,"
+                          "  document_id,"
+                          "  created_at)"
+                          " VALUES (?, ?, ?, ?,"
+                          "  ?, ?, ?, ?, ?, ?)",
                           (
-                              "CUS-" + uuid.uuid4().hex[:10],
-                              evidence_id,
-                              previous_hash,
-                              event_hash,
-                              actor_zid,
-                              action,
+                              finding_id,
+                              case_id,
+                              source,
+                              title,
+                              content,
+                              content_hash,
+                              certainty,
+                              reason,
                               document_id,
                               now,
                           ),
                       )
                   return {
-                      "evidence_id": evidence_id,
-                      "action": action,
-                      "actor_zid": actor_zid,
-                      "event_hash": event_hash,
-                      "previous_hash": previous_hash,
+                      "finding_id": finding_id,
+                      "content_hash": (
+                          content_hash
+                      ),
+                      "certainty": certainty,
                   }
 
-              def verify_custody_chain(self, *, evidence_id: str) -> bool:
+              def list_findings(
+                  self,
+                  *,
+                  case_id: str,
+              ) -> tuple[dict[str, object], ...]:
                   rows = self._db.query_all(
-                      "SELECT * FROM axis_evidence_chain"
-                      " WHERE evidence_id = ? ORDER BY occurred_at",
-                      (evidence_id,),
+                      "SELECT * FROM ciclo_findings"
+                      " WHERE case_id = ?"
+                      " ORDER BY created_at",
+                      (case_id,),
                   )
-                  previous = "GENESIS"
-                  for row in rows:
-                      metadata_hash = hashlib.sha256(
-                          (
-                              str(row["evidence_id"])
-                              + str(row["actor_zid"])
-                              + str(row["action"])
-                          ).encode("utf-8")
-                      ).hexdigest()
-                      raw = (
-                          str(row["evidence_id"])
-                          + "|"
-                          + str(row["previous_hash"])
-                          + "|"
-                          + str(row["actor_zid"])
-                          + "|"
-                          + str(row["action"])
-                          + "|"
-                          + str(row["occurred_at"])
-                          + "|"
-                          + metadata_hash
-                      )
-                      expected = hashlib.sha256(
-                          raw.encode("utf-8")
-                      ).hexdigest()
-                      if (
-                          str(row["event_hash"]) != expected
-                          or str(row["previous_hash"]) != previous
-                      ):
-                          return False
-                      previous = str(row["event_hash"])
-                  return True
+                  return tuple(
+                      {
+                          "finding_id": str(
+                              r["finding_id"]
+                          ),
+                          "source": str(
+                              r["source"]
+                          ),
+                          "title": str(
+                              r["title"]
+                          ),
+                          "certainty": str(
+                              r["certainty"]
+                          ),
+                          "reason": (
+                              str(r["reason"])
+                              if r["reason"]
+                              is not None
+                              else None
+                          ),
+                      }
+                      for r in rows
+                  )
 
-              def emergency_summary(self) -> dict[str, object]:
-                  open_rows = self._db.query_all(
-                      "SELECT emergency_id FROM axis_emergencies"
-                      " WHERE status != 'resolved'"
+              def add_reconstruction(
+                  self,
+                  *,
+                  reconstruction_id: str,
+                  case_id: str,
+                  title: str,
+                  description: str,
+                  basis: str,
+                  certainty: str,
+              ) -> dict[str, object]:
+                  if certainty not in (
+                      CERTAINTY_LEVELS
+                  ):
+                      raise ValueError(
+                          f"unknown certainty:"
+                          f" {certainty}"
+                      )
+                  row = self._db.query_one(
+                      "SELECT case_id FROM"
+                      " ciclo_arch_cases WHERE"
+                      " case_id = ?",
+                      (case_id,),
                   )
-                  resolved = self._db.query_one(
-                      "SELECT COUNT(*) AS n FROM axis_emergencies"
-                      " WHERE status = 'resolved'"
-                  )
+                  if row is None:
+                      raise LookupError(
+                          "unknown archaeology"
+                          f" case: {case_id}"
+                      )
+                  now = self._clock.now()
+                  with self._db.transaction() as cursor:
+                      cursor.execute(
+                          "INSERT INTO"
+                          " ciclo_reconstructions ("
+                          " reconstruction_id,"
+                          "  case_id, title,"
+                          "  description, basis,"
+                          "  certainty, created_at)"
+                          " VALUES (?, ?, ?, ?,"
+                          "  ?, ?, ?)",
+                          (
+                              reconstruction_id,
+                              case_id,
+                              title,
+                              description,
+                              basis,
+                              certainty,
+                              now,
+                          ),
+                      )
                   return {
-                      "open_emergencies": len(open_rows),
-                      "resolved_emergencies": (
-                          int(resolved["n"]) if resolved is not None else 0
+                      "reconstruction_id": (
+                          reconstruction_id
                       ),
+                      "certainty": certainty,
+                  }
+
+              def seal_arch_case(
+                  self,
+                  *,
+                  case_id: str,
+                  sealed_doc: str,
+              ) -> dict[str, object]:
+                  now = self._clock.now()
+                  with self._db.transaction() as cursor:
+                      cursor.execute(
+                          "UPDATE ciclo_arch_cases"
+                          " SET status = 'sealed',"
+                          " sealed_doc = ?,"
+                          " updated_at = ?"
+                          " WHERE case_id = ?",
+                          (
+                              sealed_doc,
+                              now,
+                              case_id,
+                          ),
+                      )
+                  return self.get_arch_case(
+                      case_id
+                  )
+
+              # ---------- valoracion (v2) ----------
+
+              def add_valuation(
+                  self,
+                  *,
+                  valuation_id: str,
+                  item_id: str,
+                  category: str,
+                  condition: str,
+              ) -> dict[str, object]:
+                  if category not in (
+                      CATEGORIES
+                  ):
+                      raise ValueError(
+                          f"unknown category:"
+                          f" {category}"
+                      )
+                  base_values = {
+                      "foto": 3.0,
+                      "video": 8.0,
+                      "documento": 5.0,
+                      "datos": 4.0,
+                      "otro": 2.0,
+                  }
+                  condition_factor = {
+                      "bueno": 1.0,
+                      "regular": 0.7,
+                      "malo": 0.4,
+                  }
+                  estimated = round(
+                      base_values[category]
+                      * condition_factor[
+                          condition
+                      ],
+                      2,
+                  )
+                  reward = max(
+                      1,
+                      int(estimated // 2),
+                  )
+                  now = self._clock.now()
+                  with self._db.transaction() as cursor:
+                      cursor.execute(
+                          "INSERT INTO"
+                          " ciclo_valuations ("
+                          " valuation_id,"
+                          "  item_id, category,"
+                          "  condition,"
+                          "  estimated_value,"
+                          "  reward_tokens,"
+                          "  created_at)"
+                          " VALUES (?, ?, ?, ?,"
+                          "  ?, ?, ?)",
+                          (
+                              valuation_id,
+                              item_id,
+                              category,
+                              condition,
+                              estimated,
+                              reward,
+                              now,
+                          ),
+                      )
+                  return {
+                      "valuation_id": (
+                          valuation_id
+                      ),
+                      "estimated_value": (
+                          estimated
+                      ),
+                      "reward_tokens": reward,
                   }
           PYEOF
-          python -m py_compile apps/axis/infrastructure/persistence/axis_store.py
+          python -m py_compile apps/ciclo_digital/infrastructure/persistence/ciclo_store.py
           echo "store v2 written"
 
-      - name: ADD server patches v3 (doc passed in, api routes inside _api_post)
+      - name: ADD server patches (doc passed in, api inside _api_post)
         run: |
           set -euo pipefail
           PYTHONPATH="$PWD" python - <<'PYEOF'
           from pathlib import Path
 
-          path = Path("apps/axis/server.py")
+          path = Path("apps/ciclo_digital/server.py")
           source = path.read_text(encoding="utf-8")
 
           def apply(text, old, new, label):
@@ -940,240 +809,316 @@ jobs:
               return text.replace(old, new, 1)
 
           IMPORT_ANCHOR = "\n".join([
-              "from apps.axis.services.axis_link import AxisLink",
+              "from apps.ciclo_digital.services.ciclo_link import (",
+              "    CicloLink,",
+              ")",
           ])
           IMPORT_NEW = "\n".join([
               IMPORT_ANCHOR,
-              "from apps.axis.services.axis_link_ext import AxisLinkExt",
+              "from apps.ciclo_digital.services.ciclo_link_ext import (",
+              "    CicloLinkExt,",
+              ")",
               "import uuid as _uuid",
           ])
 
           GET_ANCHOR = "\n".join([
-              '        if s[0] == "paciente":',
+              '        if (',
+              '            s[0] == "balance"',
+              '            and len(s) == 2',
+              '        ):',
           ])
           GET_ROUTES = "\n".join([
-              '        if s[0] == "emergencias":',
-              '            self._screen_emergencias()',
+              '        if s[0] == "arqueologia" and len(s) == 2:',
+              '            self._screen_archaeology(s[1])',
               '            return',
               GET_ANCHOR,
           ])
 
           POST_ANCHOR = "\n".join([
-              '        if s == ["incident"]:',
+              '        if s == ["recycle"]:',
           ])
           POST_ROUTES = "\n".join([
-              '        if s == ["exam"]:',
-              '            self._exam_form(doc)',
+              '        if s == ["arch-case"]:',
+              '            self._arch_case_form(doc)',
               '            return',
-              '        if s == ["exam-result"]:',
-              '            self._exam_result_form(doc)',
+              '        if s == ["arch-finding"]:',
+              '            self._arch_finding_form(doc)',
+              '            return',
+              '        if s == ["arch-reconstruct"]:',
+              '            self._arch_reconstruct_form(doc)',
+              '            return',
+              '        if s == ["arch-seal"]:',
+              '            self._arch_seal_form(doc)',
+              '            return',
+              '        if s == ["api", "recycling", "value"]:',
+              '            self._api_value(doc)',
               '            return',
               POST_ANCHOR,
           ])
 
           API_ANCHOR = "\n".join([
               '        doc = self._read_json()',
-              '        if s == ["accounts"]:',
+              '        if s == ["recycled"]:',
           ])
           API_ROUTES = "\n".join([
               '        doc = self._read_json()',
-              '        if s == ["emergencies"]:',
-              '            self._emergency_create(doc)',
+              '        if s == ["archaeology", "cases"]:',
+              '            self._api_arch_case(doc)',
               '            return',
-              '        if s == ["emergencies", "resolve"]:',
-              '            self._emergency_resolve(doc)',
+              '        if s == ["archaeology", "findings"]:',
+              '            self._api_arch_finding(doc)',
               '            return',
-              '        if (',
-              '            len(s) == 3',
-              '            and s[0] == "emergencies"',
-              '            and s[2] == "dispatch"',
-              '        ):',
-              '            self._emergency_dispatch(doc, s[1])',
+              '        if s == ["archaeology", "reconstruct"]:',
+              '            self._api_arch_reconstruct(doc)',
+              '            return',
+              '        if s == ["recycling", "value"]:',
+              '            self._api_value(doc)',
               '            return',
               API_ANCHOR,
           ])
 
           METHODS = "\n".join([
-              '    def _ext(self) -> AxisLinkExt:',
+              '    def _ext(self) -> CicloLinkExt:',
               '        link = type(self).link',
-              '        return AxisLinkExt(',
+              '        return CicloLinkExt(',
               '            getattr(link, "_client")',
               '        )',
               '',
-              '    def _exam_patient(self, exam_id: str) -> str:',
+              '    def _arch_case_form(self, doc) -> None:',
               '        store = type(self).store',
-              '        row = store._db.query_one(',
-              '            "SELECT patient_account FROM axis_exams"',
-              '            " WHERE exam_id = ?",',
-              '            (exam_id,),',
-              '        )',
-              '        if row is None:',
-              '            raise LookupError("unknown exam: " + exam_id)',
-              '        return str(row["patient_account"])',
-              '',
-              '    def _exam_form(self, doc) -> None:',
-              '        store = type(self).store',
-              '        patient_account = self._req(doc, "patient_account")',
-              '        doctor_account = self._req(doc, "doctor_account")',
-              '        exam_type = self._req(doc, "exam_type")',
-              '        exam_id = "EXM-" + _uuid.uuid4().hex[:10]',
-              '        row = store.add_exam(',
-              '            exam_id=exam_id,',
-              '            patient_account=patient_account,',
-              '            doctor_account=doctor_account,',
-              '            exam_type=exam_type,',
+              '        owner_zid = self._req(doc, "owner_zid")',
+              '        title = self._req(doc, "title")',
+              '        description = self._req(doc, "description")',
+              '        case_id = "ARC-" + _uuid.uuid4().hex[:10]',
+              '        row = store.create_arch_case(',
+              '            case_id=case_id,',
+              '            owner_zid=owner_zid,',
+              '            title=title,',
+              '            description=description,',
               '        )',
               '        self._html(',
               '            200,',
               '            _page(',
-              '                "Examen ordenado",',
-              '                "<h1>Examen ordenado</h1>"',
-              '                "<p>" + str(row["exam_id"])',
-              '                + " (" + exam_type + ")</p>"',
-              '                "<a href=\'/axis/medico/"',
-              '                + doctor_account',
-              '                + "\'><button>Volver</button></a>"',
+              '                "Expediente creado",',
+              '                "<h1>Expediente arqueologico</h1>"',
+              '                "<p>" + str(row["case_id"]) + "</p>"',
+              '                "<a href=\'/ciclo/arqueologia/"',
+              '                + case_id',
+              '                + "\'><button>Abrir expediente</button></a>"',
               '            ),',
               '        )',
               '',
-              '    def _exam_result_form(self, doc) -> None:',
+              '    def _arch_finding_form(self, doc) -> None:',
               '        store = type(self).store',
               '        ext = self._ext()',
-              '        exam_id = self._req(doc, "exam_id")',
-              '        doctor_account = self._req(doc, "doctor_account")',
-              '        summary = self._req(doc, "summary")',
-              '        severity = self._req(doc, "severity")',
-              '        requires = (',
-              '            str(doc.get("requires_followup", ""))',
-              '            in ("1", "true", "si", "on")',
+              '        case_id = self._req(doc, "case_id")',
+              '        source = self._req(doc, "source")',
+              '        title = self._req(doc, "title")',
+              '        content = self._req(doc, "content")',
+              '        certainty = self._req(doc, "certainty")',
+              '        case = store.get_arch_case(case_id)',
+              '        document_id = None',
+              '        if case["owner_zid"]:',
+              '            ok, doc_id = ext.seal_document(',
+              '                owner_zid=case["owner_zid"],',
+              '                title="Hallazgo " + title,',
+              '                content=content,',
+              '            )',
+              '            if ok and doc_id:',
+              '                document_id = doc_id',
+              '        finding = store.add_finding(',
+              '            finding_id="FND-" + _uuid.uuid4().hex[:10],',
+              '            case_id=case_id,',
+              '            source=source,',
+              '            title=title,',
+              '            content=content,',
+              '            certainty=certainty,',
+              '            reason=None,',
+              '            document_id=document_id,',
               '        )',
-              '        reason = doc.get("followup_reason")',
-              '        reason = (',
-              '            str(reason) if reason is not None else None',
+              '        self._html(',
+              '            200,',
+              '            _page(',
+              '                "Hallazgo registrado",',
+              '                "<h1>Hallazgo registrado</h1>"',
+              '                "<p>Certeza: " + certainty + "</p>"',
+              '                "<p>Hash: " + finding["content_hash"] + "</p>"',
+              '                "<a href=\'/ciclo/arqueologia/"',
+              '                + case_id',
+              '                + "\'><button>Volver al expediente</button></a>"',
+              '            ),',
               '        )',
-              '        patient_account = self._exam_patient(exam_id)',
-              '        patient = store.get_account(patient_account)',
-              '        zid = patient.get("zid")',
+              '',
+              '    def _arch_reconstruct_form(self, doc) -> None:',
+              '        store = type(self).store',
+              '        case_id = self._req(doc, "case_id")',
+              '        title = self._req(doc, "title")',
+              '        description = self._req(doc, "description")',
+              '        basis = self._req(doc, "basis")',
+              '        certainty = self._req(doc, "certainty")',
+              '        reconstruction = store.add_reconstruction(',
+              '            reconstruction_id="RCN-"',
+              '            + _uuid.uuid4().hex[:10],',
+              '            case_id=case_id,',
+              '            title=title,',
+              '            description=description,',
+              '            basis=basis,',
+              '            certainty=certainty,',
+              '        )',
+              '        self._html(',
+              '            200,',
+              '            _page(',
+              '                "Reconstruccion registrada",',
+              '                "<h1>Reconstruccion registrada</h1>"',
+              '                "<p>Certeza: " + certainty + "</p>"',
+              '                "<a href=\'/ciclo/arqueologia/"',
+              '                + case_id',
+              '                + "\'><button>Volver al expediente</button></a>"',
+              '            ),',
+              '        )',
+              '',
+              '    def _arch_seal_form(self, doc) -> None:',
+              '        store = type(self).store',
+              '        ext = self._ext()',
+              '        case_id = self._req(doc, "case_id")',
+              '        case = store.get_arch_case(case_id)',
+              '        findings = store.list_findings(',
+              '            case_id=case_id',
+              '        )',
+              '        content = (',
+              '            "EXPEDIENTE " + case_id',
+              '            + " | " + case["title"]',
+              '            + " | hallazgos: "',
+              '            + str(len(findings))',
+              '        )',
               '        sealed_doc = None',
-              '        if zid is not None:',
-              '            ok, doc_id = ext.seal_evidence_canonical(',
-              '                owner_zid=str(zid),',
-              '                title="Resultado " + exam_id,',
-              '                content=summary,',
+              '        if case["owner_zid"]:',
+              '            ok, doc_id = ext.seal_document(',
+              '                owner_zid=case["owner_zid"],',
+              '                title="Expediente " + case_id,',
+              '                content=content,',
               '            )',
               '            if ok and doc_id:',
               '                sealed_doc = doc_id',
-              '                ext.append_history(',
-              '                    zid=str(zid),',
-              '                    event="resultado_examen",',
-              '                    detail=exam_id + ": " + severity,',
-              '                )',
-              '        result = store.add_exam_result(',
-              '            result_id="RES-" + _uuid.uuid4().hex[:10],',
-              '            exam_id=exam_id,',
-              '            summary=summary,',
-              '            severity=severity,',
-              '            requires_followup=requires,',
-              '            followup_reason=reason,',
-              '            sealed_doc=sealed_doc,',
+              '        case = store.seal_arch_case(',
+              '            case_id=case_id,',
+              '            sealed_doc=sealed_doc',
+              '            or "local-pending",',
               '        )',
-              '        cita = "no requiere seguimiento"',
-              '        if requires:',
-              '            appointment = store.create_appointment(',
-              '                appointment_id="APT-" + _uuid.uuid4().hex[:10],',
-              '                patient_account=patient_account,',
-              '                doctor_account=doctor_account,',
-              '                result_id=result["result_id"],',
-              '                reason=reason or "seguimiento de resultado",',
-              '                scheduled_at=str(',
-              '                    doc.get("scheduled_at", "por programar")',
-              '                ),',
-              '            )',
-              '            cita = appointment["scheduled_at"]',
               '        self._html(',
               '            200,',
               '            _page(',
-              '                "Resultado registrado",',
-              '                "<h1>Resultado (sellado en la Red)</h1>"',
-              '                "<p>Severidad: " + severity + "</p>"',
-              '                "<p>Requiere seguimiento: " + str(requires) + "</p>"',
-              '                "<p>Cita automatica: " + cita + "</p>"',
-              '                "<p>El paciente sera recordado.</p>"',
-              '                "<a href=\'/axis/medico/"',
-              '                + doctor_account',
-              '                + "\'><button>Volver</button></a>"',
+              '                "Expediente sellado",',
+              '                "<h1>Expediente sellado</h1>"',
+              '                "<p>Documento: "',
+              '                + str(sealed_doc or "pendiente")',
+              '                + "</p>"',
+              '                "<a href=\'/ciclo\'><button>Inicio</button></a>"',
               '            ),',
               '        )',
               '',
-              '    def _emergency_create(self, doc) -> None:',
+              '    def _api_arch_case(self, doc) -> None:',
               '        store = type(self).store',
-              '        emergency_type = self._req(doc, "emergency_type")',
-              '        severity = self._req(doc, "severity")',
-              '        description = self._req(doc, "description")',
-              '        subject_account = doc.get("subject_account")',
-              '        subject_account_str = None',
-              '        if subject_account is not None:',
-              '            try:',
-              '                account = store.get_account(str(subject_account))',
-              '                subject_account_str = str(account["account_id"])',
-              '            except LookupError:',
-              '                subject_account_str = None',
-              '        emergency = store.create_emergency(',
-              '            emergency_id="EMG-" + _uuid.uuid4().hex[:10],',
-              '            source_app=str(doc.get("source_app", "manual")),',
-              '            subject_account=subject_account_str,',
-              '            subject_zid=None,',
-              '            emergency_type=emergency_type,',
-              '            severity=severity,',
-              '            description=description,',
+              '        case = store.create_arch_case(',
+              '            case_id="ARC-" + _uuid.uuid4().hex[:10],',
+              '            owner_zid=self._req(doc, "owner_zid"),',
+              '            title=self._req(doc, "title"),',
+              '            description=self._req(',
+              '                doc, "description"',
+              '            ),',
               '        )',
-              '        self._send(201, {"ok": True, "data": emergency})',
+              '        self._send(201, {"ok": True, "data": case})',
               '',
-              '    def _emergency_dispatch(self, doc, emergency_id: str) -> None:',
+              '    def _api_arch_finding(self, doc) -> None:',
               '        store = type(self).store',
-              '        agency = self._req(doc, "agency")',
-              '        priority = str(doc.get("priority", "alta"))',
-              '        emergency = store.dispatch_emergency(',
-              '            emergency_id=emergency_id,',
-              '            agency=agency,',
-              '            priority=priority,',
+              '        finding = store.add_finding(',
+              '            finding_id="FND-" + _uuid.uuid4().hex[:10],',
+              '            case_id=self._req(doc, "case_id"),',
+              '            source=self._req(doc, "source"),',
+              '            title=self._req(doc, "title"),',
+              '            content=self._req(doc, "content"),',
+              '            certainty=self._req(doc, "certainty"),',
+              '            reason=doc.get("reason"),',
+              '            document_id=None,',
               '        )',
-              '        self._send(200, {"ok": True, "data": emergency})',
+              '        self._send(201, {"ok": True, "data": finding})',
               '',
-              '    def _emergency_resolve(self, doc) -> None:',
+              '    def _api_arch_reconstruct(self, doc) -> None:',
               '        store = type(self).store',
-              '        emergency = store.resolve_emergency(',
-              '            emergency_id=self._req(doc, "emergency_id"),',
+              '        reconstruction = store.add_reconstruction(',
+              '            reconstruction_id="RCN-"',
+              '            + _uuid.uuid4().hex[:10],',
+              '            case_id=self._req(doc, "case_id"),',
+              '            title=self._req(doc, "title"),',
+              '            description=self._req(',
+              '                doc, "description"',
+              '            ),',
+              '            basis=self._req(doc, "basis"),',
+              '            certainty=self._req(doc, "certainty"),',
               '        )',
-              '        self._send(200, {"ok": True, "data": emergency})',
+              '        self._send(201, {"ok": True, "data": reconstruction})',
               '',
-              '    def _screen_emergencias(self) -> None:',
+              '    def _api_value(self, doc) -> None:',
               '        store = type(self).store',
-              '        open_emergencies = store.list_open_emergencies()',
-              '        items = ""',
-              '        for e in open_emergencies:',
-              '            agencies = ", ".join(',
-              '                str(d["agency"]) for d in e["dispatches"]',
+              '        item_id = self._req(doc, "item_id")',
+              '        category = self._req(doc, "category")',
+              '        condition = self._req(doc, "condition")',
+              '        valuation = store.add_valuation(',
+              '            valuation_id="VAL-" + _uuid.uuid4().hex[:10],',
+              '            item_id=item_id,',
+              '            category=category,',
+              '            condition=condition,',
+              '        )',
+              '        owner_zid = doc.get("owner_zid")',
+              '        if owner_zid is not None:',
+              '            ext = self._ext()',
+              '            ok, data = ext.earn_tokens(',
+              '                subject_zid=str(owner_zid),',
+              '                activity="reciclaje_valorado",',
+              '                ref_id=item_id,',
               '            )',
-              '            items = (',
-              '                items',
-              '                + "<li>- " + e["emergency_id"]',
-              '                + " | " + e["emergency_type"]',
-              '                + " | " + e["severity"]',
-              '                + " | " + e["status"]',
-              '                + " | recursos: " + (agencies or "sin despachar")',
-              '                + "</li>"',
+              '            valuation["network_tokens"] = bool(ok)',
+              '        self._send(201, {"ok": True, "data": valuation})',
+              '',
+              '    def _screen_archaeology(self, case_id: str) -> None:',
+              '        store = type(self).store',
+              '        case = store.get_arch_case(case_id)',
+              '        findings_html = ""',
+              '        for f in case["findings"]:',
+              '            findings_html = (',
+              '                findings_html',
+              '                + "<li>- " + f["title"]',
+              '                + " [" + f["certainty"] + "]</li>"',
               '            )',
-              '        if not items:',
-              '            items = "<li>Sin emergencias abiertas</li>"',
+              '        if not findings_html:',
+              '            findings_html = (',
+              '                "<li>Sin hallazgos aun</li>"',
+              '            )',
+              '        recon_html = ""',
+              '        for r in case["reconstructions"]:',
+              '            recon_html = (',
+              '                recon_html',
+              '                + "<li>- " + r["title"]',
+              '                + " [" + r["certainty"] + "]</li>"',
+              '            )',
+              '        if not recon_html:',
+              '            recon_html = (',
+              '                "<li>Sin reconstrucciones aun</li>"',
+              '            )',
               '        body = (',
-              '            "<h1>Centro de Emergencias</h1>"',
-              '            "<h2>Abiertas</h2><ul>" + items + "</ul>"',
-              '            "<a href=\'/axis\'><button class=\'gray\'>Inicio</button></a>"',
+              '            "<h1>Expediente " + case_id + "</h1>"',
+              '            "<p>" + case["title"] + " | "',
+              '            + case["status"] + "</p>"',
+              '            "<h2>Hallazgos (certeza)</h2><ul>"',
+              '            + findings_html + "</ul>"',
+              '            "<h2>Reconstrucciones</h2><ul>"',
+              '            + recon_html + "</ul>"',
+              '            "<a href=\'/ciclo\'><button class=\'gray\'>',
+              '            " Inicio</button></a>"',
               '        )',
               '        self._html(',
               '            200,',
-              '            _page("AXIS - Emergencias", body),',
+              '            _page("CICLO - Expediente", body),',
               '        )',
               '',
           ])
@@ -1192,10 +1137,10 @@ jobs:
           path.write_text(source, encoding="utf-8")
           print("ALL 5 ADD-PATCHES APPLIED")
           PYEOF
-          python -m py_compile apps/axis/server.py
+          python -m py_compile apps/ciclo_digital/server.py
           echo "server patched and compiles"
 
-      - name: Internal probe (followup + emergency + custody)
+      - name: Internal probe (archaeology + valuation on SQLiteAdapter)
         run: |
           set -euo pipefail
           PYTHONPATH="$PWD" python - <<'PYEOF'
@@ -1205,111 +1150,113 @@ jobs:
           from shared_engines.common.clocks import FrozenClock
           from shared_engines.storage.database import SQLiteAdapter
 
-          from apps.axis.infrastructure.persistence.axis_store import AxisStore
+          from apps.ciclo_digital.infrastructure.persistence.ciclo_store import (
+              CicloStore,
+          )
 
           tmp = Path(tempfile.mkdtemp())
           db = SQLiteAdapter(tmp / "probe.db")
           clock = FrozenClock()
-          store = AxisStore(db, clock)
-          store.add_account(
-              account_id="AX-doc", zid=None, name="Dr", role="medico"
+          store = CicloStore(db, clock)
+          case = store.create_arch_case(
+              case_id="ARC-1",
+              owner_zid="ZID-a",
+              title="Foto perdida",
+              description="recuperar foto familiar",
           )
-          store.add_account(
-              account_id="AX-pat", zid=None, name="Maria", role="paciente"
+          assert case["status"] == "open"
+          finding = store.add_finding(
+              finding_id="FND-1",
+              case_id="ARC-1",
+              source="red",
+              title="fragmento foto",
+              content="metadata de la foto",
+              certainty="evidencia_encontrada",
+              reason=None,
+              document_id="DOC-1",
           )
-          exam = store.add_exam(
-              exam_id="EXM-1",
-              patient_account="AX-pat",
-              doctor_account="AX-doc",
-              exam_type="sangre",
+          assert finding["certainty"] == "evidencia_encontrada"
+          assert len(finding["content_hash"]) == 64
+          finding2 = store.add_finding(
+              finding_id="FND-2",
+              case_id="ARC-1",
+              source="memoria",
+              title="testimonio",
+              content="la foto era en la playa",
+              certainty="inferencia",
+              reason="testimonio del usuario",
+              document_id=None,
           )
-          assert exam["status"] == "ordered"
-          result = store.add_exam_result(
-              result_id="RES-1",
-              exam_id="EXM-1",
-              summary="anemia detectada",
-              severity="media",
-              requires_followup=True,
-              followup_reason="control en 2 semanas",
-              sealed_doc="DOC-1",
+          assert finding2["certainty"] == "inferencia"
+          reconstruction = store.add_reconstruction(
+              reconstruction_id="RCN-1",
+              case_id="ARC-1",
+              title="foto familiar playa",
+              description="reconstruccion parcial",
+              basis="FND-1 + FND-2",
+              certainty="reconstruccion",
           )
-          assert result["requires_followup"] is True
-          appointment = store.create_appointment(
-              appointment_id="APT-1",
-              patient_account="AX-pat",
-              doctor_account="AX-doc",
-              result_id="RES-1",
-              reason="control en 2 semanas",
-              scheduled_at="lunes 9am",
-          )
-          assert appointment["status"] == "scheduled"
-          reminders = store.pending_reminders()
-          assert len(reminders) == 1
-          emergency = store.create_emergency(
-              emergency_id="EMG-1",
-              source_app="semilla",
-              subject_account="AX-pat",
-              subject_zid=None,
-              emergency_type="emergencia_medica",
-              severity="critica",
-              description="alumno enfermo detectado por IA-Tutor",
-          )
-          assert emergency["status"] == "open"
-          assert len(emergency["timeline"]) == 1
-          dispatched = store.dispatch_emergency(
-              emergency_id="EMG-1",
-              agency="ambulancia",
-              priority="critica",
-          )
-          assert dispatched["status"] == "dispatched"
-          dispatched = store.dispatch_emergency(
-              emergency_id="EMG-1",
-              agency="hospital",
-              priority="alta",
-          )
-          assert len(dispatched["dispatches"]) == 2
-          resolved = store.resolve_emergency(emergency_id="EMG-1")
-          assert resolved["status"] == "resolved"
-          assert len(resolved["timeline"]) == 4
+          assert reconstruction["certainty"] == "reconstruccion"
+          case = store.get_arch_case("ARC-1")
+          assert len(case["findings"]) == 2
+          assert len(case["reconstructions"]) == 1
           try:
-              store.dispatch_emergency(
-                  emergency_id="EMG-1", agency="policia", priority="alta"
+              store.add_finding(
+                  finding_id="FND-bad",
+                  case_id="ARC-1",
+                  source="x",
+                  title="x",
+                  content="x",
+                  certainty="adivinanza",
+                  reason=None,
+                  document_id=None,
               )
-              raise AssertionError("resolved must reject dispatch")
+              raise AssertionError("bad certainty must fail")
           except ValueError:
               pass
-          assert len(store.list_open_emergencies()) == 0
-          custody1 = store.add_custody_event(
-              evidence_id="EV-1",
-              actor_zid="ZID-pol",
-              action="captured",
-              document_id="DOC-2",
+          sealed = store.seal_arch_case(
+              case_id="ARC-1",
+              sealed_doc="DOC-sealed",
           )
-          assert custody1["previous_hash"] == "GENESIS"
-          custody2 = store.add_custody_event(
-              evidence_id="EV-1",
-              actor_zid="ZID-pol",
-              action="transferred",
-              document_id="DOC-2",
+          assert sealed["status"] == "sealed"
+          assert sealed["sealed_doc"] == "DOC-sealed"
+          valuation = store.add_valuation(
+              valuation_id="VAL-1",
+              item_id="REC-1",
+              category="foto",
+              condition="bueno",
           )
-          assert custody2["previous_hash"] == custody1["event_hash"]
-          assert store.verify_custody_chain(evidence_id="EV-1") is True
-          summary = store.emergency_summary()
-          assert summary["open_emergencies"] == 0
-          assert summary["resolved_emergencies"] == 1
-          print("PROBE OK: followup + emergency + custody")
+          assert valuation["estimated_value"] == 3.0
+          assert valuation["reward_tokens"] == 1
+          valuation2 = store.add_valuation(
+              valuation_id="VAL-2",
+              item_id="REC-2",
+              category="video",
+              condition="malo",
+          )
+          assert valuation2["estimated_value"] == 3.2
+          try:
+              store.add_valuation(
+                  valuation_id="VAL-3",
+                  item_id="REC-3",
+                  category="nave",
+                  condition="bueno",
+              )
+              raise AssertionError("bad category must fail")
+          except ValueError:
+              pass
+          print("PROBE OK: archaeology + valuation")
           db.close()
           PYEOF
 
-      - name: Write axis e2e tests v5 (no unverified network GET, no re-raise bug)
+      - name: Write ciclo e2e tests (new file - old tests untouched)
         run: |
           set -euo pipefail
-          cat > apps/axis/tests/test_axis_emergencias_e2e.py <<'PYEOF'
-          """AXIS emergencias e2e ADD-ONLY - exam_id captured
-          from exam response, followup appointment verified via
-          store (pending reminders), emergency flow via HTTP,
-          timeline 4 (created + 2 dispatches + resolved),
-          original tests untouched."""
+          cat > apps/ciclo_digital/tests/test_ciclo_archaeology_e2e.py <<'PYEOF'
+          """CICLO archaeology e2e ADD-ONLY - case creation,
+          findings with formal certainty levels, reconstruction,
+          case sealing, valuation with network tokens; original
+          tests untouched."""
           from __future__ import annotations
 
           import json
@@ -1317,7 +1264,6 @@ jobs:
           import socket
           import threading
           from pathlib import Path
-          from urllib.error import HTTPError
           from urllib.request import Request, urlopen
 
           socket.setdefaulttimeout(20)
@@ -1330,9 +1276,9 @@ jobs:
           from shared_engines.storage.database import SQLiteAdapter
           from shared_engines.verification.signatures import Ed25519Signer
 
-          from apps.axis.infrastructure.network.network_client import NetworkClient
-          from apps.axis.infrastructure.persistence.axis_store import AxisStore
-          from apps.axis.server import serve_axis
+          from apps.ciclo_digital.infrastructure.network.network_client import NetworkClient
+          from apps.ciclo_digital.infrastructure.persistence.ciclo_store import CicloStore
+          from apps.ciclo_digital.server import serve_ciclo
 
 
           class _Eco:
@@ -1363,23 +1309,23 @@ jobs:
                       f"{self.net_server.server_address[1]}"
                   )
                   self.client = NetworkClient(self.net_base, max_retries=1)
-                  self.axis_db = SQLiteAdapter(tmp_path / "axis.db")
-                  self.store = AxisStore(self.axis_db, FrozenClock())
-                  self.axis_server = serve_axis(self.store, self.client)
+                  self.ciclo_db = SQLiteAdapter(tmp_path / "ciclo.db")
+                  self.store = CicloStore(self.ciclo_db, FrozenClock())
+                  self.ciclo_server = serve_ciclo(self.store, self.client)
                   threading.Thread(
-                      target=self.axis_server.serve_forever, daemon=True
+                      target=self.ciclo_server.serve_forever, daemon=True
                   ).start()
-                  self.axis_base = (
+                  self.ciclo_base = (
                       "http://127.0.0.1:"
-                      f"{self.axis_server.bound_port}"
+                      f"{self.ciclo_server.bound_port}"
                   )
 
               def close(self) -> None:
-                  self.axis_server.shutdown()
-                  self.axis_server.server_close()
+                  self.ciclo_server.shutdown()
+                  self.ciclo_server.server_close()
                   self.net_server.shutdown()
                   self.net_server.server_close()
-                  self.axis_db.close()
+                  self.ciclo_db.close()
                   self.net_db.close()
 
 
@@ -1391,15 +1337,8 @@ jobs:
                   ).encode("utf-8"),
                   method="POST",
               )
-              try:
-                  with urlopen(request, timeout=15) as r:
-                      return r.read().decode("utf-8")
-              except HTTPError as exc:
-                  body = exc.read().decode("utf-8", "replace")
-                  raise AssertionError(
-                      "POST " + url + " -> HTTP " + str(exc.code)
-                      + " body: " + body[:400]
-                  )
+              with urlopen(request, timeout=15) as r:
+                  return r.read().decode("utf-8")
 
 
           def _pj(url: str, doc: dict) -> dict:
@@ -1409,15 +1348,8 @@ jobs:
                   headers={"Content-Type": "application/json"},
                   method="POST",
               )
-              try:
-                  with urlopen(request, timeout=15) as r:
-                      body = json.loads(r.read().decode("utf-8"))
-              except HTTPError as exc:
-                  body = exc.read().decode("utf-8", "replace")
-                  raise AssertionError(
-                      "POST " + url + " -> HTTP " + str(exc.code)
-                      + " body: " + body[:400]
-                  )
+              with urlopen(request, timeout=15) as r:
+                  body = json.loads(r.read().decode("utf-8"))
               assert isinstance(body, dict)
               return body
 
@@ -1427,266 +1359,245 @@ jobs:
                   return r.read().decode("utf-8")
 
 
-          def _accounts(eco) -> tuple[str, str]:
-              ok, data, _err = eco.client.post(
-                  "/identity/register",
-                  {
-                      "kind": "person",
-                      "display_name": "Dr Ramirez",
-                      "actor": "axis",
-                  },
-              )
-              assert ok is True and data is not None
-              doctor_zid = str(data.get("zid"))
-              assert doctor_zid.startswith("ZID-")
-              eco.client.post(
-                  "/trust/complete", {"zid": doctor_zid, "actor": "axis"}
-              )
-              ok, data, _err = eco.client.post(
-                  "/identity/register",
-                  {
-                      "kind": "person",
-                      "display_name": "Maria Lopez",
-                      "actor": "axis",
-                  },
-              )
-              assert ok is True and data is not None
-              patient_zid = str(data.get("zid"))
-              eco.client.post(
-                  "/trust/complete", {"zid": patient_zid, "actor": "axis"}
-              )
-              eco.store.add_account(
-                  account_id="AX-doc1",
-                  zid=doctor_zid,
-                  name="Dr Ramirez",
-                  role="medico",
-              )
-              eco.store.add_account(
-                  account_id="AX-pat1",
-                  zid=patient_zid,
-                  name="Maria Lopez",
-                  role="paciente",
-              )
-              return doctor_zid, patient_zid
-
-
-          def test_1_health_exam_followup_appointment(tmp_path: Path) -> None:
+          def test_1_archaeology_full_flow(tmp_path: Path) -> None:
               eco = _Eco(tmp_path)
               try:
                   assert eco.client.post(
                       "/apps/register",
                       {
-                          "app_id": "axis",
-                          "display_name": "AXIS",
-                          "scopes": ["display_name", "contact"],
+                          "app_id": "ciclo",
+                          "display_name": "CICLO-DIGITAL",
+                          "scopes": ["display_name"],
                       },
                   )[0] is True
-                  _accounts(eco)
-                  exam_html = _pf(
-                      eco.axis_base + "/axis/exam",
+                  ok, data, _err = eco.client.post(
+                      "/identity/register",
                       {
-                          "patient_account": "AX-pat1",
-                          "doctor_account": "AX-doc1",
-                          "exam_type": "sangre",
+                          "kind": "person",
+                          "display_name": "Juan Investigador",
+                          "actor": "ciclo",
                       },
                   )
-                  assert len(eco.store.pending_reminders()) == 0
-                  exam_id = re.search(
-                      r"EXM-[a-f0-9]{10}", exam_html
-                  ).group(0)
-                  result_html = _pf(
-                      eco.axis_base + "/axis/exam-result",
+                  assert ok is True and data is not None
+                  owner_zid = str(data.get("zid"))
+                  assert owner_zid.startswith("ZID-")
+                  eco.client.post(
+                      "/trust/complete",
+                      {"zid": owner_zid, "actor": "ciclo"},
+                  )
+                  case = _pj(
+                      eco.ciclo_base + "/ciclo/api/archaeology/cases",
                       {
-                          "exam_id": exam_id,
-                          "doctor_account": "AX-doc1",
-                          "summary": "anemia detectada",
-                          "severity": "media",
-                          "requires_followup": "1",
-                          "followup_reason": "control en 2 semanas",
-                          "scheduled_at": "lunes 9am",
+                          "owner_zid": owner_zid,
+                          "title": "Foto familiar perdida",
+                          "description": (
+                              "recuperar foto borrada"
+                          ),
+                      },
+                  )["data"]
+                  case_id = case["case_id"]
+                  assert case_id.startswith("ARC-")
+                  assert case["status"] == "open"
+                  finding_html = _pf(
+                      eco.ciclo_base + "/ciclo/arch-finding",
+                      {
+                          "case_id": case_id,
+                          "source": "red",
+                          "title": "fragmento foto",
+                          "content": "metadata recuperada",
+                          "certainty": "evidencia_encontrada",
                       },
                   )
-                  assert "Resultado" in result_html
-                  assert "lunes 9am" in result_html
-                  assert "recordado" in result_html
-                  reminders = eco.store.pending_reminders()
-                  assert len(reminders) == 1
-                  assert reminders[0]["patient_account"] == "AX-pat1"
-                  patient_panel = _h(
-                      eco.axis_base + "/axis/paciente/AX-pat1"
+                  assert "Hallazgo registrado" in finding_html
+                  assert "evidencia_encontrada" in finding_html
+                  finding2_html = _pf(
+                      eco.ciclo_base + "/ciclo/arch-finding",
+                      {
+                          "case_id": case_id,
+                          "source": "memoria",
+                          "title": "testimonio",
+                          "content": "era en la playa",
+                          "certainty": "inferencia",
+                      },
                   )
-                  assert "Mi Salud" in patient_panel
-                  assert "Maria Lopez" in patient_panel
+                  assert "inferencia" in finding2_html
+                  recon_html = _pf(
+                      eco.ciclo_base + "/ciclo/arch-reconstruct",
+                      {
+                          "case_id": case_id,
+                          "title": "foto familiar playa",
+                          "description": "reconstruccion parcial",
+                          "basis": "FND-1 + FND-2",
+                          "certainty": "reconstruccion",
+                      },
+                  )
+                  assert "Reconstruccion registrada" in recon_html
+                  seal_html = _pf(
+                      eco.ciclo_base + "/ciclo/arch-seal",
+                      {"case_id": case_id},
+                  )
+                  assert "Expediente sellado" in seal_html
+                  panel = _h(
+                      eco.ciclo_base
+                      + "/ciclo/arqueologia/"
+                      + case_id
+                  )
+                  assert "Expediente" in panel
+                  assert "sealed" in panel
+                  assert "evidencia_encontrada" in panel
+                  assert "inferencia" in panel
+                  assert "reconstruccion" in panel
+                  home = _h(eco.ciclo_base + "/ciclo")
+                  assert "CICLO-DIGITAL" in home
+                  assert "Reciclar" in home
+                  assert "Arqueologia" in home
               finally:
                   eco.close()
 
 
-          def test_2_emergency_coordinated_dispatch(tmp_path: Path) -> None:
+          def test_2_valuation_with_network_tokens(
+              tmp_path: Path,
+          ) -> None:
               eco = _Eco(tmp_path)
               try:
                   assert eco.client.post(
                       "/apps/register",
                       {
-                          "app_id": "axis",
-                          "display_name": "AXIS",
-                          "scopes": ["display_name", "contact"],
+                          "app_id": "ciclo",
+                          "display_name": "CICLO-DIGITAL",
+                          "scopes": ["display_name"],
                       },
                   )[0] is True
-                  eco.store.add_account(
-                      account_id="AX-pat2",
-                      zid=None,
-                      name="Juan Emergencia",
-                      role="paciente",
-                  )
-                  created = _pj(
-                      eco.axis_base + "/axis/api/emergencies",
+                  ok, data, _err = eco.client.post(
+                      "/identity/register",
                       {
-                          "source_app": "semilla",
-                          "subject_account": "AX-pat2",
-                          "emergency_type": "emergencia_medica",
-                          "severity": "critica",
-                          "description": (
-                              "IA-Tutor detecto emergencia medica"
-                              " en alumno"
-                          ),
+                          "kind": "person",
+                          "display_name": "Reciclador",
+                          "actor": "ciclo",
+                      },
+                  )
+                  assert ok is True and data is not None
+                  zid = str(data.get("zid"))
+                  eco.client.post(
+                      "/trust/complete",
+                      {"zid": zid, "actor": "ciclo"},
+                  )
+                  balance_ok, balance, _err = eco.client.get(
+                      "/tokens/" + zid + "/balance"
+                  )
+                  assert balance_ok is True
+                  valuation = _pj(
+                      eco.ciclo_base + "/ciclo/api/recycling/value",
+                      {
+                          "item_id": "REC-e2e1",
+                          "owner_zid": zid,
+                          "category": "video",
+                          "condition": "bueno",
                       },
                   )["data"]
-                  emergency_id = created["emergency_id"]
-                  assert created["status"] == "open"
-                  assert created["source_app"] == "semilla"
-                  assert len(created["timeline"]) == 1
-                  dispatched = _pj(
-                      eco.axis_base
-                      + "/axis/api/emergencies/"
-                      + emergency_id
-                      + "/dispatch",
-                      {"agency": "ambulancia", "priority": "critica"},
+                  assert valuation["estimated_value"] == 8.0
+                  assert valuation["reward_tokens"] == 4
+                  assert valuation["network_tokens"] is True
+                  bad = _pj(
+                      eco.ciclo_base + "/ciclo/api/recycling/value",
+                      {
+                          "item_id": "REC-e2e2",
+                          "category": "documento",
+                          "condition": "malo",
+                      },
                   )["data"]
-                  assert dispatched["status"] == "dispatched"
-                  assert dispatched["dispatches"][0]["agency"] == "ambulancia"
-                  dispatched = _pj(
-                      eco.axis_base
-                      + "/axis/api/emergencies/"
-                      + emergency_id
-                      + "/dispatch",
-                      {"agency": "hospital", "priority": "alta"},
-                  )["data"]
-                  assert len(dispatched["dispatches"]) == 2
-                  resolved = _pj(
-                      eco.axis_base
-                      + "/axis/api/emergencies/resolve",
-                      {"emergency_id": emergency_id},
-                  )["data"]
-                  assert resolved["status"] == "resolved"
-                  assert len(resolved["timeline"]) == 4
-                  rejected = False
+                  assert bad["estimated_value"] == 2.0
+                  assert bad["reward_tokens"] == 1
                   try:
                       _pj(
-                          eco.axis_base
-                          + "/axis/api/emergencies/"
-                          + emergency_id
-                          + "/dispatch",
-                          {"agency": "policia", "priority": "alta"},
+                          eco.ciclo_base
+                          + "/ciclo/api/recycling/value",
+                          {
+                              "item_id": "REC-e2e3",
+                              "category": "nave",
+                              "condition": "bueno",
+                          },
                       )
-                  except AssertionError as exc:
-                      rejected = "HTTP" in str(exc)
-                  assert rejected is True
-                  screen = _h(eco.axis_base + "/axis/emergencias")
-                  assert "Centro de Emergencias" in screen
-                  assert "Sin emergencias abiertas" in screen
-                  home = _h(eco.axis_base + "/axis")
-                  assert "AXIS" in home
-                  assert "Registrarme" in home
+                      raise AssertionError("bad category must fail")
+                  except Exception as exc:
+                      assert "400" in str(exc)
               finally:
                   eco.close()
 
 
           def test_3_offline_resilience(tmp_path: Path) -> None:
-              db = SQLiteAdapter(tmp_path / "axis.db")
+              db = SQLiteAdapter(tmp_path / "ciclo.db")
               clock = FrozenClock()
-              store = AxisStore(db, clock)
+              store = CicloStore(db, clock)
               dead_client = NetworkClient(
                   "http://127.0.0.1:1",
                   timeout_seconds=1.0,
                   max_retries=0,
               )
-              server = serve_axis(store, dead_client)
+              server = serve_ciclo(store, dead_client)
               thread = threading.Thread(
                   target=server.serve_forever, daemon=True
               )
               thread.start()
               base = "http://127.0.0.1:" f"{server.bound_port}"
               try:
-                  store.add_account(
-                      account_id="AX-off",
-                      zid=None,
-                      name="Off Patient",
-                      role="paciente",
+                  store.add_recycled(
+                      item_id="REC-off",
+                      owner_zid="ZID-off",
+                      description="dato offline",
+                      data_hash="abc",
+                      token_amount=5,
+                      document_id=None,
+                      synced=False,
                   )
-                  store.add_exam(
-                      exam_id="EXM-off",
-                      patient_account="AX-off",
-                      doctor_account="AX-doc",
-                      exam_type="radiografia",
+                  case = store.create_arch_case(
+                      case_id="ARC-off",
+                      owner_zid="ZID-off",
+                      title="Caso offline",
+                      description="sin red",
                   )
-                  result = store.add_exam_result(
-                      result_id="RES-off",
-                      exam_id="EXM-off",
-                      summary="fractura",
-                      severity="alta",
-                      requires_followup=True,
-                      followup_reason="yeso y control",
-                      sealed_doc=None,
+                  finding = store.add_finding(
+                      finding_id="FND-off",
+                      case_id="ARC-off",
+                      source="local",
+                      title="fragmento local",
+                      content="contenido local",
+                      certainty="evidencia_encontrada",
+                      reason=None,
+                      document_id=None,
                   )
-                  assert result["requires_followup"] is True
-                  appointment = store.create_appointment(
-                      appointment_id="APT-off",
-                      patient_account="AX-off",
-                      doctor_account="AX-doc",
-                      result_id="RES-off",
-                      reason="yeso y control",
-                      scheduled_at="martes 10am",
+                  assert finding["certainty"] == "evidencia_encontrada"
+                  sealed = store.seal_arch_case(
+                      case_id="ARC-off",
+                      sealed_doc="local-pending",
                   )
-                  assert appointment["status"] == "scheduled"
-                  emergency = store.create_emergency(
-                      emergency_id="EMG-off",
-                      source_app="semilla",
-                      subject_account="AX-off",
-                      subject_zid=None,
-                      emergency_type="emergencia_medica",
-                      severity="alta",
-                      description="offline emergency",
+                  assert sealed["status"] == "sealed"
+                  valuation = store.add_valuation(
+                      valuation_id="VAL-off",
+                      item_id="REC-off",
+                      category="foto",
+                      condition="regular",
                   )
-                  dispatched = store.dispatch_emergency(
-                      emergency_id="EMG-off",
-                      agency="ambulancia",
-                      priority="alta",
-                  )
-                  assert dispatched["status"] == "dispatched"
-                  resolved = store.resolve_emergency(
-                      emergency_id="EMG-off"
-                  )
-                  assert resolved["status"] == "resolved"
-                  assert len(resolved["timeline"]) == 3
+                  assert valuation["reward_tokens"] == 1
                   with urlopen(
-                      base + "/axis", timeout=10
+                      base + "/ciclo", timeout=10
                   ) as response:
                       home = response.read().decode("utf-8")
-                  assert "AXIS" in home
+                  assert "CICLO-DIGITAL" in home
               finally:
                   server.shutdown()
                   server.server_close()
                   thread.join(timeout=5)
                   db.close()
           PYEOF
-          echo "axis e2e v5 written"
+          echo "ciclo e2e written"
 
-      - name: Run AXIS tests (regression plus emergencias ADD-ONLY e2e)
+      - name: Run CICLO tests (regression plus archaeology ADD-ONLY e2e)
         run: |
           set -euo pipefail
-          PYTHONPATH="$PWD" python -m pytest -q -p no:cacheprovider --timeout=60 --timeout-method=thread apps/axis/tests/
-          echo "AXIS tests OK"
-          find apps/axis -name '__pycache__' -type d \
+          PYTHONPATH="$PWD" python -m pytest -q -p no:cacheprovider --timeout=60 --timeout-method=thread apps/ciclo_digital/tests/
+          echo "CICLO tests OK"
+          find apps/ciclo_digital -name '__pycache__' -type d \
             -prune -exec rm -rf {} +
 
       - name: Commit and push (race-safe)
@@ -1700,7 +1611,7 @@ jobs:
           if git diff --cached --quiet; then
             echo "No changes."
           else
-            git commit -m "zyra: Q3 AXIS emergencias v5 - test-only fixes: removed unverified network history GET assert (same lesson as SEMILLA), removed except-AssertionError-re-raise that broke the resolved-dispatch 400 check (now flag-based), server/store/probe identical to green-proven v4"
+            git commit -m "zyra: Q3 CICLO archaeology ADD-ONLY - migration 2 (arch cases + findings with formal certainty levels + reconstructions + valuations), certainty taxonomy (evidencia_encontrada/verificada/reconstruccion/inferencia/incertidumbre), archaeology case flow (create->findings->reconstruct->seal with network seal), valuation with condition-based reward and network tokens via /tokens/earn (no hardcoded 5), link ext new file (trust/seal/history), screen expediente; original store/link/client/tests untouched; probe + 3 focused e2e"
             git push origin "HEAD:${{ github.ref_name }}"
           fi
-          echo "=== Q3 AXIS COMPLETE ==="
+          echo "=== Q3 CICLO COMPLETE ==="

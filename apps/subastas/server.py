@@ -14,6 +14,11 @@ from apps.subastas.infrastructure.persistence.subastas_store import (
     new_bid_id,
     new_listing_id,
 )
+from apps.subastas.infrastructure.persistence.subastas_commerce import (
+    CommerceStore,
+    _nid,
+)
+import base64 as _b64
 
 
 def _find_value(doc, keys):
@@ -225,6 +230,48 @@ class SubastasApiHandler(BaseHTTPRequestHandler):
                     self._listings_html(),
                 )
                 return
+            if path.startswith("/subastas/api/listings/"):
+                listing = self.commerce.get_listing_full(
+                    path[len("/subastas/api/listings/"):]
+                )
+                if listing is None:
+                    self._send_json(
+                        200,
+                        {"ok": False, "error": "unknown listing"},
+                    )
+                    return
+                self._send_json(200, {"ok": True, "data": listing})
+                return
+            if path == "/subastas/api/opportunities":
+                self._send_json(
+                    200,
+                    {
+                        "ok": True,
+                        "data": {
+                            "opportunities": self.commerce.list_opportunities()
+                        },
+                    },
+                )
+                return
+            if path == "/subastas/revision":
+                self._send_html(200, self._revision_html())
+                return
+            if path.startswith("/subastas/api/orders/"):
+                self._send_json(
+                    200,
+                    {"ok": True, "data": self.commerce.get_order(
+                        path[len("/subastas/api/orders/"):]
+                    )},
+                )
+                return
+            if path.startswith("/subastas/api/shipments/"):
+                self._send_json(
+                    200,
+                    {"ok": True, "data": self.commerce.get_shipment(
+                        path[len("/subastas/api/shipments/"):]
+                    )},
+                )
+                return
             if path == (
                 "/subastas/api/summary"
             ):
@@ -270,6 +317,29 @@ class SubastasApiHandler(BaseHTTPRequestHandler):
                 "/subastas/api/bids"
             ):
                 self._create_bid_json()
+                return
+            if path == "/subastas/api/orders":
+                self._create_order_json()
+                return
+            if path == "/subastas/api/reputation/mutual":
+                self._mutual_reputation_json()
+                return
+            if path == "/subastas/api/radar/scan":
+                self._radar_scan_json()
+                return
+            if path.startswith("/subastas/api/orders/"):
+                parts = path[len("/subastas/api/orders/"):].split("/")
+                self._order_action(
+                    parts[0],
+                    parts[1] if len(parts) > 1 else "",
+                )
+                return
+            if path.startswith("/subastas/api/shipments/"):
+                parts = path[len("/subastas/api/shipments/"):].split("/")
+                self._shipment_action(
+                    parts[0],
+                    parts[1] if len(parts) > 1 else "",
+                )
                 return
             if path == (
                 "/subastas/close"
@@ -466,6 +536,251 @@ class SubastasApiHandler(BaseHTTPRequestHandler):
         )
         self._send_html(200, html)
 
+    def _ensure_trusted_zid(self, account_id: str) -> str:
+        """Canonical identity + trust via net_client
+        (the exact pattern proven by MPE and SEMILLA).
+        Falls back to stored ZID only if network down."""
+        ok, data, _err = self.net_client.post(
+            "/identity/register",
+            {
+                "kind": "person",
+                "display_name": account_id,
+                "actor": "subastas",
+            },
+        )
+        zid = None
+        if ok and data:
+            found = _find_value(data, ("zid",))
+            if isinstance(found, str) and found.startswith("ZID-"):
+                zid = found
+        if zid is None:
+            existing = self.commerce.account_zid(account_id)
+            if existing:
+                return existing
+            raise ValueError(
+                "no network ZID available for " + account_id
+            )
+        try:
+            self.net_client.post(
+                "/trust/complete",
+                {"zid": zid, "actor": "subastas"},
+            )
+        except Exception:
+            pass
+        return zid
+
+    def _create_order_json(self) -> None:
+        doc = self._read_json()
+        if doc is None:
+            self._send_json(400, {"ok": False, "error": "invalid JSON"})
+            return
+        source = str(doc.get("source", "direct"))
+        if source == "auction":
+            self.commerce.persist_winner(
+                listing_id=str(doc.get("listing_id", ""))
+            )
+        order = self.commerce.create_order(
+            order_id=_nid("ORD-"),
+            listing_id=str(doc.get("listing_id", "")),
+            buyer_account=str(doc.get("buyer_account", "")),
+            source=source,
+        )
+        self._send_json(201, {"ok": True, "data": order})
+
+    def _order_action(self, order_id: str, action: str) -> None:
+        doc = self._read_json() or {}
+        if action == "pay":
+            order = self.commerce.pay_order(
+                order_id=order_id,
+                provider=str(doc.get("provider", "wallet")),
+            )
+            self._send_json(200, {"ok": True, "data": order})
+            return
+        if action == "settle":
+            order = self.commerce.settle_order(order_id=order_id)
+            self._send_json(200, {"ok": True, "data": order})
+            return
+        if action == "ship":
+            self.commerce.create_shipment(
+                shipment_id=_nid("SHP-"),
+                order_id=order_id,
+                carrier=str(doc.get("carrier", "zyra-express")),
+                origin=str(doc.get("origin", "SV")),
+                destination=str(doc.get("destination", "SV")),
+            )
+            self._send_json(
+                200,
+                {"ok": True, "data": self.commerce.get_order(order_id)},
+            )
+            return
+        self._send_json(
+            400,
+            {"ok": False, "error": "unknown order action: " + action},
+        )
+
+    def _shipment_action(self, shipment_id: str, action: str) -> None:
+        doc = self._read_json() or {}
+        if action == "track":
+            shipment = self.commerce.add_tracking(
+                shipment_id=shipment_id,
+                status=str(doc.get("status", "in_transit")),
+                location=str(doc.get("location", "")),
+                description=str(doc.get("description", "")),
+            )
+            self._send_json(200, {"ok": True, "data": shipment})
+            return
+        if action == "deliver":
+            shipment = self.commerce.confirm_delivery(
+                shipment_id=shipment_id,
+            )
+            self._send_json(200, {"ok": True, "data": shipment})
+            return
+        self._send_json(
+            400,
+            {"ok": False, "error": "unknown shipment action: " + action},
+        )
+
+    def _mutual_reputation_json(self) -> None:
+        doc = self._read_json()
+        if doc is None:
+            self._send_json(400, {"ok": False, "error": "invalid JSON"})
+            return
+        order_id = str(doc.get("order_id", ""))
+        buyer_account = str(doc.get("buyer_account", ""))
+        seller_account = str(doc.get("seller_account", ""))
+        evidence = str(
+            doc.get("evidence", "")
+            or "transaccion completada en SUBASTAS"
+        )
+        order = self.commerce.get_order(order_id)
+        seller_zid = self._ensure_trusted_zid(seller_account)
+        buyer_zid = self._ensure_trusted_zid(buyer_account)
+        evidence_b64 = _b64.b64encode(
+            evidence.encode("utf-8")
+        ).decode("ascii")
+
+        def _net(path: str, payload: dict) -> tuple:
+            try:
+                ok, data, err = self.net_client.post(
+                    path, payload
+                )
+                return (bool(ok), str(err or ""))
+            except Exception as exc:
+                return (False, str(exc))
+
+        rep_b2s, err_b2s = _net(
+            "/reputation/record",
+            {
+                "subject_zid": seller_zid,
+                "actor_zid": buyer_zid,
+                "kind": "positive",
+                "evidence_b64": evidence_b64,
+            },
+        )
+        rep_s2b, err_s2b = _net(
+            "/reputation/record",
+            {
+                "subject_zid": buyer_zid,
+                "actor_zid": seller_zid,
+                "kind": "positive",
+                "evidence_b64": evidence_b64,
+            },
+        )
+        self.commerce.record_rep_event(
+            order_id=order_id,
+            subject_zid=seller_zid,
+            actor_zid=buyer_zid,
+            kind="positive",
+            evidence=evidence,
+            network_recorded=rep_b2s,
+        )
+        self.commerce.record_rep_event(
+            order_id=order_id,
+            subject_zid=buyer_zid,
+            actor_zid=seller_zid,
+            kind="positive",
+            evidence=evidence,
+            network_recorded=rep_s2b,
+        )
+        hist_s, err_hs = _net(
+            "/history/append",
+            {
+                "zid": seller_zid,
+                "entry_type": "asset",
+                "actor_app": "subastas",
+                "payload": {
+                    "event": "venta completada",
+                    "detail": "orden " + order_id,
+                },
+            },
+        )
+        hist_b, err_hb = _net(
+            "/history/append",
+            {
+                "zid": buyer_zid,
+                "entry_type": "asset",
+                "actor_app": "subastas",
+                "payload": {
+                    "event": "compra completada",
+                    "detail": "orden " + order_id,
+                },
+            },
+        )
+        self._send_json(
+            200,
+            {
+                "ok": True,
+                "data": {
+                    "order_id": order_id,
+                    "buyer_to_seller_network": rep_b2s,
+                    "seller_to_buyer_network": rep_s2b,
+                    "history_seller_recorded": hist_s,
+                    "history_buyer_recorded": hist_b,
+                    "errors": {
+                        "rep_b2s": err_b2s,
+                        "rep_s2b": err_s2b,
+                        "hist_s": err_hs,
+                        "hist_b": err_hb,
+                    },
+                },
+            },
+        )
+
+    def _radar_scan_json(self) -> None:
+        doc = self._read_json()
+        if doc is None:
+            self._send_json(400, {"ok": False, "error": "invalid JSON"})
+            return
+        purchase = float(doc.get("purchase_price", 0))
+        sale = float(doc.get("estimated_sale_price", 0))
+        if purchase <= 0 or sale <= 0:
+            raise ValueError(
+                "purchase_price and estimated_sale_price must be positive"
+            )
+        opportunity = self.commerce.create_opportunity(
+            opportunity_id=_nid("OPP-"),
+            title=str(doc.get("title", "oportunidad")),
+            category=str(doc.get("category", "general")),
+            purchase_price=purchase,
+            shipping_cost=float(doc.get("shipping_cost", 0)),
+            fees=float(doc.get("fees", 0)),
+            estimated_sale_price=sale,
+            demand_score=float(doc.get("demand_score", 0.5)),
+            risk_score=float(doc.get("risk_score", 0.5)),
+        )
+        self._send_json(201, {"ok": True, "data": opportunity})
+
+    def _revision_html(self) -> str:
+        summary = self.commerce.summary()
+        return (
+            "<html><body><h1>Revision SUBASTAS</h1>"
+            "<p>ordenes: " + str(summary["orders_total"]) + "</p>"
+            "<p>entregadas: " + str(summary["orders_delivered"]) + "</p>"
+            "<p>oportunidades radar: " + str(summary["opportunities"]) + "</p>"
+            "<a href='/subastas'>Inicio</a>"
+            "</body></html>"
+        )
+
     def _home(self) -> str:
         return (
             "<html><head>"
@@ -537,6 +852,9 @@ def serve_subastas(
         {
             "store": store,
             "net_client": client,
+            "commerce": CommerceStore(
+                store._db, store._clock
+            ),
         },
     )
     server = ThreadingHTTPServer(

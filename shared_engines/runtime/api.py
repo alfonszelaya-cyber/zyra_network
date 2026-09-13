@@ -6,9 +6,11 @@ Protected routes require Bearer token when configured.
 Strengthening (additive only): native /proofing/* routes
 for biometric identity proofing, and POST /identity/enroll
 as the OFFICIAL identity creation flow: biometric proofing
-is MANDATORY — no ZID is born unless the proofing engine
-approves the person. All pre-existing routes and handlers
-are unchanged.
+is MANDATORY — no PERSON ZID is born unless the proofing
+engine approves the person. Hardening v2: /identity/register
+refuses kind=person (bypass closed); non-person kinds
+(device, institution, organization) keep working through it.
+All other pre-existing routes and handlers are unchanged.
 """
 from __future__ import annotations
 
@@ -382,6 +384,11 @@ class ZyraApiHandler(BaseHTTPRequestHandler):
         )
 
     def _handle_register_identity(self) -> None:
+        """HARDENING: kind=person is refused here —
+        persons MUST go through /identity/enroll (mandatory
+        biometric proofing). Non-person kinds keep working:
+        devices, institutions and organizations are network
+        infrastructure, not persons."""
         doc = self._read_json()
         kind_raw = self._require_str(doc, "kind")
         try:
@@ -390,6 +397,14 @@ class ZyraApiHandler(BaseHTTPRequestHandler):
             raise ApiError(
                 400, "invalid_request", "unknown kind"
             ) from exc
+        if kind == IdentityKind.PERSON:
+            raise ApiError(
+                403,
+                "person_bypass_forbidden",
+                "person identities require biometric proofing:"
+                " use POST /identity/enroll with doc_image_b64"
+                " and selfie_image_b64",
+            )
         identity = type(self).kernel.identity.register_identity(
             kind=kind,
             display_name=self._require_str(doc, "display_name"),
@@ -399,10 +414,8 @@ class ZyraApiHandler(BaseHTTPRequestHandler):
 
     def _handle_identity_enroll(self) -> None:
         """OFFICIAL identity creation: biometric proofing
-        is MANDATORY. Pipeline: doc+selfie -> proofing
-        engine -> (refused | review | approved). A ZID is
-        born ONLY on approval, and it is born bound to the
-        sealed biometric template."""
+        is MANDATORY. Idempotent finalize (hardening v2):
+        a retry of the same case never creates a second ZID."""
         doc = self._read_json()
         kind_raw = self._require_str(doc, "kind")
         try:
@@ -411,6 +424,13 @@ class ZyraApiHandler(BaseHTTPRequestHandler):
             raise ApiError(
                 400, "invalid_request", "unknown kind"
             ) from exc
+        if kind != IdentityKind.PERSON:
+            raise ApiError(
+                400,
+                "invalid_request",
+                "enroll is for person identities;"
+                " other kinds use /identity/register",
+            )
         actor = self._require_str(doc, "actor")
         display_name = self._require_str(doc, "display_name")
         engine = self._proofing_engine()
@@ -1080,4 +1100,4 @@ def _proofing_case_json(case: BiometricCase) -> dict[str, object]:
         "result": result,
         "created_at": case.created_at,
         "updated_at": case.updated_at,
-        }
+            }

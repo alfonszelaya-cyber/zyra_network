@@ -11,7 +11,10 @@ shared_engines/security/biometrics.py as a native engine,
 sealed with keys derived from ZYRA_ROOT_KEY. Every
 pre-existing engine and wiring line is unchanged; the
 biometrics engine is an addition and is fail-closed until
-the real face provider is installed.
+the real face provider is installed. The biometrics
+health component is registered only when the engine is
+actually wired, so its absence never degrades the
+network-wide health signal.
 """
 from __future__ import annotations
 
@@ -89,21 +92,15 @@ class _BiometricsHealth:
     """Reports biometric proofing availability."""
 
     def __init__(
-        self, engine: BiometricsEngine | None
+        self, engine: BiometricsEngine
     ) -> None:
         self._engine = engine
 
     def check_health(self) -> ComponentHealth:
-        if self._engine is not None:
-            return ComponentHealth(
-                "biometrics",
-                HealthStatus.HEALTHY,
-                "engine wired",
-            )
         return ComponentHealth(
             "biometrics",
-            HealthStatus.UNHEALTHY,
-            "engine not configured",
+            HealthStatus.HEALTHY,
+            "engine wired",
         )
 
 
@@ -296,10 +293,11 @@ class ZyraKernel:
         self._health.register("verification", self._verification)
         self._health.register("tokens", self._tokens)
         self._health.register("currency", self._currency)
-        self._health.register(
-            "biometrics",
-            _BiometricsHealth(self._biometrics),
-        )
+        if self._biometrics is not None:
+            self._health.register(
+                "biometrics",
+                _BiometricsHealth(self._biometrics),
+            )
         self._root_zid: str | None = None
 
     @property

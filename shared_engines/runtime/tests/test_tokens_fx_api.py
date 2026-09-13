@@ -86,11 +86,14 @@ def cluster(tmp_path: Path) -> Iterator[_Cluster]:
 
 
 def _user(cluster: _Cluster, name: str) -> dict[str, Any]:
+    """Test subject for tokens/FX. kind=organization because
+    person identities now REQUIRE biometric proofing via
+    /identity/enroll — /identity/register refuses persons."""
     status, payload = cluster.call(
         "POST",
         "/identity/register",
         {
-            "kind": "person",
+            "kind": "organization",
             "display_name": name,
             "actor": "api-clerk",
         },

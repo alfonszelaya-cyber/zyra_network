@@ -1,2149 +1,672 @@
-name: zyra-s8-laboratorio-e2e
-
-"on":
-  workflow_dispatch:
-  push:
-    branches: ["**"]
-
-permissions:
-  contents: write
-
-concurrency:
-  group: zyra-s8-lab-${{ github.ref }}
-  cancel-in-progress: false
-
-jobs:
-  build:
-    runs-on: ubuntu-latest
-    timeout-minutes: 30
-    steps:
-      - name: Checkout
-        uses: actions/checkout@v4
-
-      - name: Set up Python 3.12
-        uses: actions/setup-python@v5
-        with:
-          python-version: "3.12"
-
-      - name: Install toolchain
-        run: |
-          set -euo pipefail
-          python -m pip install --upgrade pip
-          python -m pip install "cryptography>=42,<45" "pytest>=8,<9" "pytest-timeout>=2,<3"
-
-      - name: LAB NetworkClient
-        run: |
-          set -euo pipefail
-          mkdir -p apps/laboratorio/infrastructure/network
-          touch apps/laboratorio/__init__.py
-          touch apps/laboratorio/infrastructure/__init__.py
-          touch apps/laboratorio/infrastructure/network/__init__.py
-          cat > apps/laboratorio/infrastructure/network/network_client.py <<'PYEOF'
-          """LABORATORIO HTTP client to ZYRA Network."""
-          from __future__ import annotations
-
-          import json
-          import os
-          import urllib.request
-
-
-          class NetworkClient:
-              def __init__(
-                  self,
-                  base_url: str | None = None,
-                  *,
-                  timeout_seconds: float = 5.0,
-                  max_retries: int = 2,
-              ) -> None:
-                  self._base = (
-                      base_url
-                      or os.environ.get("ZYRA_URL", "")
-                  ).rstrip("/")
-                  self._timeout = timeout_seconds
-                  self._retries = max(0, max_retries)
-
-              def get(self, path: str) -> tuple[
-                  bool, dict | None, str | None,
-              ]:
-                  return self._call("GET", path)
-
-              def post(
-                  self, path: str, payload: dict,
-              ) -> tuple[bool, dict | None, str | None]:
-                  return self._call("POST", path, payload)
-
-              def _call(
-                  self,
-                  method: str,
-                  path: str,
-                  payload: dict | None = None,
-              ) -> tuple[bool, dict | None, str | None]:
-                  if not self._base:
-                      return (
-                          False,
-                          None,
-                          "ZYRA_URL not configured",
-                      )
-                  url = self._base + path
-                  data = None
-                  if payload is not None:
-                      data = json.dumps(
-                          payload
-                      ).encode("utf-8")
-                  last_error = "unknown"
-                  for attempt in range(
-                      self._retries + 1
-                  ):
-                      try:
-                          request = urllib.request.Request(
-                              url,
-                              data=data,
-                              method=method,
-                              headers={
-                                  "Content-Type":
-                                  "application/json"
-                              },
-                          )
-                          with urllib.request.urlopen(
-                              request,
-                              timeout=self._timeout,
-                          ) as response:
-                              body = json.loads(
-                                  response.read()
-                                  .decode("utf-8")
-                              )
-                          if (
-                              body.get("ok")
-                              is True
-                          ):
-                              return (
-                                  True,
-                                  body.get("data"),
-                                  None,
-                              )
-                          error = body.get(
-                              "error", {}
-                          )
-                          return (
-                              False,
-                              None,
-                              str(
-                                  error.get(
-                                      "message",
-                                      "rejected",
-                                  )
-                              ),
-                          )
-                      except Exception as exc:
-                          last_error = str(exc)
-                  return False, None, last_error
-          PYEOF
-          python -m py_compile apps/laboratorio/infrastructure/network/network_client.py
-          echo "network client written"
-
-      - name: LAB Store
-        run: |
-          set -euo pipefail
-          mkdir -p apps/laboratorio/infrastructure/persistence
-          touch apps/laboratorio/infrastructure/persistence/__init__.py
-          cat > apps/laboratorio/infrastructure/persistence/laboratorio_store.py <<'PYEOF'
-          """LABORATORIO durable store - production."""
-          from __future__ import annotations
-
-          import uuid
-
-          from shared_engines.storage.database import (
-              Database,
-          )
-          from shared_engines.storage.migrations import (
-              Migration,
-              MigrationRunner,
-          )
-
-          SCENARIO_TYPES = (
-              "politica",
-              "ley",
-              "app",
-              "mercado",
-              "tienda",
-              "trabajo",
-              "invencion",
-          )
-
-          CREATION_TYPES = (
-              "documento",
-              "grafico",
-              "plano",
-              "logo",
-              "presentacion",
-              "ropa",
-          )
-
-          _MIGRATIONS = (
-              Migration(
-                  1,
-                  "laboratorio",
-                  (
-                      "CREATE TABLE lab_scenarios ("
-                      " scenario_id TEXT PRIMARY KEY,"
-                      " owner_zid TEXT,"
-                      " scenario_type TEXT NOT NULL,"
-                      " title TEXT NOT NULL,"
-                      " description TEXT NOT NULL,"
-                      " parameters TEXT NOT NULL,"
-                      " status TEXT NOT NULL,"
-                      " result_data TEXT,"
-                      " impact_score REAL,"
-                      " risk_level TEXT,"
-                      " recommendation TEXT,"
-                      " sealed_doc TEXT,"
-                      " created_at REAL NOT NULL,"
-                      " updated_at REAL NOT NULL)",
-                      "CREATE TABLE lab_creations ("
-                      " creation_id TEXT PRIMARY KEY,"
-                      " owner_zid TEXT,"
-                      " creation_type TEXT NOT NULL,"
-                      " title TEXT NOT NULL,"
-                      " description TEXT NOT NULL,"
-                      " svg_content TEXT NOT NULL,"
-                      " sealed_doc TEXT,"
-                      " created_at REAL NOT NULL)",
-                      "CREATE TABLE lab_projections ("
-                      " projection_id TEXT PRIMARY KEY,"
-                      " creation_id TEXT NOT NULL,"
-                      " mode TEXT NOT NULL,"
-                      " created_at REAL NOT NULL)",
-                  ),
-              ),
-          )
-
-
-          def _nid(prefix: str) -> str:
-              return prefix + uuid.uuid4().hex[:10]
-
-
-          def evaluate_scenario(
-              *,
-              scenario_type: str,
-              cost: float,
-              benefit: float,
-              affected_population: int,
-              risk_percent: float,
-              time_months: int,
-          ) -> dict[str, object]:
-              """Real deterministic evaluation math."""
-              if cost < 0 or benefit < 0:
-                  raise ValueError(
-                      "cost and benefit must be"
-                      " non-negative"
-                  )
-              if affected_population <= 0:
-                  raise ValueError(
-                      "affected_population must be"
-                      " positive"
-                  )
-              if not 0 <= risk_percent <= 100:
-                  raise ValueError(
-                      "risk_percent must be 0..100"
-                  )
-              if time_months <= 0:
-                  raise ValueError(
-                      "time_months must be positive"
-                  )
-              net_impact = round(
-                  benefit - cost, 2
-              )
-              cost_per_person = round(
-                  cost / affected_population, 4
-              )
-              benefit_per_person = round(
-                  benefit / affected_population, 4
-              )
-              if cost > 0:
-                  bc_ratio = round(
-                      benefit / cost, 2
-                  )
-              else:
-                  bc_ratio = 0.0
-              monthly_benefit = round(
-                  benefit / time_months, 2
-              )
-              if bc_ratio >= 2.0 and (
-                  risk_percent <= 30
-              ):
-                  risk_level = "bajo"
-                  impact_score = round(
-                      min(
-                          100.0,
-                          bc_ratio * 25
-                          + (
-                              100 - risk_percent
-                          )
-                          * 0.4
-                          + min(
-                              affected_population
-                              / 1000,
-                              20,
-                          ),
-                      ),
-                      2,
-                  )
-                  recommendation = (
-                      "VIABLE - proceder con"
-                      " implementacion"
-                  )
-              elif bc_ratio >= 1.0 and (
-                  risk_percent <= 60
-              ):
-                  risk_level = "medio"
-                  impact_score = round(
-                      min(
-                          100.0,
-                          bc_ratio * 20
-                          + (
-                              100 - risk_percent
-                          )
-                          * 0.3,
-                      ),
-                      2,
-                  )
-                  recommendation = (
-                      "VIABLE CON AJUSTES -"
-                      " reducir riesgo o costo"
-                      " antes de proceder"
-                  )
-              else:
-                  risk_level = "alto"
-                  impact_score = round(
-                      max(
-                          0.0,
-                          bc_ratio * 15
-                          + (
-                              100 - risk_percent
-                          )
-                          * 0.2,
-                      ),
-                      2,
-                  )
-                  recommendation = (
-                      "NO VIABLE EN ESTAS"
-                      " CONDICIONES -"
-                      " replantear parametros"
-                  )
-              return {
-                  "net_impact": net_impact,
-                  "cost_per_person": (
-                      cost_per_person
-                  ),
-                  "benefit_per_person": (
-                      benefit_per_person
-                  ),
-                  "bc_ratio": bc_ratio,
-                  "monthly_benefit": (
-                      monthly_benefit
-                  ),
-                  "risk_level": risk_level,
-                  "impact_score": (
-                      impact_score
-                  ),
-                  "recommendation": (
-                      recommendation
-                  ),
-              }
-
-
-          class LaboratorioStore:
-              def __init__(
-                  self, db: Database, clock
-              ) -> None:
-                  self._db = db
-                  self._clock = clock
-                  MigrationRunner(
-                      db,
-                      "laboratorio",
-                      _MIGRATIONS,
-                  ).run(clock)
-
-              def create_scenario(
-                  self,
-                  *,
-                  scenario_id: str,
-                  owner_zid: str | None,
-                  scenario_type: str,
-                  title: str,
-                  description: str,
-                  parameters: str,
-              ) -> dict[str, object]:
-                  if scenario_type not in (
-                      SCENARIO_TYPES
-                  ):
-                      raise ValueError(
-                          f"unknown scenario type:"
-                          f" {scenario_type}"
-                      )
-                  now = self._clock.now()
-                  with self._db.transaction() as cursor:
-                      cursor.execute(
-                          "INSERT INTO lab_scenarios ("
-                          " scenario_id, owner_zid,"
-                          "  scenario_type, title,"
-                          "  description, parameters,"
-                          "  status, created_at,"
-                          "  updated_at)"
-                          " VALUES (?, ?, ?, ?, ?, ?,"
-                          "  'created', ?, ?)",
-                          (
-                              scenario_id,
-                              owner_zid,
-                              scenario_type,
-                              title,
-                              description,
-                              parameters,
-                              now,
-                              now,
-                          ),
-                      )
-                  return self.get_scenario(
-                      scenario_id
-                  )
-
-              def run_scenario(
-                  self,
-                  *,
-                  scenario_id: str,
-                  cost: float,
-                  benefit: float,
-                  affected_population: int,
-                  risk_percent: float,
-                  time_months: int,
-              ) -> dict[str, object]:
-                  row = self._db.query_one(
-                      "SELECT scenario_type, title"
-                      " FROM lab_scenarios"
-                      " WHERE scenario_id = ?",
-                      (scenario_id,),
-                  )
-                  if row is None:
-                      raise LookupError(
-                          "unknown scenario:"
-                          f" {scenario_id}"
-                      )
-                  result = evaluate_scenario(
-                      scenario_type=str(
-                          row["scenario_type"]
-                      ),
-                      cost=cost,
-                      benefit=benefit,
-                      affected_population=(
-                          affected_population
-                      ),
-                      risk_percent=risk_percent,
-                      time_months=time_months,
-                  )
-                  now = self._clock.now()
-                  import json as _json
-
-                  with self._db.transaction() as cursor:
-                      cursor.execute(
-                          "UPDATE lab_scenarios SET"
-                          " status = 'evaluated',"
-                          " result_data = ?,"
-                          " impact_score = ?,"
-                          " risk_level = ?,"
-                          " recommendation = ?,"
-                          " updated_at = ?"
-                          " WHERE scenario_id = ?",
-                          (
-                              _json.dumps(
-                                  result
-                              ),
-                              result[
-                                  "impact_score"
-                              ],
-                              result["risk_level"],
-                              result[
-                                  "recommendation"
-                              ],
-                              now,
-                              scenario_id,
-                          ),
-                      )
-                  result["scenario_id"] = (
-                      scenario_id
-                  )
-                  result["title"] = str(
-                      row["title"]
-                  )
-                  return result
-
-              def get_scenario(
-                  self, scenario_id: str,
-              ) -> dict[str, object]:
-                  row = self._db.query_one(
-                      "SELECT * FROM lab_scenarios"
-                      " WHERE scenario_id = ?",
-                      (scenario_id,),
-                  )
-                  if row is None:
-                      raise LookupError(
-                          "unknown scenario:"
-                          f" {scenario_id}"
-                      )
-                  sealed = row["sealed_doc"]
-                  return {
-                      "scenario_id": str(
-                          row["scenario_id"]
-                      ),
-                      "owner_zid": (
-                          str(row["owner_zid"])
-                          if row["owner_zid"]
-                          is not None
-                          else None
-                      ),
-                      "scenario_type": str(
-                          row["scenario_type"]
-                      ),
-                      "title": str(row["title"]),
-                      "description": str(
-                          row["description"]
-                      ),
-                      "status": str(row["status"]),
-                      "result_data": (
-                          str(row["result_data"])
-                          if row["result_data"]
-                          is not None
-                          else None
-                      ),
-                      "impact_score": (
-                          float(
-                              row["impact_score"]
-                          )
-                          if row["impact_score"]
-                          is not None
-                          else None
-                      ),
-                      "risk_level": (
-                          str(row["risk_level"])
-                          if row["risk_level"]
-                          is not None
-                          else None
-                      ),
-                      "recommendation": (
-                          str(
-                              row[
-                                  "recommendation"
-                              ]
-                          )
-                          if row[
-                              "recommendation"
-                          ]
-                          is not None
-                          else None
-                      ),
-                      "sealed_doc": (
-                          str(sealed)
-                          if sealed is not None
-                          else None
-                      ),
-                  }
-
-              def list_scenarios(
-                  self,
-              ) -> tuple[dict[str, object], ...]:
-                  rows = self._db.query_all(
-                      "SELECT scenario_id FROM"
-                      " lab_scenarios"
-                      " ORDER BY created_at"
-                  )
-                  return tuple(
-                      self.get_scenario(
-                          str(r["scenario_id"])
-                      )
-                      for r in rows
-                  )
-
-              def seal_scenario(
-                  self,
-                  *,
-                  scenario_id: str,
-                  sealed_doc: str,
-              ) -> dict[str, object]:
-                  now = self._clock.now()
-                  with self._db.transaction() as cursor:
-                      cursor.execute(
-                          "UPDATE lab_scenarios SET"
-                          " sealed_doc = ?,"
-                          " updated_at = ?"
-                          " WHERE scenario_id = ?",
-                          (
-                              sealed_doc,
-                              now,
-                              scenario_id,
-                          ),
-                      )
-                  return self.get_scenario(
-                      scenario_id
-                  )
-
-              def create_creation(
-                  self,
-                  *,
-                  creation_id: str,
-                  owner_zid: str | None,
-                  creation_type: str,
-                  title: str,
-                  description: str,
-                  svg_content: str,
-                  sealed_doc: str | None,
-              ) -> dict[str, object]:
-                  if creation_type not in (
-                      CREATION_TYPES
-                  ):
-                      raise ValueError(
-                          f"unknown creation type:"
-                          f" {creation_type}"
-                      )
-                  now = self._clock.now()
-                  with self._db.transaction() as cursor:
-                      cursor.execute(
-                          "INSERT INTO lab_creations ("
-                          " creation_id, owner_zid,"
-                          "  creation_type, title,"
-                          "  description,"
-                          "  svg_content,"
-                          "  sealed_doc, created_at)"
-                          " VALUES (?, ?, ?, ?, ?,"
-                          "  ?, ?, ?)",
-                          (
-                              creation_id,
-                              owner_zid,
-                              creation_type,
-                              title,
-                              description,
-                              svg_content,
-                              sealed_doc,
-                              now,
-                          ),
-                      )
-                  return {
-                      "creation_id": creation_id,
-                      "creation_type": (
-                          creation_type
-                      ),
-                      "title": title,
-                  }
-
-              def get_creation(
-                  self, creation_id: str,
-              ) -> dict[str, object] | None:
-                  row = self._db.query_one(
-                      "SELECT * FROM lab_creations"
-                      " WHERE creation_id = ?",
-                      (creation_id,),
-                  )
-                  if row is None:
-                      return None
-                  sealed = row["sealed_doc"]
-                  return {
-                      "creation_id": str(
-                          row["creation_id"]
-                      ),
-                      "owner_zid": (
-                          str(row["owner_zid"])
-                          if row["owner_zid"]
-                          is not None
-                          else None
-                      ),
-                      "creation_type": str(
-                          row["creation_type"]
-                      ),
-                      "title": str(row["title"]),
-                      "description": str(
-                          row["description"]
-                      ),
-                      "svg_content": str(
-                          row["svg_content"]
-                      ),
-                      "sealed_doc": (
-                          str(sealed)
-                          if sealed is not None
-                          else None
-                      ),
-                  }
-
-              def list_creations(
-                  self,
-              ) -> tuple[dict[str, object], ...]:
-                  rows = self._db.query_all(
-                      "SELECT creation_id,"
-                      " creation_type, title,"
-                      " description FROM"
-                      " lab_creations"
-                      " ORDER BY created_at"
-                  )
-                  return tuple(
-                      {
-                          "creation_id": str(
-                              r["creation_id"]
-                          ),
-                          "creation_type": str(
-                              r["creation_type"]
-                          ),
-                          "title": str(
-                              r["title"]
-                          ),
-                          "description": str(
-                              r["description"]
-                          ),
-                      }
-                      for r in rows
-                  )
-
-              def record_projection(
-                  self,
-                  *,
-                  projection_id: str,
-                  creation_id: str,
-                  mode: str,
-              ) -> dict[str, object]:
-                  now = self._clock.now()
-                  with self._db.transaction() as cursor:
-                      cursor.execute(
-                          "INSERT INTO lab_projections"
-                          " (projection_id,"
-                          "  creation_id, mode,"
-                          "  created_at)"
-                          " VALUES (?, ?, ?, ?)",
-                          (
-                              projection_id,
-                              creation_id,
-                              mode,
-                              now,
-                          ),
-                      )
-                  return {
-                      "projection_id": (
-                          projection_id
-                      ),
-                      "creation_id": creation_id,
-                      "mode": mode,
-                  }
-
-              def summary(self) -> dict[str, object]:
-                  scenarios = self._db.query_one(
-                      "SELECT COUNT(*) AS n FROM"
-                      " lab_scenarios"
-                  )
-                  evaluated = self._db.query_one(
-                      "SELECT COUNT(*) AS n FROM"
-                      " lab_scenarios WHERE"
-                      " status = 'evaluated'"
-                  )
-                  creations = self._db.query_one(
-                      "SELECT COUNT(*) AS n FROM"
-                      " lab_creations"
-                  )
-                  projections = (
-                      self._db.query_one(
-                          "SELECT COUNT(*) AS n"
-                          " FROM lab_projections"
-                      )
-                  )
-                  return {
-                      "scenarios_total": int(
-                          scenarios["n"]
-                      )
-                      if scenarios is not None
-                      else 0,
-                      "scenarios_evaluated": int(
-                          evaluated["n"]
-                      )
-                      if evaluated is not None
-                      else 0,
-                      "creations_total": int(
-                          creations["n"]
-                      )
-                      if creations is not None
-                      else 0,
-                      "projections_total": int(
-                          projections["n"]
-                      )
-                      if projections
-                      is not None
-                      else 0,
-                  }
-          PYEOF
-          python -m py_compile apps/laboratorio/infrastructure/persistence/laboratorio_store.py
-          echo "store written"
-
-      - name: LAB Link
-        run: |
-          set -euo pipefail
-          mkdir -p apps/laboratorio/services
-          touch apps/laboratorio/services/__init__.py
-          cat > apps/laboratorio/services/laboratorio_link.py <<'PYEOF'
-          """LaboratorioLink: LAB ops on the Network."""
-          from __future__ import annotations
-
-          import base64
-
-          from apps.laboratorio.infrastructure.network.network_client import (
-              NetworkClient,
-          )
-
-
-          class LaboratorioLink:
-              def __init__(
-                  self, client: NetworkClient
-              ) -> None:
-                  self._client = client
-
-              def register_app(self) -> tuple[
-                  bool, dict | None, str | None
-              ]:
-                  return self._client.post(
-                      "/apps/register",
-                      {
-                          "app_id":
-                          "laboratorio",
-                          "display_name": (
-                              "LABORATORIO"
-                          ),
-                          "scopes": [
-                              "display_name",
-                              "contact",
-                          ],
-                      },
-                  )
-
-              def register_person(
-                  self, display_name: str
-              ) -> tuple[
-                  bool, dict | None, str | None
-              ]:
-                  return self._client.post(
-                      "/identity/register",
-                      {
-                          "kind": "person",
-                          "display_name": display_name,
-                          "actor": "laboratorio",
-                      },
-                  )
-
-              def complete_trust(
-                  self, zid: str,
-              ) -> tuple[
-                  bool, dict | None, str | None
-              ]:
-                  return self._client.post(
-                      "/trust/complete",
-                      {
-                          "zid": zid,
-                          "actor": "laboratorio",
-                      },
-                  )
-
-              def seal_document(
-                  self,
-                  *,
-                  owner_zid: str,
-                  title: str,
-                  content: str,
-              ) -> tuple[
-                  bool, dict | None, str | None
-              ]:
-                  encoded = base64.b64encode(
-                      content.encode("utf-8")
-                  ).decode("ascii")
-                  return self._client.post(
-                      "/documents/seal",
-                      {
-                          "owner_zid": owner_zid,
-                          "title": title,
-                          "content_b64": encoded,
-                          "actor_app":
-                          "laboratorio",
-                      },
-                  )
-
-              def record_lab_event(
-                  self,
-                  zid: str,
-                  event: str,
-                  detail: str,
-              ) -> tuple[
-                  bool, dict | None, str | None
-              ]:
-                  return self._client.post(
-                      "/history/append",
-                      {
-                          "zid": zid,
-                          "entry_type": "other",
-                          "actor_app":
-                          "laboratorio",
-                          "payload": {
-                              "event": event,
-                              "detail": detail,
-                          },
-                      },
-                  )
-          PYEOF
-          python -m py_compile apps/laboratorio/services/laboratorio_link.py
-          echo "link written"
-
-      - name: LAB Server
-        run: |
-          set -euo pipefail
-          cat > apps/laboratorio/server.py <<'PYEOF'
-          """LABORATORIO HTTP server - production."""
-          from __future__ import annotations
-
-          import html as _html
-          import json
-          import uuid as _uuid
-          from http.server import (
-              BaseHTTPRequestHandler,
-              ThreadingHTTPServer,
-          )
-          from typing import Any, ClassVar
-          from urllib.parse import urlparse
-
-          from apps.laboratorio.infrastructure.network.network_client import (
-              NetworkClient,
-          )
-          from apps.laboratorio.infrastructure.persistence.laboratorio_store import (
-              SCENARIO_TYPES,
-              LaboratorioStore,
-          )
-          from apps.laboratorio.services.laboratorio_link import (
-              LaboratorioLink,
-          )
-
-          _CSS = (
-              "body{font-family:system-ui,sans-serif;"
-              "background:#0d1117;color:#e6edf3;"
-              "display:flex;justify-content:center;"
-              "padding:20px;margin:0}"
-              ".wrap{max-width:680px;width:100%}"
-              "h1{font-size:1.3rem}"
-              "h2{font-size:1rem;margin-top:20px;"
-              "color:#58a6ff}"
-              ".card{background:#161b22;border:1px solid"
-              " #30363d;border-radius:10px;padding:14px;"
-              "margin-top:10px}"
-              "button{background:#238636;color:#fff;"
-              "border:none;padding:12px 18px;"
-              "border-radius:8px;font-size:1rem;"
-              "cursor:pointer;margin:6px 4px 0 0;"
-              "width:100%;text-align:left}"
-              "button.gray{background:#30363d}"
-              "input,select,textarea{width:100%;"
-              "box-sizing:border-box;background:"
-              "#0d1117;color:#e6edf3;border:1px solid"
-              " #30363d;border-radius:6px;padding:8px;"
-              "margin:4px 0;font-size:0.95rem}"
-              ".scene3d{perspective:900px;height:340px;"
-              "display:flex;align-items:center;"
-              "justify-content:center;"
-              "background:radial-gradient("
-              "ellipse at center,#16233a 0%,"
-              "#0d1117 75%);border-radius:12px;"
-              "overflow:hidden;margin-top:10px}"
-              ".holo{transform-style:preserve-3d;"
-              "animation:spin3d 14s linear infinite;"
-              "width:260px;height:260px}"
-              ".holo svg{width:100%;height:100%;"
-              "filter:drop-shadow(0 0 18px"
-              " #58a6ff)}"
-              "@keyframes spin3d{0%{transform:"
-              "rotateY(0deg) rotateX(12deg)}"
-              "100%{transform:rotateY(360deg)"
-              " rotateX(12deg)}}"
-              ".float{animation:float 5s"
-              " ease-in-out infinite}"
-              "@keyframes float{0%,100%{transform:"
-              "translateY(0)}50%{transform:"
-              "translateY(-14px)}}"
-              "small{color:#8b949e}"
-          )
-
-
-          def _page(
-              title: str, body: str,
-          ) -> str:
-              return (
-                  "<!DOCTYPE html><html lang='es'><head>"
-                  "<meta charset='utf-8'>"
-                  "<meta name='viewport' content='width="
-                  "device-width, initial-scale=1'>"
-                  f"<title>{title}</title>"
-                  f"<style>{_CSS}</style></head><body>"
-                  f"<div class='wrap'>{body}</div></body>"
-                  "</html>"
-              )
-
-
-          def _esc(text: str) -> str:
-              return _html.escape(str(text))
-
-
-          def build_svg(
-              creation_type: str,
-              title: str,
-              description: str,
-          ) -> str:
-              """Real SVG generator - production files."""
-              t = _esc(title[:40])
-              if creation_type == "plano":
-                  return (
-                      "<svg xmlns='http://www.w3.org"
-                      "/2000/svg' viewBox='0 0 400 300'>"
-                      "<rect width='400' height='300'"
-                      " fill='#f4f1ea'/>"
-                      "<rect x='30' y='30' width='340'"
-                      " height='240' fill='none'"
-                      " stroke='#333' stroke-width='3'/>"
-                      "<line x1='30' y1='150' x2='220'"
-                      " y2='150' stroke='#666'"
-                      " stroke-width='2'/>"
-                      "<line x1='220' y1='30' x2='220'"
-                      " y2='270' stroke='#666'"
-                      " stroke-width='2'/>"
-                      "<rect x='50' y='50' width='60'"
-                      " height='40' fill='none'"
-                      " stroke='#999'/>"
-                      "<rect x='240' y='170'"
-                      " width='100' height='80'"
-                      " fill='none' stroke='#999'/>"
-                      "<circle cx='310' cy='80' r='25'"
-                      " fill='none' stroke='#999'/>"
-                      f"<text x='35' y='292'"
-                      " font-size='12' fill='#333'>"
-                      f"PLANO: {t}"
-                      "</text></svg>"
-                  )
-              if creation_type == "grafico":
-                  bars = (
-                      "<rect x='60' y='180'"
-                      " width='50' height='100'"
-                      " fill='#238636'/>"
-                      "<rect x='140' y='120'"
-                      " width='50' height='160'"
-                      " fill='#58a6ff'/>"
-                      "<rect x='220' y='150'"
-                      " width='50' height='130'"
-                      " fill='#d29922'/>"
-                      "<rect x='300' y='90'"
-                      " width='50' height='190'"
-                      " fill='#da3633'/>"
-                  )
-                  return (
-                      "<svg xmlns='http://www.w3.org"
-                      "/2000/svg' viewBox='0 0 400 300'>"
-                      "<rect width='400' height='300'"
-                      " fill='#0d1117'/>"
-                      f"<text x='20' y='40'"
-                      " font-size='16' fill='#e6edf3'>"
-                      f"GRAFICO: {t}</text>"
-                      "<line x1='40' y1='280'"
-                      " x2='380' y2='280'"
-                      " stroke='#30363d'"
-                      " stroke-width='2'/>"
-                      + bars
-                      + "</svg>"
-                  )
-              if creation_type == "logo":
-                  return (
-                      "<svg xmlns='http://www.w3.org"
-                      "/2000/svg' viewBox='0 0 400 300'>"
-                      "<rect width='400' height='300'"
-                      " fill='#0d1117'/>"
-                      "<circle cx='200' cy='130' r='80'"
-                      " fill='none' stroke='#58a6ff'"
-                      " stroke-width='6'/>"
-                      "<circle cx='200' cy='130' r='40'"
-                      " fill='#58a6ff'/>"
-                      f"<text x='200' y='260'"
-                      " font-size='22' fill='#e6edf3'"
-                      " text-anchor='middle'>"
-                      f"{t}</text></svg>"
-                  )
-              if creation_type == "ropa":
-                  return (
-                      "<svg xmlns='http://www.w3.org"
-                      "/2000/svg' viewBox='0 0 400 300'>"
-                      "<rect width='400' height='300'"
-                      " fill='#1a1030'/>"
-                      "<path d='M150 60 L120 90 L90"
-                      " 180 L120 180 L120 260 L280"
-                      " 260 L280 180 L310 180 L280 90"
-                      " L250 60 L200 100 Z' fill='none'"
-                      " stroke='#d29922'"
-                      " stroke-width='3'/>"
-                      "<line x1='150' y1='60'"
-                      " x2='250' y2='60' stroke='#d29922'"
-                      " stroke-width='3'/>"
-                      f"<text x='200' y='290'"
-                      " font-size='14' fill='#e6edf3'"
-                      " text-anchor='middle'>MODA:"
-                      f" {t}</text></svg>"
-                  )
-              if creation_type == "presentacion":
-                  return (
-                      "<svg xmlns='http://www.w3.org"
-                      "/2000/svg' viewBox='0 0 400 300'>"
-                      "<rect width='400' height='300'"
-                      " fill='#0d1117'/>"
-                      "<rect x='30' y='40' width='340'"
-                      " height='100' fill='#161b22'"
-                      " stroke='#30363d'/>"
-                      "<rect x='30' y='160' width='160'"
-                      " height='110' fill='#161b22'"
-                      " stroke='#30363d'/>"
-                      "<rect x='210' y='160' width='160'"
-                      " height='110' fill='#161b22'"
-                      " stroke='#30363d'/>"
-                      f"<text x='200' y='100'"
-                      " font-size='18' fill='#e6edf3'"
-                      " text-anchor='middle'>"
-                      f"{t}</text></svg>"
-                  )
-              return (
-                  "<svg xmlns='http://www.w3.org"
-                  "/2000/svg' viewBox='0 0 400 300'>"
-                  "<rect width='400' height='300'"
-                  " fill='#0d1117'/>"
-                  "<text x='200' y='150' font-size='18'"
-                  " fill='#e6edf3' text-anchor='middle'>"
-                  f"DOCUMENTO: {t}</text></svg>"
-              )
-
-
-          class LabApiHandler(
-              BaseHTTPRequestHandler
-          ):
-              store: ClassVar[LaboratorioStore]
-              link: ClassVar[LaboratorioLink]
-
-              def log_message(
-                  self,
-                  format: str,
-                  *args: object,
-              ) -> None:
-                  return None
-
-              def do_GET(self) -> None:
-                  self._safe("GET")
-
-              def do_POST(self) -> None:
-                  self._safe("POST")
-
-              def _safe(
-                  self, method: str,
-              ) -> None:
-                  try:
-                      self._route(method)
-                  except LookupError as exc:
-                      self._html(
-                          404,
-                          _page(
-                              "No encontrado",
-                              "<h1>404</h1>"
-                              f"<p>{exc}</p>",
-                          ),
-                      )
-                  except ValueError as exc:
-                      self._html(
-                          400,
-                          _page(
-                              "Error",
-                              "<h1>Dato invalido"
-                              f"</h1><p>{exc}</p>",
-                          ),
-                      )
-                  except Exception as exc:
-                      self._html(
-                          500,
-                          _page(
-                              "Error",
-                              "<h1>Error interno"
-                              f"</h1><p>{exc}</p>",
-                          ),
-                      )
-
-              def _route(
-                  self, method: str,
-              ) -> None:
-                  path = urlparse(
-                      self.path
-                  ).path
-                  segments = [
-                      s
-                      for s in path.split("/")
-                      if s
-                  ]
-                  if segments[:1] != [
-                      "laboratorio"
-                  ]:
-                      self._html(
-                          404,
-                          _page(
-                              "404",
-                              "<h1>Fuera de"
-                              " LABORATORIO</h1>",
-                          ),
-                      )
-                      return
-                  tail = segments[1:]
-                  if method == "GET":
-                      self._get(tail)
-                  else:
-                      self._post(tail)
-
-              def _get(
-                  self, s: list[str],
-              ) -> None:
-                  if s[:1] == ["api"]:
-                      self._api_get(s[1:])
-                      return
-                  store = type(self).store
-                  if not s or s == ["home"]:
-                      self._home()
-                      return
-                  if s == ["escenarios"]:
-                      scenarios = (
-                          store.list_scenarios()
-                      )
-                      items = ""
-                      for sc in scenarios:
-                          impact = (
-                              sc["impact_score"]
-                              or "-"
-                          )
-                          items = (
-                              items
-                              + "<li>- "
-                              + str(sc["title"])
-                              + " ["
-                              + str(
-                                  sc[
-                                      "scenario_type"
-                                  ]
-                              )
-                              + "] "
-                              + str(
-                                  sc["status"]
-                              )
-                              + " | impacto: "
-                              + str(impact)
-                              + "</li>"
-                          )
-                      if not items:
-                          items = (
-                              "<li>Sin"
-                              " escenarios</li>"
-                          )
-                      body = (
-                          "<h1>Decisiones"
-                          " Reales</h1><ul>"
-                          + items
-                          + "</ul>"
-                          "<a href='/laboratorio'>"
-                          "<button class='gray'>"
-                          "Inicio</button></a>"
-                      )
-                      self._html(
-                          200,
-                          _page(
-                              "LAB - Escenarios",
-                              body,
-                          ),
-                      )
-                      return
-                  if s == ["creaciones"]:
-                      creations = (
-                          store.list_creations()
-                      )
-                      items = ""
-                      for c in creations:
-                          items = (
-                              items
-                              + "<li>- "
-                              + str(c["title"])
-                              + " ["
-                              + str(
-                                  c[
-                                      "creation_type"
-                                  ]
-                              )
-                              + "] <a href="
-                              "'/laboratorio"
-                              "/proyector/"
-                              + str(
-                                  c[
-                                      "creation_id"
-                                  ]
-                              )
-                              + "'>Proyectar</a>"
-                              + "</li>"
-                          )
-                      if not items:
-                          items = (
-                              "<li>Sin"
-                              " creaciones</li>"
-                          )
-                      body = (
-                          "<h1>Laboratorio de"
-                          " Creacion</h1><ul>"
-                          + items
-                          + "</ul>"
-                          "<a href='/laboratorio'>"
-                          "<button class='gray'>"
-                          "Inicio</button></a>"
-                      )
-                      self._html(
-                          200,
-                          _page(
-                              "LAB - Creaciones",
-                              body,
-                          ),
-                      )
-                      return
-                  if s[0] == "proyector" and len(
-                      s
-                  ) > 1:
-                      self._screen_projector(s[1])
-                      return
-                  self._html(
-                      404,
-                      _page(
-                          "404",
-                          "<h1>No encontrado</h1>",
-                      ),
-                  )
-
-              def _post(
-                  self, s: list[str],
-              ) -> None:
-                  if s[:1] == ["api"]:
-                      self._api_post(s[1:])
-                      return
-                  store = type(self).store
-                  doc = self._read_form()
-                  if s == ["scenario"]:
-                      self._scenario_form(doc)
-                      return
-                  if s == ["scenario-run"]:
-                      self._scenario_run_form(doc)
-                      return
-                  if s == ["creation"]:
-                      self._creation_form(doc)
-                      return
-                  self._html(
-                      404,
-                      _page(
-                          "404",
-                          "<h1>Ruta"
-                          " desconocida</h1>",
-                      ),
-                  )
-
-              def _scenario_form(
-                  self, doc: dict[str, Any],
-              ) -> None:
-                  store = type(self).store
-                  scenario_type = self._req(
-                      doc, "scenario_type"
-                  )
-                  title = self._req(doc, "title")
-                  description = self._req(
-                      doc, "description"
-                  )
-                  import json as _json
-
-                  parameters = _json.dumps(
-                      {
-                          "cost": float(
-                              doc.get("cost", 0)
-                              or 0
-                          ),
-                          "benefit": float(
-                              doc.get(
-                                  "benefit", 0
-                              )
-                              or 0
-                          ),
-                          "affected_population":
-                          int(
-                              doc.get(
-                                  "affected_population",
-                                  1,
-                              )
-                              or 1
-                          ),
-                          "risk_percent": float(
-                              doc.get(
-                                  "risk_percent",
-                                  0,
-                              )
-                              or 0
-                          ),
-                          "time_months": int(
-                              doc.get(
-                                  "time_months", 1
-                              )
-                              or 1
-                          ),
-                      }
-                  )
-                  scenario_id = (
-                      "SCN-"
-                      + _uuid.uuid4().hex[:10]
-                  )
-                  store.create_scenario(
-                      scenario_id=scenario_id,
-                      owner_zid=None,
-                      scenario_type=scenario_type,
-                      title=title,
-                      description=description,
-                      parameters=parameters,
-                  )
-                  self._html(
-                      200,
-                      _page(
-                          "Escenario creado",
-                          "<h1>Escenario creado"
-                          "</h1>"
-                          "<p>Ahora ejecuta la"
-                          " evaluacion real.</p>"
-                          "<form method='POST'"
-                          " action="
-                          "'/laboratorio/"
-                          "scenario-run'>"
-                          "<input type='hidden'"
-                          " name='scenario_id'"
-                          " value='"
-                          + scenario_id
-                          + "'>"
-                          "<input name='cost'"
-                          " placeholder='Costo"
-                          " total'>"
-                          "<input name='benefit'"
-                          " placeholder='Beneficio"
-                          " total'>"
-                          "<input name="
-                          "'affected_population'"
-                          " placeholder='Poblacion"
-                          " afectada'>"
-                          "<input name="
-                          "'risk_percent'"
-                          " placeholder='Riesgo %'>"
-                          "<input name="
-                          "'time_months'"
-                          " placeholder='Meses'>"
-                          "<button>Evaluar"
-                          "</button></form>",
-                      ),
-                  )
-
-              def _scenario_run_form(
-                  self, doc: dict[str, Any],
-              ) -> None:
-                  store = type(self).store
-                  scenario_id = self._req(
-                      doc, "scenario_id"
-                  )
-                  result = store.run_scenario(
-                      scenario_id=scenario_id,
-                      cost=float(
-                          doc.get("cost", 0) or 0
-                      ),
-                      benefit=float(
-                          doc.get("benefit", 0)
-                          or 0
-                      ),
-                      affected_population=int(
-                          doc.get(
-                              "affected_population",
-                              1,
-                          )
-                          or 1
-                      ),
-                      risk_percent=float(
-                          doc.get(
-                              "risk_percent", 0
-                          )
-                          or 0
-                      ),
-                      time_months=int(
-                          doc.get(
-                              "time_months", 1
-                          )
-                          or 1
-                      ),
-                  )
-                  body = (
-                      "<h1>Evaluacion real</h1>"
-                      "<div class='card'>"
-                      "<p>Impacto: <b>"
-                      + str(result["impact_score"])
-                      + "</b></p>"
-                      "<p>Riesgo: "
-                      + str(result["risk_level"])
-                      + "</p>"
-                      "<p>Beneficio/costo: "
-                      + str(result["bc_ratio"])
-                      + "</p>"
-                      "<p>Impacto neto: $"
-                      + str(result["net_impact"])
-                      + "</p>"
-                      "<p>Recomendacion: "
-                      + str(
-                          result["recommendation"]
-                      )
-                      + "</p></div>"
-                      "<a href='/laboratorio"
-                      "/escenarios'><button"
-                      " class='gray'>Mis"
-                      " escenarios</button></a>"
-                  )
-                  self._html(
-                      200,
-                      _page(
-                          "LAB - Decision", body
-                      ),
-                  )
-
-              def _creation_form(
-                  self, doc: dict[str, Any],
-              ) -> None:
-                  store = type(self).store
-                  creation_type = self._req(
-                      doc, "creation_type"
-                  )
-                  title = self._req(doc, "title")
-                  description = self._req(
-                      doc, "description"
-                  )
-                  svg_content = build_svg(
-                      creation_type,
-                      title,
-                      description,
-                  )
-                  creation_id = (
-                      "CRE-"
-                      + _uuid.uuid4().hex[:10]
-                  )
-                  store.create_creation(
-                      creation_id=creation_id,
-                      owner_zid=None,
-                      creation_type=(
-                          creation_type
-                      ),
-                      title=title,
-                      description=description,
-                      svg_content=svg_content,
-                      sealed_doc=None,
-                  )
-                  self._html(
-                      200,
-                      _page(
-                          "Creacion generada",
-                          "<h1>Creacion generada"
-                          " (archivo real SVG)"
-                          "</h1>"
-                          "<p>"
-                          + _esc(title)
-                          + " ["
-                          + creation_type
-                          + "]</p>"
-                          "<a href='/laboratorio"
-                          "/proyector/"
-                          + creation_id
-                          + "'><button>Proyectar"
-                          " en 3D</button></a>"
-                          "<a href='/laboratorio"
-                          "/creaciones'><button"
-                          " class='gray'>Mis"
-                          " creaciones</button>"
-                          "</a>",
-                      ),
-                  )
-
-              def _screen_projector(
-                  self, creation_id: str,
-              ) -> None:
-                  store = type(self).store
-                  creation = store.get_creation(
-                      creation_id
-                  )
-                  if creation is None:
-                      self._html(
-                          404,
-                          _page(
-                              "404",
-                              "<h1>No"
-                              " encontrado</h1>",
-                          ),
-                      )
-                      return
-                  store.record_projection(
-                      projection_id=(
-                          "PRJ-"
-                          + _uuid.uuid4().hex[:10]
-                      ),
-                      creation_id=creation_id,
-                      mode="holo3d",
-                  )
-                  svg = creation["svg_content"]
-                  body = (
-                      "<h1>Proyector Holografico"
-                      "</h1>"
-                      "<p>Apunta tu telefono a la"
-                      " pared o mesa (o conecta un"
-                      " proyector). El disenio flota"
-                      " en 3D.</p>"
-                      "<div class='scene3d'>"
-                      "<div class='holo float'>"
-                      + svg
-                      + "</div></div>"
-                      "<p><small>Produccion real:"
-                      " vista 3D en tu navegador."
-                      " Compatible con proyectores"
-                      " externos.</small></p>"
-                      "<a href='/laboratorio"
-                      "/creaciones'><button"
-                      " class='gray'>Volver"
-                      "</button></a>"
-                  )
-                  self._html(
-                      200,
-                      _page(
-                          "LAB - Proyector", body
-                      ),
-                  )
-
-              def _home(self) -> None:
-                  body = (
-                      "<h1>🧪 LABORATORIO</h1>"
-                      "<p>Produccion real: decisiones"
-                      " evaluadas con matematica y"
-                      " creaciones como archivos."
-                      "</p>"
-                      "<h2>Decisiones Reales</h2>"
-                      "<div class='card'>"
-                      "<form method='POST'"
-                      " action='/laboratorio"
-                      "/scenario'>"
-                      "<select name="
-                      "'scenario_type'>"
-                      "<option value='politica'>"
-                      "Politica</option>"
-                      "<option value='ley'>Ley"
-                      "</option>"
-                      "<option value='app'>App"
-                      "</option>"
-                      "<option value='mercado'>"
-                      "Mercado</option>"
-                      "<option value='tienda'>"
-                      "Tienda</option>"
-                      "<option value='trabajo'>"
-                      "Trabajo</option>"
-                      "<option value="
-                      "'invencion'>Invencion"
-                      "</option>"
-                      "</select>"
-                      "<input name='title'"
-                      " placeholder='Titulo'>"
-                      "<textarea name="
-                      "'description'"
-                      " placeholder='Describe tu"
-                      " decision'></textarea>"
-                      "<button>Crear escenario"
-                      "</button></form></div>"
-                      "<h2>Creacion con IA</h2>"
-                      "<div class='card'>"
-                      "<form method='POST'"
-                      " action='/laboratorio"
-                      "/creation'>"
-                      "<select name="
-                      "'creation_type'>"
-                      "<option value='plano'>"
-                      "Plano arquitectonico"
-                      "</option>"
-                      "<option value='grafico'>"
-                      "Grafico</option>"
-                      "<option value='logo'>"
-                      "Logo</option>"
-                      "<option value='ropa'>"
-                      "Disenio de ropa</option>"
-                      "<option value="
-                      "'presentacion'>"
-                      "Presentacion</option>"
-                      "<option value="
-                      "'documento'>Documento"
-                      "</option>"
-                      "</select>"
-                      "<input name='title'"
-                      " placeholder='Titulo'>"
-                      "<textarea name="
-                      "'description'"
-                      " placeholder='Describe"
-                      " lo que quieres crear"
-                      " (o describe la foto)'>"
-                      "</textarea>"
-                      "<button>Crear archivo"
-                      " real</button></form></div>"
-                      "<a href='/laboratorio"
-                      "/escenarios'><button"
-                      " class='gray'>Mis"
-                      " escenarios</button></a>"
-                      "<a href='/laboratorio"
-                      "/creaciones'><button"
-                      " class='gray'>Mis"
-                      " creaciones</button></a>"
-                  )
-                  self._html(
-                      200, _page("LABORATORIO", body)
-                  )
-
-              def _read_form(
-                  self,
-              ) -> dict[str, Any]:
-                  length_header = self.headers.get(
-                      "Content-Length"
-                  )
-                  if length_header is None:
-                      raise ValueError(
-                          "Content-Length required"
-                      )
-                  raw = self.rfile.read(
-                      int(length_header)
-                  ).decode("utf-8")
-                  doc: dict[str, Any] = {}
-                  for pair in raw.split("&"):
-                      if "=" in pair:
-                          key, value = pair.split(
-                              "=", 1
-                          )
-                          doc[key] = value.replace(
-                              "+", " "
-                          )
-                  return doc
-
-              def _read_json(
-                  self,
-              ) -> dict[str, Any]:
-                  length_header = self.headers.get(
-                      "Content-Length"
-                  )
-                  if length_header is None:
-                      raise ValueError(
-                          "Content-Length required"
-                      )
-                  raw = self.rfile.read(
-                      int(length_header)
-                  )
-                  parsed: Any = json.loads(
-                      raw.decode("utf-8")
-                  )
-                  if not isinstance(parsed, dict):
-                      raise ValueError(
-                          "body must be a JSON"
-                          " object"
-                      )
-                  return {
-                      str(k): v
-                      for k, v in parsed.items()
-                  }
-
-              @staticmethod
-              def _req(
-                  doc: dict[str, Any],
-                  key: str,
-              ) -> str:
-                  value: Any = doc.get(key)
-                  if isinstance(
-                      value, int
-                  ) and not isinstance(
-                      value, bool
-                  ):
-                      value = str(value)
-                  if not isinstance(value, str):
-                      raise ValueError(
-                          f"missing field: {key}"
-                      )
-                  if not value.strip():
-                      raise ValueError(
-                          f"missing field: {key}"
-                      )
-                  return value
-
-              def _api_get(
-                  self, s: list[str],
-              ) -> None:
-                  store = type(self).store
-                  if s == ["health"]:
-                      self._send(
-                          200,
-                          {
-                              "ok": True,
-                              "data": {
-                                  "app":
-                                  "laboratorio",
-                                  "status":
-                                  "operational",
-                              },
-                          },
-                      )
-                      return
-                  self._send(
-                      404,
-                      {
-                          "ok": False,
-                          "error": {
-                              "type":
-                              "not_found",
-                              "message":
-                              "unknown api route",
-                          },
-                      },
-                  )
-
-              def _api_post(
-                  self, s: list[str],
-              ) -> None:
-                  store = type(self).store
-                  doc = self._read_json()
-                  if s == ["scenarios"]:
-                      scenario = (
-                          store.create_scenario(
-                              scenario_id="SCN-"
-                              + _uuid.uuid4().hex[
-                                  :10
-                              ],
-                              owner_zid=doc.get(
-                                  "owner_zid"
-                              ),
-                              scenario_type=self._req(
-                                  doc,
-                                  "scenario_type",
-                              ),
-                              title=self._req(
-                                  doc, "title"
-                              ),
-                              description=self._req(
-                                  doc,
-                                  "description",
-                              ),
-                              parameters=str(
-                                  doc.get(
-                                      "parameters",
-                                      "{}",
-                                  )
-                              ),
-                          )
-                      )
-                      self._send(
-                          201,
-                          {
-                              "ok": True,
-                              "data": scenario,
-                          },
-                      )
-                      return
-                  self._send(
-                      404,
-                      {
-                          "ok": False,
-                          "error": {
-                              "type":
-                              "not_found",
-                              "message":
-                              "unknown api route",
-                          },
-                      },
-                  )
-
-              def _html(
-                  self, status: int, html: str,
-              ) -> None:
-                  body = html.encode("utf-8")
-                  self.send_response(status)
-                  self.send_header(
-                      "Content-Type",
-                      "text/html; charset=utf-8",
-                  )
-                  self.send_header(
-                      "Content-Length",
-                      str(len(body)),
-                  )
-                  self.end_headers()
-                  self.wfile.write(body)
-
-              def _send(
-                  self,
-                  status: int,
-                  payload: dict[str, Any],
-              ) -> None:
-                  body = json.dumps(payload).encode(
-                      "utf-8"
-                  )
-                  self.send_response(status)
-                  self.send_header(
-                      "Content-Type",
-                      "application/json",
-                  )
-                  self.send_header(
-                      "Content-Length",
-                      str(len(body)),
-                  )
-                  self.end_headers()
-                  self.wfile.write(body)
-
-
-          class LabServer(ThreadingHTTPServer):
-              daemon_threads = True
-              allow_reuse_address = True
-
-              def __init__(
-                  self,
-                  address: tuple[str, int],
-              ) -> None:
-                  super().__init__(
-                      address, LabApiHandler
-                  )
-
-              @property
-              def bound_port(self) -> int:
-                  return int(
-                      self.server_address[1]
-                  )
-
-
-          def serve_laboratorio(
-              store: LaboratorioStore,
-              client: NetworkClient,
-              *,
-              host: str = "127.0.0.1",
-              port: int = 0,
-          ) -> LabServer:
-              LabApiHandler.store = store
-              LabApiHandler.link = LaboratorioLink(
-                  client
-              )
-              return LabServer((host, port))
-          PYEOF
-          python -m py_compile apps/laboratorio/server.py
-          echo "server written"
-
-      - name: Internal probe (full production coverage)
-        run: |
-          set -euo pipefail
-          PYTHONPATH="$PWD" python - <<'PYEOF'
-          import tempfile
-          from pathlib import Path
-
-          from shared_engines.common.clocks import FrozenClock
-          from shared_engines.storage.database import SQLiteAdapter
-
-          from apps.laboratorio.infrastructure.persistence.laboratorio_store import (
-              evaluate_scenario,
-              LaboratorioStore,
-          )
-
-          tmp = Path(tempfile.mkdtemp())
-          db = SQLiteAdapter(tmp / "probe.db")
-          clock = FrozenClock()
-          store = LaboratorioStore(db, clock)
-          result = evaluate_scenario(
-              scenario_type="politica",
-              cost=10000.0,
-              benefit=30000.0,
-              affected_population=5000,
-              risk_percent=20.0,
-              time_months=12,
-          )
-          assert result["bc_ratio"] == 3.0
-          assert result["risk_level"] == "bajo"
-          assert result["impact_score"] > 60
-          assert "VIABLE" in result["recommendation"]
-          bad = evaluate_scenario(
-              scenario_type="ley",
-              cost=50000.0,
-              benefit=20000.0,
-              affected_population=1000,
-              risk_percent=80.0,
-              time_months=24,
-          )
-          assert bad["risk_level"] == "alto"
-          assert "NO VIABLE" in bad["recommendation"]
-          try:
-              evaluate_scenario(
-                  scenario_type="politica",
-                  cost=-1.0,
-                  benefit=100.0,
-                  affected_population=10,
-                  risk_percent=10.0,
-                  time_months=6,
-              )
-              raise AssertionError("negative cost must fail")
-          except ValueError:
-              pass
-          scenario = store.create_scenario(
-              scenario_id="SCN-1",
-              owner_zid="ZID-a",
-              scenario_type="mercado",
-              title="Tienda en San Salvador",
-              description="probar mercado antes de abrir",
-              parameters="{}",
-          )
-          assert scenario["status"] == "created"
-          result = store.run_scenario(
-              scenario_id="SCN-1",
-              cost=5000.0,
-              benefit=15000.0,
-              affected_population=2000,
-              risk_percent=25.0,
-              time_months=6,
-          )
-          assert result["bc_ratio"] == 3.0
-          full = store.get_scenario("SCN-1")
-          assert full["status"] == "evaluated"
-          assert full["risk_level"] == "bajo"
-          assert full["impact_score"] is not None
-          creation = store.create_creation(
-              creation_id="CRE-1",
-              owner_zid="ZID-a",
-              creation_type="plano",
-              title="Casa de campo",
-              description="casa con jardin",
-              svg_content="<svg>plano</svg>",
-              sealed_doc=None,
-          )
-          assert creation["creation_type"] == "plano"
-          got = store.get_creation("CRE-1")
-          assert got is not None
-          assert "plano" in got["svg_content"]
-          projection = store.record_projection(
-              projection_id="PRJ-1",
-              creation_id="CRE-1",
-              mode="holo3d",
-          )
-          assert projection["mode"] == "holo3d"
-          try:
-              store.create_scenario(
-                  scenario_id="SCN-bad",
-                  owner_zid=None,
-                  scenario_type="otra_cosa",
-                  title="x",
-                  description="x",
-                  parameters="{}",
-              )
-              raise AssertionError("bad type must fail")
-          except ValueError:
-              pass
-          try:
-              store.create_creation(
-                  creation_id="CRE-bad",
-                  owner_zid=None,
-                  creation_type="nave",
-                  title="x",
-                  description="x",
-                  svg_content="x",
-                  sealed_doc=None,
-              )
-              raise AssertionError("bad creation must fail")
-          except ValueError:
-              pass
-          summary = store.summary()
-          assert summary["scenarios_total"] == 1
-          assert summary["scenarios_evaluated"] == 1
-          assert summary["creations_total"] == 1
-          assert summary["projections_total"] == 1
-          print("PROBE OK: full production coverage")
-          db.close()
-          PYEOF
-
-      - name: Write lab e2e tests
-        run: |
-          set -euo pipefail
-          mkdir -p apps/laboratorio/tests
-          touch apps/laboratorio/tests/__init__.py
-          cat > apps/laboratorio/tests/test_laboratorio_e2e.py <<'PYEOF'
-          """LABORATORIO e2e production - deterministic
-          decision math, real SVG file generation, projection
-          registry, offline HTTP flows."""
-          from __future__ import annotations
-
-          import socket
-          import threading
-          from pathlib import Path
-          from urllib.error import HTTPError
-          from urllib.request import Request, urlopen
-
-          socket.setdefaulttimeout(20)
-
-          from shared_engines.common.clocks import FrozenClock
-          from shared_engines.storage.database import SQLiteAdapter
-
-          from apps.laboratorio.infrastructure.network.network_client import NetworkClient
-          from apps.laboratorio.infrastructure.persistence.laboratorio_store import (
-              LaboratorioStore,
-          )
-          from apps.laboratorio.server import serve_laboratorio
-
-
-          class _App:
-              def __init__(self, tmp_path: Path) -> None:
-                  self.db = SQLiteAdapter(tmp_path / "lab.db")
-                  self.store = LaboratorioStore(self.db, FrozenClock())
-                  dead_client = NetworkClient(
-                      "http://127.0.0.1:1",
-                      timeout_seconds=1.0,
-                      max_retries=0,
-                  )
-                  self.server = serve_laboratorio(
-                      self.store, dead_client
-                  )
-                  self.thread = threading.Thread(
-                      target=self.server.serve_forever, daemon=True
-                  )
-                  self.thread.start()
-                  self.base = (
-                      "http://127.0.0.1:"
-                      f"{self.server.bound_port}"
-                  )
-
-              def close(self) -> None:
-                  self.server.shutdown()
-                  self.server.server_close()
-                  self.thread.join(timeout=5)
-                  self.db.close()
-
-
-          def _pf(url: str, doc: dict) -> str:
-              request = Request(
-                  url,
-                  data=(
-                      "&".join(
-                          str(k) + "=" + str(v)
-                          for k, v in doc.items()
-                      )
-                  ).encode("utf-8"),
-                  method="POST",
-              )
-              try:
-                  with urlopen(request, timeout=15) as r:
-                      return r.read().decode("utf-8")
-              except HTTPError as exc:
-                  body = exc.read().decode("utf-8", "replace")
-                  raise AssertionError(
-                      "POST " + url + " -> HTTP " + str(exc.code)
-                      + " body: " + body[:600]
-                  )
-
-
-          def _h(url: str) -> str:
-              try:
-                  with urlopen(url, timeout=15)
+set -euo pipefail
+
+echo "=== ZYRA SECURITY STRENGTHENING — ADD ONLY ==="
+
+# ------------------------------------------------------------
+# 0. SEGURIDAD: NO TOCAR ARCHIVOS EXISTENTES
+# ------------------------------------------------------------
+
+NEW_FILES=(
+  "shared_engines/identity_proofing/__init__.py"
+  "shared_engines/identity_proofing/contracts.py"
+  "shared_engines/identity_proofing/engine.py"
+  "shared_engines/security/service_boundary.py"
+  "shared_engines/security/tests/test_security_strengthening.py"
+)
+
+for FILE in "${NEW_FILES[@]}"; do
+  if [ -e "$FILE" ]; then
+    echo "ERROR: el archivo ya existe: $FILE"
+    echo "ABORTADO. No se modificó nada."
+    exit 1
+  fi
+done
+
+# ------------------------------------------------------------
+# 1. IDENTITY PROOFING
+# ------------------------------------------------------------
+
+mkdir -p shared_engines/identity_proofing
+
+cat > shared_engines/identity_proofing/__init__.py <<'PY'
+"""
+ZYRA Identity Proofing.
+
+Additive security layer for identity assurance.
+Does not replace ZID, IdentityEngine, Trust, Verification,
+History, Audit, or existing identity infrastructure.
+"""
+
+from .contracts import (
+    AssuranceLevel,
+    BiometricKind,
+    DocumentCheck,
+    DocumentStatus,
+    ProofingDecision,
+    ProofingRequest,
+    ProofingResult,
+)
+
+from .engine import IdentityProofingEngine
+
+__all__ = [
+    "AssuranceLevel",
+    "BiometricKind",
+    "DocumentCheck",
+    "DocumentStatus",
+    "ProofingDecision",
+    "ProofingRequest",
+    "ProofingResult",
+    "IdentityProofingEngine",
+]
+PY
+
+cat > shared_engines/identity_proofing/contracts.py <<'PY'
+from __future__ import annotations
+
+from dataclasses import dataclass, field
+from enum import Enum
+from typing import Optional
+
+
+class AssuranceLevel(str, Enum):
+    UNVERIFIED = "unverified"
+    BASIC = "basic"
+    VERIFIED = "verified"
+    HIGH = "high"
+
+
+class BiometricKind(str, Enum):
+    FACE = "face"
+    IRIS = "iris"
+
+
+class DocumentStatus(str, Enum):
+    NOT_CHECKED = "not_checked"
+    AUTHENTIC = "authentic"
+    INVALID = "invalid"
+    REJECTED = "rejected"
+
+
+class ProofingDecision(str, Enum):
+    REJECT = "reject"
+    REVIEW = "review"
+    ACCEPT = "accept"
+
+
+@dataclass(frozen=True)
+class DocumentCheck:
+    document_type: str
+    issuer: str
+    document_fingerprint: str
+
+    authentic: bool = False
+    attributes_verified: bool = False
+    issuer_verified: bool = False
+    tamper_detected: bool = False
+
+
+@dataclass(frozen=True)
+class ProofingRequest:
+    subject_zid: str
+    document: DocumentCheck
+
+    biometric_kind: Optional[BiometricKind] = None
+    biometric_match: bool = False
+    liveness_passed: bool = False
+
+    duplicate_identity_detected: bool = False
+    source_reference: Optional[str] = None
+
+
+@dataclass(frozen=True)
+class ProofingResult:
+    decision: ProofingDecision
+    assurance: AssuranceLevel
+    document_status: DocumentStatus
+
+    reasons: tuple[str, ...] = field(default_factory=tuple)
+    evidence_digest: str = ""
+PY
+
+cat > shared_engines/identity_proofing/engine.py <<'PY'
+from __future__ import annotations
+
+import hashlib
+from dataclasses import asdict
+
+from .contracts import (
+    AssuranceLevel,
+    DocumentStatus,
+    ProofingDecision,
+    ProofingRequest,
+    ProofingResult,
+)
+
+
+class IdentityProofingEngine:
+    """
+    Additive identity-proofing decision engine.
+
+    This layer does NOT create or replace ZID.
+    It determines whether the claimed identity has enough
+    evidence to receive an assurance level.
+
+    External document/biometric providers may feed their
+    verified results into ProofingRequest.
+    """
+
+    VERSION = "1.0.0"
+
+    def evaluate(self, request: ProofingRequest) -> ProofingResult:
+        reasons: list[str] = []
+        document = request.document
+
+        if not request.subject_zid.strip():
+            return self._reject(
+                request,
+                DocumentStatus.INVALID,
+                "missing_subject_zid",
+            )
+
+        if not document.document_type.strip():
+            return self._reject(
+                request,
+                DocumentStatus.INVALID,
+                "missing_document_type",
+            )
+
+        if not document.issuer.strip():
+            return self._reject(
+                request,
+                DocumentStatus.INVALID,
+                "missing_document_issuer",
+            )
+
+        if not document.document_fingerprint.strip():
+            return self._reject(
+                request,
+                DocumentStatus.INVALID,
+                "missing_document_fingerprint",
+            )
+
+        if document.tamper_detected:
+            return self._reject(
+                request,
+                DocumentStatus.REJECTED,
+                "document_tampering_detected",
+            )
+
+        if not document.authentic:
+            return self._reject(
+                request,
+                DocumentStatus.INVALID,
+                "document_authenticity_not_confirmed",
+            )
+
+        if not document.issuer_verified:
+            return self._reject(
+                request,
+                DocumentStatus.INVALID,
+                "document_issuer_not_verified",
+            )
+
+        if not document.attributes_verified:
+            return self._reject(
+                request,
+                DocumentStatus.INVALID,
+                "document_attributes_not_verified",
+            )
+
+        if request.duplicate_identity_detected:
+            return self._reject(
+                request,
+                DocumentStatus.REJECTED,
+                "duplicate_identity_detected",
+            )
+
+        # Documento válido pero sin biometría:
+        # no se concede HIGH.
+        if request.biometric_kind is None:
+            reasons.append("biometric_binding_not_present")
+
+            return self._result(
+                request=request,
+                decision=ProofingDecision.REVIEW,
+                assurance=AssuranceLevel.BASIC,
+                document_status=DocumentStatus.AUTHENTIC,
+                reasons=reasons,
+            )
+
+        if not request.liveness_passed:
+            return self._reject(
+                request,
+                DocumentStatus.REJECTED,
+                "liveness_check_failed",
+            )
+
+        if not request.biometric_match:
+            return self._reject(
+                request,
+                DocumentStatus.REJECTED,
+                "biometric_match_failed",
+            )
+
+        # Documento autenticado + emisor/atributos verificados +
+        # biometría vinculada + liveness + sin duplicado.
+        return self._result(
+            request=request,
+            decision=ProofingDecision.ACCEPT,
+            assurance=AssuranceLevel.HIGH,
+            document_status=DocumentStatus.AUTHENTIC,
+            reasons=("identity_proofing_completed",),
+        )
+
+    def _reject(
+        self,
+        request: ProofingRequest,
+        document_status: DocumentStatus,
+        reason: str,
+    ) -> ProofingResult:
+        return self._result(
+            request=request,
+            decision=ProofingDecision.REJECT,
+            assurance=AssuranceLevel.UNVERIFIED,
+            document_status=document_status,
+            reasons=(reason,),
+        )
+
+    def _result(
+        self,
+        request: ProofingRequest,
+        decision: ProofingDecision,
+        assurance: AssuranceLevel,
+        document_status: DocumentStatus,
+        reasons: tuple[str, ...],
+    ) -> ProofingResult:
+        payload = {
+            "version": self.VERSION,
+            "request": asdict(request),
+            "decision": decision.value,
+            "assurance": assurance.value,
+            "document_status": document_status.value,
+            "reasons": reasons,
+        }
+
+        canonical = repr(payload).encode("utf-8")
+        evidence_digest = hashlib.sha256(canonical).hexdigest()
+
+        return ProofingResult(
+            decision=decision,
+            assurance=assurance,
+            document_status=document_status,
+            reasons=reasons,
+            evidence_digest=evidence_digest,
+        )
+PY
+
+# ------------------------------------------------------------
+# 2. SERVICE-TO-SERVICE SECURITY BOUNDARY
+# ------------------------------------------------------------
+
+cat > shared_engines/security/service_boundary.py <<'PY'
+from __future__ import annotations
+
+import hashlib
+import hmac
+import secrets
+import time
+from dataclasses import dataclass
+
+
+@dataclass(frozen=True)
+class ServiceCredential:
+    service_id: str
+    audience: str
+    issued_at: int
+    expires_at: int
+    nonce: str
+    signature: str
+
+
+class ServiceBoundary:
+    """
+    Additive service-to-service authorization boundary.
+
+    Credentials are:
+      - short lived
+      - audience bound
+      - cryptographically signed
+      - nonce protected
+
+    This class does not modify the existing authentication system.
+    """
+
+    VERSION = "1"
+
+    def __init__(self, service_id: str, secret: bytes):
+        if not service_id or not service_id.strip():
+            raise ValueError("service_id is required")
+
+        if len(secret) < 32:
+            raise ValueError("service secret must contain at least 32 bytes")
+
+        self.service_id = service_id
+        self._secret = bytes(secret)
+
+    def issue(
+        self,
+        audience: str,
+        ttl_seconds: int = 60,
+        now: int | None = None,
+    ) -> ServiceCredential:
+        if not audience or not audience.strip():
+            raise ValueError("audience is required")
+
+        if not 1 <= ttl_seconds <= 300:
+            raise ValueError("ttl_seconds must be between 1 and 300")
+
+        issued_at = int(time.time()) if now is None else int(now)
+        expires_at = issued_at + ttl_seconds
+        nonce = secrets.token_urlsafe(32)
+
+        signature = self._sign(
+            self.service_id,
+            audience,
+            issued_at,
+            expires_at,
+            nonce,
+        )
+
+        return ServiceCredential(
+            service_id=self.service_id,
+            audience=audience,
+            issued_at=issued_at,
+            expires_at=expires_at,
+            nonce=nonce,
+            signature=signature,
+        )
+
+    def verify(
+        self,
+        credential: ServiceCredential,
+        expected_audience: str,
+        now: int | None = None,
+    ) -> bool:
+        if credential.service_id != self.service_id:
+            return False
+
+        if credential.audience != expected_audience:
+            return False
+
+        current = int(time.time()) if now is None else int(now)
+
+        if credential.issued_at > current:
+            return False
+
+        if credential.expires_at < current:
+            return False
+
+        expected_signature = self._sign(
+            credential.service_id,
+            credential.audience,
+            credential.issued_at,
+            credential.expires_at,
+            credential.nonce,
+        )
+
+        return hmac.compare_digest(
+            credential.signature,
+            expected_signature,
+        )
+
+    def _sign(
+        self,
+        service_id: str,
+        audience: str,
+        issued_at: int,
+        expires_at: int,
+        nonce: str,
+    ) -> str:
+        canonical = "|".join(
+            (
+                self.VERSION,
+                service_id,
+                audience,
+                str(issued_at),
+                str(expires_at),
+                nonce,
+            )
+        ).encode("utf-8")
+
+        return hmac.new(
+            self._secret,
+            canonical,
+            hashlib.sha256,
+        ).hexdigest()
+PY
+
+# ------------------------------------------------------------
+# 3. TESTS — SOLO PARA LO NUEVO
+# ------------------------------------------------------------
+
+mkdir -p shared_engines/security/tests
+
+cat > shared_engines/security/tests/test_security_strengthening.py <<'PY'
+from __future__ import annotations
+
+from shared_engines.identity_proofing import (
+    AssuranceLevel,
+    BiometricKind,
+    DocumentCheck,
+    DocumentStatus,
+    IdentityProofingEngine,
+    ProofingDecision,
+    ProofingRequest,
+)
+from shared_engines.security.service_boundary import ServiceBoundary
+
+
+def valid_document() -> DocumentCheck:
+    return DocumentCheck(
+        document_type="national_id",
+        issuer="authorized_issuer",
+        document_fingerprint="DOC-123456",
+        authentic=True,
+        attributes_verified=True,
+        issuer_verified=True,
+        tamper_detected=False,
+    )
+
+
+def test_identity_proofing_high_assurance():
+    engine = IdentityProofingEngine()
+
+    request = ProofingRequest(
+        subject_zid="ZID-123",
+        document=valid_document(),
+        biometric_kind=BiometricKind.FACE,
+        biometric_match=True,
+        liveness_passed=True,
+        duplicate_identity_detected=False,
+    )
+
+    result = engine.evaluate(request)
+
+    assert result.decision is ProofingDecision.ACCEPT
+    assert result.assurance is AssuranceLevel.HIGH
+    assert result.document_status is DocumentStatus.AUTHENTIC
+    assert result.evidence_digest
+
+
+def test_fake_document_is_rejected():
+    engine = IdentityProofingEngine()
+
+    document = DocumentCheck(
+        document_type="national_id",
+        issuer="authorized_issuer",
+        document_fingerprint="FAKE",
+        authentic=False,
+        attributes_verified=False,
+        issuer_verified=False,
+        tamper_detected=True,
+    )
+
+    request = ProofingRequest(
+        subject_zid="ZID-123",
+        document=document,
+    )
+
+    result = engine.evaluate(request)
+
+    assert result.decision is ProofingDecision.REJECT
+    assert result.assurance is AssuranceLevel.UNVERIFIED
+    assert "document_tampering_detected" in result.reasons
+
+
+def test_duplicate_identity_is_rejected():
+    engine = IdentityProofingEngine()
+
+    request = ProofingRequest(
+        subject_zid="ZID-123",
+        document=valid_document(),
+        biometric_kind=BiometricKind.FACE,
+        biometric_match=True,
+        liveness_passed=True,
+        duplicate_identity_detected=True,
+    )
+
+    result = engine.evaluate(request)
+
+    assert result.decision is ProofingDecision.REJECT
+    assert "duplicate_identity_detected" in result.reasons
+
+
+def test_without_biometric_cannot_reach_high_assurance():
+    engine = IdentityProofingEngine()
+
+    request = ProofingRequest(
+        subject_zid="ZID-123",
+        document=valid_document(),
+    )
+
+    result = engine.evaluate(request)
+
+    assert result.decision is ProofingDecision.REVIEW
+    assert result.assurance is AssuranceLevel.BASIC
+
+
+def test_service_credential_is_valid_for_correct_audience():
+    boundary = ServiceBoundary(
+        service_id="nexo",
+        secret=b"x" * 32,
+    )
+
+    credential = boundary.issue(
+        audience="zyra",
+        ttl_seconds=60,
+        now=1000,
+    )
+
+    assert boundary.verify(
+        credential,
+        expected_audience="zyra",
+        now=1001,
+    )
+
+
+def test_service_credential_cannot_cross_audience():
+    boundary = ServiceBoundary(
+        service_id="nexo",
+        secret=b"x" * 32,
+    )
+
+    credential = boundary.issue(
+        audience="zyra",
+        ttl_seconds=60,
+        now=1000,
+    )
+
+    assert not boundary.verify(
+        credential,
+        expected_audience="axis",
+        now=1001,
+    )
+
+
+def test_service_credential_expires():
+    boundary = ServiceBoundary(
+        service_id="nexo",
+        secret=b"x" * 32,
+    )
+
+    credential = boundary.issue(
+        audience="zyra",
+        ttl_seconds=10,
+        now=1000,
+    )
+
+    assert not boundary.verify(
+        credential,
+        expected_audience="zyra",
+        now=1011,
+    )
+
+
+def test_service_credential_tampering_fails():
+    boundary = ServiceBoundary(
+        service_id="nexo",
+        secret=b"x" * 32,
+    )
+
+    credential = boundary.issue(
+        audience="zyra",
+        ttl_seconds=60,
+        now=1000,
+    )
+
+    tampered = type(credential)(
+        service_id=credential.service_id,
+        audience="axis",
+        issued_at=credential.issued_at,
+        expires_at=credential.expires_at,
+        nonce=credential.nonce,
+        signature=credential.signature,
+    )
+
+    assert not boundary.verify(
+        tampered,
+        expected_audience="axis",
+        now=1001,
+    )
+PY
+
+# ------------------------------------------------------------
+# 4. VERIFICACIÓN — NO MODIFICAR EXISTENTES
+# ------------------------------------------------------------
+
+echo
+echo "=== ARCHIVOS CREADOS ==="
+
+for FILE in "${NEW_FILES[@]}"; do
+  test -f "$FILE"
+  echo "CREATED: $FILE"
+done
+
+echo
+echo "=== EJECUTANDO SOLO LAS PRUEBAS NUEVAS ==="
+
+python -m pytest -q \
+  shared_engines/security/tests/test_security_strengthening.py
+
+echo
+echo "=== GIT STATUS ==="
+git status --short -- \
+  shared_engines/identity_proofing \
+  shared_engines/security/service_boundary.py \
+  shared_engines/security/tests/test_security_strengthening.py
+
+echo
+echo "=== COMPLETADO ==="
+echo "Solo se agregaron archivos nuevos."
+echo "No se modificó, reemplazó ni borró ningún archivo existente."

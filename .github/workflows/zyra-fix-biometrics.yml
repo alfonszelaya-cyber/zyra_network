@@ -1,49 +1,100 @@
-name: ZYRA Fix Biometrics Tests
+name: ZYRA Security Chain
 
 on:
+  push:
+    branches: [main]
   workflow_dispatch:
 
-permissions:
-  contents: write
-
 jobs:
-  patch-and-verify:
+  chain:
     runs-on: ubuntu-latest
     steps:
       - name: Checkout
         uses: actions/checkout@v4
 
-      - name: Apply fix automatically
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install dependencies
+        run: pip install cryptography pytest
+
+      - name: 1/3 Biometrics engine tests
+        run: python -m shared_engines.security.biometrics -v
+
+      - name: 2/3 Runtime existing tests (biometrics off)
+        run: python -m pytest shared_engines/runtime/tests -q
+
+      - name: 3/3 Native wiring smoke (router + api + kernel)
         run: |
-          python3 - <<'PYEOF'
+          python - <<'PYEOF'
+          import os, tempfile
           from pathlib import Path
 
-          path = Path("shared_engines/security/biometrics.py")
-          src = path.read_text(encoding="utf-8")
+          from shared_engines.common.clocks import SystemClock
+          from shared_engines.runtime.config import RuntimeConfig
+          from shared_engines.runtime.kernel import ZyraKernel
+          from shared_engines.runtime.api import ZyraApiHandler
+          from shared_engines.runtime.combined_api import CORE_PREFIXES
+          from shared_engines.authority.root import PersistentRootAuthority
+          from shared_engines.storage.database import SQLiteAdapter
+          from shared_engines.security.biometrics import ProviderError
 
-          fixed = src.replace('b"doc-real"', 'b"ana-face-photo"')
-          fixed = fixed.replace('b"selfie-ana"', 'b"ana-face-photo"')
+          KEY = "ab0123456789abcdef0123456789abcdef"
 
-          if fixed == src:
-              print("RESULT: nothing changed (fix already applied)")
-          else:
-              path.write_text(fixed, encoding="utf-8")
-              print("RESULT: PATCHED OK")
+          assert "proofing" in CORE_PREFIXES, (
+              "router missing proofing prefix"
+          )
+          assert hasattr(
+              ZyraApiHandler, "_handle_proofing_submit"
+          ), "api missing proofing routes"
+
+          with tempfile.TemporaryDirectory() as tmp:
+              authority = PersistentRootAuthority(
+                  data_dir=Path(tmp),
+                  master_key_hex=KEY,
+              )
+              signer, _status = authority.load_or_create()
+              db = SQLiteAdapter(
+                  os.path.join(tmp, "chain.db")
+              )
+              kernel = ZyraKernel(
+                  db=db,
+                  clock=SystemClock(),
+                  signer=signer,
+                  config=RuntimeConfig(
+                      host="127.0.0.1", port=0
+                  ),
+                  master_key_hex=KEY,
+              )
+              assert kernel.biometrics is not None, (
+                  "biometrics engine not wired"
+              )
+              components = [
+                  c.component
+                  for c in kernel.health_components()
+              ]
+              assert "biometrics" in components, (
+                  f"health missing biometrics: {components}"
+              )
+              try:
+                  kernel.biometrics.submit_case(
+                      display_name="x",
+                      actor="ci",
+                      doc_image=b"doc",
+                      selfie_image=b"doc",
+                  )
+              except ProviderError:
+                  pass
+              else:
+                  raise AssertionError(
+                      "fail-closed provider must refuse"
+                      " submissions"
+                  )
+
+          print(
+              "CHAIN OK: router + api routes + kernel"
+              " wiring + fail-closed verified"
+          )
           PYEOF
-
-      - name: Commit the fix
-        run: |
-          git config user.name "github-actions[bot]"
-          git config user.email "github-actions[bot]@users.noreply.github.com"
-          git add shared_engines/security/biometrics.py
-          if git diff --cached --quiet; then
-            echo "No changes to commit"
-          else
-            git commit -m "fix: biometrics test data for legitimate enrollment"
-            git push
-          fi
-
-      - name: Run all 8 tests to verify
-        run: |
-          pip install cryptography
-          python -m shared_engines.security.biometrics -v

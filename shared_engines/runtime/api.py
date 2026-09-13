@@ -2,6 +2,10 @@
 
 Public (no auth): GET /health, POST /verify.
 Protected routes require Bearer token when configured.
+
+Strengthening (additive only): native /proofing/* routes
+for biometric identity proofing. All pre-existing routes
+and handlers are unchanged.
 """
 from __future__ import annotations
 
@@ -26,6 +30,14 @@ from shared_engines.runtime.kernel import ZyraKernel
 from shared_engines.runtime.responses import (
     ApiError,
     map_engine_error,
+)
+from shared_engines.security.biometrics import (
+    AlreadyBoundError,
+    BiometricCase,
+    CaseNotFoundError,
+    NotApprovedError,
+    ProviderError,
+    TemplateQualityError,
 )
 from shared_engines.tokenization.ledger import (
     EmissionRule,
@@ -152,6 +164,20 @@ class ZyraApiHandler(BaseHTTPRequestHandler):
             and s[1] == "conversions"
         ):
             self._handle_get_conversion(s[2])
+        elif s == ["proofing", "cases"]:
+            self._handle_proofing_list_cases()
+        elif (
+            len(s) == 3
+            and s[0] == "proofing"
+            and s[1] == "case"
+        ):
+            self._handle_proofing_get_case(s[2])
+        elif (
+            len(s) == 3
+            and s[0] == "proofing"
+            and s[1] == "level"
+        ):
+            self._handle_proofing_level(s[2])
         else:
             raise ApiError(404, "not_found", "unknown route")
 
@@ -186,6 +212,14 @@ class ZyraApiHandler(BaseHTTPRequestHandler):
             self._handle_currency_convert()
         elif s == ["currency", "settle"]:
             self._handle_currency_settle()
+        elif s == ["proofing", "submit"]:
+            self._handle_proofing_submit()
+        elif s == ["proofing", "review"]:
+            self._handle_proofing_review()
+        elif s == ["proofing", "bind"]:
+            self._handle_proofing_bind()
+        elif s == ["proofing", "verify"]:
+            self._handle_proofing_verify()
         else:
             raise ApiError(404, "not_found", "unknown route")
 
@@ -593,6 +627,181 @@ class ZyraApiHandler(BaseHTTPRequestHandler):
             )
         self._ok(record)
 
+    # ---------------------------------------- proofing (additive)
+
+    def _proofing_engine(self) -> Any:
+        engine = type(self).kernel.biometrics
+        if engine is None:
+            raise ApiError(
+                503,
+                "biometrics_unavailable",
+                "proofing engine not configured",
+            )
+        return engine
+
+    def _proofing_image(
+        self, doc: dict[str, Any], key: str
+    ) -> bytes:
+        content = self._decode_b64(
+            self._require_str(doc, key)
+        )
+        if len(content) == 0:
+            raise ApiError(
+                400,
+                "invalid_request",
+                f"{key} is empty",
+            )
+        return content
+
+    def _handle_proofing_submit(self) -> None:
+        engine = self._proofing_engine()
+        doc = self._read_json()
+        try:
+            case = engine.submit_case(
+                display_name=self._require_str(
+                    doc, "display_name"
+                ),
+                actor=self._require_str(doc, "actor"),
+                doc_image=self._proofing_image(
+                    doc, "doc_image_b64"
+                ),
+                selfie_image=self._proofing_image(
+                    doc, "selfie_image_b64"
+                ),
+                doc_kind=self._require_optional_str(
+                    doc, "doc_kind"
+                ),
+                doc_country=self._require_optional_str(
+                    doc, "doc_country"
+                ),
+                doc_number=self._require_optional_str(
+                    doc, "doc_number"
+                ),
+            )
+        except ProviderError as exc:
+            raise ApiError(
+                503,
+                "biometrics_unavailable",
+                str(exc),
+            ) from exc
+        except TemplateQualityError as exc:
+            raise ApiError(
+                400,
+                "template_quality",
+                str(exc),
+            ) from exc
+        self._ok(_proofing_case_json(case), status=201)
+
+    def _handle_proofing_review(self) -> None:
+        engine = self._proofing_engine()
+        doc = self._read_json()
+        approve_raw = self._require_str(doc, "approve")
+        if approve_raw not in ("true", "false"):
+            raise ApiError(
+                400,
+                "invalid_request",
+                "approve must be 'true' or 'false'",
+            )
+        try:
+            case = engine.resolve_manual(
+                self._require_str(doc, "case_id"),
+                reviewer_zid=self._require_str(
+                    doc, "reviewer_zid"
+                ),
+                approve=approve_raw == "true",
+                note=self._require_str(doc, "note"),
+            )
+        except CaseNotFoundError as exc:
+            raise ApiError(
+                404, "not_found", str(exc)
+            ) from exc
+        except NotApprovedError as exc:
+            raise ApiError(
+                409, "conflict", str(exc)
+            ) from exc
+        self._ok(_proofing_case_json(case))
+
+    def _handle_proofing_bind(self) -> None:
+        engine = self._proofing_engine()
+        doc = self._read_json()
+        zid = self._require_str(doc, "zid")
+        type(self).kernel.identity.require_identity(zid)
+        try:
+            case = engine.bind_identity(
+                self._require_str(doc, "case_id"),
+                zid=zid,
+                actor=self._require_str(doc, "actor"),
+            )
+        except CaseNotFoundError as exc:
+            raise ApiError(
+                404, "not_found", str(exc)
+            ) from exc
+        except NotApprovedError as exc:
+            raise ApiError(
+                409, "conflict", str(exc)
+            ) from exc
+        except AlreadyBoundError as exc:
+            raise ApiError(
+                409, "conflict", str(exc)
+            ) from exc
+        self._ok(_proofing_case_json(case))
+
+    def _handle_proofing_verify(self) -> None:
+        engine = self._proofing_engine()
+        doc = self._read_json()
+        try:
+            report = engine.verify_face(
+                self._require_str(doc, "zid"),
+                selfie_image=self._proofing_image(
+                    doc, "selfie_image_b64"
+                ),
+                actor=self._require_str(doc, "actor"),
+            )
+        except ProviderError as exc:
+            raise ApiError(
+                503,
+                "biometrics_unavailable",
+                str(exc),
+            ) from exc
+        except TemplateQualityError as exc:
+            raise ApiError(
+                400,
+                "template_quality",
+                str(exc),
+            ) from exc
+        self._ok(
+            {
+                "zid": report.zid,
+                "matched": report.matched,
+                "score": report.score,
+                "threshold": report.threshold,
+            }
+        )
+
+    def _handle_proofing_list_cases(self) -> None:
+        engine = self._proofing_engine()
+        cases = engine.list_cases(limit=50)
+        self._ok(
+            [_proofing_case_json(c) for c in cases]
+        )
+
+    def _handle_proofing_get_case(
+        self, case_id: str
+    ) -> None:
+        engine = self._proofing_engine()
+        try:
+            case = engine.get_case(case_id)
+        except CaseNotFoundError as exc:
+            raise ApiError(
+                404, "not_found", str(exc)
+            ) from exc
+        self._ok(_proofing_case_json(case))
+
+    def _handle_proofing_level(self, zid: str) -> None:
+        engine = self._proofing_engine()
+        level = engine.assurance_level(zid)
+        self._ok({"zid": zid, "level": level})
+
     @staticmethod
     def _decode_b64(value: str) -> bytes:
         try:
@@ -749,3 +958,28 @@ def _signed_quote_json(signed: SignedQuote) -> dict[str, object]:
         ),
         "contract_version": signed.contract_version,
     }
+
+
+def _proofing_case_json(case: BiometricCase) -> dict[str, object]:
+    result: dict[str, object] = {}
+    if case.result is not None:
+        result = {
+            "decision": case.result.decision,
+            "reason": case.result.reason,
+            "doc_match_score": case.result.doc_match_score,
+            "duplicate_score": case.result.duplicate_score,
+            "duplicate_of": case.result.duplicate_of,
+            "liveness": case.result.liveness,
+            "assurance_level": case.result.assurance_level,
+        }
+    return {
+        "case_id": case.case_id,
+        "status": case.status,
+        "display_name": case.display_name,
+        "identity_zid": case.identity_zid,
+        "assurance_level": case.assurance_level,
+        "doc_image_sha256": case.doc_image_sha,
+        "result": result,
+        "created_at": case.created_at,
+        "updated_at": case.updated_at,
+        }

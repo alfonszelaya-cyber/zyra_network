@@ -1,0 +1,1554 @@
+"""ZYRA biometrics: identity-proofing security layer.
+
+Pipeline: document + selfie -> templates -> liveness ->
+1:1 doc match -> 1:N duplicate search -> decision ->
+assurance level -> sealed template + audit + metrics.
+
+Additive module inside shared_engines/security/. It never
+writes to tables it does not own and never mutates existing
+identities. Raw face images are never stored: only sealed
+numeric templates (AES-256-GCM, key derived from
+ZYRA_ROOT_KEY via HKDF).
+
+Run tests:  python -m shared_engines.security.biometrics -v
+"""
+from __future__ import annotations
+
+import hashlib
+import math
+import os
+import struct
+import unittest
+from dataclasses import dataclass
+from typing import Any, Protocol
+
+from cryptography.hazmat.primitives import hashes
+from cryptography.hazmat.primitives.ciphers.aead import (
+    AESGCM,
+)
+from cryptography.hazmat.primitives.kdf.hkdf import HKDF
+
+from shared_engines.common.clocks import Clock, SystemClock
+from shared_engines.common.errors import (
+    ConfigurationError,
+    EngineError,
+    NotFoundError,
+)
+from shared_engines.common.identifiers import (
+    new_id,
+    stable_hash,
+)
+from shared_engines.common.validation import (
+    require_int_range,
+    require_non_empty_str,
+    require_one_of,
+    require_positive_number,
+)
+from shared_engines.observability.backend import (
+    MetricsBackend,
+    NoopMetrics,
+    engine_logger,
+)
+from shared_engines.storage.database import (
+    Database,
+    SQLiteAdapter,
+)
+from shared_engines.storage.migrations import (
+    Migration,
+    MigrationRunner,
+)
+
+# =====================================================
+# Contracts
+# =====================================================
+
+MODALITY_FACE = "face"
+MODALITY_IRIS = "iris"
+BIOMETRIC_MODALITIES = (
+    MODALITY_FACE,
+    MODALITY_IRIS,
+)
+
+CASE_APPROVED = "approved"
+CASE_REJECTED = "rejected"
+CASE_MANUAL_REVIEW = "manual_review"
+CASE_STATUSES = (
+    CASE_APPROVED,
+    CASE_REJECTED,
+    CASE_MANUAL_REVIEW,
+)
+
+LEVEL_L1 = "L1"  # document + face
+LEVEL_L2 = "L2"  # document + face + liveness
+LEVEL_L3 = "L3"  # reserved for iris (future)
+ASSURANCE_LEVELS = (
+    LEVEL_L1,
+    LEVEL_L2,
+    LEVEL_L3,
+)
+
+# =====================================================
+# Errors
+# =====================================================
+
+
+class BiometricsError(EngineError):
+    """Base biometrics error."""
+
+
+class ProviderError(BiometricsError):
+    """Biometric provider failed."""
+
+
+class TemplateQualityError(BiometricsError):
+    """Template below quality requirements."""
+
+
+class DuplicateFaceError(BiometricsError):
+    """Face already registered in the network."""
+
+
+class CaseNotFoundError(BiometricsError):
+    """Case does not exist."""
+
+
+class NotApprovedError(BiometricsError):
+    """Case not approved for this operation."""
+
+
+class AlreadyBoundError(BiometricsError):
+    """Case already bound to an identity."""
+
+
+class CipherError(BiometricsError):
+    """Seal integrity failed."""
+
+
+# =====================================================
+# Policy
+# =====================================================
+
+
+def _unit(value: float, name: str) -> float:
+    require_positive_number(value, name, config=True)
+    if value > 1.0:
+        raise ConfigurationError(
+            f"{name} must be in (0, 1]"
+        )
+    return float(value)
+
+
+@dataclass(frozen=True)
+class BiometricsPolicy:
+    """Decision thresholds (cosine similarity domain).
+
+    doc_reject < doc_review < doc_auto is enforced.
+    A 1:N duplicate at or above dup_reject is fraud.
+    """
+
+    template_min_dims: int = 16
+    template_max_dims: int = 2048
+    dup_reject: float = 0.45
+    doc_auto: float = 0.55
+    doc_review: float = 0.35
+    doc_reject: float = 0.25
+    verify_auto: float = 0.45
+    require_liveness: bool = True
+
+    def __post_init__(self) -> None:
+        require_int_range(
+            self.template_min_dims,
+            "template_min_dims",
+            8,
+            4096,
+            config=True,
+        )
+        require_int_range(
+            self.template_max_dims,
+            "template_max_dims",
+            self.template_min_dims,
+            4096,
+            config=True,
+        )
+        _unit(self.dup_reject, "dup_reject")
+        _unit(self.doc_auto, "doc_auto")
+        _unit(self.doc_review, "doc_review")
+        _unit(self.doc_reject, "doc_reject")
+        _unit(self.verify_auto, "verify_auto")
+        if not (
+            self.doc_reject
+            < self.doc_review
+            < self.doc_auto
+        ):
+            raise ConfigurationError(
+                "thresholds must satisfy doc_reject"
+                " < doc_review < doc_auto"
+            )
+
+
+# =====================================================
+# Cipher (sealed biometric templates)
+# =====================================================
+
+_KEY_VERSION = 1
+_NONCE_LEN = 12
+_TAG_LEN = 16
+_CIPHER_INFO = b"ZYRA:security:biometrics:templates:v1"
+
+
+class TemplateCipher:
+    """AES-256-GCM sealing, HKDF-derived key.
+
+    Sealed format: [1B key version][12B nonce][GCM ct]
+    """
+
+    def __init__(
+        self, *, master_key_hex: str
+    ) -> None:
+        require_non_empty_str(
+            master_key_hex,
+            "master_key_hex",
+            config=True,
+        )
+        try:
+            raw = bytes.fromhex(master_key_hex)
+        except ValueError as exc:
+            raise ConfigurationError(
+                "master_key_hex must be hex"
+            ) from exc
+        if len(raw) < 32:
+            raise ConfigurationError(
+                "master_key_hex must encode at"
+                " least 32 bytes"
+            )
+        self._aead = AESGCM(
+            HKDF(
+                algorithm=hashes.SHA256(),
+                length=32,
+                salt=None,
+                info=_CIPHER_INFO,
+            ).derive(raw)
+        )
+
+    def seal(self, plaintext: bytes) -> bytes:
+        nonce = os.urandom(_NONCE_LEN)
+        ct = self._aead.encrypt(
+            nonce, bytes(plaintext), _CIPHER_INFO
+        )
+        return bytes([_KEY_VERSION]) + nonce + ct
+
+    def open(self, sealed: bytes) -> bytes:
+        sealed = bytes(sealed)
+        if len(sealed) < (
+            1 + _NONCE_LEN + _TAG_LEN
+        ):
+            raise CipherError(
+                "sealed template too short"
+            )
+        version = sealed[0]
+        if version != _KEY_VERSION:
+            raise CipherError(
+                f"unsupported key version:"
+                f" {version}"
+            )
+        nonce = sealed[1 : 1 + _NONCE_LEN]
+        ct = sealed[1 + _NONCE_LEN :]
+        try:
+            return self._aead.decrypt(
+                nonce, ct, _CIPHER_INFO
+            )
+        except Exception as exc:
+            raise CipherError(
+                "seal integrity failed"
+            ) from exc
+
+
+# =====================================================
+# Template serialization (binary, compact)
+# =====================================================
+
+
+def pack_vector(
+    vector: tuple[float, ...],
+) -> bytes:
+    return struct.pack(
+        f"<{len(vector)}d", *vector
+    )
+
+
+def unpack_vector(
+    blob: bytes, dims: int
+) -> tuple[float, ...]:
+    if len(blob) != dims * 8:
+        raise CipherError(
+            "template size mismatch"
+        )
+    return struct.unpack(f"<{dims}d", blob)
+
+
+# =====================================================
+# Provider surface (the real face engine plugs here)
+# =====================================================
+
+TemplateVector = tuple[float, ...]
+
+
+class BiometricProvider(Protocol):
+    """Any real biometric engine implements this."""
+
+    name: str
+    modality: str
+    liveness_supported: bool
+
+    def extract_template(
+        self, image: bytes
+    ) -> TemplateVector:
+        ...
+
+    def compare(
+        self,
+        a: TemplateVector,
+        b: TemplateVector,
+    ) -> float:
+        ...
+
+    def check_liveness(
+        self, image: bytes
+    ) -> bool:
+        ...
+
+
+def validate_template(
+    vector: TemplateVector,
+    policy: BiometricsPolicy,
+) -> TemplateVector:
+    """Fail-fast quality gate before storing."""
+    if not vector:
+        raise TemplateQualityError(
+            "empty template"
+        )
+    if (
+        len(vector) < policy.template_min_dims
+        or len(vector) > policy.template_max_dims
+    ):
+        raise TemplateQualityError(
+            f"template dims out of range:"
+            f" {len(vector)}"
+        )
+    clean: list[float] = []
+    for value in vector:
+        if isinstance(value, bool) or not (
+            isinstance(value, (int, float))
+        ):
+            raise TemplateQualityError(
+                "template values must be"
+                " numbers"
+            )
+        if not math.isfinite(value):
+            raise TemplateQualityError(
+                "template values must be"
+                " finite"
+            )
+        clean.append(float(value))
+    return tuple(clean)
+
+
+def cosine_similarity(
+    a: TemplateVector,
+    b: TemplateVector,
+) -> float:
+    if len(a) != len(b):
+        raise ProviderError(
+            "template dimension mismatch"
+        )
+    dot = 0.0
+    na = 0.0
+    nb = 0.0
+    for x, y in zip(a, b):
+        dot += x * y
+        na += x * x
+        nb += y * y
+    if na == 0.0 or nb == 0.0:
+        return 0.0
+    score = dot / math.sqrt(na * nb)
+    return max(-1.0, min(1.0, score))
+
+
+# =====================================================
+# Migrations (additive, own namespace)
+# =====================================================
+
+BIOMETRICS_MIGRATIONS: tuple[Migration, ...] = (
+    Migration(
+        1,
+        "biometrics_tables",
+        (
+            "CREATE TABLE biometric_cases ("
+            " case_id TEXT PRIMARY KEY,"
+            " status TEXT NOT NULL,"
+            " display_name TEXT NOT NULL,"
+            " actor TEXT NOT NULL,"
+            " doc_kind TEXT,"
+            " doc_country TEXT,"
+            " doc_number_hash TEXT,"
+            " doc_image_sha TEXT NOT NULL,"
+            " doc_match_score REAL,"
+            " dup_score REAL,"
+            " duplicate_of TEXT,"
+            " liveness INTEGER,"
+            " assurance_level TEXT,"
+            " decision_reason TEXT NOT NULL,"
+            " identity_zid TEXT,"
+            " created_at REAL NOT NULL,"
+            " updated_at REAL NOT NULL,"
+            " contract_version INTEGER"
+            " NOT NULL)",
+            "CREATE INDEX biometric_cases_status"
+            " ON biometric_cases (status)",
+            "CREATE INDEX biometric_cases_identity"
+            " ON biometric_cases (identity_zid)",
+            "CREATE TABLE biometric_templates ("
+            " template_id TEXT PRIMARY KEY,"
+            " case_id TEXT NOT NULL,"
+            " identity_zid TEXT,"
+            " modality TEXT NOT NULL,"
+            " template_enc BLOB NOT NULL,"
+            " template_sha TEXT NOT NULL,"
+            " dims INTEGER NOT NULL,"
+            " created_at REAL NOT NULL)",
+            "CREATE INDEX"
+            " biometric_templates_identity"
+            " ON biometric_templates"
+            " (identity_zid)",
+            "CREATE INDEX biometric_templates_case"
+            " ON biometric_templates (case_id)",
+            "CREATE INDEX"
+            " biometric_templates_modality"
+            " ON biometric_templates"
+            " (modality)",
+            "CREATE TABLE biometric_attempts ("
+            " attempt_id TEXT PRIMARY KEY,"
+            " case_id TEXT NOT NULL,"
+            " kind TEXT NOT NULL,"
+            " decision TEXT NOT NULL,"
+            " reason TEXT,"
+            " doc_match_score REAL,"
+            " dup_score REAL,"
+            " duplicate_of TEXT,"
+            " actor TEXT NOT NULL,"
+            " created_at REAL NOT NULL)",
+            "CREATE INDEX biometric_attempts_case"
+            " ON biometric_attempts (case_id)",
+        ),
+    ),
+)
+
+NAMESPACE = "security.biometrics"
+
+
+# =====================================================
+# Result contracts
+# =====================================================
+
+
+@dataclass(frozen=True)
+class CaseResult:
+    decision: str
+    reason: str
+    doc_match_score: float | None
+    duplicate_score: float | None
+    duplicate_of: str | None
+    liveness: bool | None
+    assurance_level: str | None
+
+
+@dataclass(frozen=True)
+class BiometricCase:
+    case_id: str
+    status: str
+    display_name: str
+    actor: str
+    doc_image_sha: str
+    doc_kind: str | None
+    doc_country: str | None
+    identity_zid: str | None
+    assurance_level: str | None
+    result: CaseResult | None
+    created_at: float
+    updated_at: float
+
+
+@dataclass(frozen=True)
+class VerifyReport:
+    zid: str
+    matched: bool
+    score: float
+    threshold: float
+
+
+# =====================================================
+# Engine
+# =====================================================
+
+
+class BiometricsEngine:
+    """Face-first identity proofing over durable
+    storage. Fraud rule: a face at or above
+    dup_reject that already exists rejects the new
+    case even if the presented document differs.
+    Rejected faces remain sealed as a watchlist."""
+
+    def __init__(
+        self,
+        *,
+        db: Database,
+        clock: Clock,
+        audit: Any,
+        provider: BiometricProvider,
+        cipher: TemplateCipher,
+        policy: BiometricsPolicy | None = None,
+        metrics: MetricsBackend | None = None,
+    ) -> None:
+        self._db = db
+        self._clock = clock
+        self._audit = audit
+        self._provider = provider
+        self._cipher = cipher
+        self._policy = (
+            policy
+            if policy is not None
+            else BiometricsPolicy()
+        )
+        self._metrics = (
+            metrics
+            if metrics is not None
+            else NoopMetrics()
+        )
+        self._log = engine_logger(
+            "security.biometrics"
+        )
+        require_one_of(
+            self._provider.modality,
+            BIOMETRIC_MODALITIES,
+            "provider.modality",
+            config=True,
+        )
+        MigrationRunner(
+            db, NAMESPACE, BIOMETRICS_MIGRATIONS
+        ).run(clock)
+
+    # ---------------------------------------- enrollment
+
+    def submit_case(
+        self,
+        *,
+        display_name: str,
+        actor: str,
+        doc_image: bytes,
+        selfie_image: bytes,
+        doc_kind: str | None = None,
+        doc_country: str | None = None,
+        doc_number: str | None = None,
+    ) -> BiometricCase:
+        """Full pipeline for one enrollment."""
+        require_non_empty_str(
+            display_name, "display_name"
+        )
+        require_non_empty_str(actor, "actor")
+        doc_image = self._require_bytes(
+            doc_image, "doc_image"
+        )
+        selfie_image = self._require_bytes(
+            selfie_image, "selfie_image"
+        )
+        case_id = f"BIO-{new_id()}"
+        now = self._clock.now()
+        doc_sha = hashlib.sha256(
+            doc_image
+        ).hexdigest()
+        doc_number_hash = (
+            stable_hash("doc-number", doc_number)
+            if doc_number
+            else None
+        )
+        try:
+            doc_vec = validate_template(
+                self._provider.extract_template(
+                    doc_image
+                ),
+                self._policy,
+            )
+            selfie_vec = validate_template(
+                self._provider.extract_template(
+                    selfie_image
+                ),
+                self._policy,
+            )
+        except ProviderError:
+            raise
+        except Exception as exc:
+            raise ProviderError(
+                "provider failed extraction:"
+                f" {exc}"
+            ) from exc
+        liveness: bool | None = None
+        if self._provider.liveness_supported:
+            liveness = bool(
+                self._provider.check_liveness(
+                    selfie_image
+                )
+            )
+        dup_score, dup_of = self._search_1n(
+            selfie_vec
+        )
+        doc_match = float(
+            self._provider.compare(
+                doc_vec, selfie_vec
+            )
+        )
+        decision, reason, level = self._decide(
+            doc_match=doc_match,
+            dup_of=dup_of,
+            liveness=liveness,
+        )
+        template_plain = pack_vector(
+            selfie_vec
+        )
+        with self._db.transaction() as cursor:
+            cursor.execute(
+                "INSERT INTO biometric_cases ("
+                " case_id, status, display_name,"
+                " actor, doc_kind, doc_country,"
+                " doc_number_hash, doc_image_sha,"
+                " doc_match_score, dup_score,"
+                " duplicate_of, liveness,"
+                " assurance_level,"
+                " decision_reason,"
+                " identity_zid, created_at,"
+                " updated_at, contract_version)"
+                " VALUES (?, ?, ?, ?, ?, ?, ?,"
+                "  ?, ?, ?, ?, ?, ?, ?, ?, ?,"
+                "  ?, ?)",
+                (
+                    case_id,
+                    decision,
+                    display_name,
+                    actor,
+                    doc_kind,
+                    doc_country,
+                    doc_number_hash,
+                    doc_sha,
+                    doc_match,
+                    dup_score,
+                    dup_of,
+                    self._bit(liveness),
+                    level,
+                    reason,
+                    None,
+                    now,
+                    now,
+                    1,
+                ),
+            )
+            cursor.execute(
+                "INSERT INTO biometric_templates"
+                " (template_id, case_id,"
+                " identity_zid, modality,"
+                " template_enc, template_sha,"
+                " dims, created_at)"
+                " VALUES (?, ?, ?, ?, ?, ?, ?,"
+                "  ?)",
+                (
+                    f"BTP-{new_id()}",
+                    case_id,
+                    None,
+                    self._provider.modality,
+                    self._cipher.seal(
+                        template_plain
+                    ),
+                    hashlib.sha256(
+                        template_plain
+                    ).hexdigest(),
+                    len(selfie_vec),
+                    now,
+                ),
+            )
+            self._attempt(
+                cursor,
+                case_id=case_id,
+                kind="submission",
+                decision=decision,
+                reason=reason,
+                doc_match=doc_match,
+                dup_score=dup_score,
+                dup_of=dup_of,
+                actor=actor,
+            )
+        self._audit_case(
+            decision=decision,
+            case_id=case_id,
+            actor=actor,
+            reason=reason,
+            dup_of=dup_of,
+        )
+        self._metrics.increment(
+            "biometrics.case.submitted",
+            tags={"decision": decision},
+        )
+        return self.get_case(case_id)
+
+    # ---------------------------------------- queries
+
+    def get_case(
+        self, case_id: str
+    ) -> BiometricCase:
+        row = self._db.query_one(
+            "SELECT * FROM biometric_cases"
+            " WHERE case_id = ?",
+            (case_id,),
+        )
+        if row is None:
+            raise CaseNotFoundError(
+                f"unknown case: {case_id}"
+            )
+        return self._case_from_row(row)
+
+    def list_cases(
+        self,
+        *,
+        status: str | None = None,
+        limit: int = 50,
+    ) -> list[BiometricCase]:
+        require_int_range(
+            limit, "limit", 1, 500
+        )
+        if status is None:
+            rows = self._db.query_all(
+                "SELECT * FROM biometric_cases"
+                " ORDER BY created_at DESC"
+                " LIMIT ?",
+                (limit,),
+            )
+        else:
+            require_one_of(
+                status,
+                (
+                    CASE_APPROVED,
+                    CASE_REJECTED,
+                    CASE_MANUAL_REVIEW,
+                ),
+                "status",
+            )
+            rows = self._db.query_all(
+                "SELECT * FROM biometric_cases"
+                " WHERE status = ? ORDER BY"
+                " created_at DESC LIMIT ?",
+                (status, limit),
+            )
+        return [
+            self._case_from_row(row)
+            for row in rows
+        ]
+
+    def assurance_level(
+        self, zid: str
+    ) -> str | None:
+        row = self._db.query_one(
+            "SELECT assurance_level FROM"
+            " biometric_cases WHERE"
+            " identity_zid = ? ORDER BY"
+            " updated_at DESC LIMIT 1",
+            (zid,),
+        )
+        if row is None:
+            return None
+        if row["assurance_level"] is None:
+            return None
+        return str(row["assurance_level"])
+
+    # ---------------------------------------- manual review
+
+    def resolve_manual(
+        self,
+        case_id: str,
+        *,
+        reviewer_zid: str,
+        approve: bool,
+        note: str,
+    ) -> BiometricCase:
+        """Human decision for review cases."""
+        require_non_empty_str(
+            reviewer_zid, "reviewer_zid"
+        )
+        require_non_empty_str(note, "note")
+        row = self._db.query_one(
+            "SELECT * FROM biometric_cases"
+            " WHERE case_id = ?",
+            (case_id,),
+        )
+        if row is None:
+            raise CaseNotFoundError(
+                f"unknown case: {case_id}"
+            )
+        if str(row["status"]) != (
+            CASE_MANUAL_REVIEW
+        ):
+            raise NotApprovedError(
+                "case is not in manual review"
+            )
+        liveness = self._unbit(row["liveness"])
+        if approve:
+            decision = CASE_APPROVED
+            level = (
+                LEVEL_L2
+                if liveness is True
+                else LEVEL_L1
+            )
+        else:
+            decision = CASE_REJECTED
+            level = None
+        reason = (
+            f"manual_review_by:{reviewer_zid}:"
+            f"{note}"
+        )
+        now = self._clock.now()
+        with self._db.transaction() as cursor:
+            cursor.execute(
+                "UPDATE biometric_cases SET"
+                " status = ?,"
+                " assurance_level = ?,"
+                " decision_reason = ?,"
+                " updated_at = ? WHERE"
+                " case_id = ?",
+                (
+                    decision,
+                    level,
+                    reason,
+                    now,
+                    case_id,
+                ),
+            )
+            self._attempt(
+                cursor,
+                case_id=case_id,
+                kind="manual_resolution",
+                decision=decision,
+                reason=reason,
+                doc_match=None,
+                dup_score=None,
+                dup_of=None,
+                actor=reviewer_zid,
+            )
+        self._audit_case(
+            decision=decision,
+            case_id=case_id,
+            actor=reviewer_zid,
+            reason=reason,
+            dup_of=None,
+        )
+        self._metrics.increment(
+            "biometrics.case.resolved",
+            tags={"decision": decision},
+        )
+        return self.get_case(case_id)
+
+    # ---------------------------------------- binding
+
+    def bind_identity(
+        self,
+        case_id: str,
+        *,
+        zid: str,
+        actor: str,
+    ) -> BiometricCase:
+        """Attach an approved case to an existing
+        ZID. The API layer verifies the ZID exists
+        via IdentityEngine before calling this."""
+        require_non_empty_str(zid, "zid")
+        require_non_empty_str(actor, "actor")
+        row = self._db.query_one(
+            "SELECT * FROM biometric_cases"
+            " WHERE case_id = ?",
+            (case_id,),
+        )
+        if row is None:
+            raise CaseNotFoundError(
+                f"unknown case: {case_id}"
+            )
+        if str(row["status"]) != CASE_APPROVED:
+            raise NotApprovedError(
+                "only approved cases bind"
+            )
+        if row["identity_zid"] is not None:
+            raise AlreadyBoundError(
+                "case already bound to"
+                f" {row['identity_zid']}"
+            )
+        now = self._clock.now()
+        with self._db.transaction() as cursor:
+            cursor.execute(
+                "UPDATE biometric_templates"
+                " SET identity_zid = ? WHERE"
+                " case_id = ?",
+                (zid, case_id),
+            )
+            cursor.execute(
+                "UPDATE biometric_cases SET"
+                " identity_zid = ?,"
+                " updated_at = ? WHERE"
+                " case_id = ?",
+                (zid, now, case_id),
+            )
+            self._attempt(
+                cursor,
+                case_id=case_id,
+                kind="binding",
+                decision="bound",
+                reason=f"bound_to:{zid}",
+                doc_match=None,
+                dup_score=None,
+                dup_of=None,
+                actor=actor,
+            )
+        self._audit.append(
+            event_type=(
+                "biometrics.identity.bound"
+            ),
+            actor=actor,
+            subject=zid,
+            payload={
+                "case_id": case_id,
+                "assurance_level": row[
+                    "assurance_level"
+                ],
+            },
+        )
+        self._metrics.increment(
+            "biometrics.identity.bound"
+        )
+        return self.get_case(case_id)
+
+    # ---------------------------------------- 1:1 verify
+
+    def verify_face(
+        self,
+        zid: str,
+        *,
+        selfie_image: bytes,
+        actor: str,
+    ) -> VerifyReport:
+        """1:1 verification of a bound identity
+        (what banks and apps will consume)."""
+        require_non_empty_str(zid, "zid")
+        require_non_empty_str(actor, "actor")
+        selfie_image = self._require_bytes(
+            selfie_image, "selfie_image"
+        )
+        row = self._db.query_one(
+            "SELECT * FROM biometric_templates"
+            " WHERE identity_zid = ? AND"
+            " modality = ? ORDER BY"
+            " created_at DESC LIMIT 1",
+            (zid, self._provider.modality),
+        )
+        if row is None:
+            raise NotFoundError(
+                "no bound template for:"
+                f" {zid}"
+            )
+        live_vec = validate_template(
+            self._provider.extract_template(
+                selfie_image
+            ),
+            self._policy,
+        )
+        stored_vec = unpack_vector(
+            self._cipher.open(
+                row["template_enc"]
+            ),
+            int(row["dims"]),
+        )
+        score = float(
+            self._provider.compare(
+                live_vec, stored_vec
+            )
+        )
+        matched = (
+            score >= self._policy.verify_auto
+        )
+        case_id = str(row["case_id"])
+        with self._db.transaction() as cursor:
+            self._attempt(
+                cursor,
+                case_id=case_id,
+                kind="verification",
+                decision=(
+                    "matched"
+                    if matched
+                    else "no_match"
+                ),
+                reason=f"score={score:.4f}",
+                doc_match=score,
+                dup_score=None,
+                dup_of=None,
+                actor=actor,
+            )
+        self._audit.append(
+            event_type=(
+                "biometrics.face.verified"
+            ),
+            actor=actor,
+            subject=zid,
+            payload={
+                "matched": matched,
+                "score": score,
+            },
+        )
+        self._metrics.increment(
+            "biometrics.face.verified",
+            tags={
+                "matched": str(matched).lower()
+            },
+        )
+        return VerifyReport(
+            zid=zid,
+            matched=matched,
+            score=score,
+            threshold=self._policy.verify_auto,
+        )
+
+    # ---------------------------------------- internals
+
+    def _search_1n(
+        self, vec: TemplateVector
+    ) -> tuple[float | None, str | None]:
+        """1:N against every sealed template.
+
+        Linear scan today (correct, auditable);
+        when volume grows, the provider gains an
+        ANN index behind the same interface and
+        this method delegates without schema
+        changes.
+        """
+        rows = self._db.query_all(
+            "SELECT case_id, identity_zid,"
+            " template_enc, dims FROM"
+            " biometric_templates WHERE"
+            " modality = ?",
+            (self._provider.modality,),
+        )
+        best = 0.0
+        ref: str | None = None
+        for row in rows:
+            try:
+                stored = unpack_vector(
+                    self._cipher.open(
+                        row["template_enc"]
+                    ),
+                    int(row["dims"]),
+                )
+            except Exception as exc:
+                raise ProviderError(
+                    "stored template unreadable"
+                ) from exc
+            score = float(
+                self._provider.compare(
+                    vec, stored
+                )
+            )
+            if score > best:
+                best = score
+                ref = (
+                    str(row["identity_zid"])
+                    if row["identity_zid"]
+                    is not None
+                    else (
+                        "unbound-case:"
+                        f"{row['case_id']}"
+                    )
+                )
+        if ref is None or best < (
+            self._policy.dup_reject
+        ):
+            return None, None
+        return best, ref
+
+    def _decide(
+        self,
+        *,
+        doc_match: float,
+        dup_of: str | None,
+        liveness: bool | None,
+    ) -> tuple[str, str, str | None]:
+        p = self._policy
+        if dup_of is not None:
+            return (
+                CASE_REJECTED,
+                "face_already_registered:"
+                f"{dup_of}",
+                None,
+            )
+        if liveness is False:
+            return (
+                CASE_REJECTED,
+                "liveness_failed:"
+                "presentation_attack",
+                None,
+            )
+        if doc_match >= p.doc_auto:
+            if p.require_liveness and (
+                liveness is not True
+            ):
+                return (
+                    CASE_MANUAL_REVIEW,
+                    "liveness_unavailable",
+                    None,
+                )
+            return (
+                CASE_APPROVED,
+                "doc_match_auto",
+                (
+                    LEVEL_L2
+                    if liveness is True
+                    else LEVEL_L1
+                ),
+            )
+        if doc_match >= p.doc_review:
+            return (
+                CASE_MANUAL_REVIEW,
+                "doc_match_inconclusive",
+                None,
+            )
+        return (
+            CASE_REJECTED,
+            "doc_match_below_threshold",
+            None,
+        )
+
+    def _attempt(
+        self,
+        cursor: Any,
+        *,
+        case_id: str,
+        kind: str,
+        decision: str,
+        reason: str,
+        doc_match: float | None,
+        dup_score: float | None,
+        dup_of: str | None,
+        actor: str,
+    ) -> None:
+        cursor.execute(
+            "INSERT INTO biometric_attempts ("
+            " attempt_id, case_id, kind,"
+            " decision, reason,"
+            " doc_match_score, dup_score,"
+            " duplicate_of, actor,"
+            " created_at)"
+            " VALUES (?, ?, ?, ?, ?, ?, ?,"
+            "  ?, ?, ?)",
+            (
+                f"BAT-{new_id()}",
+                case_id,
+                kind,
+                decision,
+                reason,
+                doc_match,
+                dup_score,
+                dup_of,
+                actor,
+                self._clock.now(),
+            ),
+        )
+
+    def _audit_case(
+        self,
+        *,
+        decision: str,
+        case_id: str,
+        actor: str,
+        reason: str,
+        dup_of: str | None,
+    ) -> None:
+        event_type = {
+            CASE_APPROVED: (
+                "biometrics.case.approved"
+            ),
+            CASE_REJECTED: (
+                "biometrics.case.rejected"
+            ),
+            CASE_MANUAL_REVIEW: (
+                "biometrics.case.manual_review"
+            ),
+        }.get(
+            decision, "biometrics.case.submitted"
+        )
+        self._audit.append(
+            event_type=event_type,
+            actor=actor,
+            subject=case_id,
+            payload={
+                "decision": decision,
+                "reason": reason,
+                "duplicate_of": dup_of,
+            },
+        )
+
+    @staticmethod
+    def _bit(
+        value: bool | None,
+    ) -> int | None:
+        if value is None:
+            return None
+        return 1 if value else 0
+
+    @staticmethod
+    def _unbit(
+        value: Any,
+    ) -> bool | None:
+        if value is None:
+            return None
+        return bool(value)
+
+    @staticmethod
+    def _require_bytes(
+        value: bytes, name: str
+    ) -> bytes:
+        if not isinstance(
+            value, (bytes, bytearray)
+        ):
+            raise ProviderError(
+                f"{name} must be image bytes"
+            )
+        if len(value) == 0:
+            raise ProviderError(
+                f"{name} is empty"
+            )
+        return bytes(value)
+
+    def _case_from_row(
+        self, row: Any
+    ) -> BiometricCase:
+        result = CaseResult(
+            decision=str(row["status"]),
+            reason=str(row["decision_reason"]),
+            doc_match_score=(
+                None
+                if row["doc_match_score"]
+                is None
+                else float(
+                    row["doc_match_score"]
+                )
+            ),
+            duplicate_score=(
+                None
+                if row["dup_score"] is None
+                else float(row["dup_score"])
+            ),
+            duplicate_of=(
+                None
+                if row["duplicate_of"] is None
+                else str(row["duplicate_of"])
+            ),
+            liveness=self._unbit(
+                row["liveness"]
+            ),
+            assurance_level=(
+                None
+                if row["assurance_level"]
+                is None
+                else str(row["assurance_level"])
+            ),
+        )
+        return BiometricCase(
+            case_id=str(row["case_id"]),
+            status=str(row["status"]),
+            display_name=str(
+                row["display_name"]
+            ),
+            actor=str(row["actor"]),
+            doc_image_sha=str(
+                row["doc_image_sha"]
+            ),
+            doc_kind=(
+                None
+                if row["doc_kind"] is None
+                else str(row["doc_kind"])
+            ),
+            doc_country=(
+                None
+                if row["doc_country"] is None
+                else str(row["doc_country"])
+            ),
+            identity_zid=(
+                None
+                if row["identity_zid"] is None
+                else str(row["identity_zid"])
+            ),
+            assurance_level=(
+                None
+                if row["assurance_level"]
+                is None
+                else str(row["assurance_level"])
+            ),
+            result=result,
+            created_at=float(row["created_at"]),
+            updated_at=float(row["updated_at"]),
+        )
+
+
+# =====================================================
+# Tests (CI + local). The DeterministicTestProvider
+# is a TEST FIXTURE ONLY: never wire it in
+# production. The real face engine plugs into the
+# same BiometricProvider surface.
+# =====================================================
+
+_TEST_KEY = "ab" * 32
+
+
+class _AuditSpy:
+    def __init__(self) -> None:
+        self.events: list[dict] = []
+
+    def append(self, **kwargs: object) -> None:
+        self.events.append(dict(kwargs))
+
+
+class DeterministicTestProvider:
+    """TEST ONLY: hash-derived stable vectors."""
+
+    name = "deterministic-test"
+    modality = MODALITY_FACE
+    liveness_supported = False
+    dims = 16
+
+    def extract_template(
+        self, image: bytes
+    ) -> tuple[float, ...]:
+        digest = hashlib.sha256(
+            image
+        ).digest()
+        values: list[float] = []
+        for i in range(self.dims):
+            byte = (
+                digest[i % len(digest)] / 255.0
+            )
+            values.append(byte * 2.0 - 1.0)
+        norm = math.sqrt(
+            sum(v * v for v in values)
+        ) or 1.0
+        return tuple(v / norm for v in values)
+
+    def compare(
+        self,
+        a: tuple[float, ...],
+        b: tuple[float, ...],
+    ) -> float:
+        return cosine_similarity(a, b)
+
+    def check_liveness(
+        self, image: bytes
+    ) -> bool:
+        return True
+
+
+class CipherTests(unittest.TestCase):
+    def test_roundtrip(self) -> None:
+        cipher = TemplateCipher(
+            master_key_hex=_TEST_KEY
+        )
+        sealed = cipher.seal(b"face-template")
+        self.assertNotEqual(
+            sealed, b"face-template"
+        )
+        self.assertEqual(
+            cipher.open(sealed),
+            b"face-template",
+        )
+
+    def test_tamper_rejected(self) -> None:
+        cipher = TemplateCipher(
+            master_key_hex=_TEST_KEY
+        )
+        sealed = bytearray(
+            cipher.seal(b"template")
+        )
+        sealed[-1] ^= 0xFF
+        with self.assertRaises(CipherError):
+            cipher.open(bytes(sealed))
+
+
+class EngineTests(unittest.TestCase):
+    def _engine(
+        self,
+        db: SQLiteAdapter,
+        policy: BiometricsPolicy | None = None,
+    ) -> BiometricsEngine:
+        return BiometricsEngine(
+            db=db,
+            clock=SystemClock(),
+            audit=_AuditSpy(),
+            provider=DeterministicTestProvider(),
+            cipher=TemplateCipher(
+                master_key_hex=_TEST_KEY
+            ),
+            policy=policy,
+        )
+
+    def test_auto_approve_no_liveness(
+        self,
+    ) -> None:
+        db = SQLiteAdapter(":memory:")
+        engine = self._engine(
+            db,
+            BiometricsPolicy(
+                require_liveness=False
+            ),
+        )
+        case = engine.submit_case(
+            display_name="Ana Perez",
+            actor="registrar",
+            doc_image=b"doc-photo-1",
+            selfie_image=b"doc-photo-1",
+        )
+        self.assertEqual(
+            CASE_APPROVED, case.status
+        )
+        self.assertEqual(
+            LEVEL_L1, case.assurance_level
+        )
+        assert case.result is not None
+        self.assertIsNone(
+            case.result.duplicate_of
+        )
+
+    def test_liveness_required_forces_review(
+        self,
+    ) -> None:
+        db = SQLiteAdapter(":memory:")
+        engine = self._engine(db)
+        case = engine.submit_case(
+            display_name="Ana Perez",
+            actor="registrar",
+            doc_image=b"doc-photo-1",
+            selfie_image=b"doc-photo-1",
+        )
+        self.assertEqual(
+            CASE_MANUAL_REVIEW, case.status
+        )
+        resolved = engine.resolve_manual(
+            case.case_id,
+            reviewer_zid="ZID-reviewer",
+            approve=True,
+            note="checked in person",
+        )
+        self.assertEqual(
+            CASE_APPROVED, resolved.status
+        )
+
+    def test_duplicate_face_rejected(
+        self,
+    ) -> None:
+        """THE anti-fraud test: same face, fake
+        document, different name -> rejected."""
+        db = SQLiteAdapter(":memory:")
+        engine = self._engine(
+            db,
+            BiometricsPolicy(
+                require_liveness=False
+            ),
+        )
+        first = engine.submit_case(
+            display_name="Ana Perez",
+            actor="registrar",
+            doc_image=b"doc-real",
+            selfie_image=b"selfie-ana",
+        )
+        self.assertEqual(
+            CASE_APPROVED, first.status
+        )
+        second = engine.submit_case(
+            display_name="Otro Nombre",
+            actor="registrar",
+            doc_image=b"doc-FALSO",
+            selfie_image=b"selfie-ana",
+        )
+        self.assertEqual(
+            CASE_REJECTED, second.status
+        )
+        assert second.result is not None
+        self.assertTrue(
+            second.result.reason.startswith(
+                "face_already_registered"
+            )
+        )
+
+    def test_different_face_rejected(
+        self,
+    ) -> None:
+        db = SQLiteAdapter(":memory:")
+        engine = self._engine(
+            db,
+            BiometricsPolicy(
+                require_liveness=False
+            ),
+        )
+        case = engine.submit_case(
+            display_name="Luis Gomez",
+            actor="registrar",
+            doc_image=b"doc-a",
+            selfie_image=b"selfie-b",
+        )
+        self.assertEqual(
+            CASE_REJECTED, case.status
+        )
+
+    def test_bind_and_verify(self) -> None:
+        db = SQLiteAdapter(":memory:")
+        engine = self._engine(
+            db,
+            BiometricsPolicy(
+                require_liveness=False
+            ),
+        )
+        case = engine.submit_case(
+            display_name="Ana Perez",
+            actor="registrar",
+            doc_image=b"doc-photo-1",
+            selfie_image=b"doc-photo-1",
+        )
+        engine.bind_identity(
+            case.case_id,
+            zid="ZID-person-1",
+            actor="registrar",
+        )
+        self.assertEqual(
+            LEVEL_L1,
+            engine.assurance_level(
+                "ZID-person-1"
+            ),
+        )
+        ok = engine.verify_face(
+            "ZID-person-1",
+            selfie_image=b"doc-photo-1",
+            actor="bank-app",
+        )
+        self.assertTrue(ok.matched)
+        bad = engine.verify_face(
+            "ZID-person-1",
+            selfie_image=b"other-person",
+            actor="bank-app",
+        )
+        self.assertFalse(bad.matched)
+
+    def test_migrations_idempotent(
+        self,
+    ) -> None:
+        db = SQLiteAdapter(":memory:")
+        self._engine(db)
+        self._engine(db)
+
+
+if __name__ == "__main__":
+    unittest.main(verbosity=2)

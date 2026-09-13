@@ -18,18 +18,22 @@ Behavior (production, honest):
 - Liveness: NOT claimed in this phase
   (liveness_supported=False). With require_liveness=True
   (the kernel policy), every strong match routes to human
-  review instead of auto-approving. Active anti-spoofing
-  arrives in the next batch; until then the system is
-  conservative, never permissive.
+  review instead of auto-approving.
 
-Optional environment:
-- ZYRA_BIOMETRICS_MODELS_DIR: directory where the
-  buffalo_l pack is stored/downloaded (~300 MB on first
-  run). Default: insightface's own home (~/.insightface).
+Import self-healing: insightface bundles a face3d/mesh
+Cython accessory compiled at install time against
+whatever numpy the build env had. This provider never
+uses face3d/mesh, so if that accessory fails to load
+(binary mismatch), it is replaced by an inert stub:
+detection and embedding are unaffected and the import
+becomes ABI-proof.
 """
 from __future__ import annotations
 
+import importlib
 import os
+import sys
+import types
 
 from shared_engines.security.biometrics import (
     ProviderError,
@@ -40,6 +44,24 @@ from shared_engines.security.biometrics import (
 
 _MAX_SIDE = 2000
 _DET_SIZE = (640, 640)
+_MESH_CYTHON = (
+    "insightface.thirdparty.face3d.mesh.cython"
+)
+
+
+def _ensure_mesh_importable() -> str:
+    """Returns 'native' if the mesh accessory loads,
+    'stubbed' if it had to be replaced by an inert
+    dummy. Detection/embedding are unaffected either
+    way."""
+    try:
+        importlib.import_module(_MESH_CYTHON)
+        return "native"
+    except Exception:
+        stub = types.ModuleType(_MESH_CYTHON)
+        stub.mesh_core_cython = None
+        sys.modules[_MESH_CYTHON] = stub
+        return "stubbed"
 
 
 class InsightFaceProvider:
@@ -54,6 +76,7 @@ class InsightFaceProvider:
     def __init__(
         self, models_dir: str | None = None
     ) -> None:
+        mesh_mode = _ensure_mesh_importable()
         try:
             import cv2  # noqa: F401
             import numpy as np  # noqa: F401
@@ -61,9 +84,8 @@ class InsightFaceProvider:
         except Exception as exc:
             raise ProviderError(
                 "face engine dependencies missing"
-                " (insightface, onnxruntime,"
-                " opencv, numpy): install them or"
-                " keep ZYRA_BIOMETRICS_PROVIDER"
+                f" ({exc}); install them or keep"
+                " ZYRA_BIOMETRICS_PROVIDER"
                 "=fail-closed"
             ) from exc
         self._cv2 = cv2
@@ -92,6 +114,10 @@ class InsightFaceProvider:
                 "face model could not be loaded:"
                 f" {exc}"
             ) from exc
+        print(
+            "FACE PROVIDER READY"
+            f" (mesh: {mesh_mode})"
+        )
 
     def _decode(
         self, image: bytes

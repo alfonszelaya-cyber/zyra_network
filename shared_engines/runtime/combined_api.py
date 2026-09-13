@@ -5,6 +5,11 @@ MRO note: both parents define _route_get/_route_post,
 so CombinedHandler overrides both with a
 first-segment dispatcher that sends each group to
 its correct parent implementation.
+
+Strengthening (additive only): "proofing" added to
+CORE_PREFIXES so the native biometric identity-
+proofing routes in api.py are reachable. No other
+change.
 """
 from __future__ import annotations
 
@@ -41,6 +46,7 @@ CORE_PREFIXES = frozenset(
         "verification",
         "tokens",
         "currency",
+        "proofing",
     }
 )
 

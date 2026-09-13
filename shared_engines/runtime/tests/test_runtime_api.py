@@ -118,7 +118,7 @@ def _register_via_api(
         "POST",
         "/identity/register",
         {
-            "kind": "person",
+            "kind": "organization",
             "display_name": name,
             "actor": "api-clerk",
         },
@@ -372,7 +372,7 @@ def test_auth_required_and_accepted(
     no_token_status, no_token = secured.call(
         "POST",
         "/identity/register",
-        {"kind": "person", "display_name": "X", "actor": "a"},
+        {"kind": "organization", "display_name": "X", "actor": "a"},
         omit_auth=True,
     )
     assert no_token_status == 401
@@ -380,14 +380,14 @@ def test_auth_required_and_accepted(
     wrong_status, _ = secured.call(
         "POST",
         "/identity/register",
-        {"kind": "person", "display_name": "X", "actor": "a"},
+        {"kind": "organization", "display_name": "X", "actor": "a"},
         token="wrong-token-wrong-token",
     )
     assert wrong_status == 401
     good_status, _ = secured.call(
         "POST",
         "/identity/register",
-        {"kind": "person", "display_name": "X", "actor": "a"},
+        {"kind": "organization", "display_name": "X", "actor": "a"},
     )
     assert good_status == 201
     health_status, _ = secured.call(
@@ -404,7 +404,7 @@ def test_unknown_route_and_bad_json(
     bad_status, _ = cluster.call(
         "POST",
         "/identity/register",
-        {"kind": "person", "display_name": "", "actor": "a"},
+        {"kind": "organization", "display_name": "", "actor": "a"},
     )
     assert bad_status == 400
 
@@ -459,3 +459,25 @@ def test_audit_chain_covers_api_traffic(
     assert cred_status == 201
     count = cluster.kernel.audit.verify()
     assert count >= 5
+
+
+def test_person_register_is_bypass_blocked(
+    cluster: _Cluster,
+) -> None:
+    """HARDENING: creating a PERSON via the legacy
+    door is refused - persons must go through
+    /identity/enroll (mandatory biometrics)."""
+    status, payload = cluster.call(
+        "POST",
+        "/identity/register",
+        {
+            "kind": "person",
+            "display_name": "Bypass Try",
+            "actor": "attacker",
+        },
+    )
+    assert status == 403
+    assert (
+        payload["error"]["type"]
+        == "person_bypass_forbidden"
+    )

@@ -1519,7 +1519,9 @@ class BiometricsEngine:
 # =====================================================
 # Tests (CI + local). DeterministicTestProvider is a
 # TEST FIXTURE ONLY. HardeningTests certify claims,
-# idempotent finalize and repair.
+# idempotent finalize and repair. Hardening tests use
+# require_liveness=False because the deterministic
+# provider cannot simulate liveness.
 # =====================================================
 
 _TEST_KEY = "ab" * 32
@@ -1811,6 +1813,10 @@ class HardeningTests(unittest.TestCase):
         db: SQLiteAdapter,
         policy: BiometricsPolicy | None = None,
     ) -> BiometricsEngine:
+        if policy is None:
+            policy = BiometricsPolicy(
+                require_liveness=False
+            )
         return BiometricsEngine(
             db=db,
             clock=SystemClock(),

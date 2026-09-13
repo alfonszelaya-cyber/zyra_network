@@ -1,6 +1,16 @@
 """Zyra Network production entrypoint (persistent
 authority + combined surface: core API and trust
-capabilities on a single port)."""
+capabilities on a single port).
+
+Strengthening (additive only): the default data
+directory is now persistent (<repo>/data) instead of
+/tmp/zyra-data, so identities, sealed biometric
+templates and audit history survive restarts and
+deploys. A startup warning fires if the resolved data
+directory lives under /tmp, because ephemeral storage
+contradicts the durability contract of the Network.
+Set ZYRA_DATA_DIR to override the location.
+"""
 from __future__ import annotations
 
 import logging
@@ -15,8 +25,12 @@ from shared_engines.runtime.config import RuntimeConfig
 from shared_engines.runtime.kernel import ZyraKernel
 from shared_engines.storage.database import SQLiteAdapter
 
+_DEFAULT_DATA_DIR = os.path.join(
+    os.path.dirname(os.path.abspath(__file__)),
+    "data",
+)
 DATA_DIR = os.environ.get(
-    "ZYRA_DATA_DIR", "/tmp/zyra-data"
+    "ZYRA_DATA_DIR", _DEFAULT_DATA_DIR
 )
 DB_PATH = os.path.join(DATA_DIR, "zyra.db")
 
@@ -54,6 +68,26 @@ def main() -> None:
         or os.environ.get("PORT")
         or 8080
     )
+
+    resolved = os.path.abspath(DATA_DIR)
+    if resolved.startswith(
+        ("/tmp/", "/var/tmp/")
+    ):
+        log.warning(
+            "DATA DIR IS EPHEMERAL:"
+            " %s lives under /tmp and can"
+            " be wiped on restart or"
+            " deploy. Identities must not"
+            " live there in production;"
+            " set ZYRA_DATA_DIR to a"
+            " persistent path.",
+            resolved,
+        )
+    else:
+        log.info(
+            "data directory: %s",
+            resolved,
+        )
 
     os.makedirs(
         DATA_DIR, exist_ok=True

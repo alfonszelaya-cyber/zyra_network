@@ -4,6 +4,24 @@ Pipeline: document + selfie -> templates -> liveness ->
 1:1 doc match -> 1:N duplicate search -> decision ->
 assurance level -> sealed template + audit + metrics.
 
+Hardening v2 (additive):
+- biometric_claims: one claim per template hash. The
+  claim is inserted in the SAME transaction as the case,
+  with PRIMARY KEY enforcement, so two concurrent
+  enrollments of the same template can never both
+  succeed (the second gets DuplicateFaceError).
+- Rejected cases (no duplicate involved) release their
+  claim: a legitimate person whose first attempt failed
+  on document quality can retry. The sealed template
+  remains as watchlist either way.
+- ensure_bound_identity(): idempotent finalize for the
+  official enrollment. Approved case -> ZID -> binding,
+  safe to retry; never creates a second ZID for an
+  already-bound case.
+- repair_unbound(): sweep that finalizes any approved
+  case left unbound by a mid-flight failure, reusing
+  the ZID recorded by the failed binding when present.
+
 Additive module inside shared_engines/security/. It never
 writes to tables it does not own and never mutates existing
 identities. Raw face images are never stored: only sealed
@@ -17,6 +35,7 @@ from __future__ import annotations
 import hashlib
 import math
 import os
+import sqlite3
 import struct
 import unittest
 from dataclasses import dataclass
@@ -105,7 +124,7 @@ class TemplateQualityError(BiometricsError):
 
 
 class DuplicateFaceError(BiometricsError):
-    """Face already registered in the network."""
+    """Face already registered or claimed."""
 
 
 class CaseNotFoundError(BiometricsError):
@@ -441,6 +460,17 @@ BIOMETRICS_MIGRATIONS: tuple[Migration, ...] = (
             " ON biometric_attempts (case_id)",
         ),
     ),
+    Migration(
+        2,
+        "biometric_claims",
+        (
+            "CREATE TABLE biometric_claims ("
+            " template_sha TEXT PRIMARY KEY,"
+            " case_id TEXT NOT NULL,"
+            " status TEXT NOT NULL,"
+            " created_at REAL NOT NULL)",
+        ),
+    ),
 )
 
 NAMESPACE = "security.biometrics"
@@ -493,9 +523,14 @@ class VerifyReport:
 
 class BiometricsEngine:
     """Face-first identity proofing over durable
-    storage. Fraud rule: a face at or above
-    dup_reject that already exists rejects the new
-    case even if the presented document differs.
+    storage. Fraud rules:
+    1. A face at or above dup_reject that already
+       exists rejects the new case even if the
+       presented document differs.
+    2. A template claim (PRIMARY KEY on the
+       template hash) makes concurrent double
+       enrollment impossible: the second submit
+       fails atomically.
     Rejected faces remain sealed as a watchlist."""
 
     def __init__(
@@ -614,7 +649,37 @@ class BiometricsEngine:
         template_plain = pack_vector(
             selfie_vec
         )
+        claim_sha = hashlib.sha256(
+            template_plain
+        ).hexdigest()
         with self._db.transaction() as cursor:
+            if dup_of is None:
+                try:
+                    cursor.execute(
+                        "INSERT INTO"
+                        " biometric_claims ("
+                        " template_sha,"
+                        " case_id, status,"
+                        " created_at)"
+                        " VALUES (?, ?, ?, ?)",
+                        (
+                            claim_sha,
+                            case_id,
+                            decision,
+                            now,
+                        ),
+                    )
+                except (
+                    sqlite3.IntegrityError
+                ) as exc:
+                    raise (
+                        DuplicateFaceError(
+                            "face claim already"
+                            " reserved:"
+                            " concurrent"
+                            " enrollment blocked"
+                        )
+                    ) from exc
             cursor.execute(
                 "INSERT INTO biometric_cases ("
                 " case_id, status, display_name,"
@@ -684,6 +749,16 @@ class BiometricsEngine:
                 dup_of=dup_of,
                 actor=actor,
             )
+            if (
+                dup_of is None
+                and decision == CASE_REJECTED
+            ):
+                cursor.execute(
+                    "DELETE FROM"
+                    " biometric_claims WHERE"
+                    " template_sha = ?",
+                    (claim_sha,),
+                )
         self._audit_case(
             decision=decision,
             case_id=case_id,
@@ -828,6 +903,13 @@ class BiometricsEngine:
                     case_id,
                 ),
             )
+            if decision == CASE_REJECTED:
+                cursor.execute(
+                    "DELETE FROM"
+                    " biometric_claims WHERE"
+                    " case_id = ?",
+                    (case_id,),
+                )
             self._attempt(
                 cursor,
                 case_id=case_id,
@@ -927,6 +1009,143 @@ class BiometricsEngine:
             "biometrics.identity.bound"
         )
         return self.get_case(case_id)
+
+    # ---------------------------------------- idempotent finalize
+
+    def ensure_bound_identity(
+        self,
+        case_id: str,
+        *,
+        kind: Any,
+        display_name: str,
+        actor: str,
+        identity_engine: Any,
+    ) -> tuple[BiometricCase, Any, bool]:
+        """Idempotent finalize for official
+        enrollment: approved case -> ZID ->
+        binding to its sealed template. Safe to
+        retry; never creates a second ZID for an
+        already-bound case. Returns
+        (case, identity_or_None, created)."""
+        require_non_empty_str(
+            case_id, "case_id"
+        )
+        require_non_empty_str(actor, "actor")
+        case = self.get_case(case_id)
+        if str(case.status) != CASE_APPROVED:
+            raise NotApprovedError(
+                "only approved cases finalize"
+            )
+        if case.identity_zid is not None:
+            return case, None, False
+        identity = (
+            identity_engine.register_identity(
+                kind=kind,
+                display_name=display_name,
+                actor=actor,
+            )
+        )
+        try:
+            bound = self.bind_identity(
+                case_id,
+                zid=identity.zid,
+                actor=actor,
+            )
+        except Exception as exc:
+            with self._db.transaction() as cursor:
+                self._attempt(
+                    cursor,
+                    case_id=case_id,
+                    kind="binding_failed",
+                    decision="compensation",
+                    reason=(
+                        "zid:"
+                        f"{identity.zid}:"
+                        f"{exc}"
+                    ),
+                    doc_match=None,
+                    dup_score=None,
+                    dup_of=None,
+                    actor=actor,
+                )
+            raise
+        return bound, identity, True
+
+    def repair_unbound(
+        self,
+        *,
+        identity_engine: Any,
+        actor: str,
+        kind: Any,
+        limit: int = 50,
+    ) -> list[str]:
+        """Sweep: finalize approved-but-unbound
+        cases. Reuses the ZID recorded by a failed
+        binding when present; otherwise creates a
+        new identity. Returns repaired case ids."""
+        require_non_empty_str(actor, "actor")
+        require_int_range(
+            limit, "limit", 1, 500
+        )
+        rows = self._db.query_all(
+            "SELECT case_id, display_name FROM"
+            " biometric_cases WHERE status = ?"
+            " AND identity_zid IS NULL"
+            " ORDER BY created_at LIMIT ?",
+            (CASE_APPROVED, int(limit)),
+        )
+        repaired: list[str] = []
+        for row in rows:
+            cid = str(row["case_id"])
+            zid = self._recorded_zid(cid)
+            if zid is not None:
+                try:
+                    identity_engine.require_identity(
+                        zid
+                    )
+                except Exception:
+                    zid = None
+            if zid is None:
+                identity = (
+                    identity_engine.register_identity(
+                        kind=kind,
+                        display_name=str(
+                            row["display_name"]
+                        ),
+                        actor=actor,
+                    )
+                )
+                zid = identity.zid
+            try:
+                self.bind_identity(
+                    cid,
+                    zid=zid,
+                    actor=actor,
+                )
+                repaired.append(cid)
+            except AlreadyBoundError:
+                continue
+            except Exception:
+                continue
+        return repaired
+
+    def _recorded_zid(
+        self, case_id: str
+    ) -> str | None:
+        trows = self._db.query_all(
+            "SELECT reason FROM"
+            " biometric_attempts WHERE"
+            " case_id = ? AND kind = ?"
+            " ORDER BY created_at DESC",
+            (case_id, "binding_failed"),
+        )
+        for trow in trows:
+            reason = str(trow["reason"])
+            if reason.startswith("zid:"):
+                parts = reason.split(":")
+                if len(parts) >= 2:
+                    return parts[1]
+        return None
 
     # ---------------------------------------- 1:1 verify
 
@@ -1298,10 +1517,9 @@ class BiometricsEngine:
 
 
 # =====================================================
-# Tests (CI + local). The DeterministicTestProvider
-# is a TEST FIXTURE ONLY: never wire it in
-# production. The real face engine plugs into the
-# same BiometricProvider surface.
+# Tests (CI + local). DeterministicTestProvider is a
+# TEST FIXTURE ONLY. HardeningTests certify claims,
+# idempotent finalize and repair.
 # =====================================================
 
 _TEST_KEY = "ab" * 32
@@ -1313,6 +1531,32 @@ class _AuditSpy:
 
     def append(self, **kwargs: object) -> None:
         self.events.append(dict(kwargs))
+
+
+class _StubIdentityEngine:
+    def __init__(self) -> None:
+        self.calls = 0
+
+    def register_identity(
+        self,
+        *,
+        kind: Any,
+        display_name: str,
+        actor: str,
+    ) -> Any:
+        self.calls += 1
+        return type(
+            "I",
+            (),
+            {"zid": f"ZID-stub-{self.calls}"},
+        )()
+
+    def require_identity(
+        self, zid: str
+    ) -> Any:
+        return type(
+            "I", (), {"zid": zid}
+        )()
 
 
 class DeterministicTestProvider:
@@ -1409,8 +1653,8 @@ class EngineTests(unittest.TestCase):
         case = engine.submit_case(
             display_name="Ana Perez",
             actor="registrar",
-            doc_image=b"doc-photo-1",
-            selfie_image=b"doc-photo-1",
+            doc_image=b"ana-face-photo",
+            selfie_image=b"ana-face-photo",
         )
         self.assertEqual(
             CASE_APPROVED, case.status
@@ -1431,8 +1675,8 @@ class EngineTests(unittest.TestCase):
         case = engine.submit_case(
             display_name="Ana Perez",
             actor="registrar",
-            doc_image=b"doc-photo-1",
-            selfie_image=b"doc-photo-1",
+            doc_image=b"ana-face-photo",
+            selfie_image=b"ana-face-photo",
         )
         self.assertEqual(
             CASE_MANUAL_REVIEW, case.status
@@ -1450,8 +1694,10 @@ class EngineTests(unittest.TestCase):
     def test_duplicate_face_rejected(
         self,
     ) -> None:
-        """THE anti-fraud test: same face, fake
-        document, different name -> rejected."""
+        """THE anti-fraud test: legitimate
+        enrollment first, then the SAME face with
+        a FAKE document and a different name ->
+        must be rejected by the 1:N search."""
         db = SQLiteAdapter(":memory:")
         engine = self._engine(
             db,
@@ -1491,17 +1737,25 @@ class EngineTests(unittest.TestCase):
         engine = self._engine(
             db,
             BiometricsPolicy(
-                require_liveness=False
+                require_liveness=False,
+                doc_reject=0.90,
+                doc_review=0.95,
+                doc_auto=1.00,
             ),
         )
         case = engine.submit_case(
             display_name="Luis Gomez",
             actor="registrar",
-            doc_image=b"doc-a",
-            selfie_image=b"selfie-b",
+            doc_image=b"luis-doc-photo",
+            selfie_image=b"luis-selfie-photo",
         )
         self.assertEqual(
             CASE_REJECTED, case.status
+        )
+        assert case.result is not None
+        self.assertEqual(
+            "doc_match_below_threshold",
+            case.result.reason,
         )
 
     def test_bind_and_verify(self) -> None:
@@ -1509,14 +1763,15 @@ class EngineTests(unittest.TestCase):
         engine = self._engine(
             db,
             BiometricsPolicy(
-                require_liveness=False
+                require_liveness=False,
+                verify_auto=0.90,
             ),
         )
         case = engine.submit_case(
             display_name="Ana Perez",
             actor="registrar",
-            doc_image=b"doc-photo-1",
-            selfie_image=b"doc-photo-1",
+            doc_image=b"ana-face-photo",
+            selfie_image=b"ana-face-photo",
         )
         engine.bind_identity(
             case.case_id,
@@ -1531,13 +1786,13 @@ class EngineTests(unittest.TestCase):
         )
         ok = engine.verify_face(
             "ZID-person-1",
-            selfie_image=b"doc-photo-1",
+            selfie_image=b"ana-face-photo",
             actor="bank-app",
         )
         self.assertTrue(ok.matched)
         bad = engine.verify_face(
             "ZID-person-1",
-            selfie_image=b"other-person",
+            selfie_image=b"impostor-face",
             actor="bank-app",
         )
         self.assertFalse(bad.matched)
@@ -1548,6 +1803,174 @@ class EngineTests(unittest.TestCase):
         db = SQLiteAdapter(":memory:")
         self._engine(db)
         self._engine(db)
+
+
+class HardeningTests(unittest.TestCase):
+    def _engine(
+        self,
+        db: SQLiteAdapter,
+        policy: BiometricsPolicy | None = None,
+    ) -> BiometricsEngine:
+        return BiometricsEngine(
+            db=db,
+            clock=SystemClock(),
+            audit=_AuditSpy(),
+            provider=DeterministicTestProvider(),
+            cipher=TemplateCipher(
+                master_key_hex=_TEST_KEY
+            ),
+            policy=policy,
+        )
+
+    def test_concurrent_claim_blocks_second(
+        self,
+    ) -> None:
+        """Two submissions racing past the 1:N
+        search: the claim PRIMARY KEY makes the
+        second one fail atomically."""
+        db = SQLiteAdapter(":memory:")
+        engine = self._engine(db)
+        first = engine.submit_case(
+            display_name="Ana Perez",
+            actor="registrar",
+            doc_image=b"ana-face-photo",
+            selfie_image=b"ana-face-photo",
+        )
+        self.assertEqual(
+            CASE_APPROVED, first.status
+        )
+        original = engine._search_1n
+        engine._search_1n = lambda vec: (
+            None,
+            None,
+        )
+        try:
+            with self.assertRaises(
+                DuplicateFaceError
+            ):
+                engine.submit_case(
+                    display_name="Impostor",
+                    actor="registrar",
+                    doc_image=b"doc-fake",
+                    selfie_image=b"ana-face-photo",
+                )
+        finally:
+            engine._search_1n = original
+
+    def test_rejected_case_releases_claim(
+        self,
+    ) -> None:
+        """A legitimate person whose first
+        attempt failed on document quality can
+        retry with real documents."""
+        db = SQLiteAdapter(":memory:")
+        engine = self._engine(
+            db,
+            BiometricsPolicy(
+                require_liveness=False,
+                dup_reject=0.99,
+                doc_reject=0.90,
+                doc_review=0.95,
+                doc_auto=1.00,
+            ),
+        )
+        bad = engine.submit_case(
+            display_name="Luis",
+            actor="registrar",
+            doc_image=b"luis-doc",
+            selfie_image=b"luis-selfie",
+        )
+        self.assertEqual(
+            CASE_REJECTED, bad.status
+        )
+        good = engine.submit_case(
+            display_name="Luis",
+            actor="registrar",
+            doc_image=b"luis-face",
+            selfie_image=b"luis-face",
+        )
+        self.assertEqual(
+            CASE_APPROVED, good.status
+        )
+
+    def test_ensure_bound_idempotent(
+        self,
+    ) -> None:
+        db = SQLiteAdapter(":memory:")
+        engine = self._engine(db)
+        stub = _StubIdentityEngine()
+        case = engine.submit_case(
+            display_name="Ana",
+            actor="registrar",
+            doc_image=b"ana-face-photo",
+            selfie_image=b"ana-face-photo",
+        )
+        c1, ident1, created1 = (
+            engine.ensure_bound_identity(
+                case.case_id,
+                kind="person",
+                display_name="Ana",
+                actor="registrar",
+                identity_engine=stub,
+            )
+        )
+        self.assertTrue(created1)
+        self.assertIsNotNone(ident1)
+        c2, ident2, created2 = (
+            engine.ensure_bound_identity(
+                case.case_id,
+                kind="person",
+                display_name="Ana",
+                actor="registrar",
+                identity_engine=stub,
+            )
+        )
+        self.assertFalse(created2)
+        self.assertIsNone(ident2)
+        self.assertEqual(
+            c1.identity_zid,
+            c2.identity_zid,
+        )
+        self.assertEqual(1, stub.calls)
+
+    def test_repair_after_failed_binding(
+        self,
+    ) -> None:
+        db = SQLiteAdapter(":memory:")
+        engine = self._engine(db)
+        stub = _StubIdentityEngine()
+        case = engine.submit_case(
+            display_name="Ana",
+            actor="registrar",
+            doc_image=b"ana-face-photo",
+            selfie_image=b"ana-face-photo",
+        )
+        real_bind = engine.bind_identity
+
+        def boom(*a: Any, **k: Any) -> None:
+            raise RuntimeError("boom")
+
+        engine.bind_identity = boom
+        with self.assertRaises(RuntimeError):
+            engine.ensure_bound_identity(
+                case.case_id,
+                kind="person",
+                display_name="Ana",
+                actor="registrar",
+                identity_engine=stub,
+            )
+        engine.bind_identity = real_bind
+        repaired = engine.repair_unbound(
+            identity_engine=stub,
+            actor="repair",
+            kind="person",
+        )
+        self.assertIn(case.case_id, repaired)
+        final = engine.get_case(case.case_id)
+        self.assertIsNotNone(
+            final.identity_zid
+        )
+        self.assertEqual(1, stub.calls)
 
 
 if __name__ == "__main__":

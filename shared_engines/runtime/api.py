@@ -4,8 +4,11 @@ Public (no auth): GET /health, POST /verify.
 Protected routes require Bearer token when configured.
 
 Strengthening (additive only): native /proofing/* routes
-for biometric identity proofing. All pre-existing routes
-and handlers are unchanged.
+for biometric identity proofing, and POST /identity/enroll
+as the OFFICIAL identity creation flow: biometric proofing
+is MANDATORY — no ZID is born unless the proofing engine
+approves the person. All pre-existing routes and handlers
+are unchanged.
 """
 from __future__ import annotations
 
@@ -34,6 +37,7 @@ from shared_engines.runtime.responses import (
 from shared_engines.security.biometrics import (
     AlreadyBoundError,
     BiometricCase,
+    CASE_APPROVED,
     CaseNotFoundError,
     NotApprovedError,
     ProviderError,
@@ -184,6 +188,8 @@ class ZyraApiHandler(BaseHTTPRequestHandler):
     def _route_post(self, s: list[str]) -> None:
         if s == ["identity", "register"]:
             self._handle_register_identity()
+        elif s == ["identity", "enroll"]:
+            self._handle_identity_enroll()
         elif s == ["identity", "transition"]:
             self._handle_transition()
         elif s == ["verification", "media"]:
@@ -390,6 +396,98 @@ class ZyraApiHandler(BaseHTTPRequestHandler):
             actor=self._require_str(doc, "actor"),
         )
         self._ok(_identity_json(identity), status=201)
+
+    def _handle_identity_enroll(self) -> None:
+        """OFFICIAL identity creation: biometric proofing
+        is MANDATORY. Pipeline: doc+selfie -> proofing
+        engine -> (refused | review | approved). A ZID is
+        born ONLY on approval, and it is born bound to the
+        sealed biometric template."""
+        doc = self._read_json()
+        kind_raw = self._require_str(doc, "kind")
+        try:
+            kind = IdentityKind(kind_raw)
+        except ValueError as exc:
+            raise ApiError(
+                400, "invalid_request", "unknown kind"
+            ) from exc
+        actor = self._require_str(doc, "actor")
+        display_name = self._require_str(doc, "display_name")
+        engine = self._proofing_engine()
+        try:
+            case = engine.submit_case(
+                display_name=display_name,
+                actor=actor,
+                doc_image=self._proofing_image(
+                    doc, "doc_image_b64"
+                ),
+                selfie_image=self._proofing_image(
+                    doc, "selfie_image_b64"
+                ),
+                doc_kind=self._require_optional_str(
+                    doc, "doc_kind"
+                ),
+                doc_country=self._require_optional_str(
+                    doc, "doc_country"
+                ),
+                doc_number=self._require_optional_str(
+                    doc, "doc_number"
+                ),
+            )
+        except ProviderError as exc:
+            raise ApiError(
+                503,
+                "biometrics_unavailable",
+                str(exc),
+            ) from exc
+        except TemplateQualityError as exc:
+            raise ApiError(
+                400,
+                "template_quality",
+                str(exc),
+            ) from exc
+        if case.status != CASE_APPROVED:
+            self._send_json(
+                422,
+                {
+                    "ok": False,
+                    "error": {
+                        "type": "biometrics_gate",
+                        "message": (
+                            "identity enrollment refused:"
+                            " biometric proofing did not"
+                            " approve"
+                        ),
+                        "case_id": case.case_id,
+                        "case_status": case.status,
+                        "reason": (
+                            case.result.reason
+                            if case.result is not None
+                            else None
+                        ),
+                    },
+                },
+            )
+            return
+        identity = (
+            type(self).kernel.identity.register_identity(
+                kind=kind,
+                display_name=display_name,
+                actor=actor,
+            )
+        )
+        case = engine.bind_identity(
+            case.case_id,
+            zid=identity.zid,
+            actor=actor,
+        )
+        self._ok(
+            {
+                "identity": _identity_json(identity),
+                "proofing": _proofing_case_json(case),
+            },
+            status=201,
+        )
 
     def _handle_get_identity(self, zid: str) -> None:
         identity = type(self).kernel.identity.get_identity(zid)

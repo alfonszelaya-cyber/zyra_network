@@ -1462,8 +1462,8 @@ class EngineTests(unittest.TestCase):
         first = engine.submit_case(
             display_name="Ana Perez",
             actor="registrar",
-            doc_image=b"doc-real",
-            selfie_image=b"selfie-ana",
+            doc_image=b"ana-face-photo",
+            selfie_image=b"ana-face-photo",
         )
         self.assertEqual(
             CASE_APPROVED, first.status
@@ -1472,7 +1472,7 @@ class EngineTests(unittest.TestCase):
             display_name="Otro Nombre",
             actor="registrar",
             doc_image=b"doc-FALSO",
-            selfie_image=b"selfie-ana",
+            selfie_image=b"ana-face-photo",
         )
         self.assertEqual(
             CASE_REJECTED, second.status

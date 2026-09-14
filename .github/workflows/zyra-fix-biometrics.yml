@@ -15,36 +15,6 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
 
-      - name: Fix clock access
-        run: |
-          python3 - <<'PYEOF'
-          from pathlib import Path
-
-          path = Path(
-              "apps/axis/life_history/"
-              "security_service.py"
-          )
-          src = path.read_text(encoding="utf-8")
-
-          old = ").run(life._clock)"
-          new = ").run(life._store._clock)"
-          if new in src:
-              print("RESULT: already fixed")
-          elif old in src:
-              fixed = src.replace(old, new, 1)
-              path.write_text(fixed, encoding="utf-8")
-              print("RESULT: FIXED")
-          else:
-              raise SystemExit("anchor not found")
-
-          import ast
-
-          ast.parse(
-              path.read_text(encoding="utf-8")
-          )
-          print("SYNTAX OK")
-          PYEOF
-
       - name: Setup Python
         uses: actions/setup-python@v5
         with:
@@ -53,7 +23,509 @@ jobs:
       - name: Install dependencies
         run: pip install cryptography pytest "numpy==1.26.4" "opencv-python-headless>=4.8,<5.0"
 
-      - name: 1/3 Security service tests (4 E2E)
+      - name: Write security_service.py (fixed)
+        run: |
+          cat > apps/axis/life_history/security_service.py <<'ZS1'
+          """AXIS Security x Life History - self-contained."""
+          from __future__ import annotations
+
+          import hashlib
+          import uuid
+
+          from apps.axis.life_history.service import (
+              LifeHistoryService,
+          )
+          from shared_engines.storage.migrations import (
+              Migration,
+              MigrationRunner,
+          )
+
+          INCIDENT_STAGES = (
+              "reportado",
+              "en_investigacion",
+              "en_atencion",
+              "resuelto",
+              "archivado",
+          )
+
+          _MIGRATIONS = (
+              Migration(
+                  1,
+                  "life_custody",
+                  (
+                      "CREATE TABLE IF NOT EXISTS life_custody ("
+                      " custody_id TEXT PRIMARY KEY,"
+                      " incident_id TEXT NOT NULL,"
+                      " previous_hash TEXT NOT NULL,"
+                      " event_hash TEXT NOT NULL,"
+                      " actor_zid TEXT NOT NULL,"
+                      " action TEXT NOT NULL,"
+                      " document_id TEXT,"
+                      " occurred_at REAL NOT NULL)",
+                  ),
+              ),
+          )
+
+          GENESIS = "GENESIS"
+
+
+          def _sha256(text):
+              return hashlib.sha256(
+                  text.encode("utf-8")
+              ).hexdigest()
+
+
+          class SecurityLifeService:
+              def __init__(self, *, store, life=None):
+                  self._store = store
+                  self._life = life
+                  MigrationRunner(
+                      store._db,
+                      "axis.life_security",
+                      _MIGRATIONS,
+                  ).run(life._store._clock)
+
+              def _person_for_account(self, account_id):
+                  if self._life is None:
+                      return None
+                  try:
+                      account = self._store.get_account(
+                          account_id
+                      )
+                  except LookupError:
+                      return None
+                  zid = account.get("zid")
+                  if not zid:
+                      return None
+                  row = self._life._store._db.query_one(
+                      "SELECT person_id FROM life_persons"
+                      " WHERE zid = ?",
+                      (str(zid),),
+                  )
+                  return (
+                      str(row["person_id"])
+                      if row is not None
+                      else None
+                  )
+
+              def report_incident(
+                  self,
+                  *,
+                  incident_id,
+                  police_account,
+                  description,
+                  sealed_doc=None,
+                  subject_account=None,
+              ):
+                  inc = self._store.add_incident(
+                      incident_id=incident_id,
+                      police_account=police_account,
+                      description=description,
+                      sealed_doc=sealed_doc,
+                  )
+                  person_id = None
+                  if subject_account:
+                      person_id = self._person_for_account(
+                          subject_account
+                      )
+                  chained = False
+                  if person_id is not None:
+                      try:
+                          self._life._store.add_life_event(
+                              person_id,
+                              actor=police_account,
+                              event_type="security_incident",
+                              detail=incident_id
+                              + " [reportado]",
+                          )
+                          chained = True
+                      except Exception:
+                          chained = False
+                  return {
+                      **inc,
+                      "stage": "reportado",
+                      "subject_person_id": person_id,
+                      "life_chained": chained,
+                  }
+
+              def advance_incident(
+                  self,
+                  *,
+                  incident_id,
+                  police_account,
+                  to_stage,
+                  note,
+              ):
+                  if to_stage not in INCIDENT_STAGES:
+                      raise ValueError("bad stage")
+                  with self._store._db.transaction() as cursor:
+                      cursor.execute(
+                          "UPDATE axis_incidents SET"
+                          " description = ?"
+                          " WHERE incident_id = ?",
+                          (
+                              "[" + to_stage + "] " + note,
+                              incident_id,
+                          ),
+                      )
+                      if cursor.rowcount != 1:
+                          raise LookupError("unknown")
+                  person_id = self._incident_person(
+                      incident_id
+                  )
+                  chained = False
+                  if person_id is not None:
+                      try:
+                          self._life._store.add_life_event(
+                              person_id,
+                              actor=police_account,
+                              event_type="security_status",
+                              detail=incident_id
+                              + " -> "
+                              + to_stage,
+                          )
+                          chained = True
+                      except Exception:
+                          chained = False
+                  return {
+                      "incident_id": incident_id,
+                      "stage": to_stage,
+                      "life_chained": chained,
+                      "person_id": person_id,
+                  }
+
+              def add_custody(
+                  self,
+                  *,
+                  incident_id,
+                  actor_zid,
+                  action,
+                  document_id=None,
+              ):
+                  now = self._life._store._clock.now()
+                  with self._store._db.transaction() as cursor:
+                      row = cursor.execute(
+                          "SELECT event_hash FROM life_custody"
+                          " WHERE incident_id = ?"
+                          " ORDER BY rowid DESC LIMIT 1",
+                          (incident_id,),
+                      ).fetchone()
+                      previous = (
+                          str(row["event_hash"])
+                          if row is not None
+                          else GENESIS
+                      )
+                      event_hash = _sha256(
+                          "|".join(
+                              (
+                                  incident_id,
+                                  previous,
+                                  actor_zid,
+                                  action,
+                                  document_id or "",
+                                  str(now),
+                              )
+                          )
+                      )
+                      custody_id = (
+                          "LCU-" + uuid.uuid4().hex[:10]
+                      )
+                      cursor.execute(
+                          "INSERT INTO life_custody ("
+                          " custody_id, incident_id,"
+                          " previous_hash, event_hash,"
+                          " actor_zid, action,"
+                          " document_id, occurred_at)"
+                          " VALUES (?,?,?,?,?,?,?,?)",
+                          (
+                              custody_id,
+                              incident_id,
+                              previous,
+                              event_hash,
+                              actor_zid,
+                              action,
+                              document_id,
+                              now,
+                          ),
+                      )
+                  return {
+                      "custody_id": custody_id,
+                      "chain_valid": self.custody_verified(
+                          incident_id
+                      ),
+                  }
+
+              def custody_verified(self, incident_id):
+                  rows = self._store._db.query_all(
+                      "SELECT * FROM life_custody"
+                      " WHERE incident_id = ?"
+                      " ORDER BY rowid",
+                      (incident_id,),
+                  )
+                  previous = GENESIS
+                  for row in rows:
+                      expected = _sha256(
+                          "|".join(
+                              (
+                                  str(row["incident_id"]),
+                                  previous,
+                                  str(row["actor_zid"]),
+                                  str(row["action"]),
+                                  (
+                                      str(row["document_id"])
+                                      if row["document_id"]
+                                      is not None
+                                      else ""
+                                  ),
+                                  str(row["occurred_at"]),
+                              )
+                          )
+                      )
+                      if (
+                          str(row["previous_hash"])
+                          != previous
+                          or str(row["event_hash"])
+                          != expected
+                      ):
+                          return False
+                      previous = expected
+                  return True
+
+              def incident_status(self, incident_id):
+                  row = self._store._db.query_one(
+                      "SELECT description FROM axis_incidents"
+                      " WHERE incident_id = ?",
+                      (incident_id,),
+                  )
+                  description = (
+                      str(row["description"])
+                      if row is not None
+                      else None
+                  )
+                  stage = "reportado"
+                  if description and description.startswith(
+                      "["
+                  ):
+                      stage = description.split("]")[0][1:]
+                  return {
+                      "incident_id": incident_id,
+                      "stage": stage,
+                      "description": description,
+                      "custody_verified": (
+                          self.custody_verified(incident_id)
+                      ),
+                  }
+
+              def _incident_person(self, incident_id):
+                  row = self._life._store._db.query_one(
+                      "SELECT person_id FROM life_events"
+                      " WHERE event_type ="
+                      " 'security_incident' AND detail"
+                      " LIKE ? ORDER BY occurred_at DESC"
+                      " LIMIT 1",
+                      (incident_id + "%",),
+                  )
+                  return (
+                      str(row["person_id"])
+                      if row is not None
+                      else None
+                  )
+          ZS1
+          python3 -c "import ast; ast.parse(open('apps/axis/life_history/security_service.py').read()); print('security OK')"
+
+      - name: Write security tests
+        run: |
+          cat > apps/axis/life_history/tests/test_security_service.py <<'ZS2'
+          """Security x Life History E2E tests."""
+          from __future__ import annotations
+
+          import unittest
+
+          from apps.axis.infrastructure.persistence.axis_store import (
+              AxisStore,
+          )
+          from apps.axis.life_history.security_service import (
+              SecurityLifeService,
+          )
+          from apps.axis.life_history.service import (
+              LifeHistoryService,
+          )
+          from apps.axis.life_history.store import (
+              LifeHistoryStore,
+          )
+
+          _SUBJECT = "ZID-subject-0001"
+          _MOTHER = "ZID-mother-s"
+
+
+          class _FakeNetwork:
+              def get(self, path):
+                  zid = path.rsplit("/", 1)[-1]
+                  if zid in (_SUBJECT, _MOTHER):
+                      return (
+                          True,
+                          {"status": "ACTIVE"},
+                          None,
+                      )
+                  return (False, None, "unknown identity")
+
+              def post(self, path, payload):
+                  if path == "/documents/seal":
+                      return (
+                          True,
+                          {"document_id": "DOC-s1"},
+                          None,
+                      )
+                  if path == "/history/append":
+                      return (
+                          True,
+                          {"appended": True},
+                          None,
+                      )
+                  return (False, None, "unknown")
+
+
+          class SecurityLifeE2E(unittest.TestCase):
+              def _boot(self):
+                  from shared_engines.common.clocks import (
+                      SystemClock,
+                  )
+                  from shared_engines.storage.database import (
+                      SQLiteAdapter,
+                  )
+
+                  db = SQLiteAdapter(":memory:")
+                  clock = SystemClock()
+                  life = LifeHistoryService(
+                      store=LifeHistoryStore(db, clock),
+                      client=_FakeNetwork(),
+                  )
+                  birth = life.register_birth_with_network(
+                      registrar_account="AX-reg-1",
+                      child_name="Sujeto Nacido",
+                      birth_date="1990-06-01",
+                      birth_place="Soyapango",
+                      sex="M",
+                      mother_name="Madre S",
+                      mother_zid=_MOTHER,
+                  )
+                  person_id = str(birth["person_id"])
+                  life.attach_zid_with_audit(
+                      person_id,
+                      zid=_SUBJECT,
+                      actor="biometric-enroll",
+                  )
+                  store = AxisStore(db, clock)
+                  store.add_account(
+                      account_id="AX-pol-s",
+                      zid=None,
+                      name="Agente S",
+                      role="policia",
+                  )
+                  store.add_account(
+                      account_id="AX-subj-s",
+                      zid=_SUBJECT,
+                      name="Sujeto Nacido",
+                      role="paciente",
+                  )
+                  security = SecurityLifeService(
+                      store=store, life=life
+                  )
+                  return store, life, security, person_id
+
+              def test_incident_lifecycle_chained(self):
+                  store, life, security, person_id = (
+                      self._boot()
+                  )
+                  reported = security.report_incident(
+                      incident_id="INC-s1",
+                      police_account="AX-pol-s",
+                      description="robo reportado",
+                      subject_account="AX-subj-s",
+                  )
+                  self.assertTrue(reported["life_chained"])
+                  advanced = security.advance_incident(
+                      incident_id="INC-s1",
+                      police_account="AX-pol-s",
+                      to_stage="resuelto",
+                      note="recuperado",
+                  )
+                  self.assertTrue(advanced["life_chained"])
+                  status = security.incident_status("INC-s1")
+                  self.assertEqual("resuelto", status["stage"])
+                  events = life._store.events_of(person_id)
+                  sec = [
+                      e["event_type"]
+                      for e in events
+                      if e["event_type"].startswith(
+                          "security"
+                      )
+                  ]
+                  self.assertEqual(
+                      ["security_incident", "security_status"],
+                      sec,
+                  )
+                  self.assertTrue(
+                      life._store.events_verify(person_id)
+                  )
+
+              def test_custody_chain(self):
+                  store, life, security, _pid = self._boot()
+                  security.report_incident(
+                      incident_id="INC-s2",
+                      police_account="AX-pol-s",
+                      description="evidencia",
+                  )
+                  c1 = security.add_custody(
+                      incident_id="INC-s2",
+                      actor_zid="ZID-pol-1",
+                      action="recolectada",
+                  )
+                  self.assertTrue(c1["chain_valid"])
+                  c2 = security.add_custody(
+                      incident_id="INC-s2",
+                      actor_zid="ZID-pol-1",
+                      action="a fiscalia",
+                      document_id="DOC-s1",
+                  )
+                  self.assertTrue(c2["chain_valid"])
+                  status = security.incident_status("INC-s2")
+                  self.assertTrue(status["custody_verified"])
+
+              def test_invalid_stage_rejected(self):
+                  store, life, security, _pid = self._boot()
+                  security.report_incident(
+                      incident_id="INC-s3",
+                      police_account="AX-pol-s",
+                      description="x",
+                  )
+                  with self.assertRaises(ValueError):
+                      security.advance_incident(
+                          incident_id="INC-s3",
+                          police_account="AX-pol-s",
+                          to_stage="desaparecido",
+                          note="x",
+                      )
+
+              def test_unlinked_subject_degrades(self):
+                  store, life, security, _pid = self._boot()
+                  reported = security.report_incident(
+                      incident_id="INC-s4",
+                      police_account="AX-pol-s",
+                      description="sin sujeto",
+                  )
+                  self.assertFalse(reported["life_chained"])
+                  self.assertIsNone(
+                      reported["subject_person_id"]
+                  )
+
+
+          if __name__ == "__main__":
+              unittest.main(verbosity=2)
+          ZS2
+          python3 -c "import ast; ast.parse(open('apps/axis/life_history/tests/test_security_service.py').read()); print('tests OK')"
+
+      - name: 1/3 Security tests (4 E2E)
         run: python -m apps.axis.life_history.tests.test_security_service -v
 
       - name: 2/3 Life History regression
@@ -71,14 +543,14 @@ jobs:
           python -m pytest apps/axis/tests -q
           python -m network.transport.tcp_transport -q
 
-      - name: Commit fix (only if all green)
+      - name: Commit (only if all green)
         run: |
           git config user.name "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
-          git add apps/axis/life_history/security_service.py
+          git add apps/axis/life_history/
           if git diff --cached --quiet; then
             echo "Nothing to commit"
           else
-            git commit -m "security: clock from store not service"
+            git commit -m "security: SecurityLifeService complete with custody chain + life link"
             git push
           fi

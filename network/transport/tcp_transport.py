@@ -730,10 +730,7 @@ class TcpServerTransport:
 # Tests: real TCP over localhost, ephemeral ports.
 # =====================================================
 
-_TEST_KEY = (
-    "3f2a9c8e7b6d5f4a3c2b1d0e9f8a7b6c"
-    "5d4e3f2a1b0c9d8e7f6a5b4c3d2e1f0"
-)
+_TEST_KEY = "ab" * 32
 
 
 class TcpTransportTests(unittest.TestCase):

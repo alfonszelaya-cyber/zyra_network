@@ -1,4 +1,4 @@
-name: ZYRA AXIS Block B
+name: ZYRA AXIS Block B Final
 
 on:
   push:
@@ -15,48 +15,6 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
 
-      - name: Fix bridge - create its table
-        run: |
-          python3 - <<'PYEOF'
-          from pathlib import Path
-
-          path = Path(
-              "apps/axis/life_history/"
-              "outbox_bridge.py"
-          )
-          src = path.read_text(encoding="utf-8")
-
-          if "CREATE TABLE IF NOT EXISTS" in src:
-              print("RESULT: already fixed")
-          else:
-              anchor = (
-                  "          class OutboxBridge:\n"
-                  "              def __init__(self, *, life, outbox, clock):\n"
-                  "                  self._life = life\n"
-                  "                  self._outbox = outbox\n"
-                  "                  self._clock = clock\n"
-              )
-              assert anchor in src, "anchor not found"
-              fixed = anchor + (
-                  "                  self._life._store._db.execute(\n"
-                  "                      \"CREATE TABLE IF NOT EXISTS\"\n"
-                  "                      \" life_outbox_sent (\"\n"
-                  "                      \" event_id TEXT PRIMARY KEY,\"\n"
-                  "                      \" sent_at REAL NOT NULL)\"\n"
-                  "                  )\n"
-              )
-              src = src.replace(anchor, fixed, 1)
-              path.write_text(src, encoding="utf-8")
-              print("RESULT: TABLE CREATION ADDED")
-
-          import ast
-
-          ast.parse(
-              path.read_text(encoding="utf-8")
-          )
-          print("SYNTAX OK")
-          PYEOF
-
       - name: Setup Python
         uses: actions/setup-python@v5
         with:
@@ -64,6 +22,219 @@ jobs:
 
       - name: Install deps
         run: pip install cryptography pytest "numpy==1.26.4" "opencv-python-headless>=4.8,<5.0"
+
+      - name: Write outbox_bridge.py WITH table creation
+        run: |
+          cat > apps/axis/life_history/outbox_bridge.py <<'BEOF'
+          """AXIS Life History -> Network Outbox bridge."""
+          from __future__ import annotations
+
+
+          _EVENT_TO_LIFE = {
+              "birth_registered": "life.birth.registered",
+              "zid_biometric_upgrade": "life.zid.biometric_upgrade",
+              "health_exam": "life.health.event",
+              "health_result": "life.health.event",
+              "health_appointment": "life.health.event",
+              "justice_case": "life.justice.event",
+              "justice_status": "life.justice.event",
+              "security_incident": "life.security.event",
+              "security_status": "life.security.event",
+          }
+
+
+          class OutboxBridge:
+              def __init__(self, *, life, outbox, clock):
+                  self._life = life
+                  self._outbox = outbox
+                  self._clock = clock
+                  self._life._store._db.execute(
+                      "CREATE TABLE IF NOT EXISTS"
+                      " life_outbox_sent ("
+                      " event_id TEXT PRIMARY KEY,"
+                      " sent_at REAL NOT NULL)"
+                  )
+
+              def sync_pending(self):
+                  emitted = 0
+                  skipped = 0
+                  rows = self._life._store._db.query_all(
+                      "SELECT event_id, person_id,"
+                      " event_type, detail, occurred_at"
+                      " FROM life_events"
+                      " ORDER BY occurred_at, rowid"
+                  )
+                  for row in rows:
+                      event_id = str(row["event_id"])
+                      already = self._life._store._db.query_one(
+                          "SELECT 1 FROM life_outbox_sent"
+                          " WHERE event_id = ?",
+                          (event_id,),
+                      )
+                      if already is not None:
+                          skipped += 1
+                          continue
+                      etype = str(row["event_type"])
+                      network_type = _EVENT_TO_LIFE.get(etype)
+                      if network_type is None:
+                          continue
+                      try:
+                          self._outbox.enqueue(
+                              {
+                                  "event_id": event_id,
+                                  "event_type": network_type,
+                                  "aggregate_id": str(
+                                      row["person_id"]
+                                  ),
+                                  "payload": {
+                                      "detail": str(
+                                          row["detail"] or ""
+                                      ),
+                                      "source": "axis",
+                                  },
+                              }
+                          )
+                      except Exception:
+                          continue
+                      self._life._store._db.execute(
+                          "INSERT INTO life_outbox_sent"
+                          " (event_id, sent_at) VALUES (?, ?)",
+                          (event_id, self._clock.now()),
+                      )
+                      emitted += 1
+                  return {
+                      "emitted": emitted,
+                      "skipped": skipped,
+                  }
+          BEOF
+          python3 -c "import ast; ast.parse(open('apps/axis/life_history/outbox_bridge.py').read()); print('bridge OK')"
+
+      - name: Write bridge tests
+        run: |
+          cat > apps/axis/life_history/tests/test_outbox_bridge.py <<'B2EOF'
+          """Outbox bridge E2E tests."""
+          from __future__ import annotations
+
+          import unittest
+
+          from apps.axis.life_history.outbox_bridge import (
+              OutboxBridge,
+          )
+          from apps.axis.life_history.service import (
+              LifeHistoryService,
+          )
+          from apps.axis.life_history.store import (
+              LifeHistoryStore,
+          )
+          from shared_engines.common.clocks import SystemClock
+          from shared_engines.storage.database import (
+              SQLiteAdapter,
+          )
+
+          _MOTHER = "ZID-mother-ob"
+
+
+          class _FakeNet:
+              def get(self, path):
+                  zid = path.rsplit("/", 1)[-1]
+                  if zid == _MOTHER:
+                      return True, {"status": "ACTIVE"}, None
+                  return False, None, "unknown identity"
+
+              def post(self, path, payload):
+                  if path == "/documents/seal":
+                      return True, {"document_id": "DOC-ob"}, None
+                  if path == "/history/append":
+                      return True, {"appended": True}, None
+                  return False, None, "unknown"
+
+
+          class _FakeOutbox:
+              def __init__(self, working=True):
+                  self.working = working
+                  self.enqueued = []
+
+              def enqueue(self, event):
+                  if not self.working:
+                      raise RuntimeError("outbox unreachable")
+                  self.enqueued.append(event)
+
+
+          class OutboxBridgeTests(unittest.TestCase):
+              def _boot(self, outbox_ok=True):
+                  db = SQLiteAdapter(":memory:")
+                  clock = SystemClock()
+                  life = LifeHistoryService(
+                      store=LifeHistoryStore(db, clock),
+                      client=_FakeNet(),
+                  )
+                  birth = life.register_birth_with_network(
+                      registrar_account="AX-reg-1",
+                      child_name="Bebe Outbox",
+                      birth_date="2025-01-15",
+                      birth_place="San Salvador",
+                      sex="F",
+                      mother_name="Madre O",
+                      mother_zid=_MOTHER,
+                  )
+                  life._store.add_life_event(
+                      life._store._db.query_one(
+                          "SELECT person_id FROM life_persons"
+                      )["person_id"],
+                      actor="AX-doc-1",
+                      event_type="health_exam",
+                      detail="EXM-1: sangre",
+                  )
+                  outbox = _FakeOutbox(working=outbox_ok)
+                  bridge = OutboxBridge(
+                      life=life, outbox=outbox, clock=clock
+                  )
+                  return life, bridge, outbox
+
+              def test_events_reach_outbox(self):
+                  life, bridge, outbox = self._boot()
+                  result = bridge.sync_pending()
+                  self.assertEqual(2, result["emitted"])
+                  self.assertEqual(2, len(outbox.enqueued))
+                  kinds = [
+                      e["event_type"]
+                      for e in outbox.enqueued
+                  ]
+                  self.assertIn(
+                      "life.birth.registered", kinds
+                  )
+                  self.assertIn(
+                      "life.health.event", kinds
+                  )
+
+              def test_sync_is_idempotent(self):
+                  life, bridge, outbox = self._boot()
+                  first = bridge.sync_pending()
+                  self.assertEqual(2, first["emitted"])
+                  second = bridge.sync_pending()
+                  self.assertEqual(0, second["emitted"])
+                  self.assertEqual(
+                      2, len(outbox.enqueued)
+                  )
+
+              def test_outbox_down_no_loss(self):
+                  life, bridge, outbox = self._boot(
+                      outbox_ok=False
+                  )
+                  first = bridge.sync_pending()
+                  self.assertEqual(0, first["emitted"])
+                  outbox.working = True
+                  second = bridge.sync_pending()
+                  self.assertEqual(2, second["emitted"])
+                  self.assertEqual(
+                      2, len(outbox.enqueued)
+                  )
+
+
+          if __name__ == "__main__":
+              unittest.main(verbosity=2)
+          B2EOF
+          python3 -c "import ast; ast.parse(open('apps/axis/life_history/tests/test_outbox_bridge.py').read()); print('test OK')"
 
       - name: 1/3 Outbox bridge tests
         run: python -m pytest apps/axis/life_history/tests/test_outbox_bridge.py -v
@@ -83,10 +254,10 @@ jobs:
         run: |
           git config user.name "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
-          git add apps/axis/life_history/outbox_bridge.py
+          git add apps/axis/life_history/
           if git diff --cached --quiet; then
             echo "Nothing to commit"
           else
-            git commit -m "outbox bridge: creates its sent-table on init"
+            git commit -m "axis: outbox bridge complete - table self-created, idempotent, offline-safe"
             git push
           fi

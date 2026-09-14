@@ -1,0 +1,282 @@
+"""ZYRA Clearance Engine - network-native.
+
+Official background-check certification layer.
+Lives in the Network (authority), consumed by
+apps (AXIS etc). Additive, own audit table.
+
+The engine scans life_events for justice_* and
+security_* events of the subject ZID and reports
+them. The active-vs-closed refinement is done by
+the AXIS layer, which owns full case status.
+The engine only vouches for what it sees, signed
+and audited.
+"""
+from __future__ import annotations
+
+import hashlib
+import hmac
+import unittest
+import uuid
+
+from shared_engines.common.clocks import (
+    Clock,
+    SystemClock,
+)
+from shared_engines.storage.database import (
+    SQLiteAdapter,
+)
+
+_INFO = b"ZYRA:security:clearance:v1"
+
+_AUDIT_TABLE = (
+    "CREATE TABLE IF NOT EXISTS"
+    " clearance_requests ("
+    " request_id TEXT PRIMARY KEY,"
+    " requester TEXT NOT NULL,"
+    " subject_zid TEXT NOT NULL,"
+    " finding TEXT NOT NULL,"
+    " response_hash TEXT NOT NULL,"
+    " created_at REAL NOT NULL)"
+)
+
+
+class ClearanceEngine:
+    def __init__(
+        self,
+        *,
+        db,
+        clock: Clock,
+        master_key_hex: str,
+    ) -> None:
+        self._db = db
+        self._clock = clock
+        raw = bytes.fromhex(master_key_hex)
+        self._key = hashlib.sha256(
+            raw + _INFO
+        ).digest()
+        db.execute(_AUDIT_TABLE)
+
+    def _sign(self, payload: str) -> str:
+        return hmac.new(
+            self._key,
+            payload.encode("utf-8"),
+            hashlib.sha256,
+        ).hexdigest()
+
+    def certify(
+        self,
+        *,
+        requester: str,
+        subject_zid: str,
+        life_store=None,
+    ) -> dict:
+        if not requester.strip():
+            raise ValueError(
+                "requester required"
+            )
+        if not subject_zid.startswith("ZID-"):
+            raise ValueError(
+                "subject must be a ZID"
+            )
+        now = self._clock.now()
+        findings: list[dict] = []
+        if life_store is not None:
+            try:
+                rows = life_store._db.query_all(
+                    "SELECT * FROM life_events"
+                    " WHERE person_id IN"
+                    " (SELECT person_id FROM"
+                    " life_persons WHERE zid = ?)"
+                    " ORDER BY occurred_at",
+                    (subject_zid,),
+                )
+            except Exception:
+                rows = []
+            for row in rows:
+                etype = str(row["event_type"])
+                detail = str(
+                    row["detail"] or ""
+                )
+                if etype == "justice_case":
+                    findings.append(
+                        {
+                            "type": "justicia",
+                            "ref": detail.split(" ")[0],
+                            "stage": "registrado",
+                        }
+                    )
+                elif etype == "security_incident":
+                    findings.append(
+                        {
+                            "type": "seguridad",
+                            "ref": detail.split(" ")[0],
+                            "stage": "reportado",
+                        }
+                    )
+        if findings:
+            finding = "CON_REGISTROS_REPORTADOS"
+        else:
+            finding = "SIN_REGISTROS_REPORTADOS"
+        cert_id = "CLR-" + uuid.uuid4().hex[:12]
+        issued_at = now
+        payload = "|".join(
+            (
+                cert_id,
+                requester,
+                subject_zid,
+                finding,
+                str(issued_at),
+            )
+        )
+        signature = self._sign(payload)
+        request_id = "CRQ-" + uuid.uuid4().hex[:10]
+        self._db.execute(
+            "INSERT INTO clearance_requests ("
+            " request_id, requester,"
+            " subject_zid, finding,"
+            " response_hash, created_at)"
+            " VALUES (?, ?, ?, ?, ?, ?)",
+            (
+                request_id,
+                requester.strip(),
+                subject_zid,
+                finding,
+                signature,
+                issued_at,
+            ),
+        )
+        return {
+            "cert_id": cert_id,
+            "requester": requester.strip(),
+            "subject_zid": subject_zid,
+            "finding": finding,
+            "records": findings,
+            "issued_at": issued_at,
+            "signature": signature,
+        }
+
+    def verify(self, *, cert: dict) -> bool:
+        payload = "|".join(
+            (
+                str(cert["cert_id"]),
+                str(cert["requester"]),
+                str(cert["subject_zid"]),
+                str(cert["finding"]),
+                str(cert["issued_at"]),
+            )
+        )
+        expected = self._sign(payload)
+        return hmac.compare_digest(
+            expected,
+            str(cert["signature"]),
+        )
+
+
+class ClearanceTests(unittest.TestCase):
+    def _engine(self):
+        db = SQLiteAdapter(":memory:")
+        return ClearanceEngine(
+            db=db,
+            clock=SystemClock(),
+            master_key_hex="ab" * 32,
+        ), db
+
+    def test_clean_certification(self) -> None:
+        engine, _db = self._engine()
+        cert = engine.certify(
+            requester="Banco-X",
+            subject_zid="ZID-clean-1",
+        )
+        self.assertEqual(
+            "SIN_REGISTROS_REPORTADOS",
+            cert["finding"],
+        )
+        self.assertEqual([], cert["records"])
+        self.assertTrue(engine.verify(cert=cert))
+
+    def test_verify_rejects_tamper(self) -> None:
+        engine, _db = self._engine()
+        cert = engine.certify(
+            requester="Banco-X",
+            subject_zid="ZID-clean-2",
+        )
+        tampered = dict(cert)
+        tampered["finding"] = "CON_REGISTROS_REPORTADOS"
+        self.assertFalse(engine.verify(cert=tampered))
+
+    def test_requests_are_audited(self) -> None:
+        engine, db = self._engine()
+        engine.certify(
+            requester="Empleador-Y",
+            subject_zid="ZID-clean-3",
+        )
+        engine.certify(
+            requester="Empleador-Y",
+            subject_zid="ZID-clean-4",
+        )
+        rows = db.query_all(
+            "SELECT * FROM clearance_requests"
+        )
+        self.assertEqual(2, len(rows))
+
+    def test_invalid_zid_rejected(self) -> None:
+        engine, _db = self._engine()
+        with self.assertRaises(ValueError):
+            engine.certify(
+                requester="Banco",
+                subject_zid="no-es-zid",
+            )
+
+    def test_records_found_for_subject(self) -> None:
+        from shared_engines.storage.database import (
+            SQLiteAdapter as SA,
+        )
+        from apps.axis.life_history.store import (
+            LifeHistoryStore,
+        )
+
+        engine, _db = self._engine()
+        ls = LifeHistoryStore(
+            SA(":memory:"), SystemClock()
+        )
+        ls.register_birth(
+            registrar_account="AX-reg-1",
+            child_name="Sujeto",
+            birth_date="1990-01-01",
+            birth_place="SS",
+            sex="M",
+            mother_name="Madre",
+            mother_zid="ZID-m-x",
+        )
+        ls.attach_zid(
+            ls._db.query_one(
+                "SELECT person_id FROM life_persons"
+            )["person_id"],
+            zid="ZID-subj-x",
+            actor="enroll",
+        )
+        person = ls._db.query_one(
+            "SELECT person_id FROM life_persons"
+            " WHERE zid = 'ZID-subj-x'"
+        )
+        ls.add_life_event(
+            str(person["person_id"]),
+            actor="AX-law-1",
+            event_type="justice_case",
+            detail="CASE-99 abierto [denuncia]",
+        )
+        cert = engine.certify(
+            requester="Empleador-Z",
+            subject_zid="ZID-subj-x",
+            life_store=ls,
+        )
+        self.assertEqual(
+            "CON_REGISTROS_REPORTADOS",
+            cert["finding"],
+        )
+        self.assertEqual(1, len(cert["records"]))
+        self.assertTrue(engine.verify(cert=cert))
+
+
+if __name__ == "__main__":
+    unittest.main(verbosity=2)

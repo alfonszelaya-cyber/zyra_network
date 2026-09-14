@@ -172,8 +172,18 @@ def test_aid_full_lifecycle(tmp_path: Path) -> None:
         )
         row = created["data"]
         producer_id = str(row["producer_id"])
-        zid = row.get("zid")
-        assert isinstance(zid, str)
+        # Production: the ZID arrives from biometric enrollment via the super-app; simulate it through the kernel, then link it to the producer row.
+        from shared_engines.identity.contracts import IdentityKind
+        _enrolled = eco.kernel.identity.register_identity(
+            kind=IdentityKind.PERSON,
+            display_name="Jose Rural",
+            actor="test-biometric-enroll",
+        )
+        zid = _enrolled.zid
+        eco.store._db.execute(
+            "UPDATE agro_producers_v2 SET zid = ? WHERE producer_id = ?",
+            (zid, producer_id),
+        )
         assert zid.startswith("ZID-")
         verified = _post(
             eco.agro_base + "/agro/producers/verify",

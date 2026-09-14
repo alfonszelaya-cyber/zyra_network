@@ -124,7 +124,7 @@ def _accounts(eco) -> tuple[str, str]:
     ok, data, _err = eco.client.post(
         "/identity/register",
         {
-            "kind": "person",
+            "kind": "organization",
             "display_name": "Dr Ramirez",
             "actor": "axis",
         },
@@ -138,7 +138,7 @@ def _accounts(eco) -> tuple[str, str]:
     ok, data, _err = eco.client.post(
         "/identity/register",
         {
-            "kind": "person",
+            "kind": "organization",
             "display_name": "Maria Lopez",
             "actor": "axis",
         },

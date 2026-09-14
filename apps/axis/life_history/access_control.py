@@ -1,4 +1,4 @@
-"""AXIS granular access control."""
+"""AXIS granular access control - complete."""
 from __future__ import annotations
 
 import unittest
@@ -7,6 +7,8 @@ from apps.axis.life_history.permissions import (
     HISTORY_READERS,
     REGISTRY_OPERATORS,
 )
+
+THIRD_PARTIES = ("empleador", "tercero")
 
 OPERATIONS = {
     "birth.register": REGISTRY_OPERATORS,
@@ -17,6 +19,8 @@ OPERATIONS = {
     "security.report": ("policia", "gobierno"),
     "security.advance": ("policia", "gobierno"),
     "clearance.emit": REGISTRY_OPERATORS,
+    "code.generate": REGISTRY_OPERATORS,
+    "code.redeem": HISTORY_READERS + THIRD_PARTIES,
     "history.read": HISTORY_READERS,
     "zid.upgrade": REGISTRY_OPERATORS
     + ("biometric-enroll",),
@@ -42,19 +46,29 @@ class AccessControlTests(unittest.TestCase):
         )
         self.assertTrue(
             authorize(
-                "health.record", "medico"
+                "code.generate", "gobierno"
             )
         )
         self.assertTrue(
             authorize(
-                "clearance.emit", "gobierno"
+                "code.redeem", "empleador"
+            )
+        )
+        self.assertTrue(
+            authorize(
+                "health.record", "medico"
             )
         )
 
     def test_roles_denied(self):
         self.assertFalse(
             authorize(
-                "clearance.emit", "paciente"
+                "code.generate", "paciente"
+            )
+        )
+        self.assertFalse(
+            authorize(
+                "code.redeem", "hacker"
             )
         )
         self.assertFalse(

@@ -62,6 +62,7 @@ class AxisApiHandler(
 ):
     store: ClassVar[AxisStore]
     link: ClassVar[AxisLink]
+    life_history_service: ClassVar[object] = None
 
     def log_message(
         self, format: str, *args: object
@@ -138,6 +139,12 @@ class AxisApiHandler(
             return
         if s[0] == "emergencias":
             self._screen_emergencias()
+            return
+        if s[0] == "registro-civil":
+            self._screen_registro_civil()
+            return
+        if s[0] == "life":
+            self._screen_life_person(s)
             return
         if s[0] == "paciente":
             self._screen_patient(s)
@@ -412,6 +419,9 @@ class AxisApiHandler(
             return
         if s == ["exam"]:
             self._exam_form(doc)
+            return
+        if s == ["birth-register"]:
+            self._birth_register(doc)
             return
         if s == ["exam-result"]:
             self._exam_result_form(doc)
@@ -840,6 +850,12 @@ class AxisApiHandler(
             "<button>Crear cuenta"
             "</button>"
             "</form></div>"
+            "<h2>Registro Civil (Life History)</h2>"
+            "<div class='card'>"
+            "<a href='/axis/registro-civil'>"
+            "<button>Abrir Registro Civil"
+            "</button></a>"
+            "</div>"
             "<h2>Paneles</h2>"
             "<div class='card'>"
             "<p>Ingresa con tu ID de"
@@ -1137,6 +1153,208 @@ class AxisApiHandler(
         self.wfile.write(body)
 
 
+
+
+    def _lh(self):
+        svc = type(self).life_history_service
+        if svc is None:
+            raise LookupError(
+                "life_history not wired"
+            )
+        return svc
+
+    def _screen_registro_civil(self) -> None:
+        body = (
+            "<h1>📜 Registro Civil</h1>"
+            "<p>Nueva partida de nacimiento"
+            " (se sella en la cadena nacional"
+            " inalterable).</p>"
+            "<div class='card'>"
+            "<form method='POST'"
+            " action='/axis/birth-register'>"
+            "<input name='registrar_account'"
+            " placeholder='Mi ID (AX-...)'>"
+            "<input name='child_name'"
+            " placeholder='Nombre del recien nacido'>"
+            "<input name='birth_date'"
+            " placeholder='Fecha (AAAA-MM-DD)'>"
+            "<input name='birth_place'"
+            " placeholder='Lugar de nacimiento'>"
+            "<select name='sex'>"
+            "<option value='F'>F</option>"
+            "<option value='M'>M</option>"
+            "<option value='I'>I</option>"
+            "</select>"
+            "<input name='mother_name'"
+            " placeholder='Nombre de la madre'>"
+            "<input name='mother_zid'"
+            " placeholder='ZID de la madre (ZID-...)'>"
+            "<input name='father_name'"
+            " placeholder='Nombre del padre (opcional)'>"
+            "<input name='father_zid'"
+            " placeholder='ZID del padre (ZID-...)'>"
+            "<input name='source_hospital'"
+            " placeholder='Hospital (opcional)'>"
+            "<button>Registrar partida</button>"
+            "</form></div>"
+            "<a href='/axis'><button"
+            " class='gray'>Inicio</button></a>"
+        )
+        self._html(
+            200,
+            _page(
+                "AXIS - Registro Civil",
+                body,
+            ),
+        )
+
+    def _birth_register(self, doc) -> None:
+        svc = self._lh()
+        father_name = doc.get("father_name")
+        father_name = (
+            str(father_name).strip()
+            if father_name
+            and str(father_name).strip()
+            else None
+        )
+        father_zid = doc.get("father_zid")
+        father_zid = (
+            str(father_zid).strip()
+            if father_zid
+            and str(father_zid).strip()
+            else None
+        )
+        hospital = doc.get("source_hospital")
+        hospital = (
+            str(hospital).strip()
+            if hospital
+            and str(hospital).strip()
+            else None
+        )
+        birth = (
+            svc.register_birth_with_network(
+                registrar_account=self._req(
+                    doc, "registrar_account"
+                ),
+                child_name=self._req(
+                    doc, "child_name"
+                ),
+                birth_date=self._req(
+                    doc, "birth_date"
+                ),
+                birth_place=self._req(
+                    doc, "birth_place"
+                ),
+                sex=self._req(doc, "sex"),
+                mother_name=self._req(
+                    doc, "mother_name"
+                ),
+                mother_zid=self._req(
+                    doc, "mother_zid"
+                ),
+                father_name=father_name,
+                father_zid=father_zid,
+                source_hospital=hospital,
+            )
+        )
+        seal = (
+            birth.get("network_seal")
+            or "-"
+        )
+        body = (
+            "<h1>📜 Partida registrada"
+            "</h1>"
+            "<p>ID partida: <b>"
+            + str(birth["birth_id"])
+            + "</b></p>"
+            "<p>ID persona: <b>"
+            + str(birth["person_id"])
+            + "</b></p>"
+            "<p>Sello de certificado:"
+            " <b>"
+            + str(birth["cert_hash"])[:24]
+            + "...</b></p>"
+            "<p>Sello en la Red: <b>"
+            + seal
+            + "</b></p>"
+            "<p>La partida esta encadenada"
+            " al registro nacional"
+            " inalterable.</p>"
+            "<a href='/axis/registro-civil'>"
+            "<button>Registrar otra"
+            "</button></a>"
+            "<a href='/axis'><button"
+            " class='gray'>Inicio"
+            "</button></a>"
+        )
+        self._html(
+            200,
+            _page(
+                "AXIS - Partida emitida",
+                body,
+            ),
+        )
+
+    def _screen_life_person(
+        self, s: list[str],
+    ) -> None:
+        svc = self._lh()
+        if len(s) < 2:
+            raise LookupError(
+                "person id required"
+            )
+        person_id = s[1]
+        person = svc._store.get_person(
+            person_id
+        )
+        events = svc._store.events_of(
+            person_id
+        )
+        items = ""
+        for e in events:
+            items = (
+                items
+                + "<li>• "
+                + e["event_type"]
+                + " — "
+                + str(e["detail"] or "")
+                + "</li>"
+            )
+        if not items:
+            items = "<li>Sin eventos</li>"
+        chain = (
+            "VERIFICADA"
+            if svc._store.events_verify(
+                person_id
+            )
+            else "COMPROMETIDA"
+        )
+        body = (
+            "<h1>🧬 Historial de Vida</h1>"
+            "<p>"
+            + str(person["full_name"])
+            + " | estado: "
+            + person["status"]
+            + " | ZID: "
+            + str(person["zid"] or "pendiente")
+            + "</p>"
+            "<p>Cadena: " + chain + "</p>"
+            "<h2>Eventos</h2><ul>"
+            + items
+            + "</ul>"
+            "<a href='/axis'><button"
+            " class='gray'>Inicio"
+            "</button></a>"
+        )
+        self._html(
+            200,
+            _page(
+                "AXIS - Historial de Vida",
+                body,
+            ),
+        )
+
+
 class AxisServer(ThreadingHTTPServer):
     daemon_threads = True
     allow_reuse_address = True
@@ -1161,7 +1379,9 @@ def serve_axis(
     *,
     host: str = "127.0.0.1",
     port: int = 0,
+    life_history_service=None,
 ) -> AxisServer:
     AxisApiHandler.store = store
     AxisApiHandler.link = AxisLink(client)
+    AxisApiHandler.life_history_service = life_history_service
     return AxisServer((host, port))

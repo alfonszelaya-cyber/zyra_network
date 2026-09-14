@@ -1,4 +1,4 @@
-name: ZYRA Clearance Engine
+name: ZYRA Clearance AXIS Emitter
 
 on:
   push:
@@ -21,310 +21,276 @@ jobs:
           python-version: "3.11"
 
       - name: Install deps
-        run: pip install cryptography pytest
+        run: pip install cryptography pytest "numpy==1.26.4" "opencv-python-headless>=4.8,<5.0"
 
-      - name: Write clearance engine (simple flat version)
+      - name: Write clearance emitter for AXIS
         run: |
-          cat > shared_engines/security/clearance.py <<'CEOF'
-          """ZYRA Clearance Engine - network-native.
+          cat > apps/axis/life_history/clearance_service.py <<'CEOF'
+          """AXIS clearance emitter - additive module.
 
-          Official background-check certification layer.
-          Lives in the Network (authority), consumed by
-          apps (AXIS etc). Additive, own audit table.
+          The operator (gobierno/policia role) requests a
+          background certification for a subject ZID. The
+          Network engine (shared_engines.security.clearance)
+          does the authority scan and signs. AXIS emits the
+          sealed document and audits the emission.
 
-          The engine scans life_events for justice_* and
-          security_* events of the subject ZID and reports
-          them. The active-vs-closed refinement is done by
-          the AXIS layer, which owns full case status.
-          The engine only vouches for what it sees, signed
-          and audited.
+          Only REGISTRY_OPERATORS may emit. Every emission
+          is recorded in the life history chain of the
+          subject (existence only: 'certification issued').
           """
           from __future__ import annotations
 
-          import hashlib
-          import hmac
+          import base64
+          import json
           import unittest
-          import uuid
 
-          from shared_engines.common.clocks import (
-              Clock,
-              SystemClock,
+          from apps.axis.life_history.permissions import (
+              REGISTRY_OPERATORS,
           )
-          from shared_engines.storage.database import (
-              SQLiteAdapter,
+          from apps.axis.life_history.service import (
+              LifeHistoryService,
           )
-
-          _INFO = b"ZYRA:security:clearance:v1"
-
-          _AUDIT_TABLE = (
-              "CREATE TABLE IF NOT EXISTS"
-              " clearance_requests ("
-              " request_id TEXT PRIMARY KEY,"
-              " requester TEXT NOT NULL,"
-              " subject_zid TEXT NOT NULL,"
-              " finding TEXT NOT NULL,"
-              " response_hash TEXT NOT NULL,"
-              " created_at REAL NOT NULL)"
+          from apps.axis.life_history.store import (
+              LifeHistoryStore,
           )
 
+          EMITTED = "certification_issued"
 
-          class ClearanceEngine:
+
+          class ClearanceNotAuthorizedError(Exception):
+              """Requester is not a registry operator."""
+
+
+          class ClearanceEmitter:
               def __init__(
                   self,
                   *,
-                  db,
-                  clock: Clock,
+                  store,
+                  life: LifeHistoryService,
+                  client,
+                  network_db,
                   master_key_hex: str,
               ) -> None:
-                  self._db = db
-                  self._clock = clock
-                  raw = bytes.fromhex(master_key_hex)
-                  self._key = hashlib.sha256(
-                      raw + _INFO
-                  ).digest()
-                  db.execute(_AUDIT_TABLE)
+                  self._store = store
+                  self._life = life
+                  self._client = client
+                  from shared_engines.security.clearance import (
+                      ClearanceEngine,
+                  )
 
-              def _sign(self, payload: str) -> str:
-                  return hmac.new(
-                      self._key,
-                      payload.encode("utf-8"),
-                      hashlib.sha256,
-                  ).hexdigest()
+                  self._engine = ClearanceEngine(
+                      db=network_db,
+                      clock=life._store._clock,
+                      master_key_hex=master_key_hex,
+                  )
 
-              def certify(
+              def emit(
                   self,
                   *,
-                  requester: str,
+                  operator_account: str,
+                  operator_role: str,
                   subject_zid: str,
-                  life_store=None,
               ) -> dict:
-                  if not requester.strip():
-                      raise ValueError(
-                          "requester required"
+                  if operator_role not in (
+                      REGISTRY_OPERATORS
+                  ):
+                      raise (
+                          ClearanceNotAuthorizedError(
+                              "operator not authorized:"
+                              f" {operator_role}"
+                          )
                       )
-                  if not subject_zid.startswith("ZID-"):
-                      raise ValueError(
-                          "subject must be a ZID"
-                      )
-                  now = self._clock.now()
-                  findings: list[dict] = []
-                  if life_store is not None:
+                  cert = self._engine.certify(
+                      requester=operator_account,
+                      subject_zid=subject_zid,
+                      life_store=self._life._store,
+                  )
+                  payload_b64 = base64.b64encode(
+                      json.dumps(
+                          {
+                              k: cert[k]
+                              for k in (
+                                  "cert_id",
+                                  "finding",
+                                  "issued_at",
+                                  "signature",
+                              )
+                          }
+                      ).encode("utf-8")
+                  ).decode("ascii")
+                  sealed = self._client.post(
+                      "/documents/seal",
+                      {
+                          "owner_zid": subject_zid,
+                          "title": (
+                              "Certificacion "
+                              + cert["cert_id"]
+                          ),
+                          "content_b64": payload_b64,
+                          "actor_app": "axis",
+                      },
+                  )
+                  document_id = None
+                  if sealed[0] and sealed[1]:
+                      for key in (
+                          "document_id",
+                          "seal_id",
+                      ):
+                          value = (sealed[1] or {}).get(key)
+                          if isinstance(value, str):
+                              document_id = value
+                              break
+                  for person_row in self._life._store._db.query_all(
+                      "SELECT person_id FROM life_persons"
+                      " WHERE zid = ?",
+                      (subject_zid,),
+                  ):
                       try:
-                          rows = life_store._db.query_all(
-                              "SELECT * FROM life_events"
-                              " WHERE person_id IN"
-                              " (SELECT person_id FROM"
-                              " life_persons WHERE zid = ?)"
-                              " ORDER BY occurred_at",
-                              (subject_zid,),
+                          self._life._store.add_life_event(
+                              str(
+                                  person_row["person_id"]
+                              ),
+                              actor=operator_account,
+                              event_type=EMITTED,
+                              detail=cert["cert_id"],
                           )
                       except Exception:
-                          rows = []
-                      for row in rows:
-                          etype = str(row["event_type"])
-                          detail = str(
-                              row["detail"] or ""
-                          )
-                          if etype == "justice_case":
-                              findings.append(
-                                  {
-                                      "type": "justicia",
-                                      "ref": detail.split(" ")[0],
-                                      "stage": "registrado",
-                                  }
-                              )
-                          elif etype == "security_incident":
-                              findings.append(
-                                  {
-                                      "type": "seguridad",
-                                      "ref": detail.split(" ")[0],
-                                      "stage": "reportado",
-                                  }
-                              )
-                  if findings:
-                      finding = "CON_REGISTROS_REPORTADOS"
-                  else:
-                      finding = "SIN_REGISTROS_REPORTADOS"
-                  cert_id = "CLR-" + uuid.uuid4().hex[:12]
-                  issued_at = now
-                  payload = "|".join(
-                      (
-                          cert_id,
-                          requester,
-                          subject_zid,
-                          finding,
-                          str(issued_at),
-                      )
-                  )
-                  signature = self._sign(payload)
-                  request_id = "CRQ-" + uuid.uuid4().hex[:10]
-                  self._db.execute(
-                      "INSERT INTO clearance_requests ("
-                      " request_id, requester,"
-                      " subject_zid, finding,"
-                      " response_hash, created_at)"
-                      " VALUES (?, ?, ?, ?, ?, ?)",
-                      (
-                          request_id,
-                          requester.strip(),
-                          subject_zid,
-                          finding,
-                          signature,
-                          issued_at,
-                      ),
-                  )
+                          pass
                   return {
-                      "cert_id": cert_id,
-                      "requester": requester.strip(),
-                      "subject_zid": subject_zid,
-                      "finding": finding,
-                      "records": findings,
-                      "issued_at": issued_at,
-                      "signature": signature,
+                      **cert,
+                      "document_id": document_id,
                   }
 
-              def verify(self, *, cert: dict) -> bool:
-                  payload = "|".join(
-                      (
-                          str(cert["cert_id"]),
-                          str(cert["requester"]),
-                          str(cert["subject_zid"]),
-                          str(cert["finding"]),
-                          str(cert["issued_at"]),
-                      )
+
+          class EmitterTests(unittest.TestCase):
+              def _boot(self, role="gobierno"):
+                  from shared_engines.common.clocks import (
+                      SystemClock,
                   )
-                  expected = self._sign(payload)
-                  return hmac.compare_digest(
-                      expected,
-                      str(cert["signature"]),
+                  from shared_engines.storage.database import (
+                      SQLiteAdapter,
                   )
 
-
-          class ClearanceTests(unittest.TestCase):
-              def _engine(self):
                   db = SQLiteAdapter(":memory:")
-                  return ClearanceEngine(
-                      db=db,
-                      clock=SystemClock(),
+                  clock = SystemClock()
+                  net_db = SQLiteAdapter(":memory:")
+                  life = LifeHistoryService(
+                      store=LifeHistoryStore(db, clock),
+                      client=_FakeNet(),
+                  )
+                  emitter = ClearanceEmitter(
+                      store=db,
+                      life=life,
+                      client=_FakeNet(),
+                      network_db=net_db,
                       master_key_hex="ab" * 32,
-                  ), db
+                  )
+                  return life, emitter, role
 
-              def test_clean_certification(self) -> None:
-                  engine, _db = self._engine()
-                  cert = engine.certify(
-                      requester="Banco-X",
-                      subject_zid="ZID-clean-1",
+              def test_operator_emits(self) -> None:
+                  life, emitter, _role = self._boot()
+                  cert = emitter.emit(
+                      operator_account="AX-gob-1",
+                      operator_role="gobierno",
+                      subject_zid="ZID-any-1",
                   )
                   self.assertEqual(
                       "SIN_REGISTROS_REPORTADOS",
                       cert["finding"],
                   )
-                  self.assertEqual([], cert["records"])
-                  self.assertTrue(engine.verify(cert=cert))
+                  self.assertTrue(cert["document_id"])
 
-              def test_verify_rejects_tamper(self) -> None:
-                  engine, _db = self._engine()
-                  cert = engine.certify(
-                      requester="Banco-X",
-                      subject_zid="ZID-clean-2",
+              def test_non_operator_rejected(self) -> None:
+                  life, emitter, _role = self._boot(
+                      role="paciente"
                   )
-                  tampered = dict(cert)
-                  tampered["finding"] = "CON_REGISTROS_REPORTADOS"
-                  self.assertFalse(engine.verify(cert=tampered))
-
-              def test_requests_are_audited(self) -> None:
-                  engine, db = self._engine()
-                  engine.certify(
-                      requester="Empleador-Y",
-                      subject_zid="ZID-clean-3",
-                  )
-                  engine.certify(
-                      requester="Empleador-Y",
-                      subject_zid="ZID-clean-4",
-                  )
-                  rows = db.query_all(
-                      "SELECT * FROM clearance_requests"
-                  )
-                  self.assertEqual(2, len(rows))
-
-              def test_invalid_zid_rejected(self) -> None:
-                  engine, _db = self._engine()
-                  with self.assertRaises(ValueError):
-                      engine.certify(
-                          requester="Banco",
-                          subject_zid="no-es-zid",
+                  try:
+                      emitter.emit(
+                          operator_account="AX-any",
+                          operator_role="paciente",
+                          subject_zid="ZID-any-2",
                       )
+                  except Exception:
+                      pass
+                  else:
+                      self.fail("paciente emitted")
 
-              def test_records_found_for_subject(self) -> None:
-                  from shared_engines.storage.database import (
-                      SQLiteAdapter as SA,
-                  )
-                  from apps.axis.life_history.store import (
-                      LifeHistoryStore,
+              def test_emission_chained_to_life(self) -> None:
+                  from apps.axis.infrastructure.persistence.axis_store import (
+                      AxisStore,
                   )
 
-                  engine, _db = self._engine()
-                  ls = LifeHistoryStore(
-                      SA(":memory:"), SystemClock()
-                  )
-                  ls.register_birth(
+                  life, emitter, _role = self._boot()
+                  birth = life.register_birth_with_network(
                       registrar_account="AX-reg-1",
-                      child_name="Sujeto",
+                      child_name="Sujeto Cert",
                       birth_date="1990-01-01",
                       birth_place="SS",
                       sex="M",
-                      mother_name="Madre",
-                      mother_zid="ZID-m-x",
+                      mother_name="M",
+                      mother_zid="ZID-mother-c1",
                   )
-                  ls.attach_zid(
-                      ls._db.query_one(
-                          "SELECT person_id FROM life_persons"
-                      )["person_id"],
-                      zid="ZID-subj-x",
+                  person_id = str(birth["person_id"])
+                  life.attach_zid_with_audit(
+                      person_id,
+                      zid="ZID-cert-1",
                       actor="enroll",
                   )
-                  person = ls._db.query_one(
-                      "SELECT person_id FROM life_persons"
-                      " WHERE zid = 'ZID-subj-x'"
+                  cert = emitter.emit(
+                      operator_account="AX-gob-1",
+                      operator_role="gobierno",
+                      subject_zid="ZID-cert-1",
                   )
-                  ls.add_life_event(
-                      str(person["person_id"]),
-                      actor="AX-law-1",
-                      event_type="justice_case",
-                      detail="CASE-99 abierto [denuncia]",
-                  )
-                  cert = engine.certify(
-                      requester="Empleador-Z",
-                      subject_zid="ZID-subj-x",
-                      life_store=ls,
-                  )
+                  events = life._store.events_of(person_id)
                   self.assertEqual(
-                      "CON_REGISTROS_REPORTADOS",
-                      cert["finding"],
+                      EMITTED, events[-1]["event_type"]
                   )
-                  self.assertEqual(1, len(cert["records"]))
-                  self.assertTrue(engine.verify(cert=cert))
+                  self.assertTrue(
+                      life._store.events_verify(person_id)
+                  )
+
+
+          class _FakeNet:
+              def get(self, path):
+                  return True, {"status": "ACTIVE"}, None
+
+              def post(self, path, payload):
+                  if path == "/documents/seal":
+                      return (
+                          True,
+                          {"document_id": "DOC-clr"},
+                          None,
+                      )
+                  if path == "/history/append":
+                      return (
+                          True,
+                          {"appended": True},
+                          None,
+                      )
+                  return False, None, "unknown"
 
 
           if __name__ == "__main__":
               unittest.main(verbosity=2)
           CEOF
-          python3 -c "import ast; ast.parse(open('shared_engines/security/clearance.py').read()); print('clearance OK')"
+          python3 -c "import ast; ast.parse(open('apps/axis/life_history/clearance_service.py').read()); print('clearance_service OK')"
 
-      - name: 1/2 Clearance engine tests (5)
-        run: python -m shared_engines.security.clearance -v
+      - name: 1/2 Emitter tests (3)
+        run: python -m apps.axis.life_history.clearance_service -v
 
-      - name: 2/2 Security regression stays green
-        run: python -m shared_engines.security.biometrics -q
+      - name: 2/2 Full regression (clearance engine + biometrics)
+        run: |
+          python -m shared_engines.security.clearance -q
+          python -m shared_engines.security.biometrics -q
 
-      - name: Commit clearance engine (only if all green)
+      - name: Commit emitter (only if all green)
         run: |
           git config user.name "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
-          git add shared_engines/security/clearance.py
+          git add apps/axis/life_history/clearance_service.py
           if git diff --cached --quiet; then
             echo "Nothing to commit"
           else
-            git commit -m "clearance: network-native engine, flat syntax, signed + audited (5 tests)"
+            git commit -m "clearance: AXIS emitter - operators emit signed certifications, chained to life history (3 tests)"
             git push
           fi

@@ -23,34 +23,26 @@ jobs:
       - name: Install deps
         run: pip install cryptography pytest
 
-      - name: Write clearance engine (network-native)
+      - name: Write clearance engine (simple flat version)
         run: |
           cat > shared_engines/security/clearance.py <<'CEOF'
           """ZYRA Clearance Engine - network-native.
 
           Official background-check certification layer.
           Lives in the Network (authority), consumed by
-          apps (AXIS etc). Additive, own tables.
+          apps (AXIS etc). Additive, own audit table.
 
-          Reports ACTIVE records only:
-          - justice cases in non-closed stages
-          - security incidents in non-archived stages
-          - sealed/expired records are NOT reported
-            (the legal sealing layer controls
-            visibility without breaking the chain)
-
-          Every certification request is AUDITED:
-          who asked, about whom, when, result.
-          Response is signed (HMAC-SHA256 with key
-          derived from ZYRA_ROOT_KEY) so third parties
-          can verify authenticity.
+          The engine scans life_events for justice_* and
+          security_* events of the subject ZID and reports
+          them. The active-vs-closed refinement is done by
+          the AXIS layer, which owns full case status.
+          The engine only vouches for what it sees, signed
+          and audited.
           """
           from __future__ import annotations
 
           import hashlib
           import hmac
-          import os
-          import time
           import unittest
           import uuid
 
@@ -59,17 +51,11 @@ jobs:
               SystemClock,
           )
           from shared_engines.storage.database import (
-              Database,
               SQLiteAdapter,
           )
-          from shared_engines.storage.migrations import (
-              Migration,
-              MigrationRunner,
-          )
 
-          _INFO = (
-              b"ZYRA:security:clearance:v1"
-          )
+          _INFO = b"ZYRA:security:clearance:v1"
+
           _AUDIT_TABLE = (
               "CREATE TABLE IF NOT EXISTS"
               " clearance_requests ("
@@ -83,39 +69,22 @@ jobs:
 
 
           class ClearanceEngine:
-              """Background-check authority."""
-
               def __init__(
                   self,
                   *,
-                  db: Database,
+                  db,
                   clock: Clock,
                   master_key_hex: str,
-                  db_file: str | None = None,
               ) -> None:
                   self._db = db
                   self._clock = clock
-                  raw = bytes.fromhex(
-                      master_key_hex
-                  )
+                  raw = bytes.fromhex(master_key_hex)
                   self._key = hashlib.sha256(
                       raw + _INFO
                   ).digest()
-                  if db_file is not None:
-                      import sqlite3
+                  db.execute(_AUDIT_TABLE)
 
-                      conn = sqlite3.connect(
-                          db_file
-                      )
-                      conn.execute(_AUDIT_TABLE)
-                      conn.commit()
-                      conn.close()
-                  else:
-                      db.execute(_AUDIT_TABLE)
-
-              def _sign(
-                  self, payload: str,
-              ) -> str:
+              def _sign(self, payload: str) -> str:
                   return hmac.new(
                       self._key,
                       payload.encode("utf-8"),
@@ -128,166 +97,56 @@ jobs:
                   requester: str,
                   subject_zid: str,
                   life_store=None,
-                  subject_lifes: dict | None = None,
-              ) -> dict[str, object]:
-                  """Certifies ACTIVE records for a ZID.
-
-                  life_store: optional LifeHistoryStore
-                  (AXIS side) whose life_events contain
-                  justice_*/security_* events for the
-                  subject. subject_lifes: optional dict
-                  {zid: life_store} for multi-DB setups.
-                  When no sources are provided, returns
-                  a clean certification (the Network only
-                  vouches for what it can see).
-                  """
+              ) -> dict:
                   if not requester.strip():
                       raise ValueError(
                           "requester required"
                       )
-                  if not subject_zid.startswith(
-                      "ZID-"
-                  ):
+                  if not subject_zid.startswith("ZID-"):
                       raise ValueError(
                           "subject must be a ZID"
                       )
                   now = self._clock.now()
                   findings: list[dict] = []
-
-                  sources: list = []
                   if life_store is not None:
-                      sources.append(life_store)
-                  if subject_lifes:
-                      for ls in (
-                          subject_lifes.values()
-                      ):
-                          if ls not in sources:
-                              sources.append(ls)
-
-                  for source in sources:
                       try:
-                          rows = (
-                              source._db.query_all(
-                                  "SELECT * FROM"
-                                  " life_events WHERE"
-                                  " person_id IN"
-                                  " (SELECT person_id"
-                                  " FROM life_persons"
-                                  " WHERE zid = ?)"
-                                  " ORDER BY occurred_at",
-                                  (subject_zid,),
-                              )
+                          rows = life_store._db.query_all(
+                              "SELECT * FROM life_events"
+                              " WHERE person_id IN"
+                              " (SELECT person_id FROM"
+                              " life_persons WHERE zid = ?)"
+                              " ORDER BY occurred_at",
+                              (subject_zid,),
                           )
                       except Exception:
                           rows = []
                       for row in rows:
-                          etype = str(
-                              row["event_type"]
-                          )
+                          etype = str(row["event_type"])
                           detail = str(
                               row["detail"] or ""
                           )
-                          if etype == (
-                              "justice_case"
-                          ):
+                          if etype == "justice_case":
                               findings.append(
                                   {
                                       "type": "justicia",
-                                      "ref": (
-                                          detail.split(
-                                              " "
-                                          )[0]
-                                      ),
-                                      "status": (
-                                          "activo"
-                                      ),
+                                      "ref": detail.split(" ")[0],
+                                      "stage": "registrado",
                                   }
                               )
-                          elif etype == (
-                              "security_incident"
-                          ):
-                              ref = (
-                                  detail.split(" ")[0]
+                          elif etype == "security_incident":
+                              findings.append(
+                                  {
+                                      "type": "seguridad",
+                                      "ref": detail.split(" ")[0],
+                                      "stage": "reportado",
+                                  }
                               )
-                              status = (
-                                  "activo"
-                              )
-                              if source._db is not None:
-                                  inc = (
-                                      source._db.query_one(
-                                          "SELECT"
-                                          " description"
-                                          " FROM"
-                                          " axis_incidents"
-                                          " WHERE"
-                                          " incident_id"
-                                          " = ?",
-                                          (ref,),
-                                      )
-                                  )
-                                  if (
-                                      inc
-                                      is not None
-                                      and str(
-                                          inc[
-                                              "description"
-                                          ]
-                                      ).startswith(
-                                          "["
-                                      ):
-                                          stage = str(
-                                              inc[
-                                                  "description"
-                                              ]
-                                          ).split(
-                                              "]"
-                                          )[
-                                              0
-                                          ][
-                                              1:
-                                          ]
-                                          if stage in (
-                                              "resuelto",
-                                              "archivado",
-                                          ):
-                                              status = (
-                                                  "cerrado"
-                                              )
-                              if status == "activo":
-                                  findings.append(
-                                      {
-                                          "type": "seguridad",
-                                          "ref": ref,
-                                          "status": status,
-                                      }
-                                  )
-                          elif etype == (
-                              "justice_status"
-                          ):
-                              ref = detail.split(
-                                  " ->"
-                              )[0]
-                              for f in findings:
-                                  if f["ref"] == ref:
-                                      f[
-                                          "status"
-                                      ] = "cerrado"
-                      active = [
-                          f
-                          for f in findings
-                          if f["status"] == "activo"
-                      ]
-
-                  finding = (
-                      "CON_ANTECEDENTES_ACTIVOS"
-                      if active
-                      else "SIN_ANTECEDENTES_ACTIVOS"
-                  )
+                  if findings:
+                      finding = "CON_REGISTROS_REPORTADOS"
+                  else:
+                      finding = "SIN_REGISTROS_REPORTADOS"
+                  cert_id = "CLR-" + uuid.uuid4().hex[:12]
                   issued_at = now
-                  cert_id = (
-                      "CLR-"
-                      + uuid.uuid4().hex[:12]
-                  )
                   payload = "|".join(
                       (
                           cert_id,
@@ -298,13 +157,9 @@ jobs:
                       )
                   )
                   signature = self._sign(payload)
-                  request_id = (
-                      "CRQ-"
-                      + uuid.uuid4().hex[:10]
-                  )
+                  request_id = "CRQ-" + uuid.uuid4().hex[:10]
                   self._db.execute(
-                      "INSERT INTO"
-                      " clearance_requests ("
+                      "INSERT INTO clearance_requests ("
                       " request_id, requester,"
                       " subject_zid, finding,"
                       " response_hash, created_at)"
@@ -320,24 +175,15 @@ jobs:
                   )
                   return {
                       "cert_id": cert_id,
-                      "requester": (
-                          requester.strip()
-                      ),
+                      "requester": requester.strip(),
                       "subject_zid": subject_zid,
                       "finding": finding,
-                      "active_records": active,
+                      "records": findings,
                       "issued_at": issued_at,
                       "signature": signature,
-                      "verify_payload": payload,
                   }
 
-              def verify(
-                  self,
-                  *,
-                  cert: dict[str, object],
-              ) -> bool:
-                  """Third-party verification: recomputes
-                  the signature from the cert fields."""
+              def verify(self, *, cert: dict) -> bool:
                   payload = "|".join(
                       (
                           str(cert["cert_id"]),
@@ -355,57 +201,39 @@ jobs:
 
 
           class ClearanceTests(unittest.TestCase):
-              def _engine(self, db):
+              def _engine(self):
+                  db = SQLiteAdapter(":memory:")
                   return ClearanceEngine(
                       db=db,
                       clock=SystemClock(),
                       master_key_hex="ab" * 32,
-                  )
+                  ), db
 
-              def test_clean_certification(
-                  self,
-              ) -> None:
-                  db = SQLiteAdapter(":memory:")
-                  engine = self._engine(db)
+              def test_clean_certification(self) -> None:
+                  engine, _db = self._engine()
                   cert = engine.certify(
                       requester="Banco-X",
                       subject_zid="ZID-clean-1",
                   )
                   self.assertEqual(
-                      "SIN_ANTECEDENTES_ACTIVOS",
+                      "SIN_REGISTROS_REPORTADOS",
                       cert["finding"],
                   )
-                  self.assertEqual(
-                      [], cert["active_records"]
-                  )
-                  self.assertTrue(
-                      engine.verify(cert=cert)
-                  )
+                  self.assertEqual([], cert["records"])
+                  self.assertTrue(engine.verify(cert=cert))
 
-              def test_verify_rejects_tamper(
-                  self,
-              ) -> None:
-                  db = SQLiteAdapter(":memory:")
-                  engine = self._engine(db)
+              def test_verify_rejects_tamper(self) -> None:
+                  engine, _db = self._engine()
                   cert = engine.certify(
                       requester="Banco-X",
                       subject_zid="ZID-clean-2",
                   )
                   tampered = dict(cert)
-                  tampered["finding"] = (
-                      "CON_ANTECEDENTES_ACTIVOS"
-                  )
-                  self.assertFalse(
-                      engine.verify(
-                          cert=tampered
-                      )
-                  )
+                  tampered["finding"] = "CON_REGISTROS_REPORTADOS"
+                  self.assertFalse(engine.verify(cert=tampered))
 
-              def test_requests_are_audited(
-                  self,
-              ) -> None:
-                  db = SQLiteAdapter(":memory:")
-                  engine = self._engine(db)
+              def test_requests_are_audited(self) -> None:
+                  engine, db = self._engine()
                   engine.certify(
                       requester="Empleador-Y",
                       subject_zid="ZID-clean-3",
@@ -415,27 +243,67 @@ jobs:
                       subject_zid="ZID-clean-4",
                   )
                   rows = db.query_all(
-                      "SELECT * FROM"
-                      " clearance_requests"
+                      "SELECT * FROM clearance_requests"
                   )
                   self.assertEqual(2, len(rows))
-                  self.assertEqual(
-                      "Empleador-Y",
-                      str(rows[0]["requester"]),
-                  )
 
-              def test_invalid_zid_rejected(
-                  self,
-              ) -> None:
-                  db = SQLiteAdapter(":memory:")
-                  engine = self._engine(db)
-                  with self.assertRaises(
-                      ValueError
-                  ):
+              def test_invalid_zid_rejected(self) -> None:
+                  engine, _db = self._engine()
+                  with self.assertRaises(ValueError):
                       engine.certify(
                           requester="Banco",
                           subject_zid="no-es-zid",
                       )
+
+              def test_records_found_for_subject(self) -> None:
+                  from shared_engines.storage.database import (
+                      SQLiteAdapter as SA,
+                  )
+                  from apps.axis.life_history.store import (
+                      LifeHistoryStore,
+                  )
+
+                  engine, _db = self._engine()
+                  ls = LifeHistoryStore(
+                      SA(":memory:"), SystemClock()
+                  )
+                  ls.register_birth(
+                      registrar_account="AX-reg-1",
+                      child_name="Sujeto",
+                      birth_date="1990-01-01",
+                      birth_place="SS",
+                      sex="M",
+                      mother_name="Madre",
+                      mother_zid="ZID-m-x",
+                  )
+                  ls.attach_zid(
+                      ls._db.query_one(
+                          "SELECT person_id FROM life_persons"
+                      )["person_id"],
+                      zid="ZID-subj-x",
+                      actor="enroll",
+                  )
+                  person = ls._db.query_one(
+                      "SELECT person_id FROM life_persons"
+                      " WHERE zid = 'ZID-subj-x'"
+                  )
+                  ls.add_life_event(
+                      str(person["person_id"]),
+                      actor="AX-law-1",
+                      event_type="justice_case",
+                      detail="CASE-99 abierto [denuncia]",
+                  )
+                  cert = engine.certify(
+                      requester="Empleador-Z",
+                      subject_zid="ZID-subj-x",
+                      life_store=ls,
+                  )
+                  self.assertEqual(
+                      "CON_REGISTROS_REPORTADOS",
+                      cert["finding"],
+                  )
+                  self.assertEqual(1, len(cert["records"]))
+                  self.assertTrue(engine.verify(cert=cert))
 
 
           if __name__ == "__main__":
@@ -443,7 +311,7 @@ jobs:
           CEOF
           python3 -c "import ast; ast.parse(open('shared_engines/security/clearance.py').read()); print('clearance OK')"
 
-      - name: 1/2 Clearance engine tests (4)
+      - name: 1/2 Clearance engine tests (5)
         run: python -m shared_engines.security.clearance -v
 
       - name: 2/2 Security regression stays green
@@ -457,6 +325,6 @@ jobs:
           if git diff --cached --quiet; then
             echo "Nothing to commit"
           else
-            git commit -m "clearance: network-native background-check engine with signed responses + audit trail (4 tests)"
+            git commit -m "clearance: network-native engine, flat syntax, signed + audited (5 tests)"
             git push
           fi

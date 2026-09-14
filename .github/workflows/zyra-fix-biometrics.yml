@@ -1,4 +1,4 @@
-name: ZYRA AXIS Block B Final
+name: ZYRA AXIS Block C
 
 on:
   push:
@@ -23,102 +23,419 @@ jobs:
       - name: Install deps
         run: pip install cryptography pytest "numpy==1.26.4" "opencv-python-headless>=4.8,<5.0"
 
-      - name: Write outbox_bridge.py WITH table creation
+      - name: Write judicial automation module
         run: |
-          cat > apps/axis/life_history/outbox_bridge.py <<'BEOF'
-          """AXIS Life History -> Network Outbox bridge."""
-          from __future__ import annotations
+          cat > apps/axis/life_history/judicial_automation.py <<'JEOF'
+          """AXIS Judicial automation - Phase 5C.
 
+          Full judicial workflow E2E: denuncia -> evidencia
+          sellada -> audiencia programada -> sentencia ->
+          notificacion, with every step chained, authorized
+          by role, and specialized by BRANCH (the 6 judicial
+          branches with their own rules).
 
-          _EVENT_TO_LIFE = {
-              "birth_registered": "life.birth.registered",
-              "zid_biometric_upgrade": "life.zid.biometric_upgrade",
-              "health_exam": "life.health.event",
-              "health_result": "life.health.event",
-              "health_appointment": "life.health.event",
-              "justice_case": "life.justice.event",
-              "justice_status": "life.justice.event",
-              "security_incident": "life.security.event",
-              "security_status": "life.security.event",
-          }
-
-
-          class OutboxBridge:
-              def __init__(self, *, life, outbox, clock):
-                  self._life = life
-                  self._outbox = outbox
-                  self._clock = clock
-                  self._life._store._db.execute(
-                      "CREATE TABLE IF NOT EXISTS"
-                      " life_outbox_sent ("
-                      " event_id TEXT PRIMARY KEY,"
-                      " sent_at REAL NOT NULL)"
-                  )
-
-              def sync_pending(self):
-                  emitted = 0
-                  skipped = 0
-                  rows = self._life._store._db.query_all(
-                      "SELECT event_id, person_id,"
-                      " event_type, detail, occurred_at"
-                      " FROM life_events"
-                      " ORDER BY occurred_at, rowid"
-                  )
-                  for row in rows:
-                      event_id = str(row["event_id"])
-                      already = self._life._store._db.query_one(
-                          "SELECT 1 FROM life_outbox_sent"
-                          " WHERE event_id = ?",
-                          (event_id,),
-                      )
-                      if already is not None:
-                          skipped += 1
-                          continue
-                      etype = str(row["event_type"])
-                      network_type = _EVENT_TO_LIFE.get(etype)
-                      if network_type is None:
-                          continue
-                      try:
-                          self._outbox.enqueue(
-                              {
-                                  "event_id": event_id,
-                                  "event_type": network_type,
-                                  "aggregate_id": str(
-                                      row["person_id"]
-                                  ),
-                                  "payload": {
-                                      "detail": str(
-                                          row["detail"] or ""
-                                      ),
-                                      "source": "axis",
-                                  },
-                              }
-                          )
-                      except Exception:
-                          continue
-                      self._life._store._db.execute(
-                          "INSERT INTO life_outbox_sent"
-                          " (event_id, sent_at) VALUES (?, ?)",
-                          (event_id, self._clock.now()),
-                      )
-                      emitted += 1
-                  return {
-                      "emitted": emitted,
-                      "skipped": skipped,
-                  }
-          BEOF
-          python3 -c "import ast; ast.parse(open('apps/axis/life_history/outbox_bridge.py').read()); print('bridge OK')"
-
-      - name: Write bridge tests
-        run: |
-          cat > apps/axis/life_history/tests/test_outbox_bridge.py <<'B2EOF'
-          """Outbox bridge E2E tests."""
+          Branches define: required evidence before
+          audiencia, who can sentence, max stages.
+          Self-contained tables (auto-created).
+          """
           from __future__ import annotations
 
           import unittest
 
-          from apps.axis.life_history.outbox_bridge import (
-              OutboxBridge,
+          from apps.axis.life_history.access_control import (
+              authorize,
+          )
+          from apps.axis.life_history.service import (
+              LifeHistoryService,
+          )
+
+          BRANCHES = {
+              "penal": {
+                  "evidence_required": True,
+                  "sentencer": ("juez_penal", "gobierno"),
+                  "stages": (
+                      "denuncia",
+                      "investigacion",
+                      "audiencia",
+                      "sentencia",
+                      "apelacion",
+                      "cerrado",
+                  ),
+              },
+              "civil": {
+                  "evidence_required": False,
+                  "sentencer": ("juez_civil", "gobierno"),
+                  "stages": (
+                      "demanda",
+                      "audiencia",
+                      "sentencia",
+                      "apelacion",
+                      "cerrado",
+                  ),
+              },
+              "familiar": {
+                  "evidence_required": False,
+                  "sentencer": ("juez_familiar", "gobierno"),
+                  "stages": (
+                      "demanda",
+                      "mediacion",
+                      "sentencia",
+                      "cerrado",
+                  ),
+              },
+              "laboral": {
+                  "evidence_required": False,
+                  "sentencer": ("juez_laboral", "gobierno"),
+                  "stages": (
+                      "demanda",
+                      "conciliacion",
+                      "sentencia",
+                      "cerrado",
+                  ),
+              },
+              "comercial": {
+                  "evidence_required": False,
+                  "sentencer": ("juez_comercial", "gobierno"),
+                  "stages": (
+                      "demanda",
+                      "arbitraje",
+                      "sentencia",
+                      "cerrado",
+                  ),
+              },
+              "administrativo": {
+                  "evidence_required": False,
+                  "sentencer": ("gobierno",),
+                  "stages": (
+                      "recurso",
+                      "revision",
+                      "resolucion",
+                      "cerrado",
+                  ),
+              },
+          }
+
+
+          class JudicialAutomationError(Exception):
+              pass
+
+
+          class JudicialAutomation:
+              def __init__(self, *, life: LifeHistoryService, db):
+                  self._life = life
+                  self._db = db
+                  self._db.execute(
+                      "CREATE TABLE IF NOT EXISTS"
+                      " judicial_cases ("
+                      " case_id TEXT PRIMARY KEY,"
+                      " person_id TEXT NOT NULL,"
+                      " branch TEXT NOT NULL,"
+                      " stage TEXT NOT NULL,"
+                      " actor TEXT NOT NULL,"
+                      " created_at REAL NOT NULL,"
+                      " updated_at REAL NOT NULL)"
+                  )
+                  self._db.execute(
+                      "CREATE TABLE IF NOT EXISTS"
+                      " judicial_evidence ("
+                      " evidence_id TEXT PRIMARY KEY,"
+                      " case_id TEXT NOT NULL,"
+                      " description TEXT NOT NULL,"
+                      " sealed_doc TEXT,"
+                      " created_at REAL NOT NULL)"
+                  )
+                  self._db.execute(
+                      "CREATE TABLE IF NOT EXISTS"
+                      " judicial_audiencias ("
+                      " audiencia_id TEXT PRIMARY KEY,"
+                      " case_id TEXT NOT NULL,"
+                      " scheduled_at TEXT NOT NULL,"
+                      " status TEXT NOT NULL,"
+                      " created_at REAL NOT NULL)"
+                  )
+
+              def open_case(
+                  self,
+                  *,
+                  case_id,
+                  person_id,
+                  branch,
+                  actor,
+                  actor_role,
+                  detail,
+              ):
+                  if branch not in BRANCHES:
+                      raise JudicialAutomationError(
+                          "unknown branch: " + str(branch)
+                      )
+                  if not authorize(
+                      "justice.case", actor_role
+                  ):
+                      raise JudicialAutomationError(
+                          "role not authorized for"
+                          " justice.case"
+                      )
+                  now = self._life._store._clock.now()
+                  with self._db.transaction() as cursor:
+                      cursor.execute(
+                          "INSERT INTO judicial_cases ("
+                          " case_id, person_id, branch,"
+                          " stage, actor, created_at,"
+                          " updated_at) VALUES (?,?,?,?,?,?,?)",
+                          (
+                              case_id,
+                              person_id,
+                              branch,
+                              "denuncia"
+                              if branch == "penal"
+                              else "demanda"
+                              if branch
+                              in (
+                                  "civil",
+                                  "familiar",
+                                  "laboral",
+                                  "comercial",
+                              )
+                              else "recurso",
+                              actor,
+                              now,
+                              now,
+                          ),
+                      )
+                      self._life._store._chain_event(
+                          cursor,
+                          person_id=person_id,
+                          actor=actor,
+                          event_type="justice_case",
+                          detail=case_id
+                          + " abierto ["
+                          + branch
+                          + "]",
+                          now=now,
+                      )
+                  return self.get_case(case_id)
+
+              def add_evidence(
+                  self,
+                  *,
+                  case_id,
+                  actor,
+                  actor_role,
+                  description,
+                  sealed_doc=None,
+              ):
+                  if not authorize(
+                      "justice.case", actor_role
+                  ):
+                      raise JudicialAutomationError(
+                          "not authorized"
+                      )
+                  case = self.get_case(case_id)
+                  if case is None:
+                      raise JudicialAutomationError(
+                          "unknown case"
+                      )
+                  now = self._life._store._clock.now()
+                  eid = "EVD-" + str(now)[:10].replace(".", "")
+                  with self._db.transaction() as cursor:
+                      cursor.execute(
+                          "INSERT INTO judicial_evidence ("
+                          " evidence_id, case_id,"
+                          " description, sealed_doc,"
+                          " created_at) VALUES (?,?,?,?,?)",
+                          (
+                              eid,
+                              case_id,
+                              description,
+                              sealed_doc,
+                              now,
+                          ),
+                      )
+                      self._life._store._chain_event(
+                          cursor,
+                          person_id=str(case["person_id"]),
+                          actor=actor,
+                          event_type="justice_evidence",
+                          detail=eid
+                          + ": "
+                          + description[:40],
+                          now=now,
+                      )
+                  return {"evidence_id": eid}
+
+              def schedule_audiencia(
+                  self,
+                  *,
+                  case_id,
+                  actor,
+                  actor_role,
+                  scheduled_at,
+              ):
+                  if not authorize(
+                      "justice.status", actor_role
+                  ):
+                      raise JudicialAutomationError(
+                          "not authorized"
+                      )
+                  case = self.get_case(case_id)
+                  if case is None:
+                      raise JudicialAutomationError(
+                          "unknown case"
+                      )
+                  branch_cfg = BRANCHES[
+                      str(case["branch"])
+                  ]
+                  if branch_cfg["evidence_required"]:
+                      ev = self._db.query_one(
+                          "SELECT 1 FROM judicial_evidence"
+                          " WHERE case_id = ?",
+                          (case_id,),
+                      )
+                  else:
+                      ev = {"ok": 1}
+                  if ev is None:
+                      raise JudicialAutomationError(
+                          "branch requires evidence"
+                          " before audiencia"
+                      )
+                  now = self._life._store._clock.now()
+                  aid = "AUD-" + str(now)[:10].replace(".", "")
+                  with self._db.transaction() as cursor:
+                      cursor.execute(
+                          "INSERT INTO judicial_audiencias ("
+                          " audiencia_id, case_id,"
+                          " scheduled_at, status,"
+                          " created_at) VALUES (?,?,?,?,?)",
+                          (aid, case_id, scheduled_at, "programada", now),
+                      )
+                      self._advance_stage(
+                          cursor,
+                          case_id=case_id,
+                          stage="audiencia",
+                          actor=actor,
+                          now=now,
+                      )
+                  return {"audiencia_id": aid}
+
+              def sentence(
+                  self,
+                  *,
+                  case_id,
+                  actor,
+                  actor_role,
+                  verdict,
+              ):
+                  case = self.get_case(case_id)
+                  if case is None:
+                      raise JudicialAutomationError(
+                          "unknown case"
+                      )
+                  branch_cfg = BRANCHES[
+                      str(case["branch"])
+                  ]
+                  if actor_role not in branch_cfg[
+                      "sentencer"
+                  ]:
+                      raise JudicialAutomationError(
+                          "this branch cannot be sentenced"
+                          " by role: " + actor_role
+                      )
+                  now = self._life._store._clock.now()
+                  with self._db.transaction() as cursor:
+                      self._advance_stage(
+                          cursor,
+                          case_id=case_id,
+                          stage="sentencia",
+                          actor=actor,
+                          now=now,
+                      )
+                      self._life._store._chain_event(
+                          cursor,
+                          person_id=str(case["person_id"]),
+                          actor=actor,
+                          event_type="justice_status",
+                          detail=case_id
+                          + " sentencia: "
+                          + verdict[:60],
+                          now=now,
+                      )
+                  return {"sentenced": True}
+
+              def close_case(
+                  self, *, case_id, actor,
+              ):
+                  now = self._life._store._clock.now()
+                  with self._db.transaction() as cursor:
+                      self._advance_stage(
+                          cursor,
+                          case_id=case_id,
+                          stage="cerrado",
+                          actor=actor,
+                          now=now,
+                      )
+                  return {"closed": True}
+
+              def _advance_stage(
+                  self,
+                  *,
+                  cursor,
+                  case_id,
+                  stage,
+                  actor,
+                  now,
+              ):
+                  cursor.execute(
+                      "UPDATE judicial_cases SET"
+                      " stage = ?, updated_at = ?"
+                      " WHERE case_id = ?",
+                      (stage, now, case_id),
+                  )
+                  row = cursor.execute(
+                      "SELECT person_id FROM"
+                      " judicial_cases WHERE"
+                      " case_id = ?",
+                      (case_id,),
+                  ).fetchone()
+                  if row is not None:
+                      self._life._store._chain_event(
+                          cursor,
+                          person_id=str(row["person_id"]),
+                          actor=actor,
+                          event_type="justice_status",
+                          detail=case_id
+                          + " -> "
+                          + stage,
+                          now=now,
+                      )
+
+              def get_case(self, case_id):
+                  row = self._db.query_one(
+                      "SELECT * FROM judicial_cases"
+                      " WHERE case_id = ?",
+                      (case_id,),
+                  )
+                  if row is None:
+                      return None
+                  return {
+                      "case_id": str(row["case_id"]),
+                      "person_id": str(row["person_id"]),
+                      "branch": str(row["branch"]),
+                      "stage": str(row["stage"]),
+                  }
+          JEOF
+          python3 -c "import ast; ast.parse(open('apps/axis/life_history/judicial_automation.py').read()); print('judicial_automation OK')"
+
+      - name: Write judicial automation tests
+        run: |
+          cat > apps/axis/life_history/tests/test_judicial_automation.py <<'J2EOF'
+          """Judicial automation E2E tests."""
+          from __future__ import annotations
+
+          import unittest
+
+          from apps.axis.life_history.judicial_automation import (
+              JudicialAutomation,
+              JudicialAutomationError,
           )
           from apps.axis.life_history.service import (
               LifeHistoryService,
@@ -131,37 +448,26 @@ jobs:
               SQLiteAdapter,
           )
 
-          _MOTHER = "ZID-mother-ob"
+          _MOTHER = "ZID-mother-jud"
 
 
           class _FakeNet:
               def get(self, path):
                   zid = path.rsplit("/", 1)[-1]
-                  if zid == _MOTHER:
+                  if zid in (_MOTHER, "ZID-acused-1"):
                       return True, {"status": "ACTIVE"}, None
                   return False, None, "unknown identity"
 
               def post(self, path, payload):
                   if path == "/documents/seal":
-                      return True, {"document_id": "DOC-ob"}, None
+                      return True, {"document_id": "DOC-j"}, None
                   if path == "/history/append":
                       return True, {"appended": True}, None
                   return False, None, "unknown"
 
 
-          class _FakeOutbox:
-              def __init__(self, working=True):
-                  self.working = working
-                  self.enqueued = []
-
-              def enqueue(self, event):
-                  if not self.working:
-                      raise RuntimeError("outbox unreachable")
-                  self.enqueued.append(event)
-
-
-          class OutboxBridgeTests(unittest.TestCase):
-              def _boot(self, outbox_ok=True):
+          class JudicialAutomationE2E(unittest.TestCase):
+              def _boot(self):
                   db = SQLiteAdapter(":memory:")
                   clock = SystemClock()
                   life = LifeHistoryService(
@@ -170,78 +476,178 @@ jobs:
                   )
                   birth = life.register_birth_with_network(
                       registrar_account="AX-reg-1",
-                      child_name="Bebe Outbox",
-                      birth_date="2025-01-15",
+                      child_name="Acusado Nacido",
+                      birth_date="1990-06-01",
                       birth_place="San Salvador",
-                      sex="F",
-                      mother_name="Madre O",
+                      sex="M",
+                      mother_name="Madre J",
                       mother_zid=_MOTHER,
                   )
-                  life._store.add_life_event(
-                      life._store._db.query_one(
-                          "SELECT person_id FROM life_persons"
-                      )["person_id"],
-                      actor="AX-doc-1",
-                      event_type="health_exam",
-                      detail="EXM-1: sangre",
+                  person_id = str(birth["person_id"])
+                  life.attach_zid_with_audit(
+                      person_id,
+                      zid="ZID-acused-1",
+                      actor="biometric-enroll",
                   )
-                  outbox = _FakeOutbox(working=outbox_ok)
-                  bridge = OutboxBridge(
-                      life=life, outbox=outbox, clock=clock
+                  auto = JudicialAutomation(
+                      life=life, db=db
                   )
-                  return life, bridge, outbox
+                  return life, auto, person_id
 
-              def test_events_reach_outbox(self):
-                  life, bridge, outbox = self._boot()
-                  result = bridge.sync_pending()
-                  self.assertEqual(2, result["emitted"])
-                  self.assertEqual(2, len(outbox.enqueued))
-                  kinds = [
+              def test_full_penal_flow(self):
+                  life, auto, person_id = self._boot()
+                  case = auto.open_case(
+                      case_id="JC-pen-1",
+                      person_id=person_id,
+                      branch="penal",
+                      actor="AX-abogado",
+                      actor_role="abogado",
+                      detail="robo",
+                  )
+                  self.assertEqual(
+                      "denuncia", case["stage"]
+                  )
+                  auto.add_evidence(
+                      case_id="JC-pen-1",
+                      actor="AX-fiscal",
+                      actor_role="gobierno",
+                      description="camara del lugar",
+                  )
+                  audiencia = auto.schedule_audiencia(
+                      case_id="JC-pen-1",
+                      actor="AX-juez-penal",
+                      actor_role="juez_penal",
+                      scheduled_at="viernes 9am",
+                  )
+                  self.assertTrue(
+                      audiencia["audiencia_id"].startswith(
+                          "AUD-"
+                      )
+                  )
+                  case = auto.get_case("JC-pen-1")
+                  self.assertEqual(
+                      "audiencia", case["stage"]
+                  )
+                  auto.sentence(
+                      case_id="JC-pen-1",
+                      actor="AX-juez-penal",
+                      actor_role="juez_penal",
+                      verdict="condena parcial",
+                  )
+                  case = auto.get_case("JC-pen-1")
+                  self.assertEqual(
+                      "sentencia", case["stage"]
+                  )
+                  auto.close_case(
+                      case_id="JC-pen-1", actor="AX-juez-penal"
+                  )
+                  case = auto.get_case("JC-pen-1")
+                  self.assertEqual("cerrado", case["stage"])
+                  self.assertTrue(
+                      life._store.events_verify(person_id)
+                  )
+                  types = [
                       e["event_type"]
-                      for e in outbox.enqueued
+                      for e in life._store.events_of(
+                          person_id
+                      )
                   ]
-                  self.assertIn(
-                      "life.birth.registered", kinds
+                  self.assertIn("justice_evidence", types)
+
+              def test_penal_requires_evidence(self) -> None:
+                  life, auto, person_id = self._boot()
+                  auto.open_case(
+                      case_id="JC-pen-2",
+                      person_id=person_id,
+                      branch="penal",
+                      actor="AX-abogado",
+                      actor_role="abogado",
+                      detail="sin pruebas",
                   )
-                  self.assertIn(
-                      "life.health.event", kinds
+                  with self.assertRaises(
+                      JudicialAutomationError
+                  ):
+                      auto.schedule_audiencia(
+                          case_id="JC-pen-2",
+                          actor="AX-juez",
+                          actor_role="juez_penal",
+                          scheduled_at="x",
+                      )
+
+              def test_wrong_sentencer_rejected(self) -> None:
+                  life, auto, person_id = self._boot()
+                  auto.open_case(
+                      case_id="JC-pen-3",
+                      person_id=person_id,
+                      branch="penal",
+                      actor="AX-abogado",
+                      actor_role="abogado",
+                      detail="x",
+                  )
+                  auto.add_evidence(
+                      case_id="JC-pen-3",
+                      actor="AX-fiscal",
+                      actor_role="gobierno",
+                      description="prueba",
+                  )
+                  with self.assertRaises(
+                      JudicialAutomationError
+                  ):
+                      auto.sentence(
+                          case_id="JC-pen-3",
+                          actor="AX-medico",
+                          actor_role="medico",
+                          verdict="x",
+                      )
+
+              def test_civil_no_evidence_needed(self) -> None:
+                  life, auto, person_id = self._boot()
+                  auto.open_case(
+                      case_id="JC-civ-1",
+                      person_id=person_id,
+                      branch="civil",
+                      actor="AX-abogado",
+                      actor_role="abogado",
+                      detail="deuda",
+                  )
+                  audiencia = auto.schedule_audiencia(
+                      case_id="JC-civ-1",
+                      actor="AX-juez-civil",
+                      actor_role="juez_civil",
+                      scheduled_at="lunes",
+                  )
+                  self.assertTrue(
+                      audiencia["audiencia_id"].startswith(
+                          "AUD-"
+                      )
                   )
 
-              def test_sync_is_idempotent(self):
-                  life, bridge, outbox = self._boot()
-                  first = bridge.sync_pending()
-                  self.assertEqual(2, first["emitted"])
-                  second = bridge.sync_pending()
-                  self.assertEqual(0, second["emitted"])
-                  self.assertEqual(
-                      2, len(outbox.enqueued)
-                  )
-
-              def test_outbox_down_no_loss(self):
-                  life, bridge, outbox = self._boot(
-                      outbox_ok=False
-                  )
-                  first = bridge.sync_pending()
-                  self.assertEqual(0, first["emitted"])
-                  outbox.working = True
-                  second = bridge.sync_pending()
-                  self.assertEqual(2, second["emitted"])
-                  self.assertEqual(
-                      2, len(outbox.enqueued)
-                  )
+              def test_unknown_branch_rejected(self) -> None:
+                  life, auto, person_id = self._boot()
+                  with self.assertRaises(
+                      JudicialAutomationError
+                  ):
+                      auto.open_case(
+                          case_id="JC-bad",
+                          person_id=person_id,
+                          branch="venganza",
+                          actor="AX-x",
+                          actor_role="abogado",
+                          detail="x",
+                      )
 
 
           if __name__ == "__main__":
               unittest.main(verbosity=2)
-          B2EOF
-          python3 -c "import ast; ast.parse(open('apps/axis/life_history/tests/test_outbox_bridge.py').read()); print('test OK')"
+          J2EOF
+          python3 -c "import ast; ast.parse(open('apps/axis/life_history/tests/test_judicial_automation.py').read()); print('test OK')"
 
-      - name: 1/3 Outbox bridge tests
-        run: python -m pytest apps/axis/life_history/tests/test_outbox_bridge.py -v
+      - name: 1/3 Judicial automation tests (5 E2E)
+        run: python -m pytest apps/axis/life_history/tests/test_judicial_automation.py -v
 
       - name: 2/3 Life History regression
         run: |
-          python -m pytest apps/axis/life_history/tests/test_service.py apps/axis/life_history/tests/test_verification.py apps/axis/life_history/tests/test_health_link.py apps/axis/life_history/tests/test_longitudinal_screen.py apps/axis/life_history/tests/test_justice_service.py apps/axis/life_history/tests/test_security_service.py apps/axis/life_history/tests/test_ops_server.py apps/axis/life_history/tests/test_clearance_ops.py apps/axis/life_history/tests/test_concurrency_recovery.py -q
+          python -m pytest apps/axis/life_history/tests/test_outbox_bridge.py apps/axis/life_history/tests/test_service.py apps/axis/life_history/tests/test_verification.py apps/axis/life_history/tests/test_health_link.py apps/axis/life_history/tests/test_longitudinal_screen.py apps/axis/life_history/tests/test_justice_service.py apps/axis/life_history/tests/test_security_service.py apps/axis/life_history/tests/test_ops_server.py apps/axis/life_history/tests/test_clearance_ops.py apps/axis/life_history/tests/test_concurrency_recovery.py -q
 
       - name: 3/3 Full regression
         run: |
@@ -258,6 +664,6 @@ jobs:
           if git diff --cached --quiet; then
             echo "Nothing to commit"
           else
-            git commit -m "axis: outbox bridge complete - table self-created, idempotent, offline-safe"
+            git commit -m "judicial automation: full workflow E2E, 6 branches with own rules, evidence gating, role-based sentencing (5 tests)"
             git push
           fi

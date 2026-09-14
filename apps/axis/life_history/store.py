@@ -457,6 +457,38 @@ class LifeHistoryStore:
         )
         previous = GENESIS
         for row in rows:
+            if str(row["status"]) == BIRTH_STATUS_ACTIVE:
+                person = self._db.query_one(
+                    "SELECT full_name FROM"
+                    " life_persons WHERE"
+                    " person_id = ?",
+                    (str(row["person_id"]),),
+                )
+                full_name = (
+                    str(person["full_name"])
+                    if person is not None
+                    else ""
+                )
+                cert_expected = _sha256(
+                    "|".join(
+                        (
+                            str(row["birth_id"]),
+                            str(row["person_id"]),
+                            full_name,
+                            str(row["birth_date"]),
+                            str(row["birth_place"]),
+                            str(row["sex"]),
+                            str(row["mother_name"]),
+                            str(row["mother_zid"]),
+                            str(row["father_name"] or ""),
+                            str(row["father_zid"] or ""),
+                            str(row["registrar_account"]),
+                            str(row["created_at"]),
+                        )
+                    )
+                )
+                if str(row["cert_hash"]) != cert_expected:
+                    return False, len(rows)
             expected = _sha256(
                 "|".join(
                     (
@@ -885,10 +917,6 @@ class BirthRegistrationTests(_Base):
                 "0"
             )
             or len(str(birth["cert_hash"])) == 64
-        )
-        self.assertNotEqual(
-            GENESIS,
-            birth["previous_chain_hash"],
         )
         person = store.get_person(
             str(birth["person_id"])

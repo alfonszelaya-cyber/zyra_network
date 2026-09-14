@@ -146,6 +146,9 @@ class AxisApiHandler(
         if s[0] == "life":
             self._screen_life_person(s)
             return
+        if s[0] == "longitudinal":
+            self._screen_longitudinal(s)
+            return
         if s[0] == "paciente":
             self._screen_patient(s)
             return
@@ -909,6 +912,9 @@ class AxisApiHandler(
             + "</h1>"
             "<p>Expediente medico"
             " inmutable en la Red.</p>"
+            "<a href='/axis/longitudinal/"
+            + account_id
+            + "'><button class='gray'>Mi Historial de Vida</button></a>"
             "<h2>Mis registros</h2>"
             f"<ul>{items}</ul>"
             "<a href='/axis'><button"
@@ -1350,6 +1356,87 @@ class AxisApiHandler(
             200,
             _page(
                 "AXIS - Historial de Vida",
+                body,
+            ),
+        )
+
+
+    def _screen_longitudinal(self, s):
+        svc = self._lh()
+        if len(s) < 2:
+            raise LookupError(
+                "account id required"
+            )
+        account_id = s[1]
+        from apps.axis.life_history.health_service import (
+            HealthLifeLink,
+        )
+
+        link = HealthLifeLink(
+            store=type(self).store, life=svc
+        )
+        view = link.patient_longitudinal(
+            account_id
+        )
+        if not view.get(
+            "life_linked"
+        ):
+            body = (
+                "<h1>Historial Longitudinal</h1>"
+                "<p>La cuenta "
+                + account_id
+                + " no esta vinculada al"
+                " Registro Civil.</p>"
+                "<a href='/axis'><button"
+                " class='gray'>Inicio</button></a>"
+            )
+            self._html(
+                200,
+                _page(
+                    "AXIS - Longitudinal",
+                    body,
+                ),
+            )
+            return
+        items = ""
+        for e in view["events"]:
+            items = (
+                items
+                + "<li>- "
+                + str(e["event_type"])
+                + " - "
+                + str(e["detail"] or "")
+                + "</li>"
+            )
+        chain = (
+            "VERIFICADA"
+            if view["chain_verified"]
+            else "COMPROMETIDA"
+        )
+        body = (
+            "<h1>Historial Longitudinal</h1>"
+            "<p>"
+            + str(view["full_name"])
+            + " | ZID: "
+            + str(view["zid"] or "pendiente")
+            + " | estado: "
+            + str(view["status"])
+            + "</p>"
+            "<p>Cadena de vida: "
+            + chain
+            + "</p>"
+            "<h2>Eventos encadenados ("
+            + str(len(view["events"]))
+            + ")</h2><ul>"
+            + items
+            + "</ul>"
+            "<a href='/axis'><button"
+            " class='gray'>Inicio</button></a>"
+        )
+        self._html(
+            200,
+            _page(
+                "AXIS - Longitudinal",
                 body,
             ),
         )

@@ -1,113 +1,16 @@
-name: ZYRA AGRO Final
+name: ZYRA AGRO Diagnose 400
 
 on:
   push:
     branches: [main]
   workflow_dispatch:
 
-permissions:
-  contents: write
-
 jobs:
-  build:
+  diag:
     runs-on: ubuntu-latest
     steps:
       - name: Checkout
         uses: actions/checkout@v4
-
-      - name: Patch the exact failing assertions
-        run: |
-          python3 - <<'PYEOF'
-          import re
-          from pathlib import Path
-
-          pat_zid = re.compile(
-              r"(?P<i>[ ]+)assert isinstance\(zid, str\)\n"
-              r"(?P=i)assert zid\.startswith\(\"ZID-\"\)"
-          )
-
-          def zid_repl(m):
-              i = m.group("i")
-              return (
-                  f"{i}assert zid is None or (\n"
-                  f"{i}    isinstance(zid, str)\n"
-                  f"{i}    and zid.startswith(\"ZID-\")\n"
-                  f"{i})"
-              )
-
-          pat_synced = re.compile(
-              r"(?P<i>[ ]+)assert row\[\"synced\"\] is True"
-          )
-
-          def synced_repl(m):
-              return (
-                  f'{m.group("i")}assert'
-                  ' row["synced"] == (zid is not None)'
-              )
-
-          pat_seq_aid = re.compile(
-              r"(?P<i>[ ]+)assert \(\n"
-              r"(?P=i)    aid\[\"events\"\]\[0\]\[\"network_seq\"\]\n"
-              r"(?P=i)    is not None\n"
-              r"(?P=i)\)"
-          )
-
-          def seq_aid_repl(m):
-              return (
-                  f'{m.group("i")}assert'
-                  ' (aid["events"][0]["network_seq"]'
-                  " is not None) == (zid is not None)"
-              )
-
-          pat_seq_n1 = re.compile(
-              r"(?P<i>[ ]+)assert \(\n"
-              r"(?P=i)    pdata\[\"network_seq\"\] is not None\n"
-              r"(?P=i)\)"
-          )
-
-          def seq_n1_repl(m):
-              return (
-                  f'{m.group("i")}assert'
-                  ' (pdata["network_seq"] is not None)'
-                  " == (zid is not None)"
-              )
-
-          targets = [
-              "apps/agro/tests/test_agro_aid_e2e.py",
-              "apps/agro/tests/test_agro_n1.py",
-          ]
-          for target in targets:
-              path = Path(target)
-              src = path.read_text(encoding="utf-8")
-              src, n1 = pat_zid.subn(zid_repl, src)
-              src, n2 = pat_synced.subn(
-                  synced_repl, src
-              )
-              src, n3 = pat_seq_aid.subn(
-                  seq_aid_repl, src
-              )
-              src, n4 = pat_seq_n1.subn(
-                  seq_n1_repl, src
-              )
-              total = n1 + n2 + n3 + n4
-              if total == 0:
-                  raise SystemExit(
-                      f"NO MATCH in {target}"
-                      " - aborting"
-                  )
-              path.write_text(src, encoding="utf-8")
-              print(
-                  f"{target}: zid={n1}"
-                  f" synced={n2}"
-                  f" seq_aid={n3}"
-                  f" seq_n1={n4}"
-              )
-              import ast
-
-              ast.parse(src)
-              print(f"SYNTAX OK: {target}")
-          print("ALL PATCHES APPLIED")
-          PYEOF
 
       - name: Setup Python
         uses: actions/setup-python@v5
@@ -117,24 +20,115 @@ jobs:
       - name: Install deps
         run: pip install cryptography pytest "numpy==1.26.4" "opencv-python-headless>=4.8,<5.0"
 
-      - name: 1/2 AGRO full suite
-        run: python -m pytest apps/agro/tests -v
-
-      - name: 2/2 Full system regression
+      - name: Run the 2 failing tests with full error bodies
         run: |
-          python -m pytest apps/axis/life_history/tests apps/axis/tests -q
-          python -m shared_engines.security.clearance -q
-          python -m shared_engines.security.biometrics -q
-          python -m network.transport.tcp_transport -q
+          python - <<'PYEOF'
+          import json
+          import subprocess
+          import threading
+          from pathlib import Path
+          from urllib.error import HTTPError
+          from urllib.request import Request, urlopen
 
-      - name: Commit (only if all green)
-        run: |
-          git config user.name "github-actions[bot]"
-          git config user.email "github-actions[bot]@users.noreply.github.com"
-          git add apps/agro/tests/
-          if git diff --cached --quiet; then
-            echo "Nothing to commit"
-          else
-            git commit -m "agro: E2E assertions consistent with biometric-enrollment security (zid pending tolerated, sync consistency verified)"
-            git push
-          fi
+          from shared_engines.common.clocks import FrozenClock
+          from shared_engines.runtime.capabilities import ZyraCapabilities
+          from shared_engines.runtime.combined_api import serve_combined
+          from shared_engines.runtime.config import RuntimeConfig
+          from shared_engines.runtime.kernel import ZyraKernel
+          from shared_engines.storage.database import SQLiteAdapter
+          from shared_engines.verification.signatures import Ed25519Signer
+          from apps.agro.infrastructure.network.network_client import NetworkClient
+          from apps.agro.infrastructure.persistence.agro_store import AgroStore
+          from apps.agro.server import serve_agro
+          from apps.agro.services.zyra_link import ZyraLink
+          import tempfile
+
+          tmp = tempfile.mkdtemp()
+          net_db = SQLiteAdapter(Path(tmp) / "network.db")
+          signer, _ = Ed25519Signer.generate()
+          kernel = ZyraKernel(
+              db=net_db,
+              clock=FrozenClock(),
+              signer=signer,
+              config=RuntimeConfig(host="127.0.0.1", port=0, api_token=None),
+          )
+          kernel.bootstrap_root()
+          caps = ZyraCapabilities(
+              net_db, FrozenClock(),
+              identity=kernel.identity, signer=signer,
+          )
+          net_server = serve_combined(
+              kernel, caps, host="127.0.0.1", port=0,
+          )
+          threading.Thread(
+              target=net_server.serve_forever, daemon=True
+          ).start()
+          net_base = "http://127.0.0.1:" + str(
+              net_server.server_address[1]
+          )
+          agro_db = SQLiteAdapter(Path(tmp) / "agro.db")
+          store = AgroStore(agro_db, FrozenClock())
+          client = NetworkClient(net_base, max_retries=1)
+          link = ZyraLink(client)
+          agro_server = serve_agro(store, client)
+          threading.Thread(
+              target=agro_server.serve_forever, daemon=True
+          ).start()
+          agro_base = "http://127.0.0.1:" + str(
+              agro_server.bound_port
+          )
+
+          print("=== register_app ===")
+          print(link.register_app())
+
+          print("=== POST /agro/producers (con error body) ===")
+          req = Request(
+              agro_base + "/agro/producers",
+              data=json.dumps(
+                  {
+                      "name": "Jose Rural",
+                      "producer_type": "agricultor",
+                      "location": "Chalatenango",
+                  }
+              ).encode("utf-8"),
+              headers={"Content-Type": "application/json"},
+              method="POST",
+          )
+          try:
+              with urlopen(req, timeout=10) as r:
+                  print("STATUS:", r.status)
+                  print("BODY:", r.read().decode("utf-8")[:800])
+          except HTTPError as exc:
+              print("HTTP ERROR:", exc.code)
+              print("BODY:", exc.read().decode("utf-8", "replace")[:800])
+
+          print("=== POST directo a la Red /identity/register person ===")
+          req2 = Request(
+              net_base + "/identity/register",
+              data=json.dumps(
+                  {
+                      "kind": "person",
+                      "display_name": "Prueba Persona",
+                      "actor": "agro",
+                  }
+              ).encode("utf-8"),
+              headers={"Content-Type": "application/json"},
+              method="POST",
+          )
+          try:
+              with urlopen(req2, timeout=10) as r:
+                  print("STATUS:", r.status)
+          except HTTPError as exc:
+              print("HTTP ERROR:", exc.code, "(bypass cerrado, esperado)")
+
+          print("=== zyra_link.register_person directo ===")
+          print(link.register_person("Jose Rural"))
+
+          net_server.shutdown()
+          net_server.server_close()
+          agro_server.shutdown()
+          agro_server.server_close()
+          PYEOF
+
+      - name: Done
+        run: echo "Diagnóstico completo arriba"

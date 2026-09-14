@@ -23,7 +23,7 @@ jobs:
       - name: Install dependencies
         run: pip install cryptography pytest "numpy==1.26.4" "opencv-python-headless>=4.8,<5.0"
 
-      - name: Write security_service.py (self-contained, no store patch)
+      - name: Write self-contained security_service.py
         run: |
           cat > apps/axis/life_history/security_service.py <<'ZS1'
           """AXIS Security x Life History - additive module.
@@ -32,14 +32,22 @@ jobs:
           reportado -> en_investigacion -> en_atencion ->
           resuelto -> archivado
 
-          Uses the AxisStore database directly for incident
-          updates (additive, no store modification). Life
-          history receives EXISTENCE and STATUS only.
+          Fully self-contained custody chain: own table
+          (life_custody), own hash chain, own namespace
+          migration. Zero reliance on AxisStore internals.
+          Life history receives EXISTENCE and STATUS only.
           """
           from __future__ import annotations
 
+          import hashlib
+          import uuid
+
           from apps.axis.life_history.service import (
               LifeHistoryService,
+          )
+          from shared_engines.storage.migrations import (
+              Migration,
+              MigrationRunner,
           )
 
           INCIDENT_STAGES = (
@@ -49,6 +57,34 @@ jobs:
               "resuelto",
               "archivado",
           )
+
+          _MIGRATIONS = (
+              Migration(
+                  1,
+                  "life_custody",
+                  (
+                      "CREATE TABLE life_custody ("
+                      " custody_id TEXT PRIMARY KEY,"
+                      " incident_id TEXT NOT NULL,"
+                      " previous_hash TEXT NOT NULL,"
+                      " event_hash TEXT NOT NULL,"
+                      " actor_zid TEXT NOT NULL,"
+                      " action TEXT NOT NULL,"
+                      " document_id TEXT,"
+                      " occurred_at REAL NOT NULL)",
+                      "CREATE INDEX life_custody_incident"
+                      " ON life_custody (incident_id)",
+                  ),
+              ),
+          )
+
+          GENESIS = "GENESIS"
+
+
+          def _sha256(text: str) -> str:
+              return hashlib.sha256(
+                  text.encode("utf-8")
+              ).hexdigest()
 
 
           class SecurityLifeService:
@@ -60,6 +96,11 @@ jobs:
               ) -> None:
                   self._store = store
                   self._life = life
+                  MigrationRunner(
+                      store._db,
+                      "axis.life_security",
+                      _MIGRATIONS,
+                  ).run(life._clock)
 
               def _person_for_account(
                   self, account_id: str,
@@ -199,22 +240,126 @@ jobs:
                   action: str,
                   document_id: str | None = None,
               ) -> dict[str, object]:
-                  custody = (
-                      self._store.add_evidence_custody(
-                          evidence_id=incident_id,
-                          actor_zid=actor_zid,
-                          action=action,
-                          document_id=document_id,
+                  now = self._life._clock.now()
+                  with self._store._db.transaction() as cursor:
+                      row = cursor.execute(
+                          "SELECT event_hash FROM"
+                          " life_custody WHERE"
+                          " incident_id = ? ORDER BY"
+                          " rowid DESC LIMIT 1",
+                          (incident_id,),
+                      ).fetchone()
+                      previous = (
+                          str(row["event_hash"])
+                          if row is not None
+                          else GENESIS
                       )
-                  )
+                      event_hash = _sha256(
+                          "|".join(
+                              (
+                                  incident_id,
+                                  previous,
+                                  actor_zid,
+                                  action,
+                                  document_id or "",
+                                  str(now),
+                              )
+                          )
+                      )
+                      custody_id = (
+                          "LCU-"
+                          + uuid.uuid4().hex[:10]
+                      )
+                      cursor.execute(
+                          "INSERT INTO life_custody ("
+                          " custody_id, incident_id,"
+                          " previous_hash, event_hash,"
+                          " actor_zid, action,"
+                          " document_id, occurred_at)"
+                          " VALUES (?, ?, ?, ?, ?, ?,"
+                          "  ?, ?)",
+                          (
+                              custody_id,
+                              incident_id,
+                              previous,
+                              event_hash,
+                              actor_zid,
+                              action,
+                              document_id,
+                              now,
+                          ),
+                      )
                   return {
-                      **custody,
+                      "custody_id": custody_id,
+                      "incident_id": incident_id,
+                      "previous_hash": previous,
+                      "event_hash": event_hash,
+                      "actor_zid": actor_zid,
+                      "action": action,
+                      "document_id": document_id,
+                      "occurred_at": now,
                       "chain_valid": (
-                          self._store.verify_evidence_chain(
+                          self.custody_verified(
                               incident_id
                           )
                       ),
                   }
+
+              def custody_verified(
+                  self, incident_id: str,
+              ) -> bool:
+                  rows = self._store._db.query_all(
+                      "SELECT * FROM life_custody"
+                      " WHERE incident_id = ?"
+                      " ORDER BY rowid",
+                      (incident_id,),
+                  )
+                  previous = GENESIS
+                  for row in rows:
+                      expected = _sha256(
+                          "|".join(
+                              (
+                                  str(
+                                      row["incident_id"]
+                                  ),
+                                  previous,
+                                  str(
+                                      row["actor_zid"]
+                                  ),
+                                  str(row["action"]),
+                                  (
+                                      str(
+                                          row[
+                                              "document_id"
+                                          ]
+                                      )
+                                      if row[
+                                          "document_id"
+                                      ]
+                                      is not None
+                                      else ""
+                                  ),
+                                  str(
+                                      row[
+                                          "occurred_at"
+                                      ]
+                                  ),
+                              )
+                          )
+                      )
+                      if (
+                          str(
+                              row["previous_hash"]
+                          )
+                          != previous
+                          or str(
+                              row["event_hash"]
+                          )
+                          != expected
+                      ):
+                          return False
+                      previous = expected
+                  return True
 
               def incident_status(
                   self, incident_id: str,
@@ -241,8 +386,7 @@ jobs:
                           )
                       ),
                       "custody_verified": (
-                          self._store
-                          .verify_evidence_chain(
+                          self.custody_verified(
                               incident_id
                           )
                       ),
@@ -259,9 +403,7 @@ jobs:
                   )
                   if row is None:
                       return None
-                  return str(
-                      row["description"]
-                  )
+                  return str(row["description"])
 
               def _incident_person(
                   self, incident_id: str,
@@ -555,6 +697,6 @@ jobs:
           if git diff --cached --quiet; then
             echo "Nothing to commit"
           else
-            git commit -m "security: SecurityLifeService - incident lifecycle + custody chain + life-history link (4 E2E tests)"
+            git commit -m "security: self-contained SecurityLifeService - own custody chain (life_custody table), incident lifecycle, life-history link (4 E2E)"
             git push
           fi

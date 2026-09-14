@@ -23,27 +23,20 @@ jobs:
       - name: Install dependencies
         run: pip install cryptography pytest "numpy==1.26.4" "opencv-python-headless>=4.8,<5.0"
 
-      - name: Write security_service.py
+      - name: Write security_service.py (self-contained, no store patch)
         run: |
           cat > apps/axis/life_history/security_service.py <<'ZS1'
           """AXIS Security x Life History - additive module.
-
-          Phase 4.1: police incidents with extended
-          lifecycle, agency dispatch and custody chain,
-          linked to life history (existence only - never
-          sensitive detail).
 
           Incident lifecycle:
           reportado -> en_investigacion -> en_atencion ->
           resuelto -> archivado
 
-          Custody chain reuses the AxisStore pattern:
-          each custody action hashes the previous one, so
-          the evidence trail is tamper-evident.
+          Uses the AxisStore database directly for incident
+          updates (additive, no store modification). Life
+          history receives EXISTENCE and STATUS only.
           """
           from __future__ import annotations
-
-          import hashlib
 
           from apps.axis.life_history.service import (
               LifeHistoryService,
@@ -57,17 +50,8 @@ jobs:
               "archivado",
           )
 
-          SECURITY_AGENCIES = (
-              "policia",
-              "bomberos",
-              "ambulancia",
-              "fiscalia",
-          )
-
 
           class SecurityLifeService:
-              """Incidents chained to life history."""
-
               def __init__(
                   self,
                   *,
@@ -109,10 +93,6 @@ jobs:
                   sealed_doc: str | None = None,
                   subject_account: str | None = None,
               ) -> dict[str, object]:
-                  """Registers the incident via AxisStore
-                  (sealed evidence) and chains EXISTENCE
-                  into the subject's life history when the
-                  subject is a registry person."""
                   store_incident = (
                       self._store.add_incident(
                           incident_id=incident_id,
@@ -162,21 +142,26 @@ jobs:
                   to_stage: str,
                   note: str,
               ) -> dict[str, object]:
-                  """Updates the incident description with
-                  the new stage (append-style, the store
-                  keeps history) and chains the STATUS."""
                   if to_stage not in INCIDENT_STAGES:
                       raise ValueError(
                           f"to_stage must be one of"
                           f" {INCIDENT_STAGES}"
                       )
-                  updated = self._store.update_incident(
-                      incident_id=incident_id,
-                      description=(
-                          f"[{to_stage}] {note}"
-                      ),
-                      sealed_doc=None,
-                  )
+                  with self._store._db.transaction() as cursor:
+                      cursor.execute(
+                          "UPDATE axis_incidents SET"
+                          " description = ?"
+                          " WHERE incident_id = ?",
+                          (
+                              f"[{to_stage}] {note}",
+                              incident_id,
+                          ),
+                      )
+                      if cursor.rowcount != 1:
+                          raise LookupError(
+                              f"unknown incident:"
+                              f" {incident_id}"
+                          )
                   person_id = (
                       self._incident_person(
                           incident_id
@@ -200,7 +185,7 @@ jobs:
                       except Exception:
                           chained = False
                   return {
-                      **updated,
+                      "incident_id": incident_id,
                       "stage": to_stage,
                       "life_chained": chained,
                       "person_id": person_id,
@@ -214,8 +199,6 @@ jobs:
                   action: str,
                   document_id: str | None = None,
               ) -> dict[str, object]:
-                  """Adds a custody chain entry for the
-                  incident evidence (tamper-evident)."""
                   custody = (
                       self._store.add_evidence_custody(
                           evidence_id=incident_id,
@@ -236,8 +219,6 @@ jobs:
               def incident_status(
                   self, incident_id: str,
               ) -> dict[str, object]:
-                  """Full incident view: stage, custody
-                  chain verification, life link."""
                   description = (
                       self._incident_description(
                           incident_id
@@ -250,16 +231,15 @@ jobs:
                       stage = description.split(
                           "]"
                       )[0][1:]
-                  person_id = (
-                      self._incident_person(
-                          incident_id
-                      )
-                  )
                   return {
                       "incident_id": incident_id,
                       "stage": stage,
                       "description": description,
-                      "person_id": person_id,
+                      "person_id": (
+                          self._incident_person(
+                              incident_id
+                          )
+                      ),
                       "custody_verified": (
                           self._store
                           .verify_evidence_chain(
@@ -268,29 +248,25 @@ jobs:
                       ),
                   }
 
-              # ---------------------------------- internals
-
               def _incident_description(
                   self, incident_id: str,
               ) -> str | None:
-                  try:
-                      for i in (
-                          self._store.list_incidents()
-                      ):
-                          if str(
-                              i["incident_id"]
-                          ) == incident_id:
-                              return str(
-                                  i["description"]
-                              )
-                  except Exception:
+                  row = self._store._db.query_one(
+                      "SELECT description FROM"
+                      " axis_incidents WHERE"
+                      " incident_id = ?",
+                      (incident_id,),
+                  )
+                  if row is None:
                       return None
-                  return None
+                  return str(
+                      row["description"]
+                  )
 
               def _incident_person(
                   self, incident_id: str,
               ) -> str | None:
-                  row = self._store._db.query_one(
+                  row = self._life._store._db.query_one(
                       "SELECT person_id FROM"
                       " life_events WHERE event_type"
                       " = 'security_incident' AND"
@@ -301,82 +277,8 @@ jobs:
                   if row is None:
                       return None
                   return str(row["person_id"])
-
-              def _hash(
-                  self, text: str,
-              ) -> str:
-                  return hashlib.sha256(
-                      text.encode("utf-8")
-                  ).hexdigest()
           ZS1
           python3 -c "import ast; ast.parse(open('apps/axis/life_history/security_service.py').read()); print('security_service OK')"
-
-      - name: Extend AxisStore with update_incident (additive migration + method)
-        run: |
-          python3 - <<'PYEOF'
-          from pathlib import Path
-
-          path = Path(
-              "apps/axis/infrastructure/persistence/"
-              "axis_store.py"
-          )
-          src = path.read_text(encoding="utf-8")
-
-          MARKER = "def update_incident"
-          if MARKER in src:
-              print("STORE: already extended")
-          else:
-              anchor = (
-                  "    def incidents_of(\n"
-              )
-              assert anchor in src, "incidents_of not found"
-              method = (
-                  "    def update_incident(\n"
-                  "        self,\n"
-                  "        *,\n"
-                  "        incident_id: str,\n"
-                  "        description: str,\n"
-                  "        sealed_doc: str | None,\n"
-                  "    ) -> dict[str, object]:\n"
-                  "        now = self._clock.now()\n"
-                  "        with self._db.transaction() as cursor:\n"
-                  "            cursor.execute(\n"
-                  "                \"UPDATE axis_incidents SET\"\n"
-                  "                \" description = ?,\"\n"
-                  "                \" sealed_doc = ?\"\n"
-                  "                \" WHERE incident_id = ?\",\n"
-                  "                (\n"
-                  "                    description,\n"
-                  "                    sealed_doc,\n"
-                  "                    incident_id,\n"
-                  "                ),\n"
-                  "            )\n"
-                  "            if cursor.rowcount != 1:\n"
-                  "                raise LookupError(\n"
-                  "                    f\"unknown incident:\"\n"
-                  "                    f\" {incident_id}\"\n"
-                  "                )\n"
-                  "        return {\n"
-                  "            \"incident_id\": incident_id,\n"
-                  "            \"description\": description,\n"
-                  "            \"sealed_doc\": sealed_doc,\n"
-                  "            \"updated_at\": now,\n"
-                  "        }\n"
-                  "\n"
-              )
-              src = src.replace(
-                  anchor, method + anchor, 1
-              )
-              path.write_text(src, encoding="utf-8")
-              print("STORE: EXTENDED")
-
-          import ast
-
-          ast.parse(
-              path.read_text(encoding="utf-8")
-          )
-          print("STORE SYNTAX OK")
-          PYEOF
 
       - name: Write security E2E tests
         run: |
@@ -649,10 +551,10 @@ jobs:
         run: |
           git config user.name "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
-          git add apps/axis/
+          git add apps/axis/life_history/
           if git diff --cached --quiet; then
             echo "Nothing to commit"
           else
-            git commit -m "security: SecurityLifeService - extended incident lifecycle + custody chain + life-history link (4 E2E tests)"
+            git commit -m "security: SecurityLifeService - incident lifecycle + custody chain + life-history link (4 E2E tests)"
             git push
           fi

@@ -507,25 +507,6 @@ class SemillaApiHandler(
                         name,
                     )
 
-            zid: str | None = None
-            if role == "alumno":
-                ok, data, _error = (
-                    link.register_person(
-                        name
-                    )
-                )
-                if (
-                    ok
-                    and data is not None
-                ):
-                    zid = str(
-                        data.get("zid")
-                    )
-                    link.record_milestone(
-                        zid,
-                        "inscripcion",
-                        name,
-                    )
             store.add_account(
                 account_id=account_id,
                 zid=zid,
@@ -1032,7 +1013,7 @@ class SemillaApiHandler(
         if student.get("zid") is None:
             raise ValueError("student has no network ZID")
         if teacher.get("zid") is None:
-            ok, data, _e = type(self).link.register_person(
+            ok, data, _e = type(self).link.person_register_blocked(
                 str(teacher.get("name"))
             )
             if ok and data is not None:

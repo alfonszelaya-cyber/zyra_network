@@ -73,6 +73,18 @@ class SemillaLink:
         )
 
 
+    def person_register_blocked(
+        self, *args, **kwargs
+    ) -> tuple[bool, dict | None, str | None]:
+        """LAW: person registration requires
+        biometric enrollment. Legacy calls are
+        rejected here, no network round-trip."""
+        raise ValueError(
+            "registro de persona requiere biometria:"
+            " use el registro con documento y selfie"
+        )
+
+
     def complete_trust(self, zid: str) -> tuple[bool, dict | None, str | None]:
         return self._client.post(
             "/trust/complete",

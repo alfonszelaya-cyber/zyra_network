@@ -303,16 +303,78 @@ class AgroApiHandler(
                 "PRD-"
                 + uuid.uuid4().hex[:12]
             )
+            doc_b64 = str(
+                doc.get("doc_image_b64") or ""
+            )
+            selfie_b64 = str(
+                doc.get("selfie_image_b64") or ""
+            )
+            if not doc_b64 or not selfie_b64:
+                if is_json:
+                    raise ValueError(
+                        "por ley se requiere"
+                        " doc_image_b64 y selfie_image_b64"
+                    )
+                self._html(
+                    400,
+                    _page(
+                        "AGRO - Registro",
+                        "<h1>Faltan las fotos</h1>"
+                        "<p>Por ley el registro requiere"
+                        " foto del documento y selfie en vivo.</p>"
+                        "<a href='/agro/home'>"
+                        "<button>Volver</button></a>",
+                    ),
+                )
+                return
+
+            def _prd_find_zid(obj):
+                if isinstance(obj, dict):
+                    for k, v in obj.items():
+                        if (
+                            str(k).lower() == "zid"
+                            and isinstance(v, str)
+                            and v.startswith("ZID-")
+                        ):
+                            return v
+                    for v in obj.values():
+                        found = _prd_find_zid(v)
+                        if found is not None:
+                            return found
+                elif isinstance(obj, list):
+                    for item in obj:
+                        found = _prd_find_zid(item)
+                        if found is not None:
+                            return found
+                return None
             zid: str | None = None
             synced = False
             ok, data, _error = (
-                link.register_producer_zid(
-                    name
+                link.enroll_producer(
+                    display_name=name,
+                    doc_image_b64=doc_b64,
+                    selfie_image_b64=selfie_b64,
                 )
             )
-            if ok and data is not None:
-                zid = str(data.get("zid"))
-                synced = True
+            if not ok:
+                if is_json:
+                    raise ValueError(
+                        "registro rechazado: " + str(_error)
+                    )
+                self._html(
+                    400,
+                    _page(
+                        "AGRO - Registro rechazado",
+                        "<h1>Registro rechazado</h1>"
+                        "<p>" + str(_error) + "</p>"
+                        "<a href='/agro/home'>"
+                        "<button>Volver</button></a>",
+                    ),
+                )
+                return
+            if data is not None:
+                zid = _prd_find_zid(data)
+                synced = zid is not None
             row = store.add_producer(
                 producer_id=producer_id,
                 zid=zid,

@@ -430,6 +430,83 @@ class SemillaApiHandler(
                 "SEM-"
                 + uuid.uuid4().hex[:12]
             )
+            def _findz(obj):
+                if isinstance(obj, dict):
+                    for k, v in obj.items():
+                        if (
+                            str(k).lower() == "zid"
+                            and isinstance(v, str)
+                            and v.startswith("ZID-")
+                        ):
+                            return v
+                    for v in obj.values():
+                        f2 = _findz(v)
+                        if f2 is not None:
+                            return f2
+                elif isinstance(obj, list):
+                    for item in obj:
+                        f2 = _findz(item)
+                        if f2 is not None:
+                            return f2
+                return None
+            zid: str | None = None
+            if role == "institucion":
+                ok, data, _error = (
+                    link.register_organization(
+                        name
+                    )
+                )
+                if ok and data is not None:
+                    zid = _findz(data)
+            else:
+                doc_b64 = str(
+                    doc.get("doc_image_b64") or ""
+                )
+                selfie_b64 = str(
+                    doc.get("selfie_image_b64") or ""
+                )
+                if not doc_b64 or not selfie_b64:
+                    self._html(
+                        400,
+                        _page(
+                            "SEMILLA - Registro",
+                            "<h1>Faltan las fotos</h1>"
+                            "<p>Por ley el registro requiere"
+                            " foto del documento y selfie"
+                            " en vivo.</p>"
+                            "<a href='/semilla/home'>"
+                            "<button>Volver</button></a>",
+                        ),
+                    )
+                    return
+                ok, data, _error = (
+                    link.enroll_person(
+                        display_name=name,
+                        doc_image_b64=doc_b64,
+                        selfie_image_b64=selfie_b64,
+                    )
+                )
+                if not ok:
+                    self._html(
+                        400,
+                        _page(
+                            "SEMILLA - Registro rechazado",
+                            "<h1>Registro rechazado</h1>"
+                            "<p>" + str(_error) + "</p>"
+                            "<a href='/semilla/home'>"
+                            "<button>Volver</button></a>",
+                        ),
+                    )
+                    return
+                if data is not None:
+                    zid = _findz(data)
+                if zid is not None:
+                    link.record_milestone(
+                        zid,
+                        "inscripcion",
+                        name,
+                    )
+
             zid: str | None = None
             if role == "alumno":
                 ok, data, _error = (
@@ -1185,6 +1262,35 @@ class SemillaApiHandler(
             "</button>"
             "</form></div>"
         )
+        body = (
+            body
+            + "<script>"
+            + "/*semillaBiometria*/"
+            + "(function(){"
+            + "function hook(f){"
+            + "var doc=document.createElement('input');doc.type='file';doc.accept='image/*';doc.capture='environment';doc.style.width='100%';"
+            + "var slf=document.createElement('input');slf.type='file';slf.accept='image/*';slf.capture='user';slf.style.width='100%';"
+            + "var hidD=document.createElement('input');hidD.type='hidden';hidD.name='doc_image_b64';"
+            + "var hidS=document.createElement('input');hidS.type='hidden';hidS.name='selfie_image_b64';"
+            + "var st=document.createElement('p');st.textContent='Biometria (por ley): pendiente';"
+            + "function proc(file,h){if(!file){return;}var r=new FileReader();r.onload=function(){var im=new Image();im.onload=function(){var k=Math.min(1,800/Math.max(im.width,im.height));var cv=document.createElement('canvas');cv.width=Math.round(im.width*k);cv.height=Math.round(im.height*k);cv.getContext('2d').drawImage(im,0,0,cv.width,cv.height);h.value=cv.toDataURL('image/jpeg',0.72).split(',')[1];upd();};im.src=r.result;};r.readAsDataURL(file);}"
+            + "function upd(){st.textContent='Doc: '+(hidD.value?'OK':'falta')+' | Selfie: '+(hidS.value?'OK':'falta');}"
+            + "doc.addEventListener('change',function(){proc(doc.files[0],hidD);});"
+            + "slf.addEventListener('change',function(){proc(slf.files[0],hidS);});"
+            + "var fs=document.createElement('fieldset');"
+            + "var lg=document.createElement('legend');lg.textContent='Foto del documento y selfie (por ley)';"
+            + "fs.appendChild(lg);fs.appendChild(doc);fs.appendChild(document.createElement('br'));fs.appendChild(slf);"
+            + "f.insertBefore(fs,f.firstChild);f.appendChild(hidD);f.appendChild(hidS);f.appendChild(st);"
+            + "f.addEventListener('submit',function(ev){if(!hidD.value||!hidS.value){ev.preventDefault();st.textContent='Falta foto del documento o selfie.';}});"
+            + "}"
+            + "document.querySelectorAll('form').forEach(function(f){"
+            + "var r=f.querySelector('input[name=role]');"
+            + "if(r&&(r.value==='alumno'||r.value==='profesor')){hook(f);}"
+            + "});"
+            + "})();"
+            + "</script>"
+        )
+
         self._html(
             200, _page("SEMILLA", body)
         )

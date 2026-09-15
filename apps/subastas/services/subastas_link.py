@@ -120,12 +120,8 @@ class SubastasLink:
                         {"zid": zid},
                     )
         return (
-            True,
-            {
-                "zid": "ZID-"
-                + uuid.uuid4().hex[:12],
-                "source": "local",
-            },
+        False,
+        None,
         )
 
     def give_reputation(

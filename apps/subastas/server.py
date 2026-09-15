@@ -308,6 +308,10 @@ class SubastasApiHandler(BaseHTTPRequestHandler):
     def do_POST(self) -> None:
         path = self.path.split("?")[0]
         try:
+            if path == "/subastas/register":
+                self._register_bio()
+                return
+
             if path == (
                 "/subastas/listing"
             ):
@@ -536,16 +540,36 @@ class SubastasApiHandler(BaseHTTPRequestHandler):
         )
         self._send_html(200, html)
 
-    def _ensure_trusted_zid(self, account_id: str) -> str:
-        """Canonical identity + trust via net_client
-        (the exact pattern proven by MPE and SEMILLA).
-        Falls back to stored ZID only if network down."""
-        ok, data, _err = self.net_client.post(
-            "/identity/register",
+    def _register_bio(self) -> None:
+        length = int(
+            self.headers.get("Content-Length", 0) or 0
+        )
+        raw = self.rfile.read(length) if length > 0 else b""
+        from urllib.parse import parse_qs
+        form = parse_qs(raw.decode("utf-8"))
+
+        def _fv(key: str) -> str:
+            vals = form.get(key, [])
+            return vals[0] if vals else ""
+
+        name = _fv("name").strip()
+        doc_b64 = _fv("doc_image_b64").strip()
+        selfie_b64 = _fv("selfie_image_b64").strip()
+        if not name or not doc_b64 or not selfie_b64:
+            self._bio_page(
+                400,
+                "<h2>Faltan datos obligatorios (por ley): nombre, foto del documento y selfie.</h2>",
+                True,
+            )
+            return
+        ok, data, err = self.net_client.post(
+            "/identity/enroll",
             {
                 "kind": "person",
-                "display_name": account_id,
+                "display_name": name,
                 "actor": "subastas",
+                "doc_image_b64": doc_b64,
+                "selfie_image_b64": selfie_b64,
             },
         )
         zid = None
@@ -553,12 +577,59 @@ class SubastasApiHandler(BaseHTTPRequestHandler):
             found = _find_value(data, ("zid",))
             if isinstance(found, str) and found.startswith("ZID-"):
                 zid = found
+        if not ok or zid is None:
+            msg = str(err) if err else "la red no devolvio ZID"
+            self._bio_page(
+                400,
+                "<h2>Registro rechazado</h2><p>" + msg + "</p>",
+                True,
+            )
+            return
+        self._bio_page(
+            200,
+            "<h2>Registro biometrico aprobado</h2>"
+            "<p>Tu ZID: <b>" + zid + "</b></p>"
+            "<p>Usa ese ZID como tu cuenta de vendedor o comprador al publicar y ofertar.</p>",
+            False,
+        )
+
+    def _bio_page(self, status: int, body: str, back: bool) -> None:
+        extra = (
+            "<p><a href='/'><button>Volver</button></a></p>"
+            if back
+            else ""
+        )
+        html = (
+            "<html><head><meta charset='utf-8'>"
+            "<title>SUBASTAS Registro</title></head>"
+            "<body style='font-family:sans-serif;max-width:560px;margin:24px auto'>"
+            "<h1>SUBASTAS</h1>"
+            + body
+            + extra
+            + "</body></html>"
+        )
+        payload = html.encode("utf-8")
+        self.send_response(status)
+        self.send_header("Content-Type", "text/html; charset=utf-8")
+        self.send_header("Content-Length", str(len(payload)))
+        self.end_headers()
+        self.wfile.write(payload)
+
+
+    def _ensure_trusted_zid(self, account_id: str) -> str:
+        """Canonical identity + trust via net_client
+        (the exact pattern proven by MPE and SEMILLA).
+        Falls back to stored ZID only if network down."""
+        zid = None
+        existing = self.commerce.account_zid(account_id)
+        if isinstance(existing, str) and existing.startswith("ZID-"):
+            zid = existing
         if zid is None:
-            existing = self.commerce.account_zid(account_id)
-            if existing:
-                return existing
             raise ValueError(
-                "no network ZID available for " + account_id
+                "cuenta sin ZID biometrico: registrese con"
+                " documento y selfie en la pagina principal de SUBASTAS ("
+                + account_id
+                + ")"
             )
         try:
             self.net_client.post(
@@ -787,6 +858,29 @@ class SubastasApiHandler(BaseHTTPRequestHandler):
             "<title>SUBASTAS</title>"
             "</head><body>"
             "<h1>SUBASTAS</h1>"
+            "<details><summary><b>Registrarme con biometria (por ley)</b></summary>"
+            "<form id='bioReg' method='POST' action='/subastas/register'>"
+            "<p>Nombre completo: <input name='name' required style='width:100%'></p>"
+            "<fieldset><legend>1) Foto del documento</legend><input type='file' id='bioDoc' accept='image/*' capture='environment'></fieldset>"
+            "<fieldset><legend>2) Selfie en vivo</legend><input type='file' id='bioSlf' accept='image/*' capture='user'></fieldset>"
+            "<input type='hidden' name='doc_image_b64' id='bioDocB64'>"
+            "<input type='hidden' name='selfie_image_b64' id='bioSlfB64'>"
+            "<p id='bioSt'>Estado: pendiente</p>"
+            "<button type='submit'>Registrarme</button>"
+            "</form>"
+            "<canvas id='bioCv' style='display:none'></canvas>"
+            "<script>"
+            "(function(){"
+            "var d=document.getElementById('bioDoc'),s=document.getElementById('bioSlf'),st=document.getElementById('bioSt'),hd=document.getElementById('bioDocB64'),hs=document.getElementById('bioSlfB64'),cv=document.getElementById('bioCv'),cx=cv.getContext('2d');"
+            "function p(f,h){if(!f){return;}var r=new FileReader();r.onload=function(){var i=new Image();i.onload=function(){var k=Math.min(1,800/Math.max(i.width,i.height));cv.width=Math.round(i.width*k);cv.height=Math.round(i.height*k);cx.drawImage(i,0,0,cv.width,cv.height);h.value=cv.toDataURL('image/jpeg',0.72).split(',')[1];u();};i.src=r.result;};r.readAsDataURL(f);}"
+            "function u(){st.textContent='Doc: '+(hd.value?'OK':'falta')+' | Selfie: '+(hs.value?'OK':'falta');}"
+            "d.addEventListener('change',function(){p(d.files[0],hd);});"
+            "s.addEventListener('change',function(){p(s.files[0],hs);});"
+            "document.getElementById('bioReg').addEventListener('submit',function(e){if(!hd.value||!hs.value){e.preventDefault();st.textContent='Falta foto del documento o selfie.';}});"
+            "})();"
+            "</script>"
+            "</details>"
+
             "<p>Super-market ZYRA."
             "</p>"
             "<p>Roles: vendedor |"

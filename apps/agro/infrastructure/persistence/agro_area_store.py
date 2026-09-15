@@ -1,0 +1,413 @@
+"""AGRO area store - persistence for remaining
+areas (additive, own migrations).
+
+Areas: tierras, ventas, riesgos, maquinaria,
+inventarios, recursos_hidricos. Each record
+links to producer_id. No existing table touched.
+"""
+from __future__ import annotations
+
+import uuid
+
+from shared_engines.storage.database import (
+    Database,
+)
+from shared_engines.storage.migrations import (
+    Migration,
+    MigrationRunner,
+)
+
+_MIGRATIONS = (
+    Migration(
+        1,
+        "agro_area_store",
+        (
+            "CREATE TABLE IF NOT EXISTS"
+            " agro_area_lands ("
+            " land_id TEXT PRIMARY KEY,"
+            " producer_id TEXT NOT NULL,"
+            " location TEXT NOT NULL,"
+            " size_hectares REAL NOT NULL,"
+            " land_use TEXT,"
+            " created_at REAL NOT NULL)",
+            "CREATE TABLE IF NOT EXISTS"
+            " agro_area_sales ("
+            " sale_id TEXT PRIMARY KEY,"
+            " producer_id TEXT NOT NULL,"
+            " buyer TEXT NOT NULL,"
+            " product TEXT NOT NULL,"
+            " quantity REAL NOT NULL,"
+            " unit TEXT NOT NULL,"
+            " price REAL NOT NULL,"
+            " status TEXT NOT NULL,"
+            " created_at REAL NOT NULL)",
+            "CREATE TABLE IF NOT EXISTS"
+            " agro_area_risks ("
+            " risk_id TEXT PRIMARY KEY,"
+            " producer_id TEXT NOT NULL,"
+            " risk_type TEXT NOT NULL,"
+            " severity TEXT NOT NULL,"
+            " detail TEXT,"
+            " status TEXT NOT NULL,"
+            " created_at REAL NOT NULL)",
+            "CREATE TABLE IF NOT EXISTS"
+            " agro_area_machinery ("
+            " machine_id TEXT PRIMARY KEY,"
+            " producer_id TEXT NOT NULL,"
+            " machine_type TEXT NOT NULL,"
+            " description TEXT,"
+            " created_at REAL NOT NULL)",
+            "CREATE TABLE IF NOT EXISTS"
+            " agro_area_inventory ("
+            " item_id TEXT PRIMARY KEY,"
+            " producer_id TEXT NOT NULL,"
+            " item_name TEXT NOT NULL,"
+            " quantity REAL NOT NULL,"
+            " unit TEXT NOT NULL,"
+            " created_at REAL NOT NULL)",
+            "CREATE TABLE IF NOT EXISTS"
+            " agro_area_water ("
+            " water_id TEXT PRIMARY KEY,"
+            " producer_id TEXT NOT NULL,"
+            " source_type TEXT NOT NULL,"
+            " capacity_liters REAL NOT NULL,"
+            " created_at REAL NOT NULL)",
+        ),
+    ),
+)
+
+
+class AgroAreaStore:
+    def __init__(
+        self,
+        db: Database,
+        clock,
+    ) -> None:
+        self._db = db
+        self._clock = clock
+        MigrationRunner(
+            db,
+            "agro.areas",
+            _MIGRATIONS,
+        ).run(clock)
+
+    def add_land(
+        self,
+        *,
+        producer_id,
+        location,
+        size_hectares,
+        land_use=None,
+    ):
+        land_id = "LND-" + uuid.uuid4().hex[:10]
+        now = self._clock.now()
+        with self._db.transaction() as cursor:
+            cursor.execute(
+                "INSERT INTO agro_area_lands ("
+                " land_id, producer_id,"
+                " location, size_hectares,"
+                " land_use, created_at)"
+                " VALUES (?,?,?,?,?,?)",
+                (
+                    land_id,
+                    producer_id,
+                    location,
+                    size_hectares,
+                    land_use,
+                    now,
+                ),
+            )
+        return {"land_id": land_id}
+
+    def lands_of(self, *, producer_id):
+        rows = self._db.query_all(
+            "SELECT * FROM agro_area_lands"
+            " WHERE producer_id = ?"
+            " ORDER BY created_at",
+            (producer_id,),
+        )
+        return [
+            {
+                "land_id": str(r["land_id"]),
+                "location": str(r["location"]),
+                "size_hectares": float(
+                    r["size_hectares"]
+                ),
+            }
+            for r in rows
+        ]
+
+    def create_sale(
+        self,
+        *,
+        producer_id,
+        buyer,
+        product,
+        quantity,
+        unit,
+        price,
+    ):
+        sale_id = "SAL-" + uuid.uuid4().hex[:10]
+        now = self._clock.now()
+        with self._db.transaction() as cursor:
+            cursor.execute(
+                "INSERT INTO agro_area_sales ("
+                " sale_id, producer_id, buyer,"
+                " product, quantity, unit, price,"
+                " status, created_at)"
+                " VALUES (?,?,?,?,?,?,?,?,?)",
+                (
+                    sale_id,
+                    producer_id,
+                    buyer,
+                    product,
+                    quantity,
+                    unit,
+                    price,
+                    "created",
+                    now,
+                ),
+            )
+        return {"sale_id": sale_id}
+
+    def complete_sale(self, *, sale_id):
+        with self._db.transaction() as cursor:
+            cursor.execute(
+                "UPDATE agro_area_sales SET"
+                " status = 'completed'"
+                " WHERE sale_id = ?",
+                (sale_id,),
+            )
+            if cursor.rowcount != 1:
+                raise LookupError(
+                    "unknown sale"
+                )
+        return {
+            "sale_id": sale_id,
+            "status": "completed",
+        }
+
+    def sales_of(self, *, producer_id):
+        rows = self._db.query_all(
+            "SELECT * FROM agro_area_sales"
+            " WHERE producer_id = ?"
+            " ORDER BY created_at",
+            (producer_id,),
+        )
+        return [
+            {
+                "sale_id": str(r["sale_id"]),
+                "buyer": str(r["buyer"]),
+                "product": str(r["product"]),
+                "status": str(r["status"]),
+            }
+            for r in rows
+        ]
+
+    def report_risk(
+        self,
+        *,
+        producer_id,
+        risk_type,
+        severity,
+        detail=None,
+    ):
+        risk_id = "RSK-" + uuid.uuid4().hex[:10]
+        now = self._clock.now()
+        with self._db.transaction() as cursor:
+            cursor.execute(
+                "INSERT INTO agro_area_risks ("
+                " risk_id, producer_id,"
+                " risk_type, severity, detail,"
+                " status, created_at)"
+                " VALUES (?,?,?,?,?,?,?)",
+                (
+                    risk_id,
+                    producer_id,
+                    risk_type,
+                    severity,
+                    detail,
+                    "open",
+                    now,
+                ),
+            )
+        return {"risk_id": risk_id}
+
+    def resolve_risk(self, *, risk_id):
+        with self._db.transaction() as cursor:
+            cursor.execute(
+                "UPDATE agro_area_risks SET"
+                " status = 'resolved'"
+                " WHERE risk_id = ?",
+                (risk_id,),
+            )
+            if cursor.rowcount != 1:
+                raise LookupError(
+                    "unknown risk"
+                )
+        return {
+            "risk_id": risk_id,
+            "status": "resolved",
+        }
+
+    def open_risks(self, *, producer_id):
+        rows = self._db.query_all(
+            "SELECT * FROM agro_area_risks"
+            " WHERE producer_id = ?"
+            " AND status = 'open'"
+            " ORDER BY created_at",
+            (producer_id,),
+        )
+        return [
+            {
+                "risk_id": str(r["risk_id"]),
+                "risk_type": str(
+                    r["risk_type"]
+                ),
+                "severity": str(
+                    r["severity"]
+                ),
+            }
+            for r in rows
+        ]
+
+    def add_machinery(
+        self,
+        *,
+        producer_id,
+        machine_type,
+        description=None,
+    ):
+        machine_id = "MCH-" + uuid.uuid4().hex[:10]
+        now = self._clock.now()
+        with self._db.transaction() as cursor:
+            cursor.execute(
+                "INSERT INTO"
+                " agro_area_machinery ("
+                " machine_id, producer_id,"
+                " machine_type, description,"
+                " created_at) VALUES (?,?,?,?,?)",
+                (
+                    machine_id,
+                    producer_id,
+                    machine_type,
+                    description,
+                    now,
+                ),
+            )
+        return {"machine_id": machine_id}
+
+    def machinery_of(self, *, producer_id):
+        rows = self._db.query_all(
+            "SELECT * FROM agro_area_machinery"
+            " WHERE producer_id = ?"
+            " ORDER BY created_at",
+            (producer_id,),
+        )
+        return [
+            {
+                "machine_id": str(
+                    r["machine_id"]
+                ),
+                "machine_type": str(
+                    r["machine_type"]
+                ),
+            }
+            for r in rows
+        ]
+
+    def add_inventory_item(
+        self,
+        *,
+        producer_id,
+        item_name,
+        quantity,
+        unit,
+    ):
+        item_id = "INV-" + uuid.uuid4().hex[:10]
+        now = self._clock.now()
+        with self._db.transaction() as cursor:
+            cursor.execute(
+                "INSERT INTO"
+                " agro_area_inventory ("
+                " item_id, producer_id,"
+                " item_name, quantity, unit,"
+                " created_at) VALUES (?,?,?,?,?,?)",
+                (
+                    item_id,
+                    producer_id,
+                    item_name,
+                    quantity,
+                    unit,
+                    now,
+                ),
+            )
+        return {"item_id": item_id}
+
+    def inventory_of(self, *, producer_id):
+        rows = self._db.query_all(
+            "SELECT * FROM agro_area_inventory"
+            " WHERE producer_id = ?"
+            " ORDER BY created_at",
+            (producer_id,),
+        )
+        return [
+            {
+                "item_id": str(r["item_id"]),
+                "item_name": str(
+                    r["item_name"]
+                ),
+                "quantity": float(
+                    r["quantity"]
+                ),
+                "unit": str(r["unit"]),
+            }
+            for r in rows
+        ]
+
+    def add_water_source(
+        self,
+        *,
+        producer_id,
+        source_type,
+        capacity_liters,
+    ):
+        water_id = "WTR-" + uuid.uuid4().hex[:10]
+        now = self._clock.now()
+        with self._db.transaction() as cursor:
+            cursor.execute(
+                "INSERT INTO agro_area_water ("
+                " water_id, producer_id,"
+                " source_type, capacity_liters,"
+                " created_at) VALUES (?,?,?,?,?)",
+                (
+                    water_id,
+                    producer_id,
+                    source_type,
+                    capacity_liters,
+                    now,
+                ),
+            )
+        return {"water_id": water_id}
+
+    def water_sources_of(self, *, producer_id):
+        rows = self._db.query_all(
+            "SELECT * FROM agro_area_water"
+            " WHERE producer_id = ?"
+            " ORDER BY created_at",
+            (producer_id,),
+        )
+        return [
+            {
+                "water_id": str(
+                    r["water_id"]
+                ),
+                "source_type": str(
+                    r["source_type"]
+                ),
+                "capacity_liters": float(
+                    r["capacity_liters"]
+                ),
+            }
+            for r in rows
+        ]

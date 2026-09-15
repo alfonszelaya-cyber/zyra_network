@@ -187,11 +187,70 @@ class AxisApiHandler(
                 + uuid.uuid4().hex[:12]
             )
             zid: str | None = None
+            if not (
+                str(doc.get("doc_image_b64") or "")
+                and str(doc.get("selfie_image_b64") or "")
+            ):
+                self._html(
+                    400,
+                    _page(
+                        "AXIS - Registro",
+                        "<h1>Faltan las fotos</h1>"
+                        "<p>Por ley el registro requiere"
+                        " foto del documento y selfie en vivo.</p>"
+                        "<a href='/axis/home'>"
+                        "<button>Volver</button></a>",
+                    ),
+                )
+                return
+
+            def _axis_find_zid(obj):
+                if isinstance(obj, dict):
+                    for k, v in obj.items():
+                        if (
+                            str(k).lower() == "zid"
+                            and isinstance(v, str)
+                            and v.startswith("ZID-")
+                        ):
+                            return v
+                    for v in obj.values():
+                        found = _axis_find_zid(v)
+                        if found is not None:
+                            return found
+                elif isinstance(obj, list):
+                    for item in obj:
+                        found = _axis_find_zid(item)
+                        if found is not None:
+                            return found
+                return None
+
             ok, data, _error = (
-                link.register_person(name)
+                link.enroll_person(
+                    display_name=name,
+                    doc_image_b64=str(
+                        doc.get("doc_image_b64") or ""
+                    ),
+                    selfie_image_b64=str(
+                        doc.get("selfie_image_b64") or ""
+                    ),
+                )
             )
-            if ok and data is not None:
-                zid = str(data.get("zid"))
+            if not ok:
+                self._html(
+                    400,
+                    _page(
+                        "AXIS - Registro rechazado",
+                        "<h1>Registro rechazado</h1>"
+                        "<p>"
+                        + str(_error)
+                        + "</p>"
+                        "<a href='/axis/home'>"
+                        "<button>Volver</button></a>",
+                    ),
+                )
+                return
+            if data is not None:
+                zid = _axis_find_zid(data)
             store.add_account(
                 account_id=account_id,
                 zid=zid,
@@ -850,6 +909,32 @@ class AxisApiHandler(
             "<option value='gobierno'>"
             "Gobierno</option>"
             "</select>"
+            "<fieldset><legend>1) Foto del documento (por ley)</legend><input type='file' id='axisDoc' accept='image/*' capture='environment'></fieldset>"
+            "<fieldset><legend>2) Selfie en vivo</legend>"
+            "<video id='axisCam' width='240' height='180' autoplay playsinline muted></video><br>"
+            "<button type='button' id='axisSnap'>Capturar selfie</button><br>"
+            "o desde archivo: <input type='file' id='axisSelfie' accept='image/*' capture='user'>"
+            "</fieldset>"
+            "<input type='hidden' name='doc_image_b64' id='axisDocB64'>"
+            "<input type='hidden' name='selfie_image_b64' id='axisSelfieB64'>"
+            "<canvas id='axisCv' style='display:none'></canvas>"
+            "<p id='axisSt'>Estado: pendiente</p>"
+            "<script>"
+            "(function(){"
+            "var doc=document.getElementById('axisDoc');"
+            "var slf=document.getElementById('axisSelfie');"
+            "var vid=document.getElementById('axisCam');"
+            "var cvv=document.getElementById('axisCv');"
+            "var cx=cvv.getContext('2d');"
+            "var st=document.getElementById('axisSt');"
+            "function upd(){st.textContent='Estado: doc='+(document.getElementById('axisDocB64').value?'OK':'falta')+' | selfie='+(document.getElementById('axisSelfieB64').value?'OK':'falta');}"
+            "function process(file,target){if(!file){return;}var r=new FileReader();r.onload=function(){var im=new Image();im.onload=function(){var max=800;var k=Math.min(1,max/Math.max(im.width,im.height));cvv.width=Math.round(im.width*k);cvv.height=Math.round(im.height*k);cx.drawImage(im,0,0,cvv.width,cvv.height);var d=cvv.toDataURL('image/jpeg',0.72);document.getElementById(target).value=d.split(',')[1];upd();};im.src=r.result;};r.readAsDataURL(file);}"
+            "doc.addEventListener('change',function(){process(doc.files[0],'axisDocB64');});"
+            "slf.addEventListener('change',function(){process(slf.files[0],'axisSelfieB64');});"
+            "if(navigator.mediaDevices&&navigator.mediaDevices.getUserMedia){navigator.mediaDevices.getUserMedia({video:{facingMode:'user'}}).then(function(s){vid.srcObject=s;}).catch(function(){st.textContent='Camara no disponible: use el archivo.';});}"
+            "document.getElementById('axisSnap').addEventListener('click',function(){if(!vid.videoWidth){st.textContent='Camara aun no lista.';return;}var w=480;var k=w/vid.videoWidth;cvv.width=w;cvv.height=Math.round(vid.videoHeight*k);cx.drawImage(vid,0,0,cvv.width,cvv.height);var d=cvv.toDataURL('image/jpeg',0.72);document.getElementById('axisSelfieB64').value=d.split(',')[1];upd();});"
+            "})();"
+            "</script>"
             "<button>Crear cuenta"
             "</button>"
             "</form></div>"

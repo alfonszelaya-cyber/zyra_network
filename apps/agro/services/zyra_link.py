@@ -45,6 +45,34 @@ class ZyraLink:
             },
         )
 
+    def enroll_producer(
+        self,
+        *,
+        display_name: str,
+        doc_image_b64: str,
+        selfie_image_b64: str,
+        doc_kind: str | None = None,
+        doc_country: str | None = None,
+        doc_number: str | None = None,
+    ) -> tuple[bool, dict | None, str | None]:
+        payload: dict = {
+            "kind": "person",
+            "display_name": display_name,
+            "actor": "agro",
+            "doc_image_b64": doc_image_b64,
+            "selfie_image_b64": selfie_image_b64,
+        }
+        if doc_kind:
+            payload["doc_kind"] = doc_kind
+        if doc_country:
+            payload["doc_country"] = doc_country
+        if doc_number:
+            payload["doc_number"] = doc_number
+        return self._client.post(
+            "/identity/enroll", payload
+        )
+
+
     def complete_trust(
         self, zid: str
     ) -> tuple[bool, dict | None, str | None]:

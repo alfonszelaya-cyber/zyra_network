@@ -448,6 +448,13 @@ class MpeApiHandler(BaseHTTPRequestHandler):
                     self._home(),
                 )
                 return
+            if path == "/mpe/register":
+                self._send_html(
+                    200,
+                    self._register_form_html(),
+                )
+                return
+
             if path == "/mpe/jobs":
                 self._send_html(
                     200,
@@ -1044,6 +1051,52 @@ class MpeApiHandler(BaseHTTPRequestHandler):
                 500, "server error"
             )
 
+    def _register_form_html(self) -> str:
+        return """<!DOCTYPE html>
+<html>
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>MPE Registro</title>
+</head>
+<body style="font-family:sans-serif;max-width:560px;margin:24px auto">
+<h1>MPE - Registro</h1>
+<form id="f" method="POST" action="/mpe/register">
+<p>Nombre completo:<br><input name="name" required style="width:100%"></p>
+<p>Tipo de cuenta:<br><select name="role"><option value="trabajador">Trabajador</option><option value="empresa">Empresa</option></select></p>
+<p>Profesion (opcional):<br><input name="profession" style="width:100%"></p>
+<fieldset><legend>1) Foto del documento</legend><input type="file" id="docFile" accept="image/*" capture="environment"></fieldset>
+<fieldset><legend>2) Selfie en vivo</legend>
+<video id="cam" width="240" height="180" autoplay playsinline muted></video><br>
+<button type="button" id="snapBtn">Capturar selfie</button><br>
+o desde archivo: <input type="file" id="selfieFile" accept="image/*" capture="user">
+</fieldset>
+<input type="hidden" name="doc_image_b64" id="docB64">
+<input type="hidden" name="selfie_image_b64" id="selfieB64">
+<p id="st">Estado: pendiente</p>
+<button type="submit">Registrarme</button>
+</form>
+<canvas id="cv" style="display:none"></canvas>
+<script>
+(function(){
+var doc=document.getElementById('docFile');
+var slf=document.getElementById('selfieFile');
+var vid=document.getElementById('cam');
+var cv=document.getElementById('cv');
+var cx=cv.getContext('2d');
+var st=document.getElementById('st');
+function upd(){st.textContent='Estado: doc='+(document.getElementById('docB64').value?'OK':'falta')+' | selfie='+(document.getElementById('selfieB64').value?'OK':'falta');}
+function process(file,target){if(!file){return;}var r=new FileReader();r.onload=function(){var im=new Image();im.onload=function(){var max=800;var k=Math.min(1,max/Math.max(im.width,im.height));cv.width=Math.round(im.width*k);cv.height=Math.round(im.height*k);cx.drawImage(im,0,0,cv.width,cv.height);var d=cv.toDataURL('image/jpeg',0.72);document.getElementById(target).value=d.split(',')[1];upd();};im.src=r.result;};r.readAsDataURL(file);}
+doc.addEventListener('change',function(){process(doc.files[0],'docB64');});
+slf.addEventListener('change',function(){process(slf.files[0],'selfieB64');});
+if(navigator.mediaDevices&&navigator.mediaDevices.getUserMedia){navigator.mediaDevices.getUserMedia({video:{facingMode:'user'}}).then(function(s){vid.srcObject=s;}).catch(function(){st.textContent='Camara no disponible: use el archivo.';});}
+document.getElementById('snapBtn').addEventListener('click',function(){if(!vid.videoWidth){st.textContent='Camara aun no lista.';return;}var w=480;var k=w/vid.videoWidth;cv.width=w;cv.height=Math.round(vid.videoHeight*k);cx.drawImage(vid,0,0,cv.width,cv.height);var d=cv.toDataURL('image/jpeg',0.72);document.getElementById('selfieB64').value=d.split(',')[1];upd();});
+document.getElementById('f').addEventListener('submit',function(ev){if(!document.getElementById('docB64').value||!document.getElementById('selfieB64').value){ev.preventDefault();st.textContent='Falta foto del documento o selfie.';}});
+})();
+</script>
+</body>
+</html>"""
+
     def _register(self) -> None:
         form = self._read_form()
         role = self._form_value(
@@ -1070,11 +1123,32 @@ class MpeApiHandler(BaseHTTPRequestHandler):
             return
         zid = None
         if role == "trabajador":
+            doc_b64 = self._form_value(
+                form, "doc_image_b64"
+            )
+            selfie_b64 = self._form_value(
+                form, "selfie_image_b64"
+            )
+            if not doc_b64 or not selfie_b64:
+                self._html_error(
+                    400,
+                    "se requiere foto del documento"
+                    " y selfie",
+                )
+                return
             ok, data, _err = (
-                self.link.register_user(
-                    name
+                self.link.enroll_user(
+                    display_name=name,
+                    doc_image_b64=doc_b64,
+                    selfie_image_b64=selfie_b64,
                 )
             )
+            if not ok:
+                self._html_error(
+                    400,
+                    "registro rechazado: " + str(_err),
+                )
+                return
         else:
             ok, data, _err = (
                 self.link

@@ -466,6 +466,37 @@ class ZyraApiHandler(BaseHTTPRequestHandler):
                 "template_quality",
                 str(exc),
             ) from exc
+        if (
+            case.status != CASE_APPROVED
+            and case.result is not None
+            and case.result.duplicate_of is not None
+            and str(case.result.duplicate_of).startswith("ZID-")
+            and case.result.doc_match_score is not None
+            and float(case.result.doc_match_score)
+            >= float(getattr(engine._policy, "doc_auto", 0.55))
+        ):
+            existing_zid = str(case.result.duplicate_of)
+            try:
+                type(self).kernel.identity.require_identity(
+                    existing_zid
+                )
+            except Exception:
+                existing_zid = None
+            if existing_zid is not None:
+                self._ok(
+                    {
+                        "identity": {"zid": existing_zid},
+                        "proofing": {
+                            "case_id": case.case_id,
+                            "status": case.status,
+                            "linked": True,
+                            "reason": "existing_identity_matched",
+                        },
+                    },
+                    status=200,
+                )
+                return
+
         if case.status != CASE_APPROVED:
             self._send_json(
                 422,

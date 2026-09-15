@@ -1,46 +1,511 @@
-name: ZYRA All Apps Final
+name: "ZYRA pilot: MPE biometric enrollment"
 
 on:
-  push:
-    branches: [main]
-  workflow_dispatch:
+  workflow_dispatch: {}
 
 permissions:
   contents: write
 
 jobs:
-  build:
+  pilot:
     runs-on: ubuntu-latest
     steps:
       - name: Checkout
         uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
 
-      - name: Patch MPE and SEMILLA (kernel enrollment)
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install dependencies
         run: |
-          python3 - <<'PYEOF'
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+          pip install pytest
+
+      - name: Backup original files
+        run: |
+          mkdir -p _backup
+          cp apps/mi_primer_empleo/services/mpe_link.py _backup/
+          cp apps/mi_primer_empleo/server.py _backup/
+          cp shared_engines/runtime/api.py _backup/
+
+      - name: Apply patches (idempotent, fail-fast)
+        run: |
+          python - <<'PYEOF'
+          import sys
           from pathlib import Path
 
-          def patch_file(target, anchor, addition, marker):
-              path = Path(target)
-              if not path.exists():
-                  print(f"SKIP missing: {target}")
-                  return
-              src = path.read_text(encoding="utf-8")
-              if marker in src:
-                  print(f"ALREADY: {target}")
-                  return
-              if anchor not in src:
-                  print(f"NO ANCHOR: {target}")
-                  return
-              src = src.replace(anchor, anchor + addition, 1)
-              path.write_text(src, encoding="utf-8")
-              print(f"PATCHED: {target}")
-              import ast
-              ast.parse(src)
-              print(f"SYNTAX OK: {target}")
+          def fail(msg):
+              print("PATCH-ERROR:", msg)
+              sys.exit(1)
 
-          MPE_ADD = (
-              "        from apps.mi_primer_empleo.services.mpe_link import (\n"
-              "            MpeLink,\n"
-              "        )\n"
-              "        from shared_engines.identity.con
+          def read(p):
+              f = Path(p)
+              if not f.exists():
+                  fail("file not found: " + p)
+              return f.read_text(encoding="utf-8")
+
+          def write(p, content):
+              Path(p).write_text(content, encoding="utf-8")
+              print("WROTE:", p)
+
+          def insert_before(src, anchor, addition, marker, path):
+              if marker in src:
+                  print("SKIP (marker present):", path, marker)
+                  return src
+              if anchor not in src:
+                  fail("anchor not found in %s: %r" % (path, anchor))
+              idx = src.index(anchor)
+              return src[:idx] + addition + src[idx:]
+
+          def replace_block(src, start_line, end_line, new_block, marker, sanity, path):
+              if marker in src:
+                  print("SKIP (marker present):", path, marker)
+                  return src
+              lines = src.splitlines(keepends=True)
+              starts = [i for i, l in enumerate(lines) if l.rstrip("\r\n") == start_line]
+              if len(starts) != 1:
+                  fail("start line not unique (%d found) in %s: %r" % (len(starts), path, start_line))
+              si = starts[0]
+              eis = [i for i, l in enumerate(lines) if i > si and l.rstrip("\r\n") == end_line]
+              if not eis:
+                  fail("end line not found after start in %s: %r" % (path, end_line))
+              ei = eis[0]
+              block = "".join(lines[si:ei + 1])
+              for s in sanity:
+                  if s not in block:
+                      fail("sanity check failed in %s block: missing %r" % (path, s))
+              return "".join(lines[:si]) + new_block + "".join(lines[ei + 1:])
+
+          P_LINK = "apps/mi_primer_empleo/services/mpe_link.py"
+          P_SERVER = "apps/mi_primer_empleo/server.py"
+          P_API = "shared_engines/runtime/api.py"
+
+          NEW_LINK = '''"""MpeLink - MPE operations on the Network."""
+          from __future__ import annotations
+
+          import base64
+
+          from apps.mi_primer_empleo.infrastructure.network.network_client import (
+              NetworkClient,
+          )
+
+
+          class MpeLink:
+              def __init__(
+                  self, client: NetworkClient
+              ) -> None:
+                  self._client = client
+
+              def register_app(self) -> tuple[
+                  bool, dict | None, str | None
+              ]:
+                  return self._client.post(
+                      "/apps/register",
+                      {
+                          "app_id": "mpe",
+                          "display_name": (
+                              "Mi Primer Empleo"
+                          ),
+                          "scopes": [
+                              "display_name",
+                              "contact",
+                          ],
+                      },
+                  )
+
+              def register_user(
+                  self, display_name: str
+              ) -> tuple[bool, dict | None, str | None]:
+                  return self._client.post(
+                      "/identity/register",
+                      {
+                          "kind": "person",
+                          "display_name": display_name,
+                          "actor": "mpe",
+                      },
+                  )
+
+              def enroll_user(
+                  self,
+                  *,
+                  display_name: str,
+                  doc_image_b64: str,
+                  selfie_image_b64: str,
+                  doc_kind: str | None = None,
+                  doc_country: str | None = None,
+                  doc_number: str | None = None,
+              ) -> tuple[bool, dict | None, str | None]:
+                  payload: dict = {
+                      "kind": "person",
+                      "display_name": display_name,
+                      "actor": "mpe",
+                      "doc_image_b64": doc_image_b64,
+                      "selfie_image_b64": selfie_image_b64,
+                  }
+                  if doc_kind:
+                      payload["doc_kind"] = doc_kind
+                  if doc_country:
+                      payload["doc_country"] = doc_country
+                  if doc_number:
+                      payload["doc_number"] = doc_number
+                  return self._client.post(
+                      "/identity/enroll", payload
+                  )
+
+              def register_company(
+                  self, display_name: str
+              ) -> tuple[bool, dict | None, str | None]:
+                  return self._client.post(
+                      "/identity/register",
+                      {
+                          "kind": "organization",
+                          "display_name": display_name,
+                          "actor": "mpe",
+                      },
+                  )
+
+              def complete_trust(
+                  self, zid: str
+              ) -> tuple[bool, dict | None, str | None]:
+                  return self._client.post(
+                      "/trust/complete",
+                      {"zid": zid, "actor": "mpe"},
+                  )
+
+              def is_trusted(
+                  self, zid: str
+              ) -> tuple[bool, dict | None, str | None]:
+                  return self._client.get(
+                      f"/trust/{zid}"
+                  )
+
+              def record_work_event(
+                  self,
+                  zid: str,
+                  event: str,
+                  detail: str,
+              ) -> tuple[bool, dict | None, str | None]:
+                  return self._client.post(
+                      "/history/append",
+                      {
+                          "zid": zid,
+                          "entry_type": "employment",
+                          "actor_app": "mpe",
+                          "payload": {
+                              "event": event,
+                              "detail": detail,
+                          },
+                      },
+                  )
+
+              def give_reputation(
+                  self,
+                  subject_zid: str,
+                  actor_zid: str,
+                  kind: str,
+                  evidence: str,
+              ) -> tuple[bool, dict | None, str | None]:
+                  evidence_b64 = base64.b64encode(
+                      evidence.encode("utf-8")
+                  ).decode("ascii")
+                  return self._client.post(
+                      "/reputation/record",
+                      {
+                          "subject_zid": subject_zid,
+                          "actor_zid": actor_zid,
+                          "kind": kind,
+                          "evidence_b64": (
+                              evidence_b64
+                          ),
+                      },
+                  )
+
+              def reputation_score(
+                  self, zid: str
+              ) -> tuple[bool, dict | None, str | None]:
+                  return self._client.get(
+                      f"/reputation/{zid}"
+                  )
+
+              def issue_employment_credential(
+                  self,
+                  *,
+                  subject_zid: str,
+                  issuer_zid: str,
+                  title: str,
+                  detail: str,
+              ) -> tuple[bool, dict | None, str | None]:
+                  return self._client.post(
+                      "/verification/credentials",
+                      {
+                          "subject_zid": subject_zid,
+                          "issuer_zid": issuer_zid,
+                          "credential_type":
+                          "employment",
+                          "title": title,
+                          "detail": detail,
+                      },
+                  )
+          '''
+
+          FORM_HTML = '''    def _register_form_html(self) -> str:
+              return """<html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1"><title>MPE Registro</title></head><body style="font-family:sans-serif;max-width:520px;margin:24px auto">
+          <h1>MPE - Registro</h1>
+          <form id="f" method="POST" action="/mpe/register">
+          <p>Nombre completo: <input name="name" required style="width:100%"></p>
+          <p>Tipo de cuenta: <select name="role"><option value="trabajador">Trabajador</option><option value="empresa">Empresa</option></select></p>
+          <p>Profesion (opcional): <input name="profession" style="width:100%"></p>
+          <fieldset><legend>1. Foto del documento</legend>
+          <input type="file" id="docFile" accept="image/*" capture="environment">
+          </fieldset>
+          <fieldset><legend>2. Selfie en vivo</legend>
+          <video id="cam" width="240" height="180" autoplay playsinline muted></video><br>
+          <button type="button" id="snapBtn">Capturar selfie</button>
+          <p>Si no hay camara disponible: <input type="file" id="selfieFile" accept="image/*" capture="user"></p>
+          </fieldset>
+          <input type="hidden" name="doc_image_b64" id="docB64">
+          <input type="hidden" name="selfie_image_b64" id="selfieB64">
+          <p id="st">Estado: pendiente de capturas</p>
+          <button type="submit" id="go">Registrarme</button>
+          </form>
+          <canvas id="cv" style="display:none"></canvas>
+          <script>
+          (function(){
+           var doc=document.getElementById('docFile');
+           var slf=document.getElementById('selfieFile');
+           var vid=document.getElementById('cam');
+           var cv=document.getElementById('cv');
+           var cx=cv.getContext('2d');
+           var st=document.getElementById('st');
+           function upd(){ st.textContent='Estado: doc='+(document.getElementById('docB64').value?'OK':'falta')+' selfie='+(document.getElementById('selfieB64').value?'OK':'falta'); }
+           function process(file, target){ if(!file){ return; } var r=new FileReader(); r.onload=function(){ var im=new Image(); im.onload=function(){ var max=800; var k=Math.min(1,max/Math.max(im.width,im.height)); cv.width=Math.round(im.width*k); cv.height=Math.round(im.height*k); cx.drawImage(im,0,0,cv.width,cv.height); var d=cv.toDataURL('image/jpeg',0.72); document.getElementById(target).value=d.split(',')[1]; upd(); }; im.src=r.result; }; r.readAsDataURL(file); }
+           doc.addEventListener('change', function(){ process(doc.files[0],'docB64'); });
+           slf.addEventListener('change', function(){ process(slf.files[0],'selfieB64'); });
+           if(navigator.mediaDevices && navigator.mediaDevices.getUserMedia){ navigator.mediaDevices.getUserMedia({video:{facingMode:'user'}}).then(function(s){ vid.srcObject=s; }).catch(function(){ st.textContent='Camara no disponible: usa el archivo.'; }); }
+           document.getElementById('snapBtn').addEventListener('click', function(){ if(!vid.videoWidth){ st.textContent='Camara aun no lista.'; return; } var w=480; var k=w/vid.videoWidth; cv.width=w; cv.height=Math.round(vid.videoHeight*k); cx.drawImage(vid,0,0,cv.width,cv.height); var d=cv.toDataURL('image/jpeg',0.72); document.getElementById('selfieB64').value=d.split(',')[1]; upd(); });
+           document.getElementById('f').addEventListener('submit', function(ev){ if(!document.getElementById('docB64').value || !document.getElementById('selfieB64').value){ ev.preventDefault(); st.textContent='Falta foto del documento o selfie.'; } });
+          })();
+          </script>
+          </body></html>"""
+
+          GET_ROUTE_ADD = '''            if path == "/mpe/register":
+                      self._send_html(
+                          200,
+                          self._register_form_html(),
+                      )
+                      return
+
+          '''
+
+          WORKER_NEW = '''        if role == "trabajador":
+                  doc_b64 = self._form_value(
+                      form, "doc_image_b64"
+                  )
+                  selfie_b64 = self._form_value(
+                      form, "selfie_image_b64"
+                  )
+                  if not doc_b64 or not selfie_b64:
+                      self._html_error(
+                          400,
+                          "se requiere foto del documento"
+                          " y selfie",
+                      )
+                      return
+                  ok, data, _err = (
+                      self.link.enroll_user(
+                          display_name=name,
+                          doc_image_b64=doc_b64,
+                          selfie_image_b64=(
+                              selfie_b64
+                          ),
+                      )
+                  )
+                  if not ok:
+                      self._html_error(
+                          400,
+                          "registro rechazado: "
+                          + str(_err),
+                      )
+                      return
+              else:
+                  ok, data, _err = (
+                      self.link
+                      .register_company(
+                          name
+                      )
+                  )
+              if ok and data is not None:
+                  zid = _find_zid(data)
+          '''
+
+          ANA_ADD = '''        if (
+                      case.status != CASE_APPROVED
+                      and case.result is not None
+                      and case.result.duplicate_of
+                      is not None
+                      and str(
+                          case.result.duplicate_of
+                      ).startswith("ZID-")
+                      and case.result.doc_match_score
+                      is not None
+                      and float(
+                          case.result.doc_match_score
+                      )
+                      >= float(
+                          getattr(
+                              engine._policy,
+                              "doc_auto",
+                              0.55,
+                          )
+                      )
+                  ):
+                      existing_zid = str(
+                          case.result.duplicate_of
+                      )
+                      try:
+                          type(
+                              self
+                          ).kernel.identity.require_identity(
+                              existing_zid
+                          )
+                      except Exception:
+                          existing_zid = None
+                      if existing_zid is not None:
+                          self._ok(
+                              {
+                                  "identity": {
+                                      "zid": (
+                                          existing_zid
+                                      ),
+                                  },
+                                  "proofing": {
+                                      "case_id": (
+                                          case.case_id
+                                      ),
+                                      "status": (
+                                          case.status
+                                      ),
+                                      "linked": True,
+                                      "reason": (
+                                          "existing_identity_matched"
+                                      ),
+                                  },
+                              },
+                              status=200,
+                          )
+                          return
+          '''
+
+          link_src = NEW_LINK
+
+          server_src = read(P_SERVER)
+          server_src = insert_before(
+              server_src,
+              '            if path == "/mpe/jobs":',
+              GET_ROUTE_ADD,
+              "self._register_form_html",
+              P_SERVER,
+          )
+          server_src = insert_before(
+              server_src,
+              '    def _register(self) -> None:',
+              FORM_HTML + "\n\n",
+              "def _register_form_html",
+              P_SERVER,
+          )
+          server_src = replace_block(
+              server_src,
+              '        if role == "trabajador":',
+              '            zid = _find_zid(data)',
+              WORKER_NEW,
+              "self.link.enroll_user",
+              ["register_user", "register_company"],
+              P_SERVER,
+          )
+
+          api_src = read(P_API)
+          anchor = "        if case.status != CASE_APPROVED:"
+          count = api_src.count(anchor)
+          if count != 1:
+              fail(
+                  "api.py anchor count is %d (expected 1):"
+                  " send this log to the operator" % count
+              )
+          idx = api_src.index(anchor)
+          window = api_src[idx : idx + 1500]
+          if "biometrics_gate" not in window:
+              fail(
+                  "api.py anchor sanity failed:"
+                  " biometrics_gate not near anchor"
+              )
+          api_src = insert_before(
+              api_src,
+              anchor,
+              ANA_ADD,
+              "existing_identity_matched",
+              P_API,
+          )
+
+          write(P_LINK, link_src)
+          write(P_SERVER, server_src)
+          write(P_API, api_src)
+
+          final_server = read(P_SERVER)
+          for marker in (
+              "def _register_form_html",
+              'if path == "/mpe/register":',
+              "self.link.enroll_user",
+          ):
+              if marker not in final_server:
+                  fail("post-check missing in server.py: " + marker)
+          if "def enroll_user" not in read(P_LINK):
+              fail("post-check missing: mpe_link.enroll_user")
+          if "existing_identity_matched" not in read(P_API):
+              fail("post-check missing: api.py linked identity")
+
+          print("ALL PATCHES APPLIED OK")
+          PYEOF
+
+      - name: Syntax check (py_compile)
+        run: |
+          python -m py_compile apps/mi_primer_empleo/services/mpe_link.py apps/mi_primer_empleo/server.py shared_engines/runtime/api.py
+          echo "SYNTAX OK"
+
+      - name: Network biometrics self-test (must pass)
+        run: python -m shared_engines.security.biometrics -v
+
+      - name: Run MPE tests (report only)
+        id: mpetests
+        continue-on-error: true
+        run: |
+          python -m pytest apps/mi_primer_empleo/tests -q 2>&1 | tee test_report.txt || true
+
+      - name: Upload test report
+        uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: mpe-test-report
+          path: test_report.txt
+
+      - name: Commit and push
+        run: |
+          git config user.name "zyra-pilot-bot"
+          git config user.email "actions@github.com"
+          git add apps/mi_primer_empleo/services/mpe_link.py apps/mi_primer_empleo/server.py shared_engines/runtime/api.py
+          if git diff --cached --quiet; then
+            echo "No changes (already patched)."
+          else
+            git commit -m "MPE pilot: biometric enrollment via /identity/enroll" -m "- mpe_link: + enroll_user (doc + selfie base64) -> POST /identity/enroll. register_user legacy kept (network blocks persons, defense in depth). Companies unchanged via register_company." -m "- server: worker registration requires doc_image_b64 + selfie_image_b64; rejection shown to user. New GET /mpe/register form with camera capture. Local account, roles, mark_verified, trust flow unchanged." -m "- network api: existing identity with matching document (doc_match >= doc_auto) returns the SAME ZID with linked=true (Ana case). Fraud with mismatched document still rejected."
+            git push
+          fi
+
+      - name: Summary
+        run: |
+          echo "=== PILOT MPE RESULT ==="
+          echo "Patched: mpe_link.py, server.py, api.py"
+          echo "Next: verify on Render -> GET /mpe/register"

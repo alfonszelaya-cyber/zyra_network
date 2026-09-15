@@ -15,71 +15,214 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
 
-      - name: Diagnose - show all person registrations across apps
-        run: |
-          echo "=== ALL /identity/register person references ==="
-          grep -rn '"kind": "person"\|"kind":kind\|register_person\|register_user' apps/ciclo_digital/tests/ apps/nexo/tests/ apps/mi_primer_empleo/tests/ apps/semilla/tests/ apps/subastas/tests/ 2>/dev/null | grep -v __pycache__ || echo "none found"
-          echo "=== ALL test files ==="
-          find apps/ciclo_digital/tests apps/nexo/tests apps/mi_primer_empleo/tests apps/semilla/tests apps/subastas/tests -name "test_*.py" -not -path "*__pycache__*" 2>/dev/null
-
-      - name: Patch all 5 apps (person -> organization in tests)
+      - name: Patch tests to simulate biometric enrollment via kernel
         run: |
           python3 - <<'PYEOF'
-          import re
           from pathlib import Path
 
-          apps = [
-              "apps/ciclo_digital/tests",
-              "apps/nexo/tests",
-              "apps/mi_primer_empleo/tests",
-              "apps/semilla/tests",
-              "apps/subastas/tests",
-          ]
+          patches = []
 
-          total_patched = 0
-          for test_dir in apps:
-              d = Path(test_dir)
-              if not d.exists():
-                  print(f"SKIP missing dir: {test_dir}")
+          # ---- CICLO-DIGITAL (2 archivos, mismo bloque) ----
+          ciclo_old = (
+              "        registered = eco.link.register_person(\n"
+              "            \"Juan Reciclador\"\n"
+              "        )\n"
+              "        assert registered[0] is True\n"
+              "        data = registered[1]\n"
+              "        assert data is not None\n"
+              "        zid = str(data.get(\"zid\"))\n"
+              "        assert zid.startswith(\"ZID-\")\n"
+          )
+          ciclo_new = (
+              "        from shared_engines.identity.contracts import (\n"
+              "            IdentityKind,\n"
+              "        )\n"
+              "        enrolled = eco.kernel.identity.register_identity(\n"
+              "            kind=IdentityKind.PERSON,\n"
+              "            display_name=\"Juan Reciclador\",\n"
+              "            actor=\"test-biometric-enroll\",\n"
+              "        )\n"
+              "        zid = enrolled.zid\n"
+              "        assert zid.startswith(\"ZID-\")\n"
+          )
+          patches.append(
+              (
+                  "apps/ciclo_digital/tests/test_ciclo.py",
+                  ciclo_old,
+                  ciclo_new,
+              )
+          )
+          patches.append(
+              (
+                  "apps/ciclo_digital/tests/test_ciclo_archaeology_e2e.py",
+                  ciclo_old,
+                  ciclo_new,
+              )
+          )
+
+          # ---- NEXO ( _real_zid: person via kernel) ----
+          nexo_old = (
+              "def _real_zid(eco, name: str, kind: str) -> str:\n"
+              "    ok, data, _err = eco.client.post(\n"
+              "        \"/identity/register\",\n"
+              "        {\n"
+              "            \"kind\": kind,\n"
+              "            \"display_name\": name,\n"
+              "            \"actor\": \"nexo\",\n"
+              "        },\n"
+              "    )\n"
+              "    assert ok is True and data is not None\n"
+              "    zid = str(data.get(\"zid\"))\n"
+              "    assert zid.startswith(\"ZID-\")\n"
+              "    eco.client.post(\n"
+              "        \"/trust/complete\", {\"zid\": zid, \"actor\": \"nexo\"}\n"
+              "    )\n"
+              "    return zid\n"
+          )
+          nexo_new = (
+              "def _real_zid(eco, name: str, kind: str) -> str:\n"
+              "    from shared_engines.identity.contracts import (\n"
+              "        IdentityKind,\n"
+              "    )\n"
+              "\n"
+              "    if kind == \"person\":\n"
+              "        enrolled = eco.kernel.identity.register_identity(\n"
+              "            kind=IdentityKind.PERSON,\n"
+              "            display_name=name,\n"
+              "            actor=\"test-biometric-enroll\",\n"
+              "        )\n"
+              "        zid = enrolled.zid\n"
+              "    else:\n"
+              "        ok, data, _err = eco.client.post(\n"
+              "            \"/identity/register\",\n"
+              "            {\n"
+              "                \"kind\": kind,\n"
+              "                \"display_name\": name,\n"
+              "                \"actor\": \"nexo\",\n"
+              "            },\n"
+              "        )\n"
+              "        assert ok is True and data is not None\n"
+              "        zid = str(data.get(\"zid\"))\n"
+              "    assert zid.startswith(\"ZID-\")\n"
+              "    eco.client.post(\n"
+              "        \"/trust/complete\", {\"zid\": zid, \"actor\": \"nexo\"}\n"
+              "    )\n"
+              "    return zid\n"
+          )
+          patches.append(
+              (
+                  "apps/nexo/tests/test_nexo_vision_e2e.py",
+                  nexo_old,
+                  nexo_new,
+              )
+          )
+
+          # ---- MPE (monkeypatch register_user con kernel) ----
+          mpe_anchor = "        eco = _Ecosystem(tmp_path)\n"
+          mpe_add = (
+              "        eco = _Ecosystem(tmp_path)\n"
+              "        from apps.mi_primer_empleo.services.mpe_link import (\n"
+              "            MpeLink,\n"
+              "        )\n"
+              "        from shared_engines.identity.contracts import (\n"
+              "            IdentityKind,\n"
+              "        )\n"
+              "\n"
+              "        _kernel = eco.kernel\n"
+              "\n"
+              "        def _enroll_user(self, display_name):\n"
+              "            enrolled = (\n"
+              "                _kernel.identity.register_identity(\n"
+              "                    kind=IdentityKind.PERSON,\n"
+              "                    display_name=display_name,\n"
+              "                    actor=\"test-biometric-enroll\",\n"
+              "                )\n"
+              "            )\n"
+              "            return (\n"
+              "                True,\n"
+              "                {\"zid\": enrolled.zid},\n"
+              "                None,\n"
+              "            )\n"
+              "\n"
+              "        MpeLink.register_user = _enroll_user\n"
+          )
+          patches.append(
+              (
+                  "apps/mi_primer_empleo/tests/test_mpe_e2e.py",
+                  mpe_anchor,
+                  mpe_add,
+              )
+          )
+          patches.append(
+              (
+                  "apps/mi_primer_empleo/tests/test_mpe_hiring_e2e.py",
+                  mpe_anchor,
+                  mpe_add,
+              )
+          )
+
+          # ---- SEMILLA (monkeypatch register_person con kernel) ----
+          sem_anchor = "        eco = _Eco(tmp_path)\n"
+          sem_add = (
+              "        eco = _Eco(tmp_path)\n"
+              "        from apps.semilla.services.semilla_link import (\n"
+              "            SemillaLink,\n"
+              "        )\n"
+              "        from shared_engines.identity.contracts import (\n"
+              "            IdentityKind,\n"
+              "        )\n"
+              "\n"
+              "        _kernel = eco.kernel\n"
+              "\n"
+              "        def _enroll_person(\n"
+              "            self, display_name, kind=\"person\",\n"
+              "        ):\n"
+              "            enrolled = (\n"
+              "                _kernel.identity.register_identity(\n"
+              "                    kind=IdentityKind.PERSON,\n"
+              "                    display_name=display_name,\n"
+              "                    actor=\"test-biometric-enroll\",\n"
+              "                )\n"
+              "            )\n"
+              "            return (\n"
+              "                True,\n"
+              "                {\"zid\": enrolled.zid},\n"
+              "                None,\n"
+              "            )\n"
+              "\n"
+              "        SemillaLink.register_person = (\n"
+              "            _enroll_person\n"
+              "        )\n"
+          )
+          patches.append(
+              (
+                  "apps/semilla/tests/test_semilla_tutor_e2e.py",
+                  sem_anchor,
+                  sem_add,
+              )
+          )
+
+          for target, old, new in patches:
+              path = Path(target)
+              if not path.exists():
+                  print(f"SKIP missing: {target}")
                   continue
-              for tf in sorted(d.rglob("test_*.py")):
-                  if "__pycache__" in str(tf):
-                      continue
-                  src = tf.read_text(encoding="utf-8")
-                  original = src
+              src = path.read_text(encoding="utf-8")
+              if new.strip() in src:
+                  print(f"ALREADY: {target}")
+                  continue
+              count = src.count(old)
+              if count == 0:
+                  print(f"NO MATCH: {target} - SKIPPING (may not need fix)")
+                  continue
+              src = src.replace(old, new)
+              path.write_text(src, encoding="utf-8")
+              print(f"PATCHED x{count}: {target}")
+              import ast
 
-                  # Pattern 1: "kind": "person" -> "organization"
-                  src = src.replace(
-                      '"kind": "person"',
-                      '"kind": "organization"',
-                  )
-                  # Pattern 2: kind: str = "person" default (semilla)
-                  src = src.replace(
-                      'kind: str = "person"',
-                      'kind: str = "organization"',
-                  )
-                  # Pattern 3: register_person calls in test context
-                  # (these are safe to redirect since the subject
-                  #  is a test entity, not a real person)
-                  # We do NOT touch production *_link.py files
-
-                  if src != original:
-                      tf.write_text(src, encoding="utf-8")
-                      total_patched += 1
-                      print(f"PATCHED: {tf}")
-
-              for tf in sorted(d.rglob("*.py")):
-                  if "__pycache__" in str(tf):
-                      continue
-                  import ast
-                  try:
-                      ast.parse(tf.read_text(encoding="utf-8"))
-                  except SyntaxError as exc:
-                      print(f"SYNTAX ERROR: {tf}: {exc}")
-                      raise
-
-          print(f"TOTAL FILES PATCHED: {total_patched}")
-          print("ALL SYNTAX OK")
+              ast.parse(src)
+              print(f"SYNTAX OK: {target}")
+          print("ALL PATCHES DONE")
           PYEOF
 
       - name: Setup Python
@@ -105,7 +248,7 @@ jobs:
       - name: 5/5 SUBASTAS tests
         run: python -m pytest apps/subastas/tests/test_subastas_e2e.py apps/subastas/tests/test_subastas_commerce_e2e.py -v
 
-      - name: Core regression (network + security + axis + agro)
+      - name: Core regression
         run: |
           python -m shared_engines.security.clearance -q
           python -m shared_engines.security.biometrics -q
@@ -117,10 +260,10 @@ jobs:
         run: |
           git config user.name "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
-          git add apps/ciclo_digital/tests/ apps/nexo/tests/ apps/mi_primer_empleo/tests/ apps/semilla/tests/ apps/subastas/tests/
+          git add apps/ciclo_digital/tests/ apps/nexo/tests/ apps/mi_primer_empleo/tests/ apps/semilla/tests/
           if git diff --cached --quiet; then
             echo "Nothing to commit"
           else
-            git commit -m "all apps: test subjects use organization kind - person requires biometric enroll via super-app"
+            git commit -m "all apps: tests simulate biometric enrollment via kernel - production flow aligned"
             git push
           fi

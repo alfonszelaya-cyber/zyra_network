@@ -79,13 +79,15 @@ def test_network_flow_replica(tmp_path: Path) -> None:
     eco = _Eco(tmp_path)
     try:
         eco.link.register_app()
-        registered = eco.link.register_person(
-            "Juan Reciclador"
+        from shared_engines.identity.contracts import (
+            IdentityKind,
         )
-        assert registered[0] is True
-        data = registered[1]
-        assert data is not None
-        zid = str(data.get("zid"))
+        enrolled = eco.kernel.identity.register_identity(
+            kind=IdentityKind.PERSON,
+            display_name="Juan Reciclador",
+            actor="test-biometric-enroll",
+        )
+        zid = enrolled.zid
         assert zid.startswith("ZID-")
         recycled = eco.link.seal_recycled(
             owner_zid=zid,

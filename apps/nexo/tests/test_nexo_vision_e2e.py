@@ -101,16 +101,27 @@ def _h(url: str) -> str:
 
 
 def _real_zid(eco, name: str, kind: str) -> str:
-    ok, data, _err = eco.client.post(
-        "/identity/register",
-        {
-            "kind": kind,
-            "display_name": name,
-            "actor": "nexo",
-        },
+    from shared_engines.identity.contracts import (
+        IdentityKind,
     )
-    assert ok is True and data is not None
-    zid = str(data.get("zid"))
+    if kind == "person":
+        enrolled = eco.kernel.identity.register_identity(
+            kind=IdentityKind.PERSON,
+            display_name=name,
+            actor="test-biometric-enroll",
+        )
+        zid = enrolled.zid
+    else:
+        ok, data, _err = eco.client.post(
+            "/identity/register",
+            {
+                "kind": kind,
+                "display_name": name,
+                "actor": "nexo",
+            },
+        )
+        assert ok is True and data is not None
+        zid = str(data.get("zid"))
     assert zid.startswith("ZID-")
     eco.client.post(
         "/trust/complete", {"zid": zid, "actor": "nexo"}

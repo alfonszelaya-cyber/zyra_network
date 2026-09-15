@@ -1,4 +1,4 @@
-name: "ZYRA: cierre AGRO+SEMILLA (biometria total) + render data dir"
+name: "ZYRA: cierre AGRO+SEMILLA v2 (auto-neutraliza llamadas viejas)"
 
 on:
   workflow_dispatch:
@@ -20,6 +20,13 @@ jobs:
         with:
           fetch-depth: 0
 
+      - name: Repo state report
+        run: |
+          echo "=== marcadores actuales en GitHub ==="
+          echo "agro server legacy calls: $(grep -c 'link.register_producer_zid(' apps/agro/server.py || true)"
+          echo "semilla server legacy calls: $(grep -c 'link.register_person(' apps/semilla/server.py || true)"
+          echo "render /tmp: $(grep -c '/tmp/zyra-data' render.yaml || true)"
+
       - name: Setup Python 3.11
         uses: actions/setup-python@v5
         with:
@@ -31,7 +38,7 @@ jobs:
           pip install -r requirements.txt
           pip install pytest
 
-      - name: Apply closing patches
+      - name: Apply closing patches v2
         run: |
           python3 - <<'PYEOF'
           import sys
@@ -72,6 +79,14 @@ jobs:
               return hits
 
 
+          def delete_seq(lines, seq, path, tag):
+              hits = find_seq(lines, seq)
+              if len(hits) != 1:
+                  fail("%s count %d (need 1) in %s" % (tag, len(hits), path))
+              print("DELETE %s in %s (%d lines)" % (tag, path, len(seq)))
+              return lines[: hits[0]] + lines[hits[0] + len(seq):]
+
+
           def replace_seq(lines, seq, block, path, tag):
               hits = find_seq(lines, seq)
               if len(hits) != 1:
@@ -80,14 +95,6 @@ jobs:
               ind = leading(lines[hits[0]])
               new = [(ind + t + "\n") if t else "\n" for t in block]
               return lines[: hits[0]] + new + lines[hits[0] + len(seq):]
-
-
-          def delete_seq(lines, seq, path, tag):
-              hits = find_seq(lines, seq)
-              if len(hits) != 1:
-                  fail("%s count %d (need 1) in %s" % (tag, len(hits), path))
-              print("DELETE %s in %s (%d lines)" % (tag, path, len(seq)))
-              return lines[: hits[0]] + lines[hits[0] + len(seq):]
 
 
           def safe_compile(src, path):
@@ -112,8 +119,10 @@ jobs:
 
           P_AGRO = "apps/agro/server.py"
           P_SEM = "apps/semilla/server.py"
+          P_SEM_LINK = "apps/semilla/services/semilla_link.py"
           P_RENDER = "render.yaml"
 
+          # ---------- AGRO: ruta API /agro/producers -> biometria
           AGRO_SEQ = [
               "zid: str | None = None",
               "synced = False",
@@ -202,6 +211,40 @@ jobs:
               "    synced = zid is not None",
           ]
 
+          agro_lines = read_lines(P_AGRO)
+          if "link.register_producer_zid(" in to_text(agro_lines):
+              agro_lines = replace_seq(agro_lines, AGRO_SEQ, AGRO_NEW, P_AGRO, "producers-api-route")
+          else:
+              print("SKIP AGRO (already fixed)")
+
+          # ---------- SEMILLA link: metodo bloqueador (idempotente)
+          sem_link_lines = read_lines(P_SEM_LINK)
+          if "def person_register_blocked" not in to_text(sem_link_lines):
+              anchors = [i for i, l in enumerate(sem_link_lines) if l.strip().startswith("def complete_trust(")]
+              if len(anchors) != 1:
+                  fail("semilla link anchor def complete_trust count %d (need 1)" % len(anchors))
+              ind = leading(sem_link_lines[anchors[0]])
+              BLOCKER = [
+                  "def person_register_blocked(",
+                  "    self, *args, **kwargs",
+                  ") -> tuple[bool, dict | None, str | None]:",
+                  "    \"\"\"LAW: person registration requires",
+                  "    biometric enrollment. Legacy calls are",
+                  "    rejected here, no network round-trip.\"\"\"",
+                  "    raise ValueError(",
+                  '        "registro de persona requiere biometria:"',
+                  '        " use el registro con documento y selfie"',
+                  "    )",
+                  "",
+                  "",
+              ]
+              new = [(ind + t + "\n") if t else "\n" for t in BLOCKER]
+              sem_link_lines = sem_link_lines[: anchors[0]] + new + sem_link_lines[anchors[0]:]
+              print("INSERTED person_register_blocked in semilla_link")
+          else:
+              print("SKIP semilla_link blocker (already present)")
+
+          # ---------- SEMILLA server: remnant conocido + CUALQUIER otra llamada vieja
           SEM_SEQ = [
               "zid: str | None = None",
               'if role == "alumno":',
@@ -224,18 +267,30 @@ jobs:
               ")",
           ]
 
-          agro_lines = read_lines(P_AGRO)
-          if "link.register_producer_zid(" in to_text(agro_lines):
-              agro_lines = replace_seq(agro_lines, AGRO_SEQ, AGRO_NEW, P_AGRO, "producers-api-route")
-          else:
-              print("SKIP AGRO (already fixed)")
-
           sem_lines = read_lines(P_SEM)
-          if "link.register_person(" in to_text(sem_lines):
+          if find_seq(sem_lines, SEM_SEQ):
               sem_lines = delete_seq(sem_lines, SEM_SEQ, P_SEM, "semilla-remnant")
           else:
-              print("SKIP SEMILLA (already fixed)")
+              print("SKIP semilla-remnant (already deleted)")
 
+          occ = [i for i, l in enumerate(sem_lines) if "link.register_person(" in l]
+          if occ:
+              print("FOUND %d legacy person-register call site(s):" % len(occ))
+              for i in occ:
+                  print("  --- context around line %d ---" % (i + 1))
+                  for k in range(max(0, i - 10), min(len(sem_lines), i + 12)):
+                      mark = ">>" if k == i else "  "
+                      print("  %s %4d| %s" % (mark, k + 1, sem_lines[k].rstrip()))
+              for i in occ:
+                  sem_lines[i] = sem_lines[i].replace(
+                      "link.register_person(",
+                      "link.person_register_blocked(",
+                  )
+              print("NEUTRALIZED %d legacy call site(s)" % len(occ))
+          else:
+              print("NO legacy person-register call sites remain")
+
+          # ---------- render.yaml persistente
           render_txt = Path(P_RENDER).read_text(encoding="utf-8")
           if "/tmp/zyra-data" in render_txt:
               render_txt = render_txt.replace(
@@ -249,19 +304,26 @@ jobs:
 
           safe_compile(to_text(agro_lines), P_AGRO)
           safe_compile(to_text(sem_lines), P_SEM)
+          safe_compile(to_text(sem_link_lines), P_SEM_LINK)
 
           Path(P_AGRO).write_text(to_text(agro_lines), encoding="utf-8")
           Path(P_SEM).write_text(to_text(sem_lines), encoding="utf-8")
-          print("WROTE: 3 files")
+          Path(P_SEM_LINK).write_text(to_text(sem_link_lines), encoding="utf-8")
+          print("WROTE: 4 files")
 
           agro_txt = Path(P_AGRO).read_text(encoding="utf-8")
           sem_txt = Path(P_SEM).read_text(encoding="utf-8")
+          sem_link_txt = Path(P_SEM_LINK).read_text(encoding="utf-8")
           if "link.register_producer_zid(" in agro_txt:
               fail("post-check: register_producer_zid still called in agro server")
           if "link.enroll_producer(" not in agro_txt:
               fail("post-check: enroll_producer missing in agro server")
           if "link.register_person(" in sem_txt:
               fail("post-check: register_person still called in semilla server")
+          if "link.person_register_blocked(" not in sem_txt:
+              fail("post-check: blocked call missing in semilla server")
+          if "def person_register_blocked" not in sem_link_txt:
+              fail("post-check: blocker method missing in semilla link")
           if "link.enroll_person(" not in sem_txt:
               fail("post-check: enroll_person missing in semilla server")
           if "link.register_organization(" not in sem_txt:
@@ -274,7 +336,7 @@ jobs:
 
       - name: Syntax check
         run: |
-          python3 -m py_compile apps/agro/server.py apps/semilla/server.py
+          python3 -m py_compile apps/agro/server.py apps/semilla/server.py apps/semilla/services/semilla_link.py
           echo "SYNTAX OK"
 
       - name: Network biometrics self-test
@@ -289,11 +351,11 @@ jobs:
         run: |
           git config user.name "zyra-pilot-bot"
           git config user.email "actions@github.com"
-          git add apps/agro/server.py apps/semilla/server.py render.yaml
+          git add apps/agro/server.py apps/semilla/server.py apps/semilla/services/semilla_link.py render.yaml
           if git diff --cached --quiet; then
             echo "No changes (already patched)."
           else
-            git commit -m "AGRO producers API + SEMILLA remnant: enforce biometric enrollment; render.yaml data dir durable" -m "AGRO /agro/producers now requires doc+selfie and calls enroll_producer (JSON and HTML). SEMILLA: removed legacy remnant that reset zid to None after enrollment (broke all 3 roles). render.yaml: ZYRA_DATA_DIR moved out of /tmp per durability contract in main.py."
+            git commit -m "AGRO producers API + SEMILLA: enforce biometric enrollment everywhere; render data dir durable" -m "AGRO /agro/producers requires doc+selfie via enroll_producer (JSON and HTML). SEMILLA: remnant deleted; ANY remaining legacy person-register call site neutralized via person_register_blocked (rejects with clear message, context printed in CI log). render.yaml: durable data dir."
             git pull --rebase origin main
             git push
           fi

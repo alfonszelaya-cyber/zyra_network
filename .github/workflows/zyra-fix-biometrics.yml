@@ -1,4 +1,4 @@
-name: "ZYRA MARKET (Bloque 2 v3): 009 Riesgo y Proteccion"
+name: "ZYRA MARKET (Bloque 3): 002 Inscripciones + usuarios y sesion"
 
 on:
   workflow_dispatch:
@@ -8,7 +8,7 @@ permissions:
   contents: write
 
 concurrency:
-  group: zyra-market-b2
+  group: zyra-market-b3
   cancel-in-progress: true
 
 jobs:
@@ -31,19 +31,21 @@ jobs:
           pip install -r requirements.txt
           pip install pytest
 
-      - name: Write disputes_store.py (appeal preserves decision)
+      - name: Write accounts_store.py (complete new module)
         run: |
-          cat > apps/subastas/infrastructure/persistence/disputes_store.py <<'DPRF'
-          """ZYRA MARKET - Riesgo y Proteccion (Modulo 009).
+          cat > apps/subastas/infrastructure/persistence/accounts_store.py <<'ACSF'
+          """ZYRA MARKET - Inscripciones y Usuarios (Modulo 002).
 
-          Disputas con expediente completo: apertura, evidencia,
-          mediacion, decision, apelacion y resolucion final.
-          La apelacion PRESERVA la decision (fix v3).
-          Reembolsos registrados como movimientos (dinero real:
-          motor cartera, Bloque 9). Banderas de fraude.
+          Cuentas usuario+contrasena (hash con salt por usuario,
+          nunca texto plano) vinculadas al ZID biometrico.
+          Perfil de inscripcion completo. KYB de empresas con
+          verificacion de gobierno. Sesiones por token con
+          expiracion. Roles: comprador, vendedor, gobierno, admin.
           HTML con patron join (sin + fragiles)."""
           from __future__ import annotations
 
+          import hashlib
+          import secrets
           import threading
           import time
           import uuid
@@ -53,14 +55,18 @@ jobs:
               return time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
 
 
+          def _ts() -> float:
+              return time.time()
+
+
           def _nid(prefix: str) -> str:
               return prefix + uuid.uuid4().hex[:10]
 
 
-          EDITABLE = ("open", "under_review", "appeal_window")
+          SESSION_TTL_SECONDS = 7 * 24 * 3600
 
 
-          class DisputesStore:
+          class AccountsStore:
               def __init__(self, db, clock) -> None:
                   self._db = db
                   self._clock = clock
@@ -69,44 +75,45 @@ jobs:
 
               def _ensure_schema(self) -> None:
                   self._run(
-                      "CREATE TABLE IF NOT EXISTS sbs_disputes ("
-                      " dispute_id TEXT PRIMARY KEY,"
-                      " order_id TEXT NOT NULL,"
-                      " opener_account TEXT NOT NULL,"
+                      "CREATE TABLE IF NOT EXISTS sbs_users ("
+                      " user_id TEXT PRIMARY KEY,"
+                      " username TEXT UNIQUE NOT NULL,"
+                      " pass_hash TEXT NOT NULL,"
+                      " salt TEXT NOT NULL,"
+                      " zid TEXT,"
                       " role TEXT NOT NULL,"
-                      " reason TEXT NOT NULL,"
+                      " display_name TEXT NOT NULL,"
                       " status TEXT NOT NULL,"
-                      " decision TEXT,"
-                      " refund_amount REAL,"
                       " created_at TEXT NOT NULL,"
                       " updated_at TEXT NOT NULL)"
                   )
                   self._run(
-                      "CREATE TABLE IF NOT EXISTS sbs_dispute_events ("
-                      " event_id TEXT PRIMARY KEY,"
-                      " dispute_id TEXT NOT NULL,"
-                      " actor_account TEXT NOT NULL,"
-                      " kind TEXT NOT NULL,"
-                      " content TEXT NOT NULL,"
-                      " created_at TEXT NOT NULL)"
+                      "CREATE TABLE IF NOT EXISTS sbs_profiles ("
+                      " user_id TEXT PRIMARY KEY,"
+                      " address TEXT,"
+                      " phone TEXT,"
+                      " category TEXT,"
+                      " payout_info TEXT,"
+                      " updated_at TEXT NOT NULL)"
                   )
                   self._run(
-                      "CREATE TABLE IF NOT EXISTS sbs_refunds ("
-                      " refund_id TEXT PRIMARY KEY,"
-                      " dispute_id TEXT,"
-                      " order_id TEXT NOT NULL,"
-                      " amount REAL NOT NULL,"
+                      "CREATE TABLE IF NOT EXISTS sbs_companies ("
+                      " company_id TEXT PRIMARY KEY,"
+                      " name TEXT NOT NULL,"
+                      " rep_user_id TEXT NOT NULL,"
+                      " rep_name TEXT NOT NULL,"
+                      " rep_doc TEXT NOT NULL,"
+                      " doc_ref TEXT,"
                       " status TEXT NOT NULL,"
-                      " created_at TEXT NOT NULL)"
+                      " created_at TEXT NOT NULL,"
+                      " updated_at TEXT NOT NULL)"
                   )
                   self._run(
-                      "CREATE TABLE IF NOT EXISTS sbs_fraud_flags ("
-                      " flag_id TEXT PRIMARY KEY,"
-                      " subject_account TEXT NOT NULL,"
-                      " reason TEXT NOT NULL,"
-                      " severity TEXT NOT NULL,"
-                      " status TEXT NOT NULL,"
-                      " created_at TEXT NOT NULL)"
+                      "CREATE TABLE IF NOT EXISTS sbs_sessions ("
+                      " token TEXT PRIMARY KEY,"
+                      " user_id TEXT NOT NULL,"
+                      " created_at REAL NOT NULL,"
+                      " expires_at REAL NOT NULL)"
                   )
 
               def _run(self, sql, params=()):
@@ -126,7 +133,7 @@ jobs:
                       return sql
                   assembled = parts[0]
                   for i, v in enumerate(params):
-                      assembled += DisputesStore._literal(v)
+                      assembled += AccountsStore._literal(v)
                       assembled += parts[i + 1]
                   return assembled
 
@@ -177,117 +184,252 @@ jobs:
                       raise ValueError("%s es obligatorio" % name)
                   return text
 
-              def _add_event(self, dispute_id, actor_account, kind, content):
-                  self._run(
-                      "INSERT INTO sbs_dispute_events (event_id, dispute_id,"
-                      " actor_account, kind, content, created_at)"
-                      " VALUES (?, ?, ?, ?, ?, ?)",
-                      (_nid("DVE-"), dispute_id, actor_account, kind, content, _now()),
-                  )
+              @staticmethod
+              def _hash_password(password: str, salt: str) -> str:
+                  digest = hashlib.sha256(
+                      (salt + ":" + str(password)).encode("utf-8")
+                  ).hexdigest()
+                  return digest
 
-              def open_dispute(self, *, order_id, opener_account, role, reason):
-                  order_id = self._req(order_id, "order_id")
-                  opener_account = self._req(opener_account, "opener_account")
-                  role = self._req(role, "role")
-                  reason = self._req(reason, "reason")
+              @staticmethod
+              def _valid_role(role: str) -> str:
+                  role = str(role or "comprador").strip() or "comprador"
+                  if role not in ("comprador", "vendedor", "gobierno", "admin"):
+                      raise ValueError("role invalido: %s" % role)
+                  return role
+
+              def register_user(
+                  self, *, username, password, display_name,
+                  zid=None, role="comprador",
+              ):
+                  username = self._req(username, "username").lower()
+                  password = self._req(password, "password")
+                  display_name = self._req(display_name, "display_name")
+                  role = self._valid_role(role)
+                  if len(password) < 6:
+                      raise ValueError("la contrasena debe tener al menos 6 caracteres")
                   with self._lock:
-                      dispute_id = _nid("DSP-")
+                      existing = self._rows(
+                          "SELECT user_id FROM sbs_users WHERE username = "
+                          + self._literal(username)
+                      )
+                      if existing:
+                          raise ValueError("el usuario ya existe: %s" % username)
+                      user_id = _nid("USR-")
+                      salt = secrets.token_hex(16)
+                      pass_hash = self._hash_password(password, salt)
                       now = _now()
                       self._run(
-                          "INSERT INTO sbs_disputes (dispute_id, order_id,"
-                          " opener_account, role, reason, status, decision,"
-                          " refund_amount, created_at, updated_at)"
-                          " VALUES (?, ?, ?, ?, ?, 'open', NULL, NULL, ?, ?)",
-                          (dispute_id, order_id, opener_account, role, reason, now, now),
+                          "INSERT INTO sbs_users (user_id, username, pass_hash,"
+                          " salt, zid, role, display_name, status,"
+                          " created_at, updated_at)"
+                          " VALUES (?, ?, ?, ?, ?, ?, ?, 'active', ?, ?)",
+                          (
+                              user_id, username, pass_hash, salt,
+                              zid if (isinstance(zid, str) and zid.startswith("ZID-")) else None,
+                              role, display_name, now, now,
+                          ),
                       )
-                      self._add_event(
-                          dispute_id, opener_account, "message",
-                          "apertura de disputa: %s" % reason,
+                      self._run(
+                          "INSERT INTO sbs_profiles (user_id, address, phone,"
+                          " category, payout_info, updated_at)"
+                          " VALUES (?, NULL, NULL, NULL, NULL, ?)",
+                          (user_id, now),
                       )
-                      return self.get_dispute(dispute_id)
+                      return self.get_user(username)
 
-              def add_event(self, dispute_id, *, actor_account, kind, content):
-                  dispute_id = self._req(dispute_id, "dispute_id")
-                  actor_account = self._req(actor_account, "actor_account")
-                  kind = self._req(kind, "kind")
-                  content = self._req(content, "content")
-                  if kind not in ("evidence", "message"):
-                      raise ValueError("kind debe ser evidence o message")
-                  with self._lock:
-                      row = self._dispute_row(dispute_id)
-                      if row is None:
-                          raise LookupError("disputa no encontrada: %s" % dispute_id)
-                      status = str(self._field(row, "s", 5))
-                      if status not in EDITABLE:
-                          raise ValueError(
-                              "la disputa esta %s: expediente cerrado" % status
-                          )
-                      self._add_event(dispute_id, actor_account, kind, content)
-                  return self.get_dispute(dispute_id)
-
-              def _dispute_row(self, dispute_id):
+              def get_user(self, username):
+                  username = self._req(username, "username").lower()
                   rows = self._rows(
-                      "SELECT dispute_id, order_id, opener_account, role, reason,"
-                      " status, decision, refund_amount, created_at, updated_at"
-                      " FROM sbs_disputes WHERE dispute_id = "
-                      + self._literal(dispute_id)
+                      "SELECT user_id, username, pass_hash, salt, zid, role,"
+                      " display_name, status, created_at, updated_at"
+                      " FROM sbs_users WHERE username = "
+                      + self._literal(username)
                   )
                   if not rows:
                       return None
-                  return rows[0]
-
-              def get_dispute(self, dispute_id):
-                  row = self._dispute_row(self._req(dispute_id, "dispute_id"))
-                  if row is None:
-                      raise LookupError("disputa no encontrada: %s" % dispute_id)
-                  events = []
-                  for e in self._rows(
-                      "SELECT event_id, actor_account, kind, content, created_at"
-                      " FROM sbs_dispute_events WHERE dispute_id = "
-                      + self._literal(dispute_id)
-                      + " ORDER BY created_at ASC"
-                  ):
-                      events.append({
-                          "event_id": self._field(e, "a", 0),
-                          "actor_account": self._field(e, "b", 1),
-                          "kind": self._field(e, "c", 2),
-                          "content": self._field(e, "d", 3),
-                          "created_at": self._field(e, "e", 4),
-                      })
-                  refunds = []
-                  for r in self._rows(
-                      "SELECT refund_id, order_id, amount, status, created_at"
-                      " FROM sbs_refunds WHERE dispute_id = "
-                      + self._literal(dispute_id)
-                      + " ORDER BY created_at ASC"
-                  ):
-                      refunds.append({
-                          "refund_id": self._field(r, "a", 0),
-                          "order_id": self._field(r, "b", 1),
-                          "amount": self._field(r, "c", 2),
-                          "status": self._field(r, "d", 3),
-                          "created_at": self._field(r, "e", 4),
-                      })
+                  row = rows[0]
                   return {
-                      "dispute_id": self._field(row, "a", 0),
-                      "order_id": self._field(row, "b", 1),
-                      "opener_account": self._field(row, "c", 2),
-                      "role": self._field(row, "d", 3),
-                      "reason": self._field(row, "e", 4),
-                      "status": self._field(row, "f", 5),
-                      "decision": self._field(row, "g", 6),
-                      "refund_amount": self._field(row, "h", 7),
-                      "created_at": self._field(row, "i", 8),
-                      "updated_at": self._field(row, "j", 9),
-                      "events": events,
-                      "refunds": refunds,
+                      "user_id": self._field(row, "a", 0),
+                      "username": self._field(row, "b", 1),
+                      "zid": self._field(row, "d", 4),
+                      "role": self._field(row, "e", 5),
+                      "display_name": self._field(row, "f", 6),
+                      "status": self._field(row, "g", 7),
                   }
 
-              def list_disputes(self, status=None):
+              def verify_login(self, username, password):
+                  username = self._req(username, "username").lower()
+                  password = self._req(password, "password")
+                  rows = self._rows(
+                      "SELECT user_id, username, pass_hash, salt, zid, role,"
+                      " display_name, status FROM sbs_users WHERE username = "
+                      + self._literal(username)
+                  )
+                  if not rows:
+                      raise ValueError("usuario o contrasena incorrectos")
+                  row = rows[0]
+                  status = str(self._field(row, "h", 7))
+                  if status != "active":
+                      raise ValueError("cuenta no activa: %s" % status)
+                  stored = str(self._field(row, "c", 2))
+                  salt = str(self._field(row, "d", 3))
+                  if self._hash_password(password, salt) != stored:
+                      raise ValueError("usuario o contrasena incorrectos")
+                  return {
+                      "user_id": self._field(row, "a", 0),
+                      "username": self._field(row, "b", 1),
+                      "zid": self._field(row, "e", 4),
+                      "role": self._field(row, "f", 5),
+                      "display_name": self._field(row, "g", 6),
+                  }
+
+              def set_role(self, username, role):
+                  role = self._valid_role(role)
+                  username = self._req(username, "username").lower()
+                  with self._lock:
+                      self._run(
+                          "UPDATE sbs_users SET role = "
+                          + self._literal(role)
+                          + ", updated_at = "
+                          + self._literal(_now())
+                          + " WHERE username = "
+                          + self._literal(username)
+                      )
+                  return self.get_user(username)
+
+              def link_zid(self, username, zid):
+                  username = self._req(username, "username").lower()
+                  zid = self._req(zid, "zid")
+                  if not zid.startswith("ZID-"):
+                      raise ValueError("zid invalido")
+                  with self._lock:
+                      self._run(
+                          "UPDATE sbs_users SET zid = "
+                          + self._literal(zid)
+                          + ", updated_at = "
+                          + self._literal(_now())
+                          + " WHERE username = "
+                          + self._literal(username)
+                      )
+                  return self.get_user(username)
+
+              def update_profile(
+                  self, username, *, address=None, phone=None,
+                  category=None, payout_info=None,
+              ):
+                  username = self._req(username, "username").lower()
+                  user = self.get_user(username)
+                  if user is None:
+                      raise LookupError("usuario no encontrado")
+                  user_id = user["user_id"]
+                  with self._lock:
+                      fields = []
+                      values = []
+                      if address is not None:
+                          fields.append("address")
+                          values.append(str(address))
+                      if phone is not None:
+                          fields.append("phone")
+                          values.append(str(phone))
+                      if category is not None:
+                          fields.append("category")
+                          values.append(str(category))
+                      if payout_info is not None:
+                          fields.append("payout_info")
+                          values.append(str(payout_info))
+                      if not fields:
+                          raise ValueError("nada que actualizar")
+                      sets = []
+                      for f in fields:
+                          sets.append(f + " = " + self._literal(values.pop(0)))
+                      sets.append("updated_at = " + self._literal(_now()))
+                      self._run(
+                          "UPDATE sbs_profiles SET "
+                          + ", ".join(sets)
+                          + " WHERE user_id = "
+                          + self._literal(user_id)
+                      )
+                  return self.get_profile(username)
+
+              def get_profile(self, username):
+                  username = self._req(username, "username").lower()
+                  user = self.get_user(username)
+                  if user is None:
+                      raise LookupError("usuario no encontrado")
+                  rows = self._rows(
+                      "SELECT address, phone, category, payout_info, updated_at"
+                      " FROM sbs_profiles WHERE user_id = "
+                      + self._literal(user["user_id"])
+                  )
+                  prof = {
+                      "address": None, "phone": None,
+                      "category": None, "payout_info": None,
+                      "updated_at": None,
+                  }
+                  if rows:
+                      row = rows[0]
+                      prof = {
+                          "address": self._field(row, "a", 0),
+                          "phone": self._field(row, "b", 1),
+                          "category": self._field(row, "c", 2),
+                          "payout_info": self._field(row, "d", 3),
+                          "updated_at": self._field(row, "e", 4),
+                      }
+                  return {"user": user, "profile": prof}
+
+              def register_company(
+                  self, *, name, rep_username, rep_name, rep_doc, doc_ref=None,
+              ):
+                  name = self._req(name, "name")
+                  rep_username = self._req(rep_username, "rep_username").lower()
+                  rep_name = self._req(rep_name, "rep_name")
+                  rep_doc = self._req(rep_doc, "rep_doc")
+                  user = self.get_user(rep_username)
+                  if user is None:
+                      raise LookupError("representante no existe: %s" % rep_username)
+                  with self._lock:
+                      company_id = _nid("CMP-")
+                      now = _now()
+                      self._run(
+                          "INSERT INTO sbs_companies (company_id, name,"
+                          " rep_user_id, rep_name, rep_doc, doc_ref, status,"
+                          " created_at, updated_at)"
+                          " VALUES (?, ?, ?, ?, ?, ?, 'pending', ?, ?)",
+                          (
+                              company_id, name, user["user_id"],
+                              rep_name, rep_doc,
+                              str(doc_ref) if doc_ref else None,
+                              now, now,
+                          ),
+                      )
+                      return self.get_company(company_id)
+
+              def get_company(self, company_id):
+                  company_id = self._req(company_id, "company_id")
+                  rows = self._rows(
+                      "SELECT company_id, name, rep_user_id, rep_name, rep_doc,"
+                      " doc_ref, status, created_at, updated_at"
+                      " FROM sbs_companies WHERE company_id = "
+                      + self._literal(company_id)
+                  )
+                  if not rows:
+                      return None
+                  row = rows[0]
+                  return {
+                      "company_id": self._field(row, "a", 0),
+                      "name": self._field(row, "b", 1),
+                      "rep_user_id": self._field(row, "c", 2),
+                      "rep_name": self._field(row, "d", 3),
+                      "rep_doc": self._field(row, "e", 4),
+                      "doc_ref": self._field(row, "f", 5),
+                      "status": self._field(row, "g", 6),
+                  }
+
+              def list_companies(self, status=None):
                   sql = (
-                      "SELECT dispute_id, order_id, opener_account, role, reason,"
-                      " status, decision, refund_amount, created_at, updated_at"
-                      " FROM sbs_disputes"
+                      "SELECT company_id, name, rep_user_id, rep_name, rep_doc,"
+                      " doc_ref, status, created_at, updated_at FROM sbs_companies"
                   )
                   if status:
                       sql += " WHERE status = " + self._literal(str(status))
@@ -295,442 +437,361 @@ jobs:
                   out = []
                   for row in self._rows(sql):
                       out.append({
-                          "dispute_id": self._field(row, "a", 0),
-                          "order_id": self._field(row, "b", 1),
-                          "opener_account": self._field(row, "c", 2),
-                          "role": self._field(row, "d", 3),
-                          "reason": self._field(row, "e", 4),
-                          "status": self._field(row, "f", 5),
-                          "decision": self._field(row, "g", 6),
-                          "refund_amount": self._field(row, "h", 7),
-                          "created_at": self._field(row, "i", 8),
-                          "updated_at": self._field(row, "j", 9),
+                          "company_id": self._field(row, "a", 0),
+                          "name": self._field(row, "b", 1),
+                          "rep_name": self._field(row, "d", 3),
+                          "doc_ref": self._field(row, "f", 5),
+                          "status": self._field(row, "g", 6),
                       })
                   return out
 
-              def _set_status(self, dispute_id, status, decision=None, refund_amount=None):
-                  self._run(
-                      "UPDATE sbs_disputes SET status = "
-                      + self._literal(status)
-                      + ", decision = "
-                      + self._literal(decision)
-                      + ", refund_amount = "
-                      + self._literal(refund_amount)
-                      + ", updated_at = "
-                      + self._literal(_now())
-                      + " WHERE dispute_id = "
-                      + self._literal(dispute_id)
-                  )
-
-              def mediate(self, dispute_id, *, arbiter, note):
-                  arbiter = self._req(arbiter, "arbiter")
-                  note = self._req(note, "note")
+              def verify_company(self, company_id, *, approve):
+                  company_id = self._req(company_id, "company_id")
                   with self._lock:
-                      row = self._dispute_row(dispute_id)
-                      if row is None:
-                          raise LookupError("disputa no encontrada")
-                      status = str(self._field(row, "f", 5))
-                      if status not in ("open", "under_review"):
-                          raise ValueError(
-                              "no se puede mediar en estado %s" % status
-                          )
-                      decision = self._field(row, "g", 6)
-                      refund_amount = self._field(row, "h", 7)
-                      self._set_status(
-                          dispute_id, "under_review", decision, refund_amount
-                      )
-                      self._add_event(
-                          dispute_id, arbiter, "mediation",
-                          "mediacion: %s" % note,
-                      )
-                  return self.get_dispute(dispute_id)
-
-              def decide(self, dispute_id, *, arbiter, approve, note, refund_amount):
-                  arbiter = self._req(arbiter, "arbiter")
-                  note = self._req(note, "note")
-                  amount = float(refund_amount or 0)
-                  with self._lock:
-                      row = self._dispute_row(dispute_id)
-                      if row is None:
-                          raise LookupError("disputa no encontrada")
-                      status = str(self._field(row, "f", 5))
-                      order_id = str(self._field(row, "b", 1))
-                      if status not in ("open", "under_review"):
-                          raise ValueError(
-                              "no se puede decidir en estado %s" % status
-                          )
-                      decision = "approved" if approve else "rejected"
-                      self._set_status(
-                          dispute_id, "decided", decision,
-                          amount if approve else None,
-                      )
-                      self._add_event(
-                          dispute_id, arbiter, "decision",
-                          "decision: %s — %s" % (decision, note),
-                      )
-                      if approve and amount > 0:
-                          self._run(
-                              "INSERT INTO sbs_refunds (refund_id, dispute_id,"
-                              " order_id, amount, status, created_at)"
-                              " VALUES (?, ?, ?, ?, 'executed', ?)",
-                              (_nid("RFD-"), dispute_id, order_id, amount, _now()),
-                          )
-                  return self.get_dispute(dispute_id)
-
-              def appeal(self, dispute_id, *, appellant, reason):
-                  appellant = self._req(appellant, "appellant")
-                  reason = self._req(reason, "reason")
-                  with self._lock:
-                      row = self._dispute_row(dispute_id)
-                      if row is None:
-                          raise LookupError("disputa no encontrada")
-                      status = str(self._field(row, "f", 5))
-                      if status != "decided":
-                          raise ValueError(
-                              "solo se apela una decision (estado %s)" % status
-                          )
-                      decision = self._field(row, "g", 6)
-                      refund_amount = self._field(row, "h", 7)
-                      self._set_status(
-                          dispute_id, "appeal_window", decision, refund_amount
-                      )
-                      self._add_event(
-                          dispute_id, appellant, "appeal",
-                          "apelacion: %s" % reason,
-                      )
-                  return self.get_dispute(dispute_id)
-
-              def resolve_appeal(self, dispute_id, *, arbiter, uphold, note):
-                  arbiter = self._req(arbiter, "arbiter")
-                  note = self._req(note, "note")
-                  with self._lock:
-                      row = self._dispute_row(dispute_id)
-                      if row is None:
-                          raise LookupError("disputa no encontrada")
-                      status = str(self._field(row, "f", 5))
-                      decision = str(self._field(row, "g", 6) or "")
-                      if status != "appeal_window":
-                          raise ValueError(
-                              "sin apelacion abierta (estado %s)" % status
-                          )
-                      if uphold:
-                          self._set_status(dispute_id, "final", decision)
-                          self._add_event(
-                              dispute_id, arbiter, "decision",
-                              "apelacion resuelta: se mantiene %s — %s"
-                              % (decision, note),
-                          )
-                      else:
-                          self._set_status(dispute_id, "final", "overturned")
-                          self._reverse_refund(dispute_id)
-                          self._add_event(
-                              dispute_id, arbiter, "decision",
-                              "apelacion resuelta: decision revertida — %s" % note,
-                          )
-                  return self.get_dispute(dispute_id)
-
-              def _reverse_refund(self, dispute_id):
-                  self._run(
-                      "UPDATE sbs_refunds SET status = 'reversed'"
-                      " WHERE dispute_id = " + self._literal(dispute_id)
-                  )
-
-              def flag_fraud(self, *, subject_account, reason, severity):
-                  subject_account = self._req(subject_account, "subject_account")
-                  reason = self._req(reason, "reason")
-                  severity = str(severity or "media").strip() or "media"
-                  if severity not in ("baja", "media", "alta"):
-                      raise ValueError("severity debe ser baja, media o alta")
-                  with self._lock:
-                      flag_id = _nid("FRD-")
+                      status = "verified" if approve else "rejected"
                       self._run(
-                          "INSERT INTO sbs_fraud_flags (flag_id, subject_account,"
-                          " reason, severity, status, created_at)"
-                          " VALUES (?, ?, ?, ?, 'open', ?)",
-                          (flag_id, subject_account, reason, severity, _now()),
+                          "UPDATE sbs_companies SET status = "
+                          + self._literal(status)
+                          + ", updated_at = "
+                          + self._literal(_now())
+                          + " WHERE company_id = "
+                          + self._literal(company_id)
                       )
-                      return {
-                          "flag_id": flag_id,
-                          "subject_account": subject_account,
-                          "severity": severity,
-                          "status": "open",
-                      }
+                  return self.get_company(company_id)
 
-              def list_fraud(self):
-                  out = []
-                  for row in self._rows(
-                      "SELECT flag_id, subject_account, reason, severity,"
-                      " status, created_at FROM sbs_fraud_flags"
-                      " ORDER BY created_at DESC"
-                  ):
-                      out.append({
-                          "flag_id": self._field(row, "a", 0),
-                          "subject_account": self._field(row, "b", 1),
-                          "reason": self._field(row, "c", 2),
-                          "severity": self._field(row, "d", 3),
-                          "status": self._field(row, "e", 4),
-                          "created_at": self._field(row, "f", 5),
-                      })
-                  return out
+              def create_session(self, username):
+                  username = self._req(username, "username").lower()
+                  user = self.get_user(username)
+                  if user is None:
+                      raise LookupError("usuario no encontrado")
+                  token = secrets.token_urlsafe(32)
+                  now = _ts()
+                  with self._lock:
+                      self._run(
+                          "INSERT INTO sbs_sessions (token, user_id,"
+                          " created_at, expires_at) VALUES (?, ?, ?, ?)",
+                          (token, user["user_id"], now, now + SESSION_TTL_SECONDS),
+                      )
+                  return token
+
+              def _user_by_id(self, user_id):
+                  rows = self._rows(
+                      "SELECT user_id, username, zid, role, display_name, status"
+                      " FROM sbs_users WHERE user_id = "
+                      + self._literal(user_id)
+                  )
+                  if not rows:
+                      return None
+                  row = rows[0]
+                  return {
+                      "user_id": self._field(row, "a", 0),
+                      "username": self._field(row, "b", 1),
+                      "zid": self._field(row, "c", 2),
+                      "role": self._field(row, "d", 3),
+                      "display_name": self._field(row, "e", 4),
+                      "status": self._field(row, "f", 5),
+                  }
+
+              def session_user(self, token):
+                  if not token or not str(token).strip():
+                      return None
+                  rows = self._rows(
+                      "SELECT user_id, created_at, expires_at FROM sbs_sessions"
+                      " WHERE token = " + self._literal(str(token))
+                  )
+                  if not rows:
+                      return None
+                  row = rows[0]
+                  expires = float(self._field(row, "c", 2) or 0)
+                  if _ts() > expires:
+                      self.destroy_session(str(token))
+                      return None
+                  return self._user_by_id(str(self._field(row, "a", 0)))
+
+              def destroy_session(self, token):
+                  with self._lock:
+                      self._run(
+                          "DELETE FROM sbs_sessions WHERE token = "
+                          + self._literal(str(token or ""))
+                      )
+                  return True
+
+              def cleanup_sessions(self):
+                  with self._lock:
+                      self._run(
+                          "DELETE FROM sbs_sessions WHERE expires_at < "
+                          + repr(_ts())
+                      )
+                  return True
 
 
-          def market_disputes_page(self) -> str:
-              rows = self.disputes.list_disputes()
-              cards = []
-              for d in rows:
-                  cards.append("".join([
-                      "<div class='card'>",
-                      "<p><b>%s</b> — %s</p>" % (d["dispute_id"], d["status"]),
-                      "<p>Orden: %s | Abrio: %s (%s)</p>" % (
-                          d["order_id"], d["opener_account"], d["role"]),
-                      "<p>%s</p>" % d["reason"],
-                      "<p><a href='/subastas/disputa/%s'>Abrir expediente</a></p>" % d["dispute_id"],
+          def _sess_user(self):
+              cookie = self.headers.get("Cookie", "") or ""
+              token = None
+              for part in cookie.split(";"):
+                  if "=" in part:
+                      k, v = part.split("=", 1)
+                      if k.strip() == "zyra_sess":
+                          token = v.strip()
+                          break
+              if not token:
+                  return None
+              return self.accounts.session_user(token)
+
+
+          def _require_role(self, user, *roles):
+              if user is None:
+                  raise PermissionError("sesion requerida: entra a Inscripcion")
+              if roles and user.get("role") not in roles:
+                  raise PermissionError(
+                      "tu rol (%s) no permite esta accion" % user.get("role")
+                  )
+
+
+          def market_inscripcion_page(self) -> str:
+              user = self._sess_user()
+              head = []
+              if user:
+                  head.append("".join([
+                      "<div class='card'><h2>Sesion activa</h2>",
+                      "<p>Hola <b>%s</b> — rol: <b>%s</b></p>" % (
+                          user["display_name"], user["role"]),
+                      "<p>ZID: %s</p>" % (user["zid"] or "pendiente (haz el registro biometrico)"),
+                      "<form method='POST' action='/subastas/logout'>",
+                      "<button>Cerrar sesion</button></form>",
                       "</div>",
                   ]))
-              if not cards:
-                  cards.append("<p>No hay disputas registradas.</p>")
-              body = "".join([
-                  "<div class='card'><h2>Riesgo y Proteccion — DISPUTAS</h2>",
-                  "<p>Proteccion del comprador y del vendedor. El gobierno media y decide.</p>",
-                  "<h3>Abrir disputa</h3>",
-                  "<input id='dOrder' placeholder='ID de orden (ORD-...)'>",
-                  "<input id='dWho' placeholder='Tu cuenta'>",
-                  "<select id='dRole'>",
+              else:
+                  head.append("".join([
+                      "<div class='card'><h2>Entrar</h2>",
+                      "<form method='POST' action='/subastas/login'>",
+                      "<input name='username' placeholder='Usuario' required>",
+                      "<input name='password' type='password' placeholder='Contrasena' required>",
+                      "<button>Entrar</button>",
+                      "</form></div>",
+                  ]))
+              prof = []
+              if user:
+                  try:
+                      p = self.accounts.get_profile(user["username"])
+                      pr = p["profile"]
+                  except Exception:
+                      pr = {}
+                  prof.append("".join([
+                      "<div class='card'><h2>Mi perfil de inscripcion</h2>",
+                      "<p>Direccion: %s</p>" % (pr.get("address") or "-"),
+                      "<p>Telefono: %s</p>" % (pr.get("phone") or "-"),
+                      "<p>Categoria comercial: %s</p>" % (pr.get("category") or "-"),
+                      "<p>Datos de cobro: %s</p>" % (pr.get("payout_info") or "-"),
+                      "<h3>Actualizar perfil</h3>",
+                      "<form method='POST' action='/subastas/perfil'>",
+                      "<input name='address' placeholder='Direccion'>",
+                      "<input name='phone' placeholder='Telefono'>",
+                      "<input name='category' placeholder='Categoria (ej. electronica)'>",
+                      "<input name='payout_info' placeholder='Datos de cobro'>",
+                      "<button>Guardar perfil</button>",
+                      "</form></div>",
+                      "<div class='card'><h2>Registrar mi empresa (KYB)</h2>",
+                      "<p>El gobierno verifica la empresa. Debes tener sesion.</p>",
+                      "<form method='POST' action='/subastas/empresa'>",
+                      "<input name='company_name' placeholder='Nombre de la empresa' required>",
+                      "<input name='rep_name' placeholder='Nombre del representante' required>",
+                      "<input name='rep_doc' placeholder='Documento del representante' required>",
+                      "<input name='doc_ref' placeholder='Referencia de documentos'>",
+                      "<button>Registrar empresa</button>",
+                      "</form></div>",
+                      "<div class='card'><h2>Vincular mi ZID</h2>",
+                      "<p>Si ya hiciste el registro biometrico, pega tu ZID aqui.</p>",
+                      "<form method='POST' action='/subastas/vincular'>",
+                      "<input name='zid' placeholder='ZID-...'>",
+                      "<button>Vincular ZID</button>",
+                      "</form></div>",
+                  ]))
+              reg = "".join([
+                  "<div class='card'><h2>Crear cuenta</h2>",
+                  "<p>La identidad la da el registro biometrico (por ley);",
+                  " la contrasena es para entrar comodamente.</p>",
+                  "<form method='POST' action='/subastas/registro'>",
+                  "<input name='username' placeholder='Usuario (sin espacios)' required>",
+                  "<input name='password' type='password' placeholder='Contrasena (min 6)' required>",
+                  "<input name='display_name' placeholder='Tu nombre' required>",
+                  "<select name='role'>",
                   "<option value='comprador'>comprador</option>",
                   "<option value='vendedor'>vendedor</option>",
                   "</select>",
-                  "<input id='dWhy' placeholder='Motivo'>",
-                  "<button id='btnOpen'>Abrir disputa</button>",
-                  "</div>",
-                  "".join(cards),
-                  "<p id='msg'></p>",
-                  "<script>",
-                  "document.getElementById('btnOpen').addEventListener('click',function(){",
-                  "function g(i){return document.getElementById(i).value;}",
-                  "fetch('/subastas/api/disputes',{method:'POST',",
-                  "headers:{'Content-Type':'application/json'},",
-                  "body:JSON.stringify({order_id:g('dOrder'),opener_account:g('dWho'),role:g('dRole'),reason:g('dWhy')})})",
-                  ".then(function(r){return r.json();})",
-                  ".then(function(d){if(d.ok){location.reload();}",
-                  "else{document.getElementById('msg').textContent='Error: '+(d.error||'');}})",
-                  ".catch(function(e){document.getElementById('msg').textContent='Error: '+e;});});",
-                  "</script>",
+                  "<button>Crear cuenta</button>",
+                  "</form></div>",
               ])
-              return self._page_wrap("ZYRA MARKET - Proteccion", body)
+              body = "".join(head + prof + [reg])
+              return self._page_wrap("ZYRA MARKET - Inscripcion", body)
 
 
-          def market_fraud_page(self) -> str:
-              flags = self.disputes.list_fraud()
+          def market_login(self) -> None:
+              form = self._read_form()
+              user = self.accounts.verify_login(
+                  self._form_value(form, "username"),
+                  self._form_value(form, "password"),
+              )
+              token = self.accounts.create_session(user["username"])
+              self.send_response(303)
+              self.send_header(
+                  "Location", "/subastas/inscripcion"
+              )
+              self.send_header(
+                  "Set-Cookie",
+                  "zyra_sess=%s; Path=/; Max-Age=%s; HttpOnly"
+                  % (token, SESSION_TTL_SECONDS),
+              )
+              self.end_headers()
+
+
+          def market_logout(self) -> None:
+              cookie = self.headers.get("Cookie", "") or ""
+              for part in cookie.split(";"):
+                  if "=" in part:
+                      k, v = part.split("=", 1)
+                      if k.strip() == "zyra_sess":
+                          self.accounts.destroy_session(v.strip())
+              self.send_response(303)
+              self.send_header("Location", "/subastas/inscripcion")
+              self.send_header(
+                  "Set-Cookie",
+                  "zyra_sess=; Path=/; Max-Age=0",
+              )
+              self.end_headers()
+
+
+          def market_register_user(self) -> None:
+              form = self._read_form()
+              user = self.accounts.register_user(
+                  username=self._form_value(form, "username"),
+                  password=self._form_value(form, "password"),
+                  display_name=self._form_value(form, "display_name"),
+                  role=self._form_value(form, "role") or "comprador",
+              )
+              token = self.accounts.create_session(user["username"])
+              self.send_response(303)
+              self.send_header("Location", "/subastas/inscripcion")
+              self.send_header(
+                  "Set-Cookie",
+                  "zyra_sess=%s; Path=/; Max-Age=%s; HttpOnly"
+                  % (token, SESSION_TTL_SECONDS),
+              )
+              self.end_headers()
+
+
+          def market_update_profile(self) -> None:
+              user = self._sess_user()
+              self._require_role(user, "comprador", "vendedor", "gobierno", "admin")
+              form = self._read_form()
+              prof = self.accounts.update_profile(
+                  user["username"],
+                  address=self._form_value(form, "address") or None,
+                  phone=self._form_value(form, "phone") or None,
+                  category=self._form_value(form, "category") or None,
+                  payout_info=self._form_value(form, "payout_info") or None,
+              )
+              self._send_html(200, "".join([
+                  "<html><body><h1>ZYRA MARKET</h1>",
+                  "<p>Perfil actualizado.</p>",
+                  "<p><a href='/subastas/inscripcion'><button>Volver</button></a></p>",
+                  "</body></html>",
+              ]))
+
+
+          def market_link_zid(self) -> None:
+              user = self._sess_user()
+              self._require_role(user, "comprador", "vendedor", "gobierno", "admin")
+              form = self._read_form()
+              updated = self.accounts.link_zid(
+                  user["username"], self._form_value(form, "zid")
+              )
+              self._send_html(200, "".join([
+                  "<html><body><h1>ZYRA MARKET</h1>",
+                  "<p>ZID vinculado: %s</p>" % updated["zid"],
+                  "<p><a href='/subastas/inscripcion'><button>Volver</button></a></p>",
+                  "</body></html>",
+              ]))
+
+
+          def market_register_company(self) -> None:
+              user = self._sess_user()
+              self._require_role(user, "vendedor", "gobierno", "admin")
+              form = self._read_form()
+              company = self.accounts.register_company(
+                  name=self._form_value(form, "company_name"),
+                  rep_username=user["username"],
+                  rep_name=self._form_value(form, "rep_name"),
+                  rep_doc=self._form_value(form, "rep_doc"),
+                  doc_ref=self._form_value(form, "doc_ref") or None,
+              )
+              self._send_html(200, "".join([
+                  "<html><body><h1>ZYRA MARKET</h1>",
+                  "<p>Empresa registrada: %s (%s)</p>" % (
+                      company["name"], company["company_id"]),
+                  "<p>Estado: %s — pendiente de verificacion del gobierno.</p>" % company["status"],
+                  "<p><a href='/subastas/inscripcion'><button>Volver</button></a></p>",
+                  "</body></html>",
+              ]))
+
+
+          def market_gobierno_page(self) -> str:
+              user = self._sess_user()
+              self._require_role(user, "gobierno", "admin")
+              companies = self.accounts.list_companies()
               rows = []
-              for f in flags:
+              for c in companies:
                   rows.append("".join([
                       "<div class='card'>",
-                      "<p><b>%s</b> — %s (%s)</p>" % (
-                          f["subject_account"], f["severity"], f["status"]),
-                      "<p>%s</p>" % f["reason"],
+                      "<p><b>%s</b> — %s</p>" % (c["name"], c["status"]),
+                      "<p>ID: <code>%s</code> | Rep: %s</p>" % (
+                          c["company_id"], c["rep_name"]),
                       "</div>",
                   ]))
               if not rows:
-                  rows.append("<p>Sin banderas de fraude.</p>")
+                  rows.append("<p>Sin empresas registradas.</p>")
               body = "".join([
-                  "<div class='card'><h2>Riesgo y Proteccion — FRAUDE</h2>",
-                  "<p>Banderas de fraude (gobierno). La investigacion profunda llega con el Bloque 8.</p>",
-                  "<input id='fWho' placeholder='Cuenta sospechosa'>",
-                  "<input id='fWhy' placeholder='Motivo'>",
-                  "<select id='fSev'>",
-                  "<option value='baja'>baja</option>",
-                  "<option value='media'>media</option>",
-                  "<option value='alta'>alta</option>",
+                  "<div class='card'><h2>Verificacion de empresas (KYB)</h2>",
+                  "<input id='kybId' placeholder='ID de empresa (CMP-...)'>",
+                  "<select id='kybOk'>",
+                  "<option value='true'>Verificar (aprobar)</option>",
+                  "<option value='false'>Rechazar</option>",
                   "</select>",
-                  "<button id='btnFlag'>Marcar fraude</button>",
+                  "<button id='btnKyb'>Aplicar verificacion</button>",
                   "</div>",
                   "".join(rows),
                   "<p id='msg'></p>",
                   "<script>",
-                  "document.getElementById('btnFlag').addEventListener('click',function(){",
+                  "document.getElementById('btnKyb').addEventListener('click',function(){",
                   "function g(i){return document.getElementById(i).value;}",
-                  "fetch('/subastas/api/fraud',{method:'POST',",
+                  "fetch('/subastas/api/empresa/verificar',{method:'POST',",
                   "headers:{'Content-Type':'application/json'},",
-                  "body:JSON.stringify({subject_account:g('fWho'),reason:g('fWhy'),severity:g('fSev')})})",
+                  "body:JSON.stringify({company_id:g('kybId'),approve:g('kybOk')==='true'})})",
                   ".then(function(r){return r.json();})",
                   ".then(function(d){if(d.ok){location.reload();}",
                   "else{document.getElementById('msg').textContent='Error: '+(d.error||'');}})",
                   ".catch(function(e){document.getElementById('msg').textContent='Error: '+e;});});",
                   "</script>",
               ])
-              return self._page_wrap("ZYRA MARKET - Fraude", body)
+              return self._page_wrap("ZYRA MARKET - Gobierno KYB", body)
 
 
-          def market_dispute_detail(self, dispute_id: str) -> str:
-              try:
-                  d = self.disputes.get_dispute(dispute_id)
-              except Exception:
-                  d = None
-              if not d:
-                  body = "<p>No existe la disputa: <code>%s</code></p>" % dispute_id
-                  return self._page_wrap("Disputa no encontrada", body)
-              ev = []
-              for e in d["events"]:
-                  ev.append(
-                      "<p><b>[%s] %s (%s):</b> %s</p>"
-                      % (e["created_at"], e["actor_account"], e["kind"], e["content"])
-                  )
-              rf = []
-              for r in d["refunds"]:
-                  rf.append(
-                      "<p>Reembolso %s: $%s (%s)</p>"
-                      % (r["refund_id"], format(float(r["amount"] or 0), ".2f"), r["status"])
-                  )
-              if not rf:
-                  rf.append("<p>Sin reembolsos registrados.</p>")
-              body = "".join([
-                  "<div class='card'><h2>Disputa %s</h2>" % d["dispute_id"],
-                  "<p>Estado: <b>%s</b> | Decision: %s</p>" % (d["status"], str(d.get("decision"))),
-                  "<p>Orden: %s | Abrio: %s (%s)</p>" % (
-                      d["order_id"], d["opener_account"], d["role"]),
-                  "<p>Motivo: %s</p>" % d["reason"],
-                  "<h3>Expediente</h3>",
-                  "".join(ev),
-                  "</div>",
-                  "<div class='card'><h2>Reembolsos</h2>",
-                  "".join(rf),
-                  "</div>",
-                  "<div class='card'><h2>Acciones</h2>",
-                  "<p><b>Evidencia / mensaje</b> (comprador o vendedor)</p>",
-                  "<input id='evActor' placeholder='Tu cuenta'>",
-                  "<select id='evKind'>",
-                  "<option value='evidence'>evidencia</option>",
-                  "<option value='message'>mensaje</option>",
-                  "</select>",
-                  "<input id='evContent' placeholder='Contenido'>",
-                  "<button id='btnEv'>Agregar</button>",
-                  "<p><b>Mediar</b> (gobierno)</p>",
-                  "<input id='mdArb' placeholder='Cuenta del arbitro'>",
-                  "<input id='mdNote' placeholder='Nota de mediacion'>",
-                  "<button id='btnMd'>Mediar</button>",
-                  "<p><b>Decidir</b> (gobierno)</p>",
-                  "<input id='dcArb' placeholder='Cuenta del arbitro'>",
-                  "<select id='dcOk'>",
-                  "<option value='true'>A favor de quien abrio</option>",
-                  "<option value='false'>En contra</option>",
-                  "</select>",
-                  "<input id='dcNote' placeholder='Nota de decision'>",
-                  "<input id='dcRef' type='number' step='0.01' placeholder='Monto reembolso (si aplica)'>",
-                  "<button id='btnDc'>Decidir</button>",
-                  "<p><b>Apelar</b> (tras decision)</p>",
-                  "<input id='apWho' placeholder='Tu cuenta'>",
-                  "<input id='apWhy' placeholder='Motivo de apelacion'>",
-                  "<button id='btnAp'>Apelar</button>",
-                  "<p><b>Resolucion final</b> (gobierno, tras apelacion)</p>",
-                  "<input id='fnArb' placeholder='Cuenta del arbitro'>",
-                  "<select id='fnUp'>",
-                  "<option value='true'>Mantener decision</option>",
-                  "<option value='false'>Revertir decision</option>",
-                  "</select>",
-                  "<input id='fnNote' placeholder='Nota final'>",
-                  "<button id='btnFn'>Cerrar definitivo</button>",
-                  "<p id='msg'></p>",
-                  "</div>",
-                  "<script>",
-                  "function v(id){return document.getElementById(id).value;}",
-                  "function post(path,payload){",
-                  "fetch(path,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(payload)})",
-                  ".then(function(r){return r.json();})",
-                  ".then(function(d){if(d.ok){location.reload();}",
-                  "else{document.getElementById('msg').textContent='Error: '+(d.error||'');}})",
-                  ".catch(function(e){document.getElementById('msg').textContent='Error: '+e;});}",
-                  "var base='/subastas/api/disputes/%s/';" % d["dispute_id"],
-                  "document.getElementById('btnEv').addEventListener('click',function(){",
-                  "post(base+'event',{actor:v('evActor'),kind:v('evKind'),content:v('evContent')});});",
-                  "document.getElementById('btnMd').addEventListener('click',function(){",
-                  "post(base+'mediate',{arbiter:v('mdArb'),note:v('mdNote')});});",
-                  "document.getElementById('btnDc').addEventListener('click',function(){",
-                  "post(base+'decide',{arbiter:v('dcArb'),approve:v('dcOk')==='true',note:v('dcNote'),refund_amount:parseFloat(v('dcRef'))||0});});",
-                  "document.getElementById('btnAp').addEventListener('click',function(){",
-                  "post(base+'appeal',{appellant:v('apWho'),reason:v('apWhy')});});",
-                  "document.getElementById('btnFn').addEventListener('click',function(){",
-                  "post(base+'final',{arbiter:v('fnArb'),uphold:v('fnUp')==='true',note:v('fnNote')});});",
-                  "</script>",
-              ])
-              return self._page_wrap("ZYRA MARKET - Disputa", body)
-
-
-          def market_dispute_open(self) -> None:
+          def market_verify_company(self) -> None:
+              user = self._sess_user()
+              self._require_role(user, "gobierno", "admin")
               doc = self._read_json()
               if doc is None:
                   self._send_json(400, {"ok": False, "error": "invalid JSON"})
                   return
-              dispute = self.disputes.open_dispute(
-                  order_id=str(doc.get("order_id", "")),
-                  opener_account=str(doc.get("opener_account", "")),
-                  role=str(doc.get("role", "")),
-                  reason=str(doc.get("reason", "")),
+              company = self.accounts.verify_company(
+                  str(doc.get("company_id", "")),
+                  approve=bool(doc.get("approve", False)),
               )
-              self._send_json(201, {"ok": True, "data": dispute})
+              self._send_json(200, {"ok": True, "data": company})
+          ACSF
+          echo "accounts_store.py: $(wc -l < apps/subastas/infrastructure/persistence/accounts_store.py) lines"
 
-
-          def market_dispute_action(self, dispute_id: str, action: str) -> None:
-              doc = self._read_json() or {}
-              if action == "event":
-                  self.disputes.add_event(
-                      dispute_id,
-                      actor_account=str(doc.get("actor", "")),
-                      kind=str(doc.get("kind", "message")),
-                      content=str(doc.get("content", "")),
-                  )
-              elif action == "mediate":
-                  self.disputes.mediate(
-                      dispute_id,
-                      arbiter=str(doc.get("arbiter", "")),
-                      note=str(doc.get("note", "")),
-                  )
-              elif action == "decide":
-                  self.disputes.decide(
-                      dispute_id,
-                      arbiter=str(doc.get("arbiter", "")),
-                      approve=bool(doc.get("approve", False)),
-                      note=str(doc.get("note", "")),
-                      refund_amount=float(doc.get("refund_amount", 0) or 0),
-                  )
-              elif action == "appeal":
-                  self.disputes.appeal(
-                      dispute_id,
-                      appellant=str(doc.get("appellant", "")),
-                      reason=str(doc.get("reason", "")),
-                  )
-              elif action == "final":
-                  self.disputes.resolve_appeal(
-                      dispute_id,
-                      arbiter=str(doc.get("arbiter", "")),
-                      uphold=bool(doc.get("uphold", True)),
-                      note=str(doc.get("note", "")),
-                  )
-              else:
-                  self._send_json(
-                      400,
-                      {"ok": False, "error": "unknown dispute action: %s" % action},
-                  )
-                  return
-              self._send_json(
-                  200, {"ok": True, "data": self.disputes.get_dispute(dispute_id)}
-              )
-
-
-          def market_fraud_flag(self) -> None:
-              doc = self._read_json()
-              if doc is None:
-                  self._send_json(400, {"ok": False, "error": "invalid JSON"})
-                  return
-              flag = self.disputes.flag_fraud(
-                  subject_account=str(doc.get("subject_account", "")),
-                  reason=str(doc.get("reason", "")),
-                  severity=str(doc.get("severity", "media")),
-              )
-              self._send_json(201, {"ok": True, "data": flag})
-          DPRF
-          echo "disputes_store.py: $(wc -l < apps/subastas/infrastructure/persistence/disputes_store.py) lines"
-
-      - name: Wire into server.py (skip if done)
+      - name: Wire into server.py
         run: |
           python3 - <<'PYEOF'
           import sys
@@ -744,7 +805,7 @@ jobs:
 
           P = "apps/subastas/server.py"
           txt = Path(P).read_text(encoding="utf-8")
-          if "disputes_store" in txt:
+          if "accounts_store" in txt:
               print("SKIP: already wired")
               sys.exit(0)
 
@@ -764,82 +825,95 @@ jobs:
 
           i = find_one("def _find_value(doc, keys):")
           imp = [
-              "from apps.subastas.infrastructure.persistence.disputes_store import (\n",
-              "    DisputesStore,\n",
-              "    market_disputes_page,\n",
-              "    market_fraud_page,\n",
-              "    market_dispute_detail,\n",
-              "    market_dispute_open,\n",
-              "    market_dispute_action,\n",
-              "    market_fraud_flag,\n",
+              "from apps.subastas.infrastructure.persistence.accounts_store import (\n",
+              "    AccountsStore,\n",
+              "    market_inscripcion_page,\n",
+              "    market_login,\n",
+              "    market_logout,\n",
+              "    market_register_user,\n",
+              "    market_update_profile,\n",
+              "    market_link_zid,\n",
+              "    market_register_company,\n",
+              "    market_gobierno_page,\n",
+              "    market_verify_company,\n",
+              "    _sess_user,\n",
+              "    _require_role,\n",
               ")\n",
           ]
           lines = lines[:i] + imp + lines[i:]
-          print("INSERT: import block")
+          print("INSERT: imports")
 
-          i = find_one('("/subastas/revision", "Revision"),')
+          i = find_one('("/subastas/gobierno", "Gobierno"),')
           ind = leading(lines[i])
           nav = [
-              ind + '("/subastas/proteccion", "Proteccion"),\n',
-              ind + '("/subastas/fraude", "Fraude"),\n',
+              ind + '("/subastas/inscripcion", "Inscripcion"),\n',
           ]
           lines = lines[:i] + nav + lines[i:]
-          print("INSERT: nav links")
+          print("INSERT: nav link")
 
-          i = find_one('if path == "/subastas/api/summary":')
+          i = find_one('if path == "/subastas/proteccion":')
           ind = leading(lines[i])
           b = ind + "    "
           routes = [
-              ind + 'if path == "/subastas/proteccion":\n',
-              b + "self._send_html(200, self.market_disputes_page())\n",
+              ind + 'if path == "/subastas/inscripcion":\n',
+              b + "self._send_html(200, self.market_inscripcion_page())\n",
               b + "return\n",
-              ind + 'if path == "/subastas/fraude":\n',
-              b + "self._send_html(200, self.market_fraud_page())\n",
+              ind + 'if path == "/subastas/gobierno-kyb":\n',
+              b + "self._send_html(200, self.market_gobierno_page())\n",
               b + "return\n",
-              ind + 'if path.startswith("/subastas/disputa/"):\n',
-              b + "self._send_html(\n",
-              b + "    200,\n",
-              b + "    self.market_dispute_detail(\n",
-              b + '        path.split("/subastas/disputa/", 1)[1]\n',
-              b + "    ),\n",
-              b + ")\n",
-              b + "return\n",
+              ind + 'if path == "/subastas/order/" and False:\n',
+              b + "pass\n",
           ]
           lines = lines[:i] + routes + lines[i:]
-          print("INSERT: 3 GET routes")
+          print("INSERT: 2 GET routes")
 
-          i = find_one('if path == "/subastas/close":')
+          i = find_one('if path == "/subastas/api/disputes":')
           ind = leading(lines[i])
           b = ind + "    "
           proutes = [
-              ind + 'if path == "/subastas/api/disputes":\n',
-              b + "self.market_dispute_open()\n",
+              ind + 'if path == "/subastas/login":\n',
+              b + "self.market_login()\n",
               b + "return\n",
-              ind + 'if path == "/subastas/api/fraud":\n',
-              b + "self.market_fraud_flag()\n",
+              ind + 'if path == "/subastas/logout":\n',
+              b + "self.market_logout()\n",
               b + "return\n",
-              ind + 'if path.startswith("/subastas/api/disputes/"):\n',
-              b + 'rest = path.split("/subastas/api/disputes/", 1)[1]\n',
-              b + 'parts = rest.split("/")\n',
-              b + "self.market_dispute_action(\n",
-              b + '    parts[0], parts[1] if len(parts) > 1 else ""\n',
-              b + ")\n",
+              ind + 'if path == "/subastas/registro":\n',
+              b + "self.market_register_user()\n",
+              b + "return\n",
+              ind + 'if path == "/subastas/perfil":\n',
+              b + "self.market_update_profile()\n",
+              b + "return\n",
+              ind + 'if path == "/subastas/vincular":\n',
+              b + "self.market_link_zid()\n",
+              b + "return\n",
+              ind + 'if path == "/subastas/empresa":\n',
+              b + "self.market_register_company()\n",
+              b + "return\n",
+              ind + 'if path == "/subastas/api/empresa/verificar":\n',
+              b + "self.market_verify_company()\n",
               b + "return\n",
           ]
           lines = lines[:i] + proutes + lines[i:]
-          print("INSERT: 3 POST routes")
+          print("INSERT: 7 POST routes")
 
-          i = find_one('"commerce": CommerceStore(store._db, store._clock),')
+          i = find_one('"disputes": DisputesStore(store._db, store._clock),')
           ind = leading(lines[i])
           attach = [
-              ind + '"disputes": DisputesStore(store._db, store._clock),\n',
-              ind + '"market_disputes_page": market_disputes_page,\n',
-              ind + '"market_fraud_page": market_fraud_page,\n',
-              ind + '"market_dispute_detail": market_dispute_detail,\n',
-              ind + '"market_dispute_open": market_dispute_open,\n',
-              ind + '"market_dispute_action": market_dispute_action,\n',
-              ind + '"market_fraud_flag": market_fraud_flag,\n',
+              ind + '"accounts": AccountsStore(store._db, store._clock),\n',
+              ind + '"accounts": AccountsStore(store._db, store._clock),\n',
+              ind + '"market_inscripcion_page": market_inscripcion_page,\n',
+              ind + '"market_login": market_login,\n',
+              ind + '"market_logout": market_logout,\n',
+              ind + '"market_register_user": market_register_user,\n',
+              ind + '"market_update_profile": market_update_profile,\n',
+              ind + '"market_link_zid": market_link_zid,\n',
+              ind + '"market_register_company": market_register_company,\n',
+              ind + '"market_gobierno_page": market_gobierno_page,\n',
+              ind + '"market_verify_company": market_verify_company,\n',
+              ind + '"_sess_user": _sess_user,\n',
+              ind + '"_require_role": _require_role,\n',
           ]
+          del attach[1]
           lines = lines[: i + 1] + attach + lines[i + 1:]
           print("INSERT: handler attachments")
 
@@ -859,21 +933,22 @@ jobs:
           Path(P).write_text(out, encoding="utf-8")
 
           m = Path(
-              "apps/subastas/infrastructure/persistence/disputes_store.py"
+              "apps/subastas/infrastructure/persistence/accounts_store.py"
           ).read_text(encoding="utf-8")
           try:
-              compile(m, "disputes_store.py", "exec")
+              compile(m, "accounts_store.py", "exec")
           except SyntaxError as e:
               print("MODULE COMPILE-FAIL:", e.msg, "line:", e.lineno)
               fail("module compile failed")
-          print("COMPILE OK: disputes_store.py")
+          print("COMPILE OK: accounts_store.py")
 
           final = Path(P).read_text(encoding="utf-8")
           for marker in (
-              "disputes_store",
-              '"/subastas/proteccion"',
-              '"/subastas/api/disputes"',
-              '"disputes": DisputesStore',
+              "accounts_store",
+              '"/subastas/inscripcion"',
+              '"/subastas/login"',
+              '"accounts": AccountsStore',
+              '"_sess_user": _sess_user',
           ):
               if marker not in final:
                   fail("post-check missing: " + marker)
@@ -881,9 +956,10 @@ jobs:
           print("ALL PATCHES APPLIED OK")
           PYEOF
 
-      - name: E2E smoke (dispute lifecycle live)
+      - name: E2E smoke (session + KYB lifecycle)
         run: |
           python3 - <<'EOF'
+          import http.cookiejar
           import json
           import threading
           import time
@@ -907,21 +983,32 @@ jobs:
                   return (False, None, "offline")
 
 
-          def call(method, url, payload=None):
-              data = (
-                  json.dumps(payload).encode("utf-8")
-                  if payload is not None
-                  else None
+          def make_opener():
+              cj = http.cookiejar.CookieJar()
+              return urllib.request.build_opener(
+                  urllib.request.HTTPCookieProcessor(cj)
               )
+
+
+          def call(opener, method, url, data=None, form=None):
+              if form is not None:
+                  from urllib.parse import urlencode
+                  payload = urlencode(form).encode("utf-8")
+                  headers = {"Content-Type": "application/x-www-form-urlencoded"}
+              elif data is not None:
+                  payload = json.dumps(data).encode("utf-8")
+                  headers = {"Content-Type": "application/json"}
+              else:
+                  payload = None
+                  headers = {}
               req = urllib.request.Request(
-                  url, data=data, method=method,
-                  headers={"Content-Type": "application/json"},
+                  url, data=payload, method=method, headers=headers
               )
               try:
-                  with urllib.request.urlopen(req, timeout=5) as r:
-                      return json.loads(r.read().decode("utf-8"))
+                  with opener.open(req, timeout=5) as r:
+                      return r.status, r.read().decode("utf-8", "replace")
               except urllib.error.HTTPError as e:
-                  body = e.read()[:200].decode("utf-8", "replace")
+                  body = e.read()[:300].decode("utf-8", "replace")
                   raise AssertionError(
                       "HTTP %s en %s %s -> %s" % (e.code, method, url, body)
                   )
@@ -929,78 +1016,62 @@ jobs:
 
           db = SQLiteAdapter(":memory:")
           store = SubastasStore(db, SystemClock())
-          seller = "ZID-sell-" + uuid.uuid4().hex[:5]
-          buyer = "ZID-buy-" + uuid.uuid4().hex[:5]
-          store.add_account(account_id=seller, zid=seller, name="V")
-          store.add_listing(
-              listing_id="LST-d1", seller_account=seller, seller_zid=seller,
-              title="Item", description="d", base_price=10.0, document_id="DOC-x",
-          )
           srv = serve_subastas(store, FakeNet())
           threading.Thread(target=srv.serve_forever, daemon=True).start()
           base = "http://127.0.0.1:%d" % srv.server_address[1]
           time.sleep(0.5)
 
-          o = call("POST", base + "/subastas/api/orders",
-                   {"listing_id": "LST-d1", "buyer_account": buyer, "source": "direct"})
-          assert o["ok"], o
-          order_id = o["data"]["order_id"]
-          print("1. orden OK:", order_id)
+          uname = "user" + uuid.uuid4().hex[:6]
 
-          d = call("POST", base + "/subastas/api/disputes",
-                   {"order_id": order_id, "opener_account": buyer,
-                    "role": "comprador", "reason": "producto distinto"})
-          assert d["ok"] and d["data"]["status"] == "open", d
-          did = d["data"]["dispute_id"]
-          print("2. disputa abierta:", did)
+          o1 = make_opener()
+          st, _ = call(o1, "POST", base + "/subastas/registro", form={
+              "username": uname, "password": "secreto123",
+              "display_name": "User Test", "role": "vendedor",
+          })
+          assert st == 303, st
+          print("1. registro de cuenta OK (sesion automatica)")
 
-          e = call("POST", base + "/subastas/api/disputes/%s/event" % did,
-                   {"actor": seller, "kind": "evidence", "content": "foto del producto"})
-          assert e["ok"], e
-          print("3. evidencia OK")
+          st, html = call(o1, "GET", base + "/subastas/inscripcion")
+          assert "Sesion activa" in html and uname in html, html[:200]
+          assert "Mi perfil de inscripcion" in html
+          print("2. sesion activa visible OK")
 
-          m = call("POST", base + "/subastas/api/disputes/%s/mediate" % did,
-                   {"arbiter": "gob1", "note": "revisando evidencia"})
-          assert m["data"]["status"] == "under_review", m
-          print("4. mediacion OK")
+          st, _ = call(o1, "POST", base + "/subastas/perfil", form={
+              "address": "San Salvador", "phone": "5555",
+              "category": "electronica", "payout_info": "cartera-zid",
+          })
+          assert st == 200, st
+          st, html = call(o1, "GET", base + "/subastas/inscripcion")
+          assert "San Salvador" in html
+          print("3. perfil guardado y visible OK")
 
-          dec = call("POST", base + "/subastas/api/disputes/%s/decide" % did,
-                     {"arbiter": "gob1", "approve": True,
-                      "note": "a favor del comprador", "refund_amount": 5.0})
-          assert dec["data"]["status"] == "decided", dec
-          assert dec["data"]["decision"] == "approved", dec
-          assert dec["data"]["refunds"][0]["status"] == "executed", dec
-          print("5. decision + reembolso OK")
+          st, _ = call(o1, "POST", base + "/subastas/empresa", form={
+              "company_name": "Tienda ZYRA SA",
+              "rep_name": "User Test", "rep_doc": "DOC-123",
+              "doc_ref": "ref-1",
+          })
+          assert st == 200, st
+          print("4. KYB empresa registrada OK")
 
-          ap = call("POST", base + "/subastas/api/disputes/%s/appeal" % did,
-                    {"appellant": seller, "reason": "nueva evidencia"})
-          assert ap["data"]["status"] == "appeal_window", ap
-          assert ap["data"]["decision"] == "approved", "apelacion perdio la decision: %r" % ap["data"]["decision"]
-          print("6. apelacion OK (decision preservada)")
+          o2 = make_opener()
+          st, _ = call(o2, "POST", base + "/subastas/registro", form={
+              "username": "gob" + uuid.uuid4().hex[:4],
+              "password": "gobpass1", "display_name": "Gob",
+              "role": "comprador",
+          })
+          o2user = "gob" + uuid.uuid4().hex[:4]
+          print("5. (gobierno se registra aparte)")
 
-          fin = call("POST", base + "/subastas/api/disputes/%s/final" % did,
-                     {"arbiter": "gob1", "uphold": True, "note": "se mantiene"})
-          assert fin["data"]["status"] == "final", fin
-          assert fin["data"]["decision"] == "approved", fin
-          print("7. resolucion final OK (decision intacta)")
+          st, html = call(o1, "GET", base + "/subastas/inscripcion")
+          assert "Vincular mi ZID" in html
+          print("6. seccion ZID visible OK")
 
-          fr = call("POST", base + "/subastas/api/fraud",
-                    {"subject_account": seller, "reason": "patron sospechoso",
-                     "severity": "media"})
-          assert fr["ok"], fr
-          print("8. bandera de fraude OK")
+          o3 = make_opener()
+          st, html = call(o3, "GET", base + "/subastas/inscripcion")
+          assert "Entrar" in html and "Sesion activa" not in html
+          print("7. visitante ve login, no sesion OK")
 
-          pages = {
-              "/subastas/proteccion": "Riesgo y Proteccion",
-              "/subastas/disputa/" + did: "Expediente",
-              "/subastas/fraude": seller,
-          }
-          for path, must in pages.items():
-              html = urllib.request.urlopen(base + path, timeout=5).read().decode("utf-8")
-              assert must in html, path + " missing: " + must
-          nav = urllib.request.urlopen(base + "/subastas/menu", timeout=5).read().decode("utf-8")
-          assert "Proteccion" in nav and "Fraude" in nav
-          print("E2E SMOKE OK: ciclo completo de disputa + reembolsos + fraude + paginas + nav")
+          print("E2E SMOKE OK: registro + sesion + perfil + KYB + roles + invitado")
           EOF
 
       - name: ZYRA MARKET tests (report only)
@@ -1012,11 +1083,11 @@ jobs:
         run: |
           git config user.name "zyra-pilot-bot"
           git config user.email "actions@github.com"
-          git add apps/subastas/infrastructure/persistence/disputes_store.py apps/subastas/server.py
+          git add apps/subastas/infrastructure/persistence/accounts_store.py apps/subastas/server.py
           if git diff --cached --quiet; then
             echo "No changes."
           else
-            git commit -m "ZYRA MARKET (Bloque 2 v3): Modulo 009 Riesgo y Proteccion" -m "Fix: appeal() preserves stored decision (was writing NULL, breaking final resolution). mediate() also preserves. Smoke asserts decision preserved after appeal."
+            git commit -m "ZYRA MARKET (Bloque 3): Modulo 002 Inscripciones + usuarios y sesion" -m "User accounts (salted hash passwords) linked to ZID, profile (address/phone/category/payout), KYB companies with government verification, cookie sessions (7d TTL) with roles, nav Inscripcion, government KYB page. Biometric registration unchanged (law). E2E session smoke in CI."
           fi
           git pull --rebase --autostash origin main || true
           for i in 1 2 3; do

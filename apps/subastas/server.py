@@ -23,29 +23,36 @@ from apps.subastas.infrastructure.persistence.subastas_commerce import (
 )
 
 
-from apps.subastas.infrastructure.persistence.disputes_store import (
-    DisputesStore,
-    market_disputes_page,
-    market_fraud_page,
-    market_dispute_detail,
-    market_dispute_open,
-    market_dispute_action,
-    market_fraud_flag,
+import importlib as _imp
+_riesgo_mod = _imp.import_module(
+    "apps.subastas.modules.009_riesgo_proteccion.riesgo_store"
 )
-from apps.subastas.infrastructure.persistence.accounts_store import (
-    AccountsStore,
-    market_inscripcion_page,
-    market_login,
-    market_logout,
-    market_register_user,
-    market_update_profile,
-    market_link_zid,
-    market_register_company,
-    market_gobierno_page,
-    market_verify_company,
-    _sess_user,
-    _require_role,
+_accounts_mod = _imp.import_module(
+    "apps.subastas.modules.002_inscripciones.inscripciones_store"
 )
+RiesgoStore = _riesgo_mod.RiesgoStore
+market_disputes_page = _riesgo_mod.market_disputes_page
+market_fraud_page = _riesgo_mod.market_fraud_page
+market_dispute_detail = _riesgo_mod.market_dispute_detail
+market_dispute_open = _riesgo_mod.market_dispute_open
+market_dispute_action = _riesgo_mod.market_dispute_action
+market_fraud_flag = _riesgo_mod.market_fraud_flag
+market_riesgo_page = _riesgo_mod.market_riesgo_page
+market_riesgo_scan = _riesgo_mod.market_riesgo_scan
+market_riesgo_block = _riesgo_mod.market_riesgo_block
+AccountsStore = _accounts_mod.AccountsStore
+market_inscripcion_page = _accounts_mod.market_inscripcion_page
+market_login = _accounts_mod.market_login
+market_logout = _accounts_mod.market_logout
+market_register_user = _accounts_mod.market_register_user
+market_update_profile = _accounts_mod.market_update_profile
+market_link_zid = _accounts_mod.market_link_zid
+market_register_company = _accounts_mod.market_register_company
+market_gobierno_page = _accounts_mod.market_gobierno_page
+market_verify_company = _accounts_mod.market_verify_company
+_sess_user = _accounts_mod._sess_user
+_require_role = _accounts_mod._require_role
+# (accounts via importlib)
 def _find_value(doc, keys):
     if isinstance(doc, dict):
         for k, v in doc.items():
@@ -210,6 +217,9 @@ class SubastasApiHandler(BaseHTTPRequestHandler):
             if path == "/subastas/proteccion":
                 self._send_html(200, self.market_disputes_page())
                 return
+            if path == "/subastas/riesgo":
+                self._send_html(200, self.market_riesgo_page())
+                return
             if path == "/subastas/fraude":
                 self._send_html(200, self.market_fraud_page())
                 return
@@ -283,6 +293,12 @@ class SubastasApiHandler(BaseHTTPRequestHandler):
             if path == "/subastas/api/disputes":
                 self.market_dispute_open()
                 return
+            if path == "/subastas/api/riesgo/scan":
+                self.market_riesgo_scan()
+                return
+            if path == "/subastas/api/riesgo/bloqueo":
+                self.market_riesgo_block()
+                return
             if path == "/subastas/api/fraud":
                 self.market_fraud_flag()
                 return
@@ -309,16 +325,23 @@ class SubastasApiHandler(BaseHTTPRequestHandler):
         description = self._form_value(form, "description")
         raw_price = self._form_value(form, "base_price")
         if not seller_account or not title:
-            self._send_html(400, "<html><body><h1>Faltan datos</h1></body></html>")
+            self._send_html(400,
+                "<html><body><h1>Faltan datos</h1></body></html>")
             return
+        if self.riesgo.is_blocked(seller_account):
+            raise PermissionError(
+                "cuenta bloqueada por proteccion: " + seller_account
+            )
         try:
             base_price = float(raw_price)
         except (TypeError, ValueError):
-            self._send_html(400, "<html><body><h1>Precio invalido</h1></body></html>")
+            self._send_html(400,
+                "<html><body><h1>Precio invalido</h1></body></html>")
             return
         account = self.store.get_account(seller_account)
         seller_zid = account["zid"] if account else None
-        document_id = self._seal_listing(seller_account, title, description, base_price)
+        document_id = self._seal_listing(
+            seller_account, title, description, base_price)
         listing_id = new_listing_id()
         self.store.add_listing(
             listing_id=listing_id,
@@ -334,23 +357,26 @@ class SubastasApiHandler(BaseHTTPRequestHandler):
             "<p>SELLADO</p>",
             "<p>listing: %s</p>" % listing_id,
             "<p>documento: %s</p>" % document_id,
-            "<p><a href='/subastas/menu'><button>Volver al menu</button></a></p>",
+            "<p><a href='/subastas/menu'><button>Volver</button></a></p>",
             "</body></html>",
         ]))
-
     def _create_bid_json(self) -> None:
         doc = self._read_json()
         if doc is None:
             self._send_json(400, {"ok": False, "error": "invalid JSON"})
             return
+        bidder = str(doc.get("bidder_account", ""))
+        if self.riesgo.is_blocked(bidder):
+            raise PermissionError(
+                "cuenta bloqueada por proteccion: " + bidder
+            )
         bid = self.store.place_bid(
             bid_id=new_bid_id(),
             listing_id=str(doc.get("listing_id", "")),
-            bidder_account=str(doc.get("bidder_account", "")),
+            bidder_account=bidder,
             amount=float(doc.get("amount", 0)),
         )
         self._send_json(200, {"ok": True, "bid": bid})
-
     def _close_form(self) -> None:
         form = self._read_form()
         closed = self.store.close_listing(
@@ -444,16 +470,22 @@ class SubastasApiHandler(BaseHTTPRequestHandler):
             self._send_json(400, {"ok": False, "error": "invalid JSON"})
             return
         source = str(doc.get("source", "direct"))
+        buyer = str(doc.get("buyer_account", ""))
+        if self.riesgo.is_blocked(buyer):
+            raise PermissionError(
+                "cuenta bloqueada por proteccion: " + buyer
+            )
         if source == "auction":
-            self.commerce.persist_winner(listing_id=str(doc.get("listing_id", "")))
+            self.commerce.persist_winner(
+                listing_id=str(doc.get("listing_id", ""))
+            )
         order = self.commerce.create_order(
             order_id=_nid("ORD-"),
             listing_id=str(doc.get("listing_id", "")),
-            buyer_account=str(doc.get("buyer_account", "")),
+            buyer_account=buyer,
             source=source,
         )
         self._send_json(201, {"ok": True, "data": order})
-
     def _order_action(self, order_id, action) -> None:
         doc = self._read_json() or {}
         if action == "pay":
@@ -610,6 +642,7 @@ class SubastasApiHandler(BaseHTTPRequestHandler):
             ("/subastas/gobierno-kyb", "KYB"),
             ("/subastas/gobierno", "Gobierno"),
             ("/subastas/proteccion", "Proteccion"),
+            ("/subastas/riesgo", "Riesgo"),
             ("/subastas/fraude", "Fraude"),
             ("/subastas/revision", "Revision"),
         )
@@ -925,6 +958,7 @@ class SubastasApiHandler(BaseHTTPRequestHandler):
 
 
 def serve_subastas(store, client, *, host="127.0.0.1", port=0):
+    _riesgo_inst = RiesgoStore(store._db, store._clock)
     handler = type(
         "BoundSubastasHandler",
         (SubastasApiHandler,),
@@ -932,7 +966,11 @@ def serve_subastas(store, client, *, host="127.0.0.1", port=0):
             "store": store,
             "net_client": client,
             "commerce": CommerceStore(store._db, store._clock),
-            "disputes": DisputesStore(store._db, store._clock),
+            "disputes": _riesgo_inst,
+            "riesgo": _riesgo_inst,
+            "market_riesgo_page": market_riesgo_page,
+            "market_riesgo_scan": market_riesgo_scan,
+            "market_riesgo_block": market_riesgo_block,
             "accounts": AccountsStore(store._db, store._clock),
             "market_inscripcion_page": market_inscripcion_page,
             "market_login": market_login,

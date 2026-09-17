@@ -1,11 +1,4 @@
-"""ZYRA MARKET - Riesgo y Proteccion (Modulo 009).
-
-Disputas con expediente completo: apertura, evidencia,
-mediacion, decision, apelacion y resolucion final.
-La apelacion PRESERVA la decision (fix v3).
-Reembolsos registrados como movimientos (dinero real:
-motor cartera, Bloque 9). Banderas de fraude.
-HTML con patron join (sin + fragiles)."""
+"""ZYRA MARKET - Modulo 009 Riesgo y Proteccion (completo)."""
 from __future__ import annotations
 
 import threading
@@ -24,7 +17,7 @@ def _nid(prefix: str) -> str:
 EDITABLE = ("open", "under_review", "appeal_window")
 
 
-class DisputesStore:
+class RiesgoStore:
     def __init__(self, db, clock) -> None:
         self._db = db
         self._clock = clock
@@ -72,6 +65,23 @@ class DisputesStore:
             " status TEXT NOT NULL,"
             " created_at TEXT NOT NULL)"
         )
+        self._run(
+            "CREATE TABLE IF NOT EXISTS sbs_fraud_alerts ("
+            " alert_id TEXT PRIMARY KEY,"
+            " subject_account TEXT NOT NULL,"
+            " pattern TEXT NOT NULL,"
+            " detail TEXT NOT NULL,"
+            " created_at TEXT NOT NULL)"
+        )
+        self._run(
+            "CREATE TABLE IF NOT EXISTS sbs_blocks ("
+            " block_id TEXT PRIMARY KEY,"
+            " subject_account TEXT NOT NULL,"
+            " reason TEXT NOT NULL,"
+            " status TEXT NOT NULL,"
+            " created_at TEXT NOT NULL,"
+            " released_at TEXT)"
+        )
 
     def _run(self, sql, params=()):
         if not params:
@@ -90,7 +100,7 @@ class DisputesStore:
             return sql
         assembled = parts[0]
         for i, v in enumerate(params):
-            assembled += DisputesStore._literal(v)
+            assembled += RiesgoStore._literal(v)
             assembled += parts[i + 1]
         return assembled
 
@@ -183,9 +193,7 @@ class DisputesStore:
                 raise LookupError("disputa no encontrada: %s" % dispute_id)
             status = str(self._field(row, "s", 5))
             if status not in EDITABLE:
-                raise ValueError(
-                    "la disputa esta %s: expediente cerrado" % status
-                )
+                raise ValueError("la disputa esta %s" % status)
             self._add_event(dispute_id, actor_account, kind, content)
         return self.get_dispute(dispute_id)
 
@@ -295,18 +303,11 @@ class DisputesStore:
                 raise LookupError("disputa no encontrada")
             status = str(self._field(row, "f", 5))
             if status not in ("open", "under_review"):
-                raise ValueError(
-                    "no se puede mediar en estado %s" % status
-                )
+                raise ValueError("no se puede mediar en estado %s" % status)
             decision = self._field(row, "g", 6)
             refund_amount = self._field(row, "h", 7)
-            self._set_status(
-                dispute_id, "under_review", decision, refund_amount
-            )
-            self._add_event(
-                dispute_id, arbiter, "mediation",
-                "mediacion: %s" % note,
-            )
+            self._set_status(dispute_id, "under_review", decision, refund_amount)
+            self._add_event(dispute_id, arbiter, "mediation", "mediacion: %s" % note)
         return self.get_dispute(dispute_id)
 
     def decide(self, dispute_id, *, arbiter, approve, note, refund_amount):
@@ -320,9 +321,7 @@ class DisputesStore:
             status = str(self._field(row, "f", 5))
             order_id = str(self._field(row, "b", 1))
             if status not in ("open", "under_review"):
-                raise ValueError(
-                    "no se puede decidir en estado %s" % status
-                )
+                raise ValueError("no se puede decidir en estado %s" % status)
             decision = "approved" if approve else "rejected"
             self._set_status(
                 dispute_id, "decided", decision,
@@ -330,7 +329,7 @@ class DisputesStore:
             )
             self._add_event(
                 dispute_id, arbiter, "decision",
-                "decision: %s — %s" % (decision, note),
+                "decision: %s - %s" % (decision, note),
             )
             if approve and amount > 0:
                 self._run(
@@ -350,18 +349,11 @@ class DisputesStore:
                 raise LookupError("disputa no encontrada")
             status = str(self._field(row, "f", 5))
             if status != "decided":
-                raise ValueError(
-                    "solo se apela una decision (estado %s)" % status
-                )
+                raise ValueError("solo se apela una decision (estado %s)" % status)
             decision = self._field(row, "g", 6)
             refund_amount = self._field(row, "h", 7)
-            self._set_status(
-                dispute_id, "appeal_window", decision, refund_amount
-            )
-            self._add_event(
-                dispute_id, appellant, "appeal",
-                "apelacion: %s" % reason,
-            )
+            self._set_status(dispute_id, "appeal_window", decision, refund_amount)
+            self._add_event(dispute_id, appellant, "appeal", "apelacion: %s" % reason)
         return self.get_dispute(dispute_id)
 
     def resolve_appeal(self, dispute_id, *, arbiter, uphold, note):
@@ -374,30 +366,24 @@ class DisputesStore:
             status = str(self._field(row, "f", 5))
             decision = str(self._field(row, "g", 6) or "")
             if status != "appeal_window":
-                raise ValueError(
-                    "sin apelacion abierta (estado %s)" % status
-                )
+                raise ValueError("sin apelacion abierta (estado %s)" % status)
             if uphold:
                 self._set_status(dispute_id, "final", decision)
                 self._add_event(
                     dispute_id, arbiter, "decision",
-                    "apelacion resuelta: se mantiene %s — %s"
-                    % (decision, note),
+                    "apelacion resuelta: se mantiene %s - %s" % (decision, note),
                 )
             else:
                 self._set_status(dispute_id, "final", "overturned")
-                self._reverse_refund(dispute_id)
+                self._run(
+                    "UPDATE sbs_refunds SET status = 'reversed'"
+                    " WHERE dispute_id = " + self._literal(dispute_id)
+                )
                 self._add_event(
                     dispute_id, arbiter, "decision",
-                    "apelacion resuelta: decision revertida — %s" % note,
+                    "apelacion resuelta: decision revertida - %s" % note,
                 )
         return self.get_dispute(dispute_id)
-
-    def _reverse_refund(self, dispute_id):
-        self._run(
-            "UPDATE sbs_refunds SET status = 'reversed'"
-            " WHERE dispute_id = " + self._literal(dispute_id)
-        )
 
     def flag_fraud(self, *, subject_account, reason, severity):
         subject_account = self._req(subject_account, "subject_account")
@@ -437,6 +423,91 @@ class DisputesStore:
             })
         return out
 
+    def scan_patterns(self, *, account, orders_last_hour, account_age_days, activity_count, doc_duplicates):
+        """Reglas: mas de 10 ordenes/hora; cuenta menor a 7 dias
+        con mas de 20 actividades; documentos duplicados."""
+        account = self._req(account, "account")
+        alerts = []
+        if float(orders_last_hour or 0) > 10:
+            alerts.append(("velocidad_ordenes", "mas de 10 ordenes en una hora"))
+        if float(account_age_days or 999) < 7 and float(activity_count or 0) > 20:
+            alerts.append(("cuenta_nueva_alta_actividad", "cuenta nueva con alta actividad"))
+        if float(doc_duplicates or 0) >= 1:
+            alerts.append(("documento_duplicado", "documentos coincidentes"))
+        created = []
+        with self._lock:
+            for pattern, detail in alerts:
+                alert_id = _nid("ALR-")
+                self._run(
+                    "INSERT INTO sbs_fraud_alerts (alert_id,"
+                    " subject_account, pattern, detail, created_at)"
+                    " VALUES (?, ?, ?, ?, ?)",
+                    (alert_id, account, pattern, detail, _now()),
+                )
+                created.append({"alert_id": alert_id, "pattern": pattern, "detail": detail})
+        return created
+
+    def list_alerts(self):
+        out = []
+        for row in self._rows(
+            "SELECT alert_id, subject_account, pattern, detail, created_at"
+            " FROM sbs_fraud_alerts ORDER BY created_at DESC"
+        ):
+            out.append({
+                "alert_id": self._field(row, "a", 0),
+                "subject_account": self._field(row, "b", 1),
+                "pattern": self._field(row, "c", 2),
+                "detail": self._field(row, "d", 3),
+                "created_at": self._field(row, "e", 4),
+            })
+        return out
+
+    def _block_internal(self, subject_account, reason):
+        block_id = _nid("BLK-")
+        self._run(
+            "INSERT INTO sbs_blocks (block_id, subject_account,"
+            " reason, status, created_at, released_at)"
+            " VALUES (?, ?, ?, 'active', ?, NULL)",
+            (block_id, subject_account, reason, _now()),
+        )
+        return block_id
+
+    def block_account(self, *, subject_account, reason, actor):
+        subject_account = self._req(subject_account, "subject_account")
+        reason = self._req(reason, "reason")
+        self._req(actor, "actor")
+        with self._lock:
+            block_id = self._block_internal(subject_account, reason)
+        return {"block_id": block_id, "subject_account": subject_account, "status": "active"}
+
+    def is_blocked(self, account):
+        account = str(account or "").strip()
+        if not account:
+            return False
+        rows = self._rows(
+            "SELECT block_id FROM sbs_blocks WHERE subject_account = "
+            + self._literal(account)
+            + " AND status = 'active' LIMIT 1"
+        )
+        return bool(rows)
+
+    def list_blocks(self):
+        out = []
+        for row in self._rows(
+            "SELECT block_id, subject_account, reason, status,"
+            " created_at, released_at FROM sbs_blocks"
+            " ORDER BY created_at DESC"
+        ):
+            out.append({
+                "block_id": self._field(row, "a", 0),
+                "subject_account": self._field(row, "b", 1),
+                "reason": self._field(row, "c", 2),
+                "status": self._field(row, "d", 3),
+                "created_at": self._field(row, "e", 4),
+                "released_at": self._field(row, "f", 5),
+            })
+        return out
+
 
 def market_disputes_page(self) -> str:
     rows = self.disputes.list_disputes()
@@ -444,7 +515,7 @@ def market_disputes_page(self) -> str:
     for d in rows:
         cards.append("".join([
             "<div class='card'>",
-            "<p><b>%s</b> — %s</p>" % (d["dispute_id"], d["status"]),
+            "<p><b>%s</b> - %s</p>" % (d["dispute_id"], d["status"]),
             "<p>Orden: %s | Abrio: %s (%s)</p>" % (
                 d["order_id"], d["opener_account"], d["role"]),
             "<p>%s</p>" % d["reason"],
@@ -454,8 +525,7 @@ def market_disputes_page(self) -> str:
     if not cards:
         cards.append("<p>No hay disputas registradas.</p>")
     body = "".join([
-        "<div class='card'><h2>Riesgo y Proteccion — DISPUTAS</h2>",
-        "<p>Proteccion del comprador y del vendedor. El gobierno media y decide.</p>",
+        "<div class='card'><h2>Riesgo y Proteccion - DISPUTAS</h2>",
         "<h3>Abrir disputa</h3>",
         "<input id='dOrder' placeholder='ID de orden (ORD-...)'>",
         "<input id='dWho' placeholder='Tu cuenta'>",
@@ -489,7 +559,7 @@ def market_fraud_page(self) -> str:
     for f in flags:
         rows.append("".join([
             "<div class='card'>",
-            "<p><b>%s</b> — %s (%s)</p>" % (
+            "<p><b>%s</b> - %s (%s)</p>" % (
                 f["subject_account"], f["severity"], f["status"]),
             "<p>%s</p>" % f["reason"],
             "</div>",
@@ -497,8 +567,7 @@ def market_fraud_page(self) -> str:
     if not rows:
         rows.append("<p>Sin banderas de fraude.</p>")
     body = "".join([
-        "<div class='card'><h2>Riesgo y Proteccion — FRAUDE</h2>",
-        "<p>Banderas de fraude (gobierno). La investigacion profunda llega con el Bloque 8.</p>",
+        "<div class='card'><h2>Riesgo y Proteccion - FRAUDE</h2>",
         "<input id='fWho' placeholder='Cuenta sospechosa'>",
         "<input id='fWhy' placeholder='Motivo'>",
         "<select id='fSev'>",
@@ -523,6 +592,62 @@ def market_fraud_page(self) -> str:
         "</script>",
     ])
     return self._page_wrap("ZYRA MARKET - Fraude", body)
+
+
+def market_riesgo_page(self) -> str:
+    alerts = self.riesgo.list_alerts()
+    blocks = self.riesgo.list_blocks()
+    a_rows = []
+    for a in alerts:
+        a_rows.append(
+            "<p>- <b>%s</b> (%s): %s</p>" % (
+                a["subject_account"], a["pattern"], a["detail"]))
+    b_rows = []
+    for b in blocks:
+        b_rows.append(
+            "<p>- <b>%s</b> (%s): %s</p>" % (
+                b["subject_account"], b["status"], b["reason"]))
+    if not a_rows:
+        a_rows.append("<p>Sin alertas.</p>")
+    if not b_rows:
+        b_rows.append("<p>Sin bloqueos.</p>")
+    body = "".join([
+        "<div class='card'><h2>Escaneo de patrones</h2>",
+        "<input id='scAcc' placeholder='Cuenta'>",
+        "<input id='scOrders' type='number' placeholder='Ordenes ultima hora'>",
+        "<input id='scAge' type='number' placeholder='Edad de cuenta (dias)'>",
+        "<input id='scAct' type='number' placeholder='Actividades totales'>",
+        "<input id='scDup' type='number' placeholder='Documentos duplicados'>",
+        "<button id='btnScan'>Escanear patrones</button>",
+        "</div>",
+        "<div class='card'><h2>Alertas automaticas</h2>",
+        "".join(a_rows),
+        "</div>",
+        "<div class='card'><h2>Bloqueos de cuenta</h2>",
+        "<p>Cuenta bloqueada no puede pujar, publicar ni comprar.</p>",
+        "<input id='blAcc' placeholder='Cuenta a bloquear'>",
+        "<input id='blWhy' placeholder='Motivo'>",
+        "<input id='blWho' placeholder='Tu cuenta (gobierno)'>",
+        "<button id='btnBlk'>Bloquear cuenta</button>",
+        "".join(b_rows),
+        "</div>",
+        "<p id='msg'></p>",
+        "<script>",
+        "function v(id){return document.getElementById(id).value;}",
+        "function num(id){var x=parseFloat(v(id));return isNaN(x)?0:x;}",
+        "function post(path,payload){",
+        "fetch(path,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(payload)})",
+        ".then(function(r){return r.json();})",
+        ".then(function(d){if(d.ok){location.reload();}",
+        "else{document.getElementById('msg').textContent='Error: '+(d.error||'');}})",
+        ".catch(function(e){document.getElementById('msg').textContent='Error: '+e;});}",
+        "document.getElementById('btnScan').addEventListener('click',function(){",
+        "post('/subastas/api/riesgo/scan',{account:v('scAcc'),orders_last_hour:num('scOrders'),account_age_days:num('scAge'),activity_count:num('scAct'),doc_duplicates:num('scDup')});});",
+        "document.getElementById('btnBlk').addEventListener('click',function(){",
+        "post('/subastas/api/riesgo/bloqueo',{subject_account:v('blAcc'),reason:v('blWhy'),actor:v('blWho')});});",
+        "</script>",
+    ])
+    return self._page_wrap("ZYRA MARKET - Riesgo", body)
 
 
 def market_dispute_detail(self, dispute_id: str) -> str:
@@ -560,7 +685,7 @@ def market_dispute_detail(self, dispute_id: str) -> str:
         "".join(rf),
         "</div>",
         "<div class='card'><h2>Acciones</h2>",
-        "<p><b>Evidencia / mensaje</b> (comprador o vendedor)</p>",
+        "<p><b>Evidencia / mensaje</b></p>",
         "<input id='evActor' placeholder='Tu cuenta'>",
         "<select id='evKind'>",
         "<option value='evidence'>evidencia</option>",
@@ -579,20 +704,20 @@ def market_dispute_detail(self, dispute_id: str) -> str:
         "<option value='false'>En contra</option>",
         "</select>",
         "<input id='dcNote' placeholder='Nota de decision'>",
-        "<input id='dcRef' type='number' step='0.01' placeholder='Monto reembolso (si aplica)'>",
+        "<input id='dcRef' type='number' step='0.01' placeholder='Monto reembolso'>",
         "<button id='btnDc'>Decidir</button>",
-        "<p><b>Apelar</b> (tras decision)</p>",
+        "<p><b>Apelar</b></p>",
         "<input id='apWho' placeholder='Tu cuenta'>",
-        "<input id='apWhy' placeholder='Motivo de apelacion'>",
+        "<input id='apWhy' placeholder='Motivo'>",
         "<button id='btnAp'>Apelar</button>",
-        "<p><b>Resolucion final</b> (gobierno, tras apelacion)</p>",
+        "<p><b>Resolucion final</b> (gobierno)</p>",
         "<input id='fnArb' placeholder='Cuenta del arbitro'>",
         "<select id='fnUp'>",
-        "<option value='true'>Mantener decision</option>",
-        "<option value='false'>Revertir decision</option>",
+        "<option value='true'>Mantener</option>",
+        "<option value='false'>Revertir</option>",
         "</select>",
         "<input id='fnNote' placeholder='Nota final'>",
-        "<button id='btnFn'>Cerrar definitivo</button>",
+        "<button id='btnFn'>Cerrar</button>",
         "<p id='msg'></p>",
         "</div>",
         "<script>",
@@ -691,3 +816,31 @@ def market_fraud_flag(self) -> None:
         severity=str(doc.get("severity", "media")),
     )
     self._send_json(201, {"ok": True, "data": flag})
+
+
+def market_riesgo_scan(self) -> None:
+    doc = self._read_json()
+    if doc is None:
+        self._send_json(400, {"ok": False, "error": "invalid JSON"})
+        return
+    created = self.riesgo.scan_patterns(
+        account=str(doc.get("account", "")),
+        orders_last_hour=doc.get("orders_last_hour", 0),
+        account_age_days=doc.get("account_age_days", 999),
+        activity_count=doc.get("activity_count", 0),
+        doc_duplicates=doc.get("doc_duplicates", 0),
+    )
+    self._send_json(200, {"ok": True, "data": {"alerts": created}})
+
+
+def market_riesgo_block(self) -> None:
+    doc = self._read_json()
+    if doc is None:
+        self._send_json(400, {"ok": False, "error": "invalid JSON"})
+        return
+    result = self.riesgo.block_account(
+        subject_account=str(doc.get("subject_account", "")),
+        reason=str(doc.get("reason", "")),
+        actor=str(doc.get("actor", "")),
+    )
+    self._send_json(201, {"ok": True, "data": result})

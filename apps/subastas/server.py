@@ -30,6 +30,17 @@ _riesgo_mod = _imp.import_module(
 _accounts_mod = _imp.import_module(
     "apps.subastas.modules.002_inscripciones.inscripciones_store"
 )
+_iext_mod = _imp.import_module(
+    "apps.subastas.modules.002_inscripciones.inscripciones_ext"
+)
+InscripcionesExt = _iext_mod.InscripcionesExt
+market_ins_ext_page = _iext_mod.market_ins_ext_page
+market_gov_inscripcion_page = _iext_mod.market_gov_inscripcion_page
+market_entity_register = _iext_mod.market_entity_register
+market_doc_submit = _iext_mod.market_doc_submit
+market_pm_add = _iext_mod.market_pm_add
+market_verify_entity = _iext_mod.market_verify_entity
+market_verify_document = _iext_mod.market_verify_document
 RiesgoStore = _riesgo_mod.RiesgoStore
 market_disputes_page = _riesgo_mod.market_disputes_page
 market_fraud_page = _riesgo_mod.market_fraud_page
@@ -208,6 +219,12 @@ class SubastasApiHandler(BaseHTTPRequestHandler):
                     {"ok": True, "data": self.commerce.get_shipment(path.split("/subastas/api/shipments/", 1)[1])},
                 )
                 return
+            if path == "/subastas/mi-inscripcion":
+                self._send_html(200, self.market_ins_ext_page())
+                return
+            if path == "/subastas/gov-inscripcion":
+                self._send_html(200, self.market_gov_inscripcion_page())
+                return
             if path == "/subastas/inscripcion":
                 self._send_html(200, self.market_inscripcion_page())
                 return
@@ -268,6 +285,21 @@ class SubastasApiHandler(BaseHTTPRequestHandler):
                 rest = path.split("/subastas/api/shipments/", 1)[1]
                 parts = rest.split("/")
                 self._shipment_action(parts[0], parts[1] if len(parts) > 1 else "")
+                return
+            if path == "/subastas/api/inscripcion/entidad":
+                self.market_entity_register()
+                return
+            if path == "/subastas/api/inscripcion/documento":
+                self.market_doc_submit()
+                return
+            if path == "/subastas/api/inscripcion/pago":
+                self.market_pm_add()
+                return
+            if path == "/subastas/api/inscripcion/verificar-entidad":
+                self.market_verify_entity()
+                return
+            if path == "/subastas/api/inscripcion/verificar-documento":
+                self.market_verify_document()
                 return
             if path == "/subastas/login":
                 self.market_login()
@@ -638,6 +670,7 @@ class SubastasApiHandler(BaseHTTPRequestHandler):
             ("/subastas/vendedor", "Vendedor"),
             ("/subastas/comprador", "Comprador"),
             ("/subastas/operaciones", "Ordenes y envios"),
+            ("/subastas/mi-inscripcion", "Mi Inscripcion"),
             ("/subastas/inscripcion", "Inscripcion"),
             ("/subastas/gobierno-kyb", "KYB"),
             ("/subastas/gobierno", "Gobierno"),
@@ -959,6 +992,7 @@ class SubastasApiHandler(BaseHTTPRequestHandler):
 
 def serve_subastas(store, client, *, host="127.0.0.1", port=0):
     _riesgo_inst = RiesgoStore(store._db, store._clock)
+    _iext_inst = InscripcionesExt(store._db, store._clock, client)
     handler = type(
         "BoundSubastasHandler",
         (SubastasApiHandler,),
@@ -966,6 +1000,14 @@ def serve_subastas(store, client, *, host="127.0.0.1", port=0):
             "store": store,
             "net_client": client,
             "commerce": CommerceStore(store._db, store._clock),
+            "iext": _iext_inst,
+            "market_ins_ext_page": market_ins_ext_page,
+            "market_gov_inscripcion_page": market_gov_inscripcion_page,
+            "market_entity_register": market_entity_register,
+            "market_doc_submit": market_doc_submit,
+            "market_pm_add": market_pm_add,
+            "market_verify_entity": market_verify_entity,
+            "market_verify_document": market_verify_document,
             "disputes": _riesgo_inst,
             "riesgo": _riesgo_inst,
             "market_riesgo_page": market_riesgo_page,

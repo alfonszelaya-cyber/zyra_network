@@ -23,6 +23,15 @@ from apps.subastas.infrastructure.persistence.subastas_commerce import (
 )
 
 
+from apps.subastas.infrastructure.persistence.disputes_store import (
+    DisputesStore,
+    market_disputes_page,
+    market_fraud_page,
+    market_dispute_detail,
+    market_dispute_open,
+    market_dispute_action,
+    market_fraud_flag,
+)
 def _find_value(doc, keys):
     if isinstance(doc, dict):
         for k, v in doc.items():
@@ -178,6 +187,20 @@ class SubastasApiHandler(BaseHTTPRequestHandler):
                     {"ok": True, "data": self.commerce.get_shipment(path.split("/subastas/api/shipments/", 1)[1])},
                 )
                 return
+            if path == "/subastas/proteccion":
+                self._send_html(200, self.market_disputes_page())
+                return
+            if path == "/subastas/fraude":
+                self._send_html(200, self.market_fraud_page())
+                return
+            if path.startswith("/subastas/disputa/"):
+                self._send_html(
+                    200,
+                    self.market_dispute_detail(
+                        path.split("/subastas/disputa/", 1)[1]
+                    ),
+                )
+                return
             if path == "/subastas/api/summary":
                 self._send_json(200, {"ok": True, "summary": self.store.summary()})
                 return
@@ -215,6 +238,19 @@ class SubastasApiHandler(BaseHTTPRequestHandler):
                 rest = path.split("/subastas/api/shipments/", 1)[1]
                 parts = rest.split("/")
                 self._shipment_action(parts[0], parts[1] if len(parts) > 1 else "")
+                return
+            if path == "/subastas/api/disputes":
+                self.market_dispute_open()
+                return
+            if path == "/subastas/api/fraud":
+                self.market_fraud_flag()
+                return
+            if path.startswith("/subastas/api/disputes/"):
+                rest = path.split("/subastas/api/disputes/", 1)[1]
+                parts = rest.split("/")
+                self.market_dispute_action(
+                    parts[0], parts[1] if len(parts) > 1 else ""
+                )
                 return
             if path == "/subastas/close":
                 self._close_form()
@@ -530,6 +566,8 @@ class SubastasApiHandler(BaseHTTPRequestHandler):
             ("/subastas/comprador", "Comprador"),
             ("/subastas/operaciones", "Ordenes y envios"),
             ("/subastas/gobierno", "Gobierno"),
+            ("/subastas/proteccion", "Proteccion"),
+            ("/subastas/fraude", "Fraude"),
             ("/subastas/revision", "Revision"),
         )
         parts = [
@@ -851,6 +889,13 @@ def serve_subastas(store, client, *, host="127.0.0.1", port=0):
             "store": store,
             "net_client": client,
             "commerce": CommerceStore(store._db, store._clock),
+            "disputes": DisputesStore(store._db, store._clock),
+            "market_disputes_page": market_disputes_page,
+            "market_fraud_page": market_fraud_page,
+            "market_dispute_detail": market_dispute_detail,
+            "market_dispute_open": market_dispute_open,
+            "market_dispute_action": market_dispute_action,
+            "market_fraud_flag": market_fraud_flag,
         },
     )
     server = ThreadingHTTPServer((host, port), handler)

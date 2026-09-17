@@ -32,6 +32,20 @@ from apps.subastas.infrastructure.persistence.disputes_store import (
     market_dispute_action,
     market_fraud_flag,
 )
+from apps.subastas.infrastructure.persistence.accounts_store import (
+    AccountsStore,
+    market_inscripcion_page,
+    market_login,
+    market_logout,
+    market_register_user,
+    market_update_profile,
+    market_link_zid,
+    market_register_company,
+    market_gobierno_page,
+    market_verify_company,
+    _sess_user,
+    _require_role,
+)
 def _find_value(doc, keys):
     if isinstance(doc, dict):
         for k, v in doc.items():
@@ -187,6 +201,12 @@ class SubastasApiHandler(BaseHTTPRequestHandler):
                     {"ok": True, "data": self.commerce.get_shipment(path.split("/subastas/api/shipments/", 1)[1])},
                 )
                 return
+            if path == "/subastas/inscripcion":
+                self._send_html(200, self.market_inscripcion_page())
+                return
+            if path == "/subastas/gobierno-kyb":
+                self._send_html(200, self.market_gobierno_page())
+                return
             if path == "/subastas/proteccion":
                 self._send_html(200, self.market_disputes_page())
                 return
@@ -238,6 +258,27 @@ class SubastasApiHandler(BaseHTTPRequestHandler):
                 rest = path.split("/subastas/api/shipments/", 1)[1]
                 parts = rest.split("/")
                 self._shipment_action(parts[0], parts[1] if len(parts) > 1 else "")
+                return
+            if path == "/subastas/login":
+                self.market_login()
+                return
+            if path == "/subastas/logout":
+                self.market_logout()
+                return
+            if path == "/subastas/registro":
+                self.market_register_user()
+                return
+            if path == "/subastas/perfil":
+                self.market_update_profile()
+                return
+            if path == "/subastas/vincular":
+                self.market_link_zid()
+                return
+            if path == "/subastas/empresa":
+                self.market_register_company()
+                return
+            if path == "/subastas/api/empresa/verificar":
+                self.market_verify_company()
                 return
             if path == "/subastas/api/disputes":
                 self.market_dispute_open()
@@ -565,6 +606,8 @@ class SubastasApiHandler(BaseHTTPRequestHandler):
             ("/subastas/vendedor", "Vendedor"),
             ("/subastas/comprador", "Comprador"),
             ("/subastas/operaciones", "Ordenes y envios"),
+            ("/subastas/inscripcion", "Inscripcion"),
+            ("/subastas/gobierno-kyb", "KYB"),
             ("/subastas/gobierno", "Gobierno"),
             ("/subastas/proteccion", "Proteccion"),
             ("/subastas/fraude", "Fraude"),
@@ -890,6 +933,18 @@ def serve_subastas(store, client, *, host="127.0.0.1", port=0):
             "net_client": client,
             "commerce": CommerceStore(store._db, store._clock),
             "disputes": DisputesStore(store._db, store._clock),
+            "accounts": AccountsStore(store._db, store._clock),
+            "market_inscripcion_page": market_inscripcion_page,
+            "market_login": market_login,
+            "market_logout": market_logout,
+            "market_register_user": market_register_user,
+            "market_update_profile": market_update_profile,
+            "market_link_zid": market_link_zid,
+            "market_register_company": market_register_company,
+            "market_gobierno_page": market_gobierno_page,
+            "market_verify_company": market_verify_company,
+            "_sess_user": _sess_user,
+            "_require_role": _require_role,
             "market_disputes_page": market_disputes_page,
             "market_fraud_page": market_fraud_page,
             "market_dispute_detail": market_dispute_detail,

@@ -1,4 +1,4 @@
-name: "ZYRA MARKET (Bloque 1 v6): server completo, patron join sin +"
+name: "ZYRA MARKET (Bloque 2): 009 Riesgo y Proteccion"
 
 on:
   workflow_dispatch:
@@ -8,7 +8,7 @@ permissions:
   contents: write
 
 concurrency:
-  group: zyra-market-b1
+  group: zyra-market-b2
   cancel-in-progress: true
 
 jobs:
@@ -31,890 +31,852 @@ jobs:
           pip install -r requirements.txt
           pip install pytest
 
-      - name: Write COMPLETE server.py (join-pattern)
+      - name: Write disputes_store.py (complete new file)
         run: |
-          cat > apps/subastas/server.py <<'SBSFILE'
-          """ZYRA MARKET (antes SUBASTAS). Todas las rutas y
-          logica originales conservadas. HTML construido con
-          listas + join (sin concatenaciones fragiles)."""
+          cat > apps/subastas/infrastructure/persistence/disputes_store.py <<'DPRF'
+          """ZYRA MARKET - Riesgo y Proteccion (Modulo 009).
+
+          Disputas con expediente completo: apertura, evidencia,
+          mediacion, decision, apelacion y resolucion final.
+          Reembolsos registrados como movimientos (dinero real:
+          motor cartera, Bloque 9). Banderas de fraude.
+          HTML con patron join (sin + fragiles)."""
           from __future__ import annotations
 
-          import base64 as _b64
-          import hashlib
-          import json
-          from http.server import (
-              BaseHTTPRequestHandler,
-              ThreadingHTTPServer,
-          )
-          from urllib.parse import parse_qs
-
-          from apps.subastas.infrastructure.persistence.subastas_store import (
-              SubastasStore,
-              new_bid_id,
-              new_listing_id,
-          )
-          from apps.subastas.infrastructure.persistence.subastas_commerce import (
-              CommerceStore,
-              _nid,
-          )
+          import threading
+          import time
+          import uuid
 
 
-          def _find_value(doc, keys):
-              if isinstance(doc, dict):
-                  for k, v in doc.items():
-                      if str(k).lower() in keys:
-                          return v
-                  for v in doc.values():
-                      found = _find_value(v, keys)
-                      if found is not None:
-                          return found
-              elif isinstance(doc, list):
-                  for item in doc:
-                      found = _find_value(item, keys)
-                      if found is not None:
-                          return found
-              return None
+          def _now() -> str:
+              return time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
 
 
-          class SubastasApiHandler(BaseHTTPRequestHandler):
-              store: SubastasStore
-              net_client: object
+          def _nid(prefix: str) -> str:
+              return prefix + uuid.uuid4().hex[:10]
 
-              def log_message(self, format: str, *args) -> None:
-                  pass
 
-              def _send_bytes(self, status, ctype, body):
-                  self.send_response(status)
-                  self.send_header("Content-Type", ctype)
-                  self.send_header("Content-Length", str(len(body)))
-                  self.end_headers()
-                  self.wfile.write(body)
+          EDITABLE = ("open", "under_review", "appeal_window")
 
-              def _send_html(self, status, html):
-                  self._send_bytes(status, "text/html", html.encode("utf-8"))
 
-              def _send_json(self, status, doc):
-                  self._send_bytes(
-                      status, "application/json", json.dumps(doc).encode("utf-8")
+          class DisputesStore:
+              def __init__(self, db, clock) -> None:
+                  self._db = db
+                  self._clock = clock
+                  self._lock = threading.Lock()
+                  self._ensure_schema()
+
+              def _ensure_schema(self) -> None:
+                  self._run(
+                      "CREATE TABLE IF NOT EXISTS sbs_disputes ("
+                      " dispute_id TEXT PRIMARY KEY,"
+                      " order_id TEXT NOT NULL,"
+                      " opener_account TEXT NOT NULL,"
+                      " role TEXT NOT NULL,"
+                      " reason TEXT NOT NULL,"
+                      " status TEXT NOT NULL,"
+                      " decision TEXT,"
+                      " refund_amount REAL,"
+                      " created_at TEXT NOT NULL,"
+                      " updated_at TEXT NOT NULL)"
+                  )
+                  self._run(
+                      "CREATE TABLE IF NOT EXISTS sbs_dispute_events ("
+                      " event_id TEXT PRIMARY KEY,"
+                      " dispute_id TEXT NOT NULL,"
+                      " actor_account TEXT NOT NULL,"
+                      " kind TEXT NOT NULL,"
+                      " content TEXT NOT NULL,"
+                      " created_at TEXT NOT NULL)"
+                  )
+                  self._run(
+                      "CREATE TABLE IF NOT EXISTS sbs_refunds ("
+                      " refund_id TEXT PRIMARY KEY,"
+                      " dispute_id TEXT,"
+                      " order_id TEXT NOT NULL,"
+                      " amount REAL NOT NULL,"
+                      " status TEXT NOT NULL,"
+                      " created_at TEXT NOT NULL)"
+                  )
+                  self._run(
+                      "CREATE TABLE IF NOT EXISTS sbs_fraud_flags ("
+                      " flag_id TEXT PRIMARY KEY,"
+                      " subject_account TEXT NOT NULL,"
+                      " reason TEXT NOT NULL,"
+                      " severity TEXT NOT NULL,"
+                      " status TEXT NOT NULL,"
+                      " created_at TEXT NOT NULL)"
                   )
 
-              def _read_body(self) -> bytes:
+              def _run(self, sql, params=()):
+                  if not params:
+                      self._db.execute(sql)
+                      return
                   try:
-                      length = int(self.headers.get("Content-Length", "0") or "0")
-                  except Exception:
-                      length = 0
-                  if length <= 0:
-                      return b""
-                  return self.rfile.read(length)
-
-              def _read_form(self) -> dict:
-                  raw = self._read_body()
-                  parsed = parse_qs(raw.decode("utf-8"))
-                  form = {}
-                  for key, values in parsed.items():
-                      if values:
-                          form[key] = values[0]
-                  return form
-
-              def _read_json(self):
-                  raw = self._read_body()
-                  if not raw:
-                      return {}
-                  try:
-                      doc = json.loads(raw.decode("utf-8"))
-                  except Exception:
-                      return None
-                  if not isinstance(doc, dict):
-                      return None
-                  return doc
+                      self._db.execute(sql, params)
+                      return
+                  except TypeError:
+                      self._db.execute(self._inline(sql, params))
 
               @staticmethod
-              def _form_value(form, key):
-                  value = form.get(key, "")
+              def _inline(sql, params):
+                  parts = sql.split("?")
+                  if len(parts) != len(params) + 1:
+                      return sql
+                  assembled = parts[0]
+                  for i, v in enumerate(params):
+                      assembled += DisputesStore._literal(v)
+                      assembled += parts[i + 1]
+                  return assembled
+
+              @staticmethod
+              def _literal(value):
                   if value is None:
-                      return ""
-                  return str(value)
+                      return "NULL"
+                  if isinstance(value, bool):
+                      return "1" if value else "0"
+                  if isinstance(value, (int, float)):
+                      return repr(value)
+                  return "'" + str(value).replace("'", "''") + "'"
 
-              def _seal_listing(self, seller, title, description, base_price):
-                  content = "|".join(
-                      (seller, title, description, format(base_price, ".2f"))
-                  )
-                  digest = hashlib.sha256(content.encode("utf-8")).hexdigest()
-                  candidates = (
-                      {"title": title, "sha256": digest, "kind": "listing"},
-                      {"title": title, "content_sha256": digest, "kind": "listing"},
-                      {"sha256": digest},
-                      {"content": content},
-                  )
-                  for payload in candidates:
-                      ok, data, _err = self.net_client.post("/documents/seal", payload)
-                      if ok and data:
-                          doc_id = _find_value(data, ("document_id", "seal_id"))
-                          if isinstance(doc_id, str) and doc_id:
-                              return doc_id
-                  return "DOC-%s" % digest[:16]
-
-              def do_GET(self) -> None:
-                  path = self.path.split("?")[0]
+              def _rows(self, sql):
+                  for name in ("query", "fetchall", "fetch_all", "fetch", "select"):
+                      fn = getattr(self._db, name, None)
+                      if callable(fn):
+                          try:
+                              rows = fn(sql)
+                              if rows is not None:
+                                  return list(rows)
+                          except Exception:
+                              continue
                   try:
-                      if path in ("/", "/subastas", "/subastas/"):
-                          self._send_html(200, self._home())
-                          return
-                      if path in ("/subastas/api/health", "/subastas/health"):
-                          self._send_json(200, {"ok": True, "app": "subastas"})
-                          return
-                      if path == "/subastas/menu":
-                          self._send_html(200, self._page_menu())
-                          return
-                      if path == "/subastas/vendedor":
-                          self._send_html(200, self._page_vendedor())
-                          return
-                      if path == "/subastas/comprador":
-                          self._send_html(200, self._page_comprador())
-                          return
-                      if path == "/subastas/operaciones":
-                          self._send_html(200, self._page_operaciones())
-                          return
-                      if path == "/subastas/gobierno":
-                          self._send_html(200, self._page_gobierno())
-                          return
-                      if path.startswith("/subastas/order/"):
-                          self._send_html(200, self._order_html(path.split("/subastas/order/", 1)[1]))
-                          return
-                      if path == "/subastas/listings":
-                          self._send_html(200, self._listings_html())
-                          return
-                      if path.startswith("/subastas/api/listings/"):
-                          listing = self.commerce.get_listing_full(
-                              path.split("/subastas/api/listings/", 1)[1]
-                          )
-                          if listing is None:
-                              self._send_json(200, {"ok": False, "error": "unknown listing"})
-                              return
-                          self._send_json(200, {"ok": True, "data": listing})
-                          return
-                      if path == "/subastas/api/opportunities":
-                          self._send_json(
-                              200,
-                              {"ok": True, "data": {"opportunities": self.commerce.list_opportunities()}},
-                          )
-                          return
-                      if path == "/subastas/revision":
-                          self._send_html(200, self._revision_html())
-                          return
-                      if path.startswith("/subastas/api/orders/"):
-                          self._send_json(
-                              200,
-                              {"ok": True, "data": self.commerce.get_order(path.split("/subastas/api/orders/", 1)[1])},
-                          )
-                          return
-                      if path.startswith("/subastas/api/shipments/"):
-                          self._send_json(
-                              200,
-                              {"ok": True, "data": self.commerce.get_shipment(path.split("/subastas/api/shipments/", 1)[1])},
-                          )
-                          return
-                      if path == "/subastas/api/summary":
-                          self._send_json(200, {"ok": True, "summary": self.store.summary()})
-                          return
-                      self._send_json(404, {"ok": False, "error": "unknown path: %s" % path})
+                      cur = self._db.execute(sql)
                   except Exception:
-                      self._send_json(500, {"ok": False, "error": "server error"})
-
-              def do_POST(self) -> None:
-                  path = self.path.split("?")[0]
+                      return []
+                  if cur is None:
+                      return []
                   try:
-                      if path == "/subastas/register":
-                          self._register_bio()
-                          return
-                      if path == "/subastas/listing":
-                          self._create_listing_form()
-                          return
-                      if path == "/subastas/api/bids":
-                          self._create_bid_json()
-                          return
-                      if path == "/subastas/api/orders":
-                          self._create_order_json()
-                          return
-                      if path == "/subastas/api/reputation/mutual":
-                          self._mutual_reputation_json()
-                          return
-                      if path == "/subastas/api/radar/scan":
-                          self._radar_scan_json()
-                          return
-                      if path.startswith("/subastas/api/orders/"):
-                          rest = path.split("/subastas/api/orders/", 1)[1]
-                          parts = rest.split("/")
-                          self._order_action(parts[0], parts[1] if len(parts) > 1 else "")
-                          return
-                      if path.startswith("/subastas/api/shipments/"):
-                          rest = path.split("/subastas/api/shipments/", 1)[1]
-                          parts = rest.split("/")
-                          self._shipment_action(parts[0], parts[1] if len(parts) > 1 else "")
-                          return
-                      if path == "/subastas/close":
-                          self._close_form()
-                          return
-                      self._send_json(404, {"ok": False, "error": "unknown path: %s" % path})
-                  except (ValueError, LookupError, PermissionError) as exc:
-                      self._send_json(400, {"ok": False, "error": str(exc)})
+                      return list(cur.fetchall())
                   except Exception:
-                      self._send_json(500, {"ok": False, "error": "server error"})
+                      return []
 
-              def _create_listing_form(self) -> None:
-                  form = self._read_form()
-                  seller_account = self._form_value(form, "seller_account")
-                  title = self._form_value(form, "title")
-                  description = self._form_value(form, "description")
-                  raw_price = self._form_value(form, "base_price")
-                  if not seller_account or not title:
-                      self._send_html(400, "<html><body><h1>Faltan datos</h1></body></html>")
-                      return
+              @staticmethod
+              def _field(row, key, index):
+                  if isinstance(row, dict):
+                      return row.get(key)
                   try:
-                      base_price = float(raw_price)
-                  except (TypeError, ValueError):
-                      self._send_html(400, "<html><body><h1>Precio invalido</h1></body></html>")
-                      return
-                  account = self.store.get_account(seller_account)
-                  seller_zid = account["zid"] if account else None
-                  document_id = self._seal_listing(seller_account, title, description, base_price)
-                  listing_id = new_listing_id()
-                  self.store.add_listing(
-                      listing_id=listing_id,
-                      seller_account=seller_account,
-                      seller_zid=seller_zid,
-                      title=title,
-                      description=description,
-                      base_price=base_price,
-                      document_id=document_id,
-                  )
-                  self._send_html(200, "".join([
-                      "<html><body><h1>ZYRA MARKET</h1>",
-                      "<p>SELLADO</p>",
-                      "<p>listing: %s</p>" % listing_id,
-                      "<p>documento: %s</p>" % document_id,
-                      "<p><a href='/subastas/menu'><button>Volver al menu</button></a></p>",
-                      "</body></html>",
-                  ]))
-
-              def _create_bid_json(self) -> None:
-                  doc = self._read_json()
-                  if doc is None:
-                      self._send_json(400, {"ok": False, "error": "invalid JSON"})
-                      return
-                  bid = self.store.place_bid(
-                      bid_id=new_bid_id(),
-                      listing_id=str(doc.get("listing_id", "")),
-                      bidder_account=str(doc.get("bidder_account", "")),
-                      amount=float(doc.get("amount", 0)),
-                  )
-                  self._send_json(200, {"ok": True, "bid": bid})
-
-              def _close_form(self) -> None:
-                  form = self._read_form()
-                  closed = self.store.close_listing(
-                      listing_id=self._form_value(form, "listing_id"),
-                      seller_account=self._form_value(form, "seller_account"),
-                  )
-                  self._send_html(200, "".join([
-                      "<html><body><h1>ZYRA MARKET</h1>",
-                      "<p>GANADOR: %s</p>" % str(closed["winner_account"]),
-                      "<p>PRECIO FINAL: %s</p>" % format(closed["final_price"], ".2f"),
-                      "<p><a href='/subastas/menu'><button>Volver al menu</button></a></p>",
-                      "</body></html>",
-                  ]))
-
-              def _register_bio(self) -> None:
-                  length = int(self.headers.get("Content-Length", 0) or 0)
-                  raw = self.rfile.read(length) if length > 0 else b""
-                  form = parse_qs(raw.decode("utf-8"))
-
-                  def _fv(key):
-                      vals = form.get(key, [])
-                      return vals[0] if vals else ""
-
-                  name = _fv("name").strip()
-                  doc_b64 = _fv("doc_image_b64").strip()
-                  selfie_b64 = _fv("selfie_image_b64").strip()
-                  if not name or not doc_b64 or not selfie_b64:
-                      self._bio_page(400, "<h2>Faltan datos obligatorios (por ley): nombre, foto del documento y selfie.</h2>", True)
-                      return
-                  ok, data, err = self.net_client.post(
-                      "/identity/enroll",
-                      {
-                          "kind": "person",
-                          "display_name": name,
-                          "actor": "subastas",
-                          "doc_image_b64": doc_b64,
-                          "selfie_image_b64": selfie_b64,
-                      },
-                  )
-                  zid = None
-                  if ok and data:
-                      found = _find_value(data, ("zid",))
-                      if isinstance(found, str) and found.startswith("ZID-"):
-                          zid = found
-                  if not ok or zid is None:
-                      msg = str(err) if err else "la red no devolvio ZID"
-                      self._bio_page(400, "<h2>Registro rechazado</h2><p>%s</p>" % msg, True)
-                      return
-                  self._bio_page(
-                      200,
-                      "".join([
-                          "<h2>Registro biometrico aprobado</h2>",
-                          "<p>Tu ZID: <b>%s</b></p>" % zid,
-                          "<p>Usa ese ZID como tu cuenta de vendedor o comprador al publicar y ofertar.</p>",
-                      ]),
-                      False,
-                  )
-
-              def _bio_page(self, status, body, back) -> None:
-                  extra = "<p><a href='/'><button>Volver</button></a></p>" if back else ""
-                  html = "".join([
-                      "<html><head><meta charset='utf-8'>",
-                      "<title>ZYRA MARKET Registro</title></head>",
-                      "<body style='font-family:sans-serif;max-width:560px;margin:24px auto'>",
-                      "<h1>ZYRA MARKET</h1>",
-                      body,
-                      extra,
-                      "</body></html>",
-                  ])
-                  self._send_html(status, html)
-
-              def _ensure_trusted_zid(self, account_id: str) -> str:
-                  zid = None
-                  existing = self.commerce.account_zid(account_id)
-                  if isinstance(existing, str) and existing.startswith("ZID-"):
-                      zid = existing
-                  if zid is None:
-                      raise ValueError(
-                          "cuenta sin ZID biometrico: registrese con documento y selfie"
-                          " en la pagina principal de ZYRA MARKET (%s)" % account_id
-                      )
-                  try:
-                      self.net_client.post("/trust/complete", {"zid": zid, "actor": "subastas"})
+                      return row[index]
                   except Exception:
-                      pass
-                  return zid
+                      return None
 
-              def _create_order_json(self) -> None:
-                  doc = self._read_json()
-                  if doc is None:
-                      self._send_json(400, {"ok": False, "error": "invalid JSON"})
-                      return
-                  source = str(doc.get("source", "direct"))
-                  if source == "auction":
-                      self.commerce.persist_winner(listing_id=str(doc.get("listing_id", "")))
-                  order = self.commerce.create_order(
-                      order_id=_nid("ORD-"),
-                      listing_id=str(doc.get("listing_id", "")),
-                      buyer_account=str(doc.get("buyer_account", "")),
-                      source=source,
+              @staticmethod
+              def _req(value, name):
+                  text = str(value or "").strip()
+                  if not text:
+                      raise ValueError("%s es obligatorio" % name)
+                  return text
+
+              def _add_event(self, dispute_id, actor_account, kind, content):
+                  self._run(
+                      "INSERT INTO sbs_dispute_events (event_id, dispute_id,"
+                      " actor_account, kind, content, created_at)"
+                      " VALUES (?, ?, ?, ?, ?, ?)",
+                      (_nid("DVE-"), dispute_id, actor_account, kind, content, _now()),
                   )
-                  self._send_json(201, {"ok": True, "data": order})
 
-              def _order_action(self, order_id, action) -> None:
-                  doc = self._read_json() or {}
-                  if action == "pay":
-                      order = self.commerce.pay_order(
-                          order_id=order_id,
-                          provider=str(doc.get("provider", "wallet")),
+              def open_dispute(self, *, order_id, opener_account, role, reason):
+                  order_id = self._req(order_id, "order_id")
+                  opener_account = self._req(opener_account, "opener_account")
+                  role = self._req(role, "role")
+                  reason = self._req(reason, "reason")
+                  with self._lock:
+                      dispute_id = _nid("DSP-")
+                      now = _now()
+                      self._run(
+                          "INSERT INTO sbs_disputes (dispute_id, order_id,"
+                          " opener_account, role, reason, status, decision,"
+                          " refund_amount, created_at, updated_at)"
+                          " VALUES (?, ?, ?, ?, ?, 'open', NULL, NULL, ?, ?)",
+                          (dispute_id, order_id, opener_account, role, reason, now, now),
                       )
-                      self._send_json(200, {"ok": True, "data": order})
-                      return
-                  if action == "settle":
-                      order = self.commerce.settle_order(order_id=order_id)
-                      self._send_json(200, {"ok": True, "data": order})
-                      return
-                  if action == "ship":
-                      self.commerce.create_shipment(
-                          shipment_id=_nid("SHP-"),
-                          order_id=order_id,
-                          carrier=str(doc.get("carrier", "zyra-express")),
-                          origin=str(doc.get("origin", "SV")),
-                          destination=str(doc.get("destination", "SV")),
+                      self._add_event(
+                          dispute_id, opener_account, "message",
+                          "apertura de disputa: %s" % reason,
                       )
-                      self._send_json(200, {"ok": True, "data": self.commerce.get_order(order_id)})
-                      return
-                  self._send_json(400, {"ok": False, "error": "unknown order action: %s" % action})
+                      return self.get_dispute(dispute_id)
 
-              def _shipment_action(self, shipment_id, action) -> None:
-                  doc = self._read_json() or {}
-                  if action == "track":
-                      shipment = self.commerce.add_tracking(
-                          shipment_id=shipment_id,
-                          status=str(doc.get("status", "in_transit")),
-                          location=str(doc.get("location", "")),
-                          description=str(doc.get("description", "")),
-                      )
-                      self._send_json(200, {"ok": True, "data": shipment})
-                      return
-                  if action == "deliver":
-                      shipment = self.commerce.confirm_delivery(shipment_id=shipment_id)
-                      self._send_json(200, {"ok": True, "data": shipment})
-                      return
-                  self._send_json(400, {"ok": False, "error": "unknown shipment action: %s" % action})
+              def add_event(self, dispute_id, *, actor_account, kind, content):
+                  dispute_id = self._req(dispute_id, "dispute_id")
+                  actor_account = self._req(actor_account, "actor_account")
+                  kind = self._req(kind, "kind")
+                  content = self._req(content, "content")
+                  if kind not in ("evidence", "message"):
+                      raise ValueError("kind debe ser evidence o message")
+                  with self._lock:
+                      row = self._dispute_row(dispute_id)
+                      if row is None:
+                          raise LookupError("disputa no encontrada: %s" % dispute_id)
+                      status = str(self._field(row, "s", 5))
+                      if status not in EDITABLE:
+                          raise ValueError(
+                              "la disputa esta %s: expediente cerrado" % status
+                          )
+                      self._add_event(dispute_id, actor_account, kind, content)
+                  return self.get_dispute(dispute_id)
 
-              def _mutual_reputation_json(self) -> None:
-                  doc = self._read_json()
-                  if doc is None:
-                      self._send_json(400, {"ok": False, "error": "invalid JSON"})
-                      return
-                  order_id = str(doc.get("order_id", ""))
-                  buyer_account = str(doc.get("buyer_account", ""))
-                  seller_account = str(doc.get("seller_account", ""))
-                  evidence = str(doc.get("evidence", "") or "transaccion completada en ZYRA MARKET")
-                  order = self.commerce.get_order(order_id)
-                  seller_zid = self._ensure_trusted_zid(seller_account)
-                  buyer_zid = self._ensure_trusted_zid(buyer_account)
-                  evidence_b64 = _b64.b64encode(evidence.encode("utf-8")).decode("ascii")
-
-                  def _net(path, payload):
-                      try:
-                          ok, data, err = self.net_client.post(path, payload)
-                          return (bool(ok), str(err or ""))
-                      except Exception as exc:
-                          return (False, str(exc))
-
-                  rep_b2s, err_b2s = _net(
-                      "/reputation/record",
-                      {"subject_zid": seller_zid, "actor_zid": buyer_zid, "kind": "positive", "evidence_b64": evidence_b64},
+              def _dispute_row(self, dispute_id):
+                  rows = self._rows(
+                      "SELECT dispute_id, order_id, opener_account, role, reason,"
+                      " status, decision, refund_amount, created_at, updated_at"
+                      " FROM sbs_disputes WHERE dispute_id = "
+                      + self._literal(dispute_id)
                   )
-                  rep_s2b, err_s2b = _net(
-                      "/reputation/record",
-                      {"subject_zid": buyer_zid, "actor_zid": seller_zid, "kind": "positive", "evidence_b64": evidence_b64},
-                  )
-                  self.commerce.record_rep_event(
-                      order_id=order_id, subject_zid=seller_zid, actor_zid=buyer_zid,
-                      kind="positive", evidence=evidence, network_recorded=rep_b2s,
-                  )
-                  self.commerce.record_rep_event(
-                      order_id=order_id, subject_zid=buyer_zid, actor_zid=seller_zid,
-                      kind="positive", evidence=evidence, network_recorded=rep_s2b,
-                  )
-                  hist_s, err_hs = _net(
-                      "/history/append",
-                      {"zid": seller_zid, "entry_type": "asset", "actor_app": "subastas",
-                       "payload": {"event": "venta completada", "detail": "orden %s" % order_id}},
-                  )
-                  hist_b, err_hb = _net(
-                      "/history/append",
-                      {"zid": buyer_zid, "entry_type": "asset", "actor_app": "subastas",
-                       "payload": {"event": "compra completada", "detail": "orden %s" % order_id}},
-                  )
-                  self._send_json(
-                      200,
-                      {
-                          "ok": True,
-                          "data": {
-                              "order_id": order_id,
-                              "buyer_to_seller_network": rep_b2s,
-                              "seller_to_buyer_network": rep_s2b,
-                              "history_seller_recorded": hist_s,
-                              "history_buyer_recorded": hist_b,
-                              "errors": {
-                                  "rep_b2s": err_b2s,
-                                  "rep_s2b": err_s2b,
-                                  "hist_s": err_hs,
-                                  "hist_b": err_hb,
-                              },
-                          },
-                      },
-                  )
-
-              def _radar_scan_json(self) -> None:
-                  doc = self._read_json()
-                  if doc is None:
-                      self._send_json(400, {"ok": False, "error": "invalid JSON"})
-                      return
-                  purchase = float(doc.get("purchase_price", 0))
-                  sale = float(doc.get("estimated_sale_price", 0))
-                  if purchase <= 0 or sale <= 0:
-                      raise ValueError("purchase_price and estimated_sale_price must be positive")
-                  opportunity = self.commerce.create_opportunity(
-                      opportunity_id=_nid("OPP-"),
-                      title=str(doc.get("title", "oportunidad")),
-                      category=str(doc.get("category", "general")),
-                      purchase_price=purchase,
-                      shipping_cost=float(doc.get("shipping_cost", 0)),
-                      fees=float(doc.get("fees", 0)),
-                      estimated_sale_price=sale,
-                      demand_score=float(doc.get("demand_score", 0.5)),
-                      risk_score=float(doc.get("risk_score", 0.5)),
-                  )
-                  self._send_json(201, {"ok": True, "data": opportunity})
-
-              def _style(self) -> str:
-                  return "".join([
-                      "<style>",
-                      "body{font-family:system-ui,sans-serif;background:#0d1117;color:#e6edf3;margin:0;padding:20px}",
-                      ".wrap{max-width:900px;margin:0 auto}",
-                      ".card{background:#161b22;border:1px solid #30363d;border-radius:12px;padding:14px;margin:10px 0}",
-                      "input,select,textarea{background:#0d1117;color:#e6edf3;border:1px solid #30363d;border-radius:8px;padding:8px;width:100%;margin:4px 0}",
-                      "button{background:#238636;color:#fff;border:none;border-radius:8px;padding:10px 16px;cursor:pointer;margin-top:6px}",
-                      "a{color:#58a6ff}",
-                      "code{background:#0d1117;padding:2px 6px;border-radius:6px}",
-                      "#msg{margin-top:8px;color:#8b949e;white-space:pre-wrap}",
-                      "</style>",
-                  ])
-
-              def _nav_html(self) -> str:
-                  links = (
-                      ("/subastas/menu", "Menu"),
-                      ("/subastas/listings", "Publicaciones"),
-                      ("/subastas/vendedor", "Vendedor"),
-                      ("/subastas/comprador", "Comprador"),
-                      ("/subastas/operaciones", "Ordenes y envios"),
-                      ("/subastas/gobierno", "Gobierno"),
-                      ("/subastas/revision", "Revision"),
-                  )
-                  parts = [
-                      "<nav style='background:#161b22;border:1px solid #30363d;border-radius:10px;"
-                      "padding:8px;margin:12px 0;display:flex;flex-wrap:wrap;gap:8px'>",
-                  ]
-                  for href, label in links:
-                      parts.append(
-                          "<a href='%s' style='color:#e6edf3;text-decoration:none;padding:6px 10px;"
-                          "background:#0d1117;border:1px solid #30363d;border-radius:8px'>%s</a>"
-                          % (href, label)
-                      )
-                  parts.append("</nav>")
-                  return "".join(parts)
-
-              def _page_wrap(self, title, body) -> str:
-                  return "".join([
-                      "<html><head><meta charset='utf-8'>",
-                      "<meta name='viewport' content='width=device-width, initial-scale=1'>",
-                      "<title>%s</title>" % title,
-                      self._style(),
-                      "</head><body><div class='wrap'>",
-                      "<h1>ZYRA MARKET</h1>",
-                      self._nav_html(),
-                      body,
-                      "</div></body></html>",
-                  ])
-
-              def _page_menu(self) -> str:
-                  body = "".join([
-                      "<p>El super mercado de la Red ZYRA. Elige tu area:</p>",
-                      "<div class='card'><h2>Soy vendedor</h2><p>Publicar, subastar y cerrar ventas.</p>"
-                      "<a href='/subastas/vendedor'><button>Entrar</button></a></div>",
-                      "<div class='card'><h2>Soy comprador</h2><p>Ofertar en subastas o comprar directo.</p>"
-                      "<a href='/subastas/comprador'><button>Entrar</button></a></div>",
-                      "<div class='card'><h2>Mis operaciones</h2><p>Pagar, enviar, rastrear y calificar.</p>"
-                      "<a href='/subastas/operaciones'><button>Entrar</button></a></div>",
-                      "<div class='card'><h2>Gobierno</h2><p>Resumen general y radar de oportunidades.</p>"
-                      "<a href='/subastas/gobierno'><button>Entrar</button></a></div>",
-                      "<div class='card'><h2>Registrarme</h2><p>Crea tu identidad biometrica (por ley).</p>"
-                      "<a href='/'><button>Ir al registro</button></a></div>",
-                  ])
-                  return self._page_wrap("ZYRA MARKET - Menu", body)
-
-              def _page_vendedor(self) -> str:
-                  body = "".join([
-                      "<div class='card'><h2>Publicar / crear subasta</h2>",
-                      "<p>Tu publicacion queda sellada en la Red (evidencia inmutable).</p>",
-                      "<form method='POST' action='/subastas/listing'>",
-                      "<input name='seller_account' placeholder='Tu cuenta' required>",
-                      "<input name='title' placeholder='Titulo' required>",
-                      "<textarea name='description' placeholder='Descripcion' rows='3'></textarea>",
-                      "<input name='base_price' type='number' step='0.01' min='0.01' placeholder='Precio base' required>",
-                      "<button>Publicar y sellar</button>",
-                      "</form></div>",
-                      "<div class='card'><h2>Cerrar subasta (declarar ganador)</h2>",
-                      "<form method='POST' action='/subastas/close'>",
-                      "<input name='listing_id' placeholder='ID de publicacion' required>",
-                      "<input name='seller_account' placeholder='Tu cuenta' required>",
-                      "<button>Cerrar subasta</button>",
-                      "</form></div>",
-                      "<p><a href='/subastas/listings'>Ver publicaciones abiertas</a></p>",
-                  ])
-                  return self._page_wrap("ZYRA MARKET - Vendedor", body)
-
-              def _page_comprador(self) -> str:
-                  body = "".join([
-                      "<div class='card'><h2>Ofertar en una subasta</h2>",
-                      "<p>Tu oferta debe superar el precio base y la mejor oferta actual.</p>",
-                      "<input id='bidListing' placeholder='ID de publicacion'>",
-                      "<input id='bidAccount' placeholder='Tu cuenta'>",
-                      "<input id='bidAmount' type='number' step='0.01' min='0.01' placeholder='Monto'>",
-                      "<button id='btnBid'>Enviar oferta</button>",
-                      "</div>",
-                      "<div class='card'><h2>Compra directa</h2>",
-                      "<input id='ordListing' placeholder='ID de publicacion'>",
-                      "<input id='ordAccount' placeholder='Tu cuenta'>",
-                      "<select id='ordSource'>",
-                      "<option value='direct'>Compra directa</option>",
-                      "<option value='auction'>Fui ganador de subasta</option>",
-                      "</select>",
-                      "<button id='btnOrder'>Crear orden</button>",
-                      "</div>",
-                      "<p id='msg'></p>",
-                      "<p><a href='/subastas/listings'>Ver publicaciones abiertas</a></p>",
-                      "<script>",
-                      "function v(id){return document.getElementById(id).value;}",
-                      "function msg(t){document.getElementById('msg').textContent=t;}",
-                      "function post(path,payload,okMsg){",
-                      "fetch(path,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(payload)})",
-                      ".then(function(r){return r.json();})",
-                      ".then(function(d){msg(d.ok?(okMsg+JSON.stringify(d.data||d.bid||d)):'Error: '+(d.error||''));})",
-                      ".catch(function(e){msg('Error: '+e);});}",
-                      "document.getElementById('btnBid').addEventListener('click',function(){",
-                      "post('/subastas/api/bids',{listing_id:v('bidListing'),bidder_account:v('bidAccount'),amount:parseFloat(v('bidAmount'))},'Oferta registrada: ');});",
-                      "document.getElementById('btnOrder').addEventListener('click',function(){",
-                      "post('/subastas/api/orders',{listing_id:v('ordListing'),buyer_account:v('ordAccount'),source:v('ordSource')},'Orden creada: ');});",
-                      "</script>",
-                  ])
-                  return self._page_wrap("ZYRA MARKET - Comprador", body)
-
-              def _page_operaciones(self) -> str:
-                  body = "".join([
-                      "<div class='card'><h2>Ver orden</h2>",
-                      "<input id='qOrder' placeholder='ID de orden (ORD-...)'>",
-                      "<button id='btnQOrder'>Ver orden</button>",
-                      "</div>",
-                      "<div class='card'><h2>Pagar / liquidar orden</h2>",
-                      "<input id='actOrder' placeholder='ID de orden'>",
-                      "<select id='payProvider'>",
-                      "<option value='wallet'>cartera</option>",
-                      "<option value='cash'>efectivo</option>",
-                      "<option value='card'>tarjeta</option>",
-                      "</select>",
-                      "<button id='btnPay'>Pagar</button>",
-                      "<button id='btnSettle'>Liquidar</button>",
-                      "</div>",
-                      "<div class='card'><h2>Enviar (crear envio)</h2>",
-                      "<input id='shipOrder' placeholder='ID de orden'>",
-                      "<input id='shipCarrier' placeholder='Transportista'>",
-                      "<input id='shipOrigin' placeholder='Origen'>",
-                      "<input id='shipDest' placeholder='Destino'>",
-                      "<button id='btnShip'>Crear envio</button>",
-                      "</div>",
-                      "<div class='card'><h2>Rastrear / entregar envio</h2>",
-                      "<input id='trkShipment' placeholder='ID de envio (SHP-...)'>",
-                      "<select id='trkStatus'>",
-                      "<option value='picked_up'>recolectado</option>",
-                      "<option value='in_transit'>en transito</option>",
-                      "<option value='customs'>en aduana</option>",
-                      "<option value='out_for_delivery'>en reparto</option>",
-                      "</select>",
-                      "<input id='trkLocation' placeholder='Ubicacion'>",
-                      "<input id='trkDesc' placeholder='Descripcion'>",
-                      "<button id='btnTrack'>Registrar tracking</button>",
-                      "<button id='btnDeliver'>Confirmar entrega</button>",
-                      "</div>",
-                      "<div class='card'><h2>Reputacion mutua (calificar)</h2>",
-                      "<input id='repOrder' placeholder='ID de orden'>",
-                      "<input id='repBuyer' placeholder='Cuenta del comprador'>",
-                      "<input id='repSeller' placeholder='Cuenta del vendedor'>",
-                      "<input id='repEvidence' placeholder='Comentario (evidencia)'>",
-                      "<button id='btnRep'>Calificar a ambos</button>",
-                      "</div>",
-                      "<div class='card'><h2>Radar: registrar oportunidad</h2>",
-                      "<input id='radTitle' placeholder='Titulo'>",
-                      "<input id='radCategory' placeholder='Categoria'>",
-                      "<input id='radBuy' type='number' step='0.01' placeholder='Precio de compra'>",
-                      "<input id='radShip' type='number' step='0.01' placeholder='Costo envio'>",
-                      "<input id='radFees' type='number' step='0.01' placeholder='Fees/comisiones'>",
-                      "<input id='radSale' type='number' step='0.01' placeholder='Precio de venta estimado'>",
-                      "<input id='radDemand' type='number' step='0.05' min='0' max='1' placeholder='Demanda 0-1'>",
-                      "<input id='radRisk' type='number' step='0.05' min='0' max='1' placeholder='Riesgo 0-1'>",
-                      "<button id='btnRadar'>Registrar en radar</button>",
-                      "</div>",
-                      "<p id='msg'></p>",
-                      "<script>",
-                      "function v(id){return document.getElementById(id).value;}",
-                      "function msg(t){document.getElementById('msg').textContent=t;}",
-                      "function post(path,payload,prefix){",
-                      "fetch(path,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(payload)})",
-                      ".then(function(r){return r.json();})",
-                      ".then(function(d){msg(d.ok?(prefix+JSON.stringify(d.data||d)):'Error: '+(d.error||''));})",
-                      ".catch(function(e){msg('Error: '+e);});}",
-                      "function num(id){var x=parseFloat(v(id));return isNaN(x)?0:x;}",
-                      "document.getElementById('btnQOrder').addEventListener('click',function(){",
-                      "location.href='/subastas/order/'+v('qOrder');});",
-                      "document.getElementById('btnPay').addEventListener('click',function(){",
-                      "post('/subastas/api/orders/'+v('actOrder')+'/pay',{provider:v('payProvider')},'Pagada: ');});",
-                      "document.getElementById('btnSettle').addEventListener('click',function(){",
-                      "post('/subastas/api/orders/'+v('actOrder')+'/settle',{},'Liquidada: ');});",
-                      "document.getElementById('btnShip').addEventListener('click',function(){",
-                      "post('/subastas/api/orders/'+v('shipOrder')+'/ship',{carrier:v('shipCarrier'),origin:v('shipOrigin'),destination:v('shipDest')},'Envio creado: ');});",
-                      "document.getElementById('btnTrack').addEventListener('click',function(){",
-                      "post('/subastas/api/shipments/'+v('trkShipment')+'/track',{status:v('trkStatus'),location:v('trkLocation'),description:v('trkDesc')},'Tracking: ');});",
-                      "document.getElementById('btnDeliver').addEventListener('click',function(){",
-                      "post('/subastas/api/shipments/'+v('trkShipment')+'/deliver',{},'Entregado: ');});",
-                      "document.getElementById('btnRep').addEventListener('click',function(){",
-                      "post('/subastas/api/reputation/mutual',{order_id:v('repOrder'),buyer_account:v('repBuyer'),seller_account:v('repSeller'),evidence:v('repEvidence')},'Reputacion: ');});",
-                      "document.getElementById('btnRadar').addEventListener('click',function(){",
-                      "post('/subastas/api/radar/scan',{title:v('radTitle'),category:v('radCategory'),purchase_price:num('radBuy'),shipping_cost:num('radShip'),fees:num('radFees'),estimated_sale_price:num('radSale'),demand_score:num('radDemand'),risk_score:num('radRisk')},'Oportunidad: ');});",
-                      "</script>",
-                  ])
-                  return self._page_wrap("ZYRA MARKET - Operaciones", body)
-
-              def _page_gobierno(self) -> str:
-                  s1 = self.store.summary()
-                  s2 = self.commerce.summary()
-                  opps = self.commerce.list_opportunities()
-                  rows = []
-                  for o in opps:
-                      buy = format(float(o.get("purchase_price") or 0), ".2f")
-                      sale = format(float(o.get("estimated_sale_price") or 0), ".2f")
-                      title = str(o.get("title", "?"))
-                      rows.append("<p>- <b>%s</b> compra %s venta est %s</p>" % (title, buy, sale))
                   if not rows:
-                      rows.append("<p>Sin oportunidades registradas.</p>")
-                  body = "".join([
-                      "<div class='card'><h2>Resumen del mercado</h2>",
-                      "<p>Publicaciones totales: %s</p>" % str(s1.get("listings_total", 0)),
-                      "<p>Abiertas: %s</p>" % str(s1.get("open_listings", 0)),
-                      "<p>Cuentas: %s</p>" % str(s1.get("accounts", 0)),
-                      "<p>Ofertas: %s</p>" % str(s1.get("bids", 0)),
-                      "<p>Ordenes: %s</p>" % str(s2.get("orders_total", 0)),
-                      "<p>Entregadas: %s</p>" % str(s2.get("orders_delivered", 0)),
-                      "</div>",
-                      "<div class='card'><h2>Radar oportunidades: %s</h2>" % str(len(opps)),
-                      "".join(rows),
-                      "</div>",
-                  ])
-                  return self._page_wrap("ZYRA MARKET - Gobierno", body)
+                      return None
+                  return rows[0]
 
-              def _order_html(self, order_id: str) -> str:
-                  try:
-                      order = self.commerce.get_order(order_id)
-                  except Exception:
-                      order = None
-                  if not order:
-                      body = "<p>No existe la orden: <code>%s</code></p>" % order_id
-                      return self._page_wrap("Orden no encontrada", body)
-                  rows = []
-                  for k, val in order.items():
-                      rows.append("<p><b>%s</b>: %s</p>" % (str(k), str(val)))
-                  body = "".join([
-                      "<div class='card'><h2>Orden %s</h2>" % order_id,
-                      "".join(rows),
-                      "</div>",
-                  ])
-                  return self._page_wrap("ZYRA MARKET - Orden", body)
+              def get_dispute(self, dispute_id):
+                  row = self._dispute_row(self._req(dispute_id, "dispute_id"))
+                  if row is None:
+                      raise LookupError("disputa no encontrada: %s" % dispute_id)
+                  events = []
+                  for e in self._rows(
+                      "SELECT event_id, actor_account, kind, content, created_at"
+                      " FROM sbs_dispute_events WHERE dispute_id = "
+                      + self._literal(dispute_id)
+                      + " ORDER BY created_at ASC"
+                  ):
+                      events.append({
+                          "event_id": self._field(e, "a", 0),
+                          "actor_account": self._field(e, "b", 1),
+                          "kind": self._field(e, "c", 2),
+                          "content": self._field(e, "d", 3),
+                          "created_at": self._field(e, "e", 4),
+                      })
+                  refunds = []
+                  for r in self._rows(
+                      "SELECT refund_id, order_id, amount, status, created_at"
+                      " FROM sbs_refunds WHERE dispute_id = "
+                      + self._literal(dispute_id)
+                      + " ORDER BY created_at ASC"
+                  ):
+                      refunds.append({
+                          "refund_id": self._field(r, "a", 0),
+                          "order_id": self._field(r, "b", 1),
+                          "amount": self._field(r, "c", 2),
+                          "status": self._field(r, "d", 3),
+                          "created_at": self._field(r, "e", 4),
+                      })
+                  return {
+                      "dispute_id": self._field(row, "a", 0),
+                      "order_id": self._field(row, "b", 1),
+                      "opener_account": self._field(row, "c", 2),
+                      "role": self._field(row, "d", 3),
+                      "reason": self._field(row, "e", 4),
+                      "status": self._field(row, "f", 5),
+                      "decision": self._field(row, "g", 6),
+                      "refund_amount": self._field(row, "h", 7),
+                      "created_at": self._field(row, "i", 8),
+                      "updated_at": self._field(row, "j", 9),
+                      "events": events,
+                      "refunds": refunds,
+                  }
 
-              def _revision_html(self) -> str:
-                  summary = self.commerce.summary()
-                  return "".join([
-                      "<html><body><h1>Revision ZYRA MARKET</h1>",
-                      "<p>ordenes: %s</p>" % str(summary["orders_total"]),
-                      "<p>entregadas: %s</p>" % str(summary["orders_delivered"]),
-                      "<p>oportunidades radar: %s</p>" % str(summary["opportunities"]),
-                      "<a href='/subastas/menu'>Menu</a>",
-                      "</body></html>",
-                  ])
+              def list_disputes(self, status=None):
+                  sql = (
+                      "SELECT dispute_id, order_id, opener_account, role, reason,"
+                      " status, decision, refund_amount, created_at, updated_at"
+                      " FROM sbs_disputes"
+                  )
+                  if status:
+                      sql += " WHERE status = " + self._literal(str(status))
+                  sql += " ORDER BY created_at DESC"
+                  out = []
+                  for row in self._rows(sql):
+                      out.append({
+                          "dispute_id": self._field(row, "a", 0),
+                          "order_id": self._field(row, "b", 1),
+                          "opener_account": self._field(row, "c", 2),
+                          "role": self._field(row, "d", 3),
+                          "reason": self._field(row, "e", 4),
+                          "status": self._field(row, "f", 5),
+                          "decision": self._field(row, "g", 6),
+                          "refund_amount": self._field(row, "h", 7),
+                          "created_at": self._field(row, "i", 8),
+                          "updated_at": self._field(row, "j", 9),
+                      })
+                  return out
 
-              def _home(self) -> str:
-                  return "".join([
-                      "<html><head><meta charset='utf-8'>",
-                      "<title>ZYRA MARKET</title>",
-                      self._style(),
-                      "</head><body><div class='wrap'>",
-                      "<h1>ZYRA MARKET</h1>",
-                      self._nav_html(),
-                      "<div class='card'><h2>Registrarme con biometria (por ley)</h2>",
-                      "<form id='bioReg' method='POST' action='/subastas/register'>",
-                      "<p>Nombre completo: <input name='name' required></p>",
-                      "<fieldset><legend>1) Foto del documento</legend>",
-                      "<input type='file' id='bioDoc' accept='image/*' capture='environment'></fieldset>",
-                      "<fieldset><legend>2) Selfie en vivo</legend>",
-                      "<input type='file' id='bioSlf' accept='image/*' capture='user'></fieldset>",
-                      "<input type='hidden' name='doc_image_b64' id='bioDocB64'>",
-                      "<input type='hidden' name='selfie_image_b64' id='bioSlfB64'>",
-                      "<p id='bioSt'>Estado: pendiente</p>",
-                      "<button type='submit'>Registrarme</button>",
-                      "</form>",
-                      "<canvas id='bioCv' style='display:none'></canvas>",
-                      "<script>",
-                      "(function(){",
-                      "var d=document.getElementById('bioDoc'),s=document.getElementById('bioSlf'),st=document.getElementById('bioSt'),hd=document.getElementById('bioDocB64'),hs=document.getElementById('bioSlfB64'),cv=document.getElementById('bioCv'),cx=cv.getContext('2d');",
-                      "function p(f,h){if(!f){return;}var r=new FileReader();r.onload=function(){var i=new Image();i.onload=function(){var k=Math.min(1,800/Math.max(i.width,i.height));cv.width=Math.round(i.width*k);cv.height=Math.round(i.height*k);cx.drawImage(i,0,0,cv.width,cv.height);h.value=cv.toDataURL('image/jpeg',0.72).split(',')[1];u();};i.src=r.result;};r.readAsDataURL(f);}",
-                      "function u(){st.textContent='Doc: '+(hd.value?'OK':'falta')+' | Selfie: '+(hs.value?'OK':'falta');}",
-                      "d.addEventListener('change',function(){p(d.files[0],hd);});",
-                      "s.addEventListener('change',function(){p(s.files[0],hs);});",
-                      "document.getElementById('bioReg').addEventListener('submit',function(e){if(!hd.value||!hs.value){e.preventDefault();st.textContent='Falta foto del documento o selfie.';}});",
-                      "})();",
-                      "</script>",
-                      "</div>",
-                      "<div class='card'><h2>ZYRA MARKET</h2>",
-                      "<p>El super mercado de la Red ZYRA.</p>",
-                      "<p>Roles: vendedor | comprador | gobierno</p>",
-                      "<a href='/subastas/menu'><button>Ir al Menu</button></a>",
-                      "</div>",
-                      "</div></body></html>",
-                  ])
+              def _set_status(self, dispute_id, status, decision=None, refund_amount=None):
+                  self._run(
+                      "UPDATE sbs_disputes SET status = "
+                      + self._literal(status)
+                      + ", decision = "
+                      + self._literal(decision)
+                      + ", refund_amount = "
+                      + self._literal(refund_amount)
+                      + ", updated_at = "
+                      + self._literal(_now())
+                      + " WHERE dispute_id = "
+                      + self._literal(dispute_id)
+                  )
 
-              def _listings_html(self) -> str:
-                  rows_data = self.store.list_open()
-                  cards = []
-                  for row in rows_data:
-                      cards.append("".join([
-                          "<div class='card'>",
-                          "<b>%s</b>" % str(row["title"]),
-                          "<p>%s</p>" % str(row["description"]),
-                          "<p>Precio base: $%s</p>" % format(float(row["base_price"]), ".2f"),
-                          "<p>ID: <code>%s</code></p>" % str(row["listing_id"]),
-                          "<p><a href='/subastas/comprador'>Ofertar o comprar</a></p>",
-                          "</div>",
-                      ]))
-                  if not cards:
-                      cards.append(
-                          "<p>No hay publicaciones abiertas. "
-                          "<a href='/subastas/vendedor'>Crea la primera</a>.</p>"
+              def mediate(self, dispute_id, *, arbiter, note):
+                  arbiter = self._req(arbiter, "arbiter")
+                  note = self._req(note, "note")
+                  with self._lock:
+                      row = self._dispute_row(dispute_id)
+                      if row is None:
+                          raise LookupError("disputa no encontrada")
+                      status = str(self._field(row, "f", 5))
+                      if status not in ("open", "under_review"):
+                          raise ValueError(
+                              "no se puede mediar en estado %s" % status
+                          )
+                      self._set_status(dispute_id, "under_review")
+                      self._add_event(
+                          dispute_id, arbiter, "mediation",
+                          "mediacion: %s" % note,
                       )
-                  return "".join([
-                      "<html><head><meta charset='utf-8'>",
-                      "<meta name='viewport' content='width=device-width, initial-scale=1'>",
-                      "<title>ZYRA MARKET</title>",
-                      self._style(),
-                      "</head><body><div class='wrap'>",
-                      "<h1>ZYRA MARKET</h1>",
-                      self._nav_html(),
-                      "<h2>Publicaciones abiertas</h2>",
-                      "".join(cards),
-                      "</div></body></html>",
-                  ])
+                  return self.get_dispute(dispute_id)
+
+              def decide(self, dispute_id, *, arbiter, approve, note, refund_amount):
+                  arbiter = self._req(arbiter, "arbiter")
+                  note = self._req(note, "note")
+                  amount = float(refund_amount or 0)
+                  with self._lock:
+                      row = self._dispute_row(dispute_id)
+                      if row is None:
+                          raise LookupError("disputa no encontrada")
+                      status = str(self._field(row, "f", 5))
+                      order_id = str(self._field(row, "b", 1))
+                      if status not in ("open", "under_review"):
+                          raise ValueError(
+                              "no se puede decidir en estado %s" % status
+                          )
+                      decision = "approved" if approve else "rejected"
+                      self._set_status(dispute_id, "decided", decision, amount if approve else None)
+                      self._add_event(
+                          dispute_id, arbiter, "decision",
+                          "decision: %s — %s" % (decision, note),
+                      )
+                      if approve and amount > 0:
+                          self._run(
+                              "INSERT INTO sbs_refunds (refund_id, dispute_id,"
+                              " order_id, amount, status, created_at)"
+                              " VALUES (?, ?, ?, ?, 'executed', ?)",
+                              (_nid("RFD-"), dispute_id, order_id, amount, _now()),
+                          )
+                  return self.get_dispute(dispute_id)
+
+              def appeal(self, dispute_id, *, appellant, reason):
+                  appellant = self._req(appellant, "appellant")
+                  reason = self._req(reason, "reason")
+                  with self._lock:
+                      row = self._dispute_row(dispute_id)
+                      if row is None:
+                          raise LookupError("disputa no encontrada")
+                      status = str(self._field(row, "f", 5))
+                      if status != "decided":
+                          raise ValueError(
+                              "solo se apela una decision (estado %s)" % status
+                          )
+                      self._set_status(dispute_id, "appeal_window")
+                      self._add_event(
+                          dispute_id, appellant, "appeal",
+                          "apelacion: %s" % reason,
+                      )
+                  return self.get_dispute(dispute_id)
+
+              def resolve_appeal(self, dispute_id, *, arbiter, uphold, note):
+                  arbiter = self._req(arbiter, "arbiter")
+                  note = self._req(note, "note")
+                  with self._lock:
+                      row = self._dispute_row(dispute_id)
+                      if row is None:
+                          raise LookupError("disputa no encontrada")
+                      status = str(self._field(row, "f", 5))
+                      decision = str(self._field(row, "g", 6) or "")
+                      if status != "appeal_window":
+                          raise ValueError(
+                              "sin apelacion abierta (estado %s)" % status
+                          )
+                      if uphold:
+                          final = decision
+                          self._set_status(dispute_id, "final", final)
+                          self._add_event(
+                              dispute_id, arbiter, "decision",
+                              "apelacion resuelta: se mantiene %s — %s" % (final, note),
+                          )
+                      else:
+                          self._set_status(dispute_id, "final", "overturned")
+                          self._reverse_refund(dispute_id)
+                          self._add_event(
+                              dispute_id, arbiter, "decision",
+                              "apelacion resuelta: decision revertida — %s" % note,
+                          )
+                  return self.get_dispute(dispute_id)
+
+              def _reverse_refund(self, dispute_id):
+                  self._run(
+                      "UPDATE sbs_refunds SET status = 'reversed'"
+                      " WHERE dispute_id = " + self._literal(dispute_id)
+                  )
+
+              def flag_fraud(self, *, subject_account, reason, severity):
+                  subject_account = self._req(subject_account, "subject_account")
+                  reason = self._req(reason, "reason")
+                  severity = str(severity or "media").strip() or "media"
+                  if severity not in ("baja", "media", "alta"):
+                      raise ValueError("severity debe ser baja, media o alta")
+                  with self._lock:
+                      flag_id = _nid("FRD-")
+                      self._run(
+                          "INSERT INTO sbs_fraud_flags (flag_id, subject_account,"
+                          " reason, severity, status, created_at)"
+                          " VALUES (?, ?, ?, ?, 'open', ?)",
+                          (flag_id, subject_account, reason, severity, _now()),
+                      )
+                      return {
+                          "flag_id": flag_id,
+                          "subject_account": subject_account,
+                          "severity": severity,
+                          "status": "open",
+                      }
+
+              def list_fraud(self):
+                  out = []
+                  for row in self._rows(
+                      "SELECT flag_id, subject_account, reason, severity,"
+                      " status, created_at FROM sbs_fraud_flags"
+                      " ORDER BY created_at DESC"
+                  ):
+                      out.append({
+                          "flag_id": self._field(row, "a", 0),
+                          "subject_account": self._field(row, "b", 1),
+                          "reason": self._field(row, "c", 2),
+                          "severity": self._field(row, "d", 3),
+                          "status": self._field(row, "e", 4),
+                          "created_at": self._field(row, "f", 5),
+                      })
+                  return out
 
 
-          def serve_subastas(store, client, *, host="127.0.0.1", port=0):
-              handler = type(
-                  "BoundSubastasHandler",
-                  (SubastasApiHandler,),
-                  {
-                      "store": store,
-                      "net_client": client,
-                      "commerce": CommerceStore(store._db, store._clock),
-                  },
+          def market_disputes_page(self) -> str:
+              rows = self.disputes.list_disputes()
+              cards = []
+              for d in rows:
+                  cards.append("".join([
+                      "<div class='card'>",
+                      "<p><b>%s</b> — %s</p>" % (d["dispute_id"], d["status"]),
+                      "<p>Orden: %s | Abrio: %s (%s)</p>" % (
+                          d["order_id"], d["opener_account"], d["role"]),
+                      "<p>%s</p>" % d["reason"],
+                      "<p><a href='/subastas/disputa/%s'>Abrir expediente</a></p>" % d["dispute_id"],
+                      "</div>",
+                  ]))
+              if not cards:
+                  cards.append("<p>No hay disputas registradas.</p>")
+              body = "".join([
+                  "<div class='card'><h2>Riesgo y Proteccion — DISPUTAS</h2>",
+                  "<p>Proteccion del comprador y del vendedor. El gobierno media y decide.</p>",
+                  "<h3>Abrir disputa</h3>",
+                  "<input id='dOrder' placeholder='ID de orden (ORD-...)'>",
+                  "<input id='dWho' placeholder='Tu cuenta'>",
+                  "<select id='dRole'>",
+                  "<option value='comprador'>comprador</option>",
+                  "<option value='vendedor'>vendedor</option>",
+                  "</select>",
+                  "<input id='dWhy' placeholder='Motivo'>",
+                  "<button id='btnOpen'>Abrir disputa</button>",
+                  "</div>",
+                  "".join(cards),
+                  "<p id='msg'></p>",
+                  "<script>",
+                  "document.getElementById('btnOpen').addEventListener('click',function(){",
+                  "function g(i){return document.getElementById(i).value;}",
+                  "fetch('/subastas/api/disputes',{method:'POST',",
+                  "headers:{'Content-Type':'application/json'},",
+                  "body:JSON.stringify({order_id:g('dOrder'),opener_account:g('dWho'),role:g('dRole'),reason:g('dWhy')})})",
+                  ".then(function(r){return r.json();})",
+                  ".then(function(d){if(d.ok){location.reload();}",
+                  "else{document.getElementById('msg').textContent='Error: '+(d.error||'');}})",
+                  ".catch(function(e){document.getElementById('msg').textContent='Error: '+e;});});",
+                  "</script>",
+              ])
+              return self._page_wrap("ZYRA MARKET - Proteccion", body)
+
+
+          def market_fraud_page(self) -> str:
+              flags = self.disputes.list_fraud()
+              rows = []
+              for f in flags:
+                  rows.append("".join([
+                      "<div class='card'>",
+                      "<p><b>%s</b> — %s (%s)</p>" % (
+                          f["subject_account"], f["severity"], f["status"]),
+                      "<p>%s</p>" % f["reason"],
+                      "</div>",
+                  ]))
+              if not rows:
+                  rows.append("<p>Sin banderas de fraude.</p>")
+              body = "".join([
+                  "<div class='card'><h2>Riesgo y Proteccion — FRAUDE</h2>",
+                  "<p>Banderas de fraude (gobierno). La investigacion profunda llega con el Bloque 8.</p>",
+                  "<input id='fWho' placeholder='Cuenta sospechosa'>",
+                  "<input id='fWhy' placeholder='Motivo'>",
+                  "<select id='fSev'>",
+                  "<option value='baja'>baja</option>",
+                  "<option value='media'>media</option>",
+                  "<option value='alta'>alta</option>",
+                  "</select>",
+                  "<button id='btnFlag'>Marcar fraude</button>",
+                  "</div>",
+                  "".join(rows),
+                  "<p id='msg'></p>",
+                  "<script>",
+                  "document.getElementById('btnFlag').addEventListener('click',function(){",
+                  "function g(i){return document.getElementById(i).value;}",
+                  "fetch('/subastas/api/fraud',{method:'POST',",
+                  "headers:{'Content-Type':'application/json'},",
+                  "body:JSON.stringify({subject_account:g('fWho'),reason:g('fWhy'),severity:g('fSev')})})",
+                  ".then(function(r){return r.json();})",
+                  ".then(function(d){if(d.ok){location.reload();}",
+                  "else{document.getElementById('msg').textContent='Error: '+(d.error||'');}})",
+                  ".catch(function(e){document.getElementById('msg').textContent='Error: '+e;});});",
+                  "</script>",
+              ])
+              return self._page_wrap("ZYRA MARKET - Fraude", body)
+
+
+          def market_dispute_detail(self, dispute_id: str) -> str:
+              try:
+                  d = self.disputes.get_dispute(dispute_id)
+              except Exception:
+                  d = None
+              if not d:
+                  body = "<p>No existe la disputa: <code>%s</code></p>" % dispute_id
+                  return self._page_wrap("Disputa no encontrada", body)
+              ev = []
+              for e in d["events"]:
+                  ev.append(
+                      "<p><b>[%s] %s (%s):</b> %s</p>"
+                      % (e["created_at"], e["actor_account"], e["kind"], e["content"])
+                  )
+              rf = []
+              for r in d["refunds"]:
+                  rf.append(
+                      "<p>Reembolso %s: $%s (%s)</p>"
+                      % (r["refund_id"], format(float(r["amount"] or 0), ".2f"), r["status"])
+                  )
+              if not rf:
+                  rf.append("<p>Sin reembolsos registrados.</p>")
+              body = "".join([
+                  "<div class='card'><h2>Disputa %s</h2>" % d["dispute_id"],
+                  "<p>Estado: <b>%s</b> | Decision: %s</p>" % (d["status"], str(d.get("decision"))),
+                  "<p>Orden: %s | Abrio: %s (%s)</p>" % (
+                      d["order_id"], d["opener_account"], d["role"]),
+                  "<p>Motivo: %s</p>" % d["reason"],
+                  "<h3>Expediente</h3>",
+                  "".join(ev),
+                  "</div>",
+                  "<div class='card'><h2>Reembolsos</h2>",
+                  "".join(rf),
+                  "</div>",
+                  "<div class='card'><h2>Acciones</h2>",
+                  "<p><b>Evidencia / mensaje</b> (comprador o vendedor)</p>",
+                  "<input id='evActor' placeholder='Tu cuenta'>",
+                  "<select id='evKind'>",
+                  "<option value='evidence'>evidencia</option>",
+                  "<option value='message'>mensaje</option>",
+                  "</select>",
+                  "<input id='evContent' placeholder='Contenido'>",
+                  "<button id='btnEv'>Agregar</button>",
+                  "<p><b>Mediar</b> (gobierno)</p>",
+                  "<input id='mdArb' placeholder='Cuenta del arbitro'>",
+                  "<input id='mdNote' placeholder='Nota de mediacion'>",
+                  "<button id='btnMd'>Mediar</button>",
+                  "<p><b>Decidir</b> (gobierno)</p>",
+                  "<input id='dcArb' placeholder='Cuenta del arbitro'>",
+                  "<select id='dcOk'>",
+                  "<option value='true'>A favor de quien abrio</option>",
+                  "<option value='false'>En contra</option>",
+                  "</select>",
+                  "<input id='dcNote' placeholder='Nota de decision'>",
+                  "<input id='dcRef' type='number' step='0.01' placeholder='Monto reembolso (si aplica)'>",
+                  "<button id='btnDc'>Decidir</button>",
+                  "<p><b>Apelar</b> (tras decision)</p>",
+                  "<input id='apWho' placeholder='Tu cuenta'>",
+                  "<input id='apWhy' placeholder='Motivo de apelacion'>",
+                  "<button id='btnAp'>Apelar</button>",
+                  "<p><b>Resolucion final</b> (gobierno, tras apelacion)</p>",
+                  "<input id='fnArb' placeholder='Cuenta del arbitro'>",
+                  "<select id='fnUp'>",
+                  "<option value='true'>Mantener decision</option>",
+                  "<option value='false'>Revertir decision</option>",
+                  "</select>",
+                  "<input id='fnNote' placeholder='Nota final'>",
+                  "<button id='btnFn'>Cerrar definitivo</button>",
+                  "<p id='msg'></p>",
+                  "</div>",
+                  "<script>",
+                  "function v(id){return document.getElementById(id).value;}",
+                  "function post(path,payload){",
+                  "fetch(path,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(payload)})",
+                  ".then(function(r){return r.json();})",
+                  ".then(function(d){if(d.ok){location.reload();}",
+                  "else{document.getElementById('msg').textContent='Error: '+(d.error||'');}})",
+                  ".catch(function(e){document.getElementById('msg').textContent='Error: '+e;});}",
+                  "var base='/subastas/api/disputes/%s/';" % d["dispute_id"],
+                  "document.getElementById('btnEv').addEventListener('click',function(){",
+                  "post(base+'event',{actor:v('evActor'),kind:v('evKind'),content:v('evContent')});});",
+                  "document.getElementById('btnMd').addEventListener('click',function(){",
+                  "post(base+'mediate',{arbiter:v('mdArb'),note:v('mdNote')});});",
+                  "document.getElementById('btnDc').addEventListener('click',function(){",
+                  "post(base+'decide',{arbiter:v('dcArb'),approve:v('dcOk')==='true',note:v('dcNote'),refund_amount:parseFloat(v('dcRef'))||0});});",
+                  "document.getElementById('btnAp').addEventListener('click',function(){",
+                  "post(base+'appeal',{appellant:v('apWho'),reason:v('apWhy')});});",
+                  "document.getElementById('btnFn').addEventListener('click',function(){",
+                  "post(base+'final',{arbiter:v('fnArb'),uphold:v('fnUp')==='true',note:v('fnNote')});});",
+                  "</script>",
+              ])
+              return self._page_wrap("ZYRA MARKET - Disputa", body)
+
+
+          def market_dispute_open(self) -> None:
+              doc = self._read_json()
+              if doc is None:
+                  self._send_json(400, {"ok": False, "error": "invalid JSON"})
+                  return
+              dispute = self.disputes.open_dispute(
+                  order_id=str(doc.get("order_id", "")),
+                  opener_account=str(doc.get("opener_account", "")),
+                  role=str(doc.get("role", "")),
+                  reason=str(doc.get("reason", "")),
               )
-              server = ThreadingHTTPServer((host, port), handler)
-              server.bound_port = server.server_address[1]
-              return server
-          SBSFILE
-          echo "server.py written: $(wc -l < apps/subastas/server.py) lines"
+              self._send_json(201, {"ok": True, "data": dispute})
 
-      - name: Compile check
+
+          def market_dispute_action(self, dispute_id: str, action: str) -> None:
+              doc = self._read_json() or {}
+              if action == "event":
+                  self.disputes.add_event(
+                      dispute_id,
+                      actor_account=str(doc.get("actor", "")),
+                      kind=str(doc.get("kind", "message")),
+                      content=str(doc.get("content", "")),
+                  )
+              elif action == "mediate":
+                  self.disputes.mediate(
+                      dispute_id,
+                      arbiter=str(doc.get("arbiter", "")),
+                      note=str(doc.get("note", "")),
+                  )
+              elif action == "decide":
+                  self.disputes.decide(
+                      dispute_id,
+                      arbiter=str(doc.get("arbiter", "")),
+                      approve=bool(doc.get("approve", False)),
+                      note=str(doc.get("note", "")),
+                      refund_amount=float(doc.get("refund_amount", 0) or 0),
+                  )
+              elif action == "appeal":
+                  self.disputes.appeal(
+                      dispute_id,
+                      appellant=str(doc.get("appellant", "")),
+                      reason=str(doc.get("reason", "")),
+                  )
+              elif action == "final":
+                  self.disputes.resolve_appeal(
+                      dispute_id,
+                      arbiter=str(doc.get("arbiter", "")),
+                      uphold=bool(doc.get("uphold", True)),
+                      note=str(doc.get("note", "")),
+                  )
+              else:
+                  self._send_json(
+                      400, {"ok": False, "error": "unknown dispute action: %s" % action}
+                  )
+                  return
+              self._send_json(200, {"ok": True, "data": self.disputes.get_dispute(dispute_id)})
+
+
+          def market_fraud_flag(self) -> None:
+              doc = self._read_json()
+              if doc is None:
+                  self._send_json(400, {"ok": False, "error": "invalid JSON"})
+                  return
+              flag = self.disputes.flag_fraud(
+                  subject_account=str(doc.get("subject_account", "")),
+                  reason=str(doc.get("reason", "")),
+                  severity=str(doc.get("severity", "media")),
+              )
+              self._send_json(201, {"ok": True, "data": flag})
+          DPRF
+          echo "disputes_store.py: $(wc -l < apps/subastas/infrastructure/persistence/disputes_store.py) lines"
+
+      - name: Wire into server.py (5 exact anchors)
         run: |
-          python3 - <<'EOF'
+          python3 - <<'PYEOF'
           import sys
-          src = open("apps/subastas/server.py").read()
-          try:
-              compile(src, "server.py", "exec")
-              print("COMPILE OK")
-          except SyntaxError as e:
-              lines = src.splitlines()
-              ln = e.lineno or 0
-              for k in range(max(0, ln - 8), min(len(lines), ln + 5)):
-                  mark = ">>" if k == ln - 1 else "  "
-                  print("%s %4d| %s" % (mark, k + 1, lines[k]))
-              sys.exit(1)
-          EOF
+          from pathlib import Path
 
-      - name: Boot smoke (market pages live)
+
+          def fail(msg):
+              print("PATCH-ERROR:", msg)
+              sys.exit(1)
+
+
+          P = "apps/subastas/server.py"
+          txt = Path(P).read_text(encoding="utf-8")
+          if "disputes_store" in txt:
+              print("SKIP: already wired")
+              sys.exit(0)
+
+          lines = txt.splitlines(keepends=True)
+
+
+          def leading(line):
+              return line[: len(line) - len(line.lstrip())]
+
+
+          def find_one(stripped):
+              hits = [i for i, l in enumerate(lines) if l.strip() == stripped]
+              if len(hits) != 1:
+                  fail("anchor %r count %d (need 1)" % (stripped, len(hits)))
+              return hits[0]
+
+
+          def insert_before(idx, new_lines):
+              return lines[:idx] + new_lines + lines[idx:]
+
+
+          def insert_after(idx, new_lines):
+              return lines[: idx + 1] + new_lines + lines[idx + 1:]
+
+
+          i = find_one("def _find_value(doc, keys):")
+          imp = [
+              "from apps.subastas.infrastructure.persistence.disputes_store import (\n",
+              "    DisputesStore,\n",
+              "    market_disputes_page,\n",
+              "    market_fraud_page,\n",
+              "    market_dispute_detail,\n",
+              "    market_dispute_open,\n",
+              "    market_dispute_action,\n",
+              "    market_fraud_flag,\n",
+              ")\n",
+          ]
+          lines = insert_before(i, imp)
+          print("INSERT: import block")
+
+          i = find_one('("/subastas/revision", "Revision"),')
+          ind = leading(lines[i])
+          nav = [
+              ind + '("/subastas/proteccion", "Proteccion"),\n',
+              ind + '("/subastas/fraude", "Fraude"),\n',
+          ]
+          lines = insert_before(i, nav)
+          print("INSERT: nav links")
+
+          i = find_one('if path == "/subastas/api/summary":')
+          ind = leading(lines[i])
+          b = ind + "    "
+          routes = [
+              b + 'if path == "/subastas/proteccion":\n',
+              b + "    self._send_html(200, self.market_disputes_page())\n",
+              b + "    return\n",
+              b + 'if path == "/subastas/fraude":\n',
+              b + "    self._send_html(200, self.market_fraud_page())\n",
+              b + "    return\n",
+              b + 'if path.startswith("/subastas/disputa/"):\n',
+              b + "    self._send_html(\n",
+              b + "        200,\n",
+              b + "        self.market_dispute_detail(\n",
+              b + '            path.split("/subastas/disputa/", 1)[1]\n',
+              b + "        ),\n",
+              b + "    )\n",
+              b + "    return\n",
+          ]
+          lines = insert_before(i, routes)
+          print("INSERT: 3 GET routes")
+
+          i = find_one('if path == "/subastas/close":')
+          ind = leading(lines[i])
+          b = ind + "    "
+          proutes = [
+              b + 'if path == "/subastas/api/disputes":\n',
+              b + "    self.market_dispute_open()\n",
+              b + "    return\n",
+              b + 'if path == "/subastas/api/fraud":\n',
+              b + "    self.market_fraud_flag()\n",
+              b + "    return\n",
+              b + 'if path.startswith("/subastas/api/disputes/"):\n',
+              b + '    rest = path.split("/subastas/api/disputes/", 1)[1]\n',
+              b + "    parts = rest.split('/')\n".replace("'", '"'),
+              b + "    self.market_dispute_action(\n",
+              b + "        parts[0], parts[1] if len(parts) > 1 else ''\n".replace("''", '""'),
+              b + "    )\n",
+              b + "    return\n",
+          ]
+          lines = insert_before(i, proutes)
+          print("INSERT: 3 POST routes")
+
+          i = find_one('"commerce": CommerceStore(store._db, store._clock),')
+          ind = leading(lines[i])
+          attach = [
+              ind + '"disputes": DisputesStore(store._db, store._clock),\n',
+              ind + '"market_disputes_page": market_disputes_page,\n',
+              ind + '"market_fraud_page": market_fraud_page,\n',
+              ind + '"market_dispute_detail": market_dispute_detail,\n',
+              ind + '"market_dispute_open": market_dispute_open,\n',
+              ind + '"market_dispute_action": market_dispute_action,\n',
+              ind + '"market_fraud_flag": market_fraud_flag,\n',
+          ]
+          lines = insert_after(i, attach)
+          print("INSERT: handler attachments")
+
+          out = "".join(lines)
+          try:
+              compile(out, P, "exec")
+          except SyntaxError as e:
+              print("COMPILE-FAIL:", e.msg, "line:", e.lineno)
+              ls = out.splitlines()
+              ln = e.lineno or 0
+              for k in range(max(0, ln - 10), min(len(ls), ln + 6)):
+                  mark = ">>" if k == ln - 1 else "  "
+                  print("%s %4d| %s" % (mark, k + 1, ls[k]))
+              fail("compile failed - NOTHING was written")
+          print("COMPILE OK: server.py")
+
+          Path(P).write_text(out, encoding="utf-8")
+
+          m = Path("apps/subastas/infrastructure/persistence/disputes_store.py").read_text(encoding="utf-8")
+          try:
+              compile(m, "disputes_store.py", "exec")
+          except SyntaxError as e:
+              print("MODULE COMPILE-FAIL:", e.msg, "line:", e.lineno)
+              fail("module compile failed")
+          print("COMPILE OK: disputes_store.py")
+
+          final = Path(P).read_text(encoding="utf-8")
+          for marker in (
+              "disputes_store",
+              '"/subastas/proteccion"',
+              '"/subastas/api/disputes"',
+              '"disputes": DisputesStore',
+              '"market_dispute_action": market_dispute_action',
+          ):
+              if marker not in final:
+                  fail("post-check missing: " + marker)
+
+          print("ALL PATCHES APPLIED OK")
+          PYEOF
+
+      - name: E2E smoke (dispute lifecycle live)
         run: |
           python3 - <<'EOF'
+          import json
           import threading
           import time
           import urllib.request
@@ -936,67 +898,101 @@ jobs:
                   return (False, None, "offline")
 
 
+          def call(method, url, payload=None):
+              data = (
+                  json.dumps(payload).encode("utf-8")
+                  if payload is not None
+                  else None
+              )
+              req = urllib.request.Request(
+                  url, data=data, method=method,
+                  headers={"Content-Type": "application/json"},
+              )
+              with urllib.request.urlopen(req, timeout=5) as r:
+                  return json.loads(r.read().decode("utf-8"))
+
+
           db = SQLiteAdapter(":memory:")
           store = SubastasStore(db, SystemClock())
-          acc = "ZID-smoke-" + uuid.uuid4().hex[:6]
-          store.add_account(account_id=acc, zid=acc, name="Smoke")
+          seller = "ZID-sell-" + uuid.uuid4().hex[:5]
+          buyer = "ZID-buy-" + uuid.uuid4().hex[:5]
+          store.add_account(account_id=seller, zid=seller, name="V")
           store.add_listing(
-              listing_id="LST-smoke1",
-              seller_account=acc,
-              seller_zid=acc,
-              title="Test Item",
-              description="desc",
-              base_price=10.0,
-              document_id="DOC-x",
+              listing_id="LST-d1", seller_account=seller, seller_zid=seller,
+              title="Item", description="d", base_price=10.0, document_id="DOC-x",
           )
           srv = serve_subastas(store, FakeNet())
           threading.Thread(target=srv.serve_forever, daemon=True).start()
           base = "http://127.0.0.1:%d" % srv.server_address[1]
           time.sleep(0.5)
-          for path, must in (
-              ("/subastas", "ZYRA MARKET"),
-              ("/subastas/menu", "Soy vendedor"),
-              ("/subastas/vendedor", "Cerrar subasta"),
-              ("/subastas/comprador", "Ofertar en una subasta"),
-              ("/subastas/operaciones", "Reputacion mutua"),
-              ("/subastas/gobierno", "Resumen del mercado"),
-              ("/subastas/listings", "Test Item"),
-          ):
+
+          o = call("POST", base + "/subastas/api/orders",
+                   {"listing_id": "LST-d1", "buyer_account": buyer, "source": "direct"})
+          assert o["ok"], o
+          order_id = o["data"]["order_id"]
+
+          d = call("POST", base + "/subastas/api/disputes",
+                   {"order_id": order_id, "opener_account": buyer,
+                    "role": "comprador", "reason": "producto distinto"})
+          assert d["ok"] and d["data"]["status"] == "open", d
+          did = d["data"]["dispute_id"]
+
+          e = call("POST", base + "/subastas/api/disputes/%s/event" % did,
+                   {"actor": seller, "kind": "evidence", "content": "foto del producto"})
+          assert e["ok"], e
+
+          m = call("POST", base + "/subastas/api/disputes/%s/mediate" % did,
+                   {"arbiter": "gob1", "note": "revisando evidencia"})
+          assert m["data"]["status"] == "under_review", m
+
+          dec = call("POST", base + "/subastas/api/disputes/%s/decide" % did,
+                     {"arbiter": "gob1", "approve": True,
+                      "note": "a favor del comprador", "refund_amount": 5.0})
+          assert dec["data"]["status"] == "decided", dec
+          assert dec["data"]["decision"] == "approved", dec
+          assert dec["data"]["refunds"][0]["status"] == "executed", dec
+
+          ap = call("POST", base + "/subastas/api/disputes/%s/appeal" % did,
+                    {"appellant": seller, "reason": "nueva evidencia"})
+          assert ap["data"]["status"] == "appeal_window", ap
+
+          fin = call("POST", base + "/subastas/api/disputes/%s/final" % did,
+                     {"arbiter": "gob1", "uphold": True, "note": "se mantiene"})
+          assert fin["data"]["status"] == "final", fin
+          assert fin["data"]["decision"] == "approved", fin
+
+          fr = call("POST", base + "/subastas/api/fraud",
+                    {"subject_account": seller, "reason": "patron sospechoso",
+                     "severity": "media"})
+          assert fr["ok"], fr
+
+          pages = {
+              "/subastas/proteccion": "Riesgo y Proteccion",
+              "/subastas/disputa/" + did: "Expediente",
+              "/subastas/fraude": seller,
+          }
+          for path, must in pages.items():
               html = urllib.request.urlopen(base + path, timeout=5).read().decode("utf-8")
               assert must in html, path + " missing: " + must
-              assert "SUBASTAS</h1>" not in html
-          print("BOOT SMOKE OK: 7 pages render as ZYRA MARKET")
+          nav = urllib.request.urlopen(base + "/subastas/menu", timeout=5).read().decode("utf-8")
+          assert "Proteccion" in nav and "Fraude" in nav
+          print("E2E SMOKE OK: dispute full lifecycle + refunds + fraud + pages + nav")
           EOF
 
-      - name: SUBASTAS tests (report only)
+      - name: ZYRA MARKET tests (report only)
         if: always()
         run: |
           python3 -m pytest apps/subastas/tests -q || true
-
-      - name: Rename portal card
-        run: |
-          python3 - <<'EOF'
-          from pathlib import Path
-          p = Path("portal/index.html")
-          if p.exists():
-              t = p.read_text(encoding="utf-8")
-              if "ZYRA MARKET" not in t:
-                  t = t.replace("SUBASTAS", "ZYRA MARKET")
-                  p.write_text(t, encoding="utf-8")
-                  print("portal renamed")
-              else:
-                  print("portal already renamed")
-          EOF
 
       - name: Commit and push
         run: |
           git config user.name "zyra-pilot-bot"
           git config user.email "actions@github.com"
-          git add apps/subastas/server.py portal/index.html
+          git add apps/subastas/infrastructure/persistence/disputes_store.py apps/subastas/server.py
           if git diff --cached --quiet; then
             echo "No changes."
           else
-            git commit -m "ZYRA MARKET (v6): complete server.py, join-pattern HTML" -m "All original routes/logic preserved. All HTML built via list+join (no fragile concatenation). Nav, menu, vendedor, comprador, operaciones, gobierno, order detail, card listings."
+            git commit -m "ZYRA MARKET (Bloque 2): Modulo 009 Riesgo y Proteccion" -m "Disputas full lifecycle (open/evidence/mediation/decision+refund/appeal/final with reversal), fraud flags, protection+fraud pages wired into nav, disputes_store.py new module. E2E lifecycle smoke in CI."
           fi
           git pull --rebase --autostash origin main || true
           for i in 1 2 3; do

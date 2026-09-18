@@ -61,6 +61,22 @@ LiveStore = _live_mod.LiveStore
 market_live_page = _live_mod.market_live_page
 market_live_api = _live_mod.market_live_api
 market_gov_live_api = _live_mod.market_gov_live_api
+_seg_mod = _imp.import_module(
+    "apps.subastas.modules.011_seguridad.seguridad_store"
+)
+_ops_mod = _imp.import_module(
+    "apps.subastas.modules.006_operaciones.operaciones_store"
+)
+_log_mod = _imp.import_module(
+    "apps.subastas.modules.008_logistica.logistica_store"
+)
+SeguridadStore = _seg_mod.SeguridadStore
+market_gov_seguridad_page = _seg_mod.market_gov_seguridad_page
+market_gov_seguridad_api = _seg_mod.market_gov_seguridad_api
+OperacionesStore = _ops_mod.OperacionesStore
+market_ops_api = _ops_mod.market_ops_api
+LogisticaStore = _log_mod.LogisticaStore
+market_logistica_api = _log_mod.market_logistica_api
 market_gov_comunidad_api = _com_mod.market_gov_comunidad_api
 InscripcionesExt = _iext_mod.InscripcionesExt
 market_ins_ext_page = _iext_mod.market_ins_ext_page
@@ -248,6 +264,9 @@ class SubastasApiHandler(BaseHTTPRequestHandler):
                     {"ok": True, "data": self.commerce.get_shipment(path.split("/subastas/api/shipments/", 1)[1])},
                 )
                 return
+            if path == "/subastas/gov-seguridad":
+                self._send_html(200, self.market_gov_seguridad_page())
+                return
             if path == "/subastas/live":
                 self._send_html(200, self.market_live_page())
                 return
@@ -305,6 +324,15 @@ class SubastasApiHandler(BaseHTTPRequestHandler):
     def do_POST(self) -> None:
         path = self.path.split("?")[0]
         try:
+            if path == "/subastas/api/gov-seguridad":
+                self.market_gov_seguridad_api()
+                return
+            if path == "/subastas/api/ops":
+                self.market_ops_api()
+                return
+            if path == "/subastas/api/logistica":
+                self.market_logistica_api()
+                return
             if path == "/subastas/api/live":
                 self.market_live_api()
                 return
@@ -735,6 +763,7 @@ class SubastasApiHandler(BaseHTTPRequestHandler):
             ("/subastas/vendedor", "Vendedor"),
             ("/subastas/comprador", "Comprador"),
             ("/subastas/operaciones", "Ordenes y envios"),
+            ("/subastas/gov-seguridad", "Seguridad"),
             ("/subastas/live", "Live"),
             ("/subastas/comunidad", "Comunidad"),
             ("/subastas/tienda", "Tiendas"),
@@ -1066,6 +1095,9 @@ def serve_subastas(store, client, *, host="127.0.0.1", port=0):
     _tdr_inst = TiendasStore(store._db, store._clock)
     _com_inst = ComunidadStore(store._db, store._clock)
     _live_inst = LiveStore(store._db, store._clock)
+    _seg_inst = SeguridadStore(store._db, store._clock)
+    _ops_inst = OperacionesStore(store._db, store._clock)
+    _log_inst = LogisticaStore(store._db, store._clock)
     handler = type(
         "BoundSubastasHandler",
         (SubastasApiHandler,),
@@ -1073,6 +1105,13 @@ def serve_subastas(store, client, *, host="127.0.0.1", port=0):
             "store": store,
             "net_client": client,
             "commerce": CommerceStore(store._db, store._clock),
+            "seg": _seg_inst,
+            "ops": _ops_inst,
+            "log": _log_inst,
+            "market_gov_seguridad_page": market_gov_seguridad_page,
+            "market_gov_seguridad_api": market_gov_seguridad_api,
+            "market_ops_api": market_ops_api,
+            "market_logistica_api": market_logistica_api,
             "live": _live_inst,
             "market_live_page": market_live_page,
             "market_live_api": market_live_api,

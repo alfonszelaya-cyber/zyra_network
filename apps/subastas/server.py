@@ -33,6 +33,12 @@ _accounts_mod = _imp.import_module(
 _iext_mod = _imp.import_module(
     "apps.subastas.modules.002_inscripciones.inscripciones_ext"
 )
+_eje_mod = _imp.import_module(
+    "apps.subastas.modules.001_ejecutivo.ejecutivo_store"
+)
+EjecutivoStore = _eje_mod.EjecutivoStore
+market_dashboard_page = _eje_mod.market_dashboard_page
+market_dashboard_api = _eje_mod.market_dashboard_api
 InscripcionesExt = _iext_mod.InscripcionesExt
 market_ins_ext_page = _iext_mod.market_ins_ext_page
 market_gov_inscripcion_page = _iext_mod.market_gov_inscripcion_page
@@ -219,6 +225,9 @@ class SubastasApiHandler(BaseHTTPRequestHandler):
                     {"ok": True, "data": self.commerce.get_shipment(path.split("/subastas/api/shipments/", 1)[1])},
                 )
                 return
+            if path == "/subastas/dashboard":
+                self._send_html(200, self.market_dashboard_page())
+                return
             if path == "/subastas/mi-inscripcion":
                 self._send_html(200, self.market_ins_ext_page())
                 return
@@ -258,6 +267,9 @@ class SubastasApiHandler(BaseHTTPRequestHandler):
     def do_POST(self) -> None:
         path = self.path.split("?")[0]
         try:
+            if path == "/subastas/api/dashboard":
+                self.market_dashboard_api()
+                return
             if path == "/subastas/register":
                 self._register_bio()
                 return
@@ -670,6 +682,7 @@ class SubastasApiHandler(BaseHTTPRequestHandler):
             ("/subastas/vendedor", "Vendedor"),
             ("/subastas/comprador", "Comprador"),
             ("/subastas/operaciones", "Ordenes y envios"),
+            ("/subastas/dashboard", "Dashboard"),
             ("/subastas/mi-inscripcion", "Mi Inscripcion"),
             ("/subastas/inscripcion", "Inscripcion"),
             ("/subastas/gobierno-kyb", "KYB"),
@@ -993,6 +1006,7 @@ class SubastasApiHandler(BaseHTTPRequestHandler):
 def serve_subastas(store, client, *, host="127.0.0.1", port=0):
     _riesgo_inst = RiesgoStore(store._db, store._clock)
     _iext_inst = InscripcionesExt(store._db, store._clock, client)
+    _eje_inst = EjecutivoStore(store._db, store._clock)
     handler = type(
         "BoundSubastasHandler",
         (SubastasApiHandler,),
@@ -1000,6 +1014,9 @@ def serve_subastas(store, client, *, host="127.0.0.1", port=0):
             "store": store,
             "net_client": client,
             "commerce": CommerceStore(store._db, store._clock),
+            "eje": _eje_inst,
+            "market_dashboard_page": market_dashboard_page,
+            "market_dashboard_api": market_dashboard_api,
             "iext": _iext_inst,
             "market_ins_ext_page": market_ins_ext_page,
             "market_gov_inscripcion_page": market_gov_inscripcion_page,

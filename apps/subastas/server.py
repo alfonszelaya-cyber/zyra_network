@@ -54,6 +54,13 @@ ComunidadStore = _com_mod.ComunidadStore
 market_comunidad_page = _com_mod.market_comunidad_page
 market_gov_comunidad_page = _com_mod.market_gov_comunidad_page
 market_comunidad_api = _com_mod.market_comunidad_api
+_live_mod = _imp.import_module(
+    "apps.subastas.modules.003_marketplace_live_commerce.live_store"
+)
+LiveStore = _live_mod.LiveStore
+market_live_page = _live_mod.market_live_page
+market_live_api = _live_mod.market_live_api
+market_gov_live_api = _live_mod.market_gov_live_api
 market_gov_comunidad_api = _com_mod.market_gov_comunidad_api
 InscripcionesExt = _iext_mod.InscripcionesExt
 market_ins_ext_page = _iext_mod.market_ins_ext_page
@@ -241,6 +248,9 @@ class SubastasApiHandler(BaseHTTPRequestHandler):
                     {"ok": True, "data": self.commerce.get_shipment(path.split("/subastas/api/shipments/", 1)[1])},
                 )
                 return
+            if path == "/subastas/live":
+                self._send_html(200, self.market_live_page())
+                return
             if path == "/subastas/comunidad":
                 self._send_html(200, self.market_comunidad_page())
                 return
@@ -295,6 +305,9 @@ class SubastasApiHandler(BaseHTTPRequestHandler):
     def do_POST(self) -> None:
         path = self.path.split("?")[0]
         try:
+            if path == "/subastas/api/live":
+                self.market_live_api()
+                return
             if path == "/subastas/api/comunidad":
                 self.market_comunidad_api()
                 return
@@ -722,6 +735,7 @@ class SubastasApiHandler(BaseHTTPRequestHandler):
             ("/subastas/vendedor", "Vendedor"),
             ("/subastas/comprador", "Comprador"),
             ("/subastas/operaciones", "Ordenes y envios"),
+            ("/subastas/live", "Live"),
             ("/subastas/comunidad", "Comunidad"),
             ("/subastas/tienda", "Tiendas"),
             ("/subastas/dashboard", "Dashboard"),
@@ -1051,6 +1065,7 @@ def serve_subastas(store, client, *, host="127.0.0.1", port=0):
     _eje_inst = EjecutivoStore(store._db, store._clock)
     _tdr_inst = TiendasStore(store._db, store._clock)
     _com_inst = ComunidadStore(store._db, store._clock)
+    _live_inst = LiveStore(store._db, store._clock)
     handler = type(
         "BoundSubastasHandler",
         (SubastasApiHandler,),
@@ -1058,6 +1073,10 @@ def serve_subastas(store, client, *, host="127.0.0.1", port=0):
             "store": store,
             "net_client": client,
             "commerce": CommerceStore(store._db, store._clock),
+            "live": _live_inst,
+            "market_live_page": market_live_page,
+            "market_live_api": market_live_api,
+            "market_gov_live_api": market_gov_live_api,
             "com": _com_inst,
             "market_comunidad_page": market_comunidad_page,
             "market_gov_comunidad_page": market_gov_comunidad_page,

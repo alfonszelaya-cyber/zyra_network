@@ -73,6 +73,27 @@ _log_mod = _imp.import_module(
 SeguridadStore = _seg_mod.SeguridadStore
 market_gov_seguridad_page = _seg_mod.market_gov_seguridad_page
 market_gov_seguridad_api = _seg_mod.market_gov_seguridad_api
+_car_mod = _imp.import_module(
+    "apps.subastas.modules.motores.cartera_store"
+)
+_trn_mod = _imp.import_module(
+    "apps.subastas.modules.motores.traduccion_store"
+)
+_rad_mod = _imp.import_module(
+    "apps.subastas.modules.motores.radar_motor"
+)
+CarteraStore = _car_mod.CarteraStore
+market_cartera_page = _car_mod.market_cartera_page
+market_gov_cartera_page = _car_mod.market_gov_cartera_page
+market_cartera_api = _car_mod.market_cartera_api
+market_gov_cartera_api = _car_mod.market_gov_cartera_api
+TraduccionStore = _trn_mod.TraduccionStore
+market_gov_traduccion_page = _trn_mod.market_gov_traduccion_page
+market_traduccion_api = _trn_mod.market_traduccion_api
+market_gov_traduccion_api = _trn_mod.market_gov_traduccion_api
+RadarMotor = _rad_mod.RadarMotor
+market_radar_page = _rad_mod.market_radar_page
+market_radar_api = _rad_mod.market_radar_api
 OperacionesStore = _ops_mod.OperacionesStore
 market_ops_api = _ops_mod.market_ops_api
 LogisticaStore = _log_mod.LogisticaStore
@@ -264,6 +285,18 @@ class SubastasApiHandler(BaseHTTPRequestHandler):
                     {"ok": True, "data": self.commerce.get_shipment(path.split("/subastas/api/shipments/", 1)[1])},
                 )
                 return
+            if path == "/subastas/cartera":
+                self._send_html(200, self.market_cartera_page())
+                return
+            if path == "/subastas/radar":
+                self._send_html(200, self.market_radar_page())
+                return
+            if path == "/subastas/gov-cartera":
+                self._send_html(200, self.market_gov_cartera_page())
+                return
+            if path == "/subastas/gov-traduccion":
+                self._send_html(200, self.market_gov_traduccion_page())
+                return
             if path == "/subastas/gov-seguridad":
                 self._send_html(200, self.market_gov_seguridad_page())
                 return
@@ -324,6 +357,21 @@ class SubastasApiHandler(BaseHTTPRequestHandler):
     def do_POST(self) -> None:
         path = self.path.split("?")[0]
         try:
+            if path == "/subastas/api/cartera":
+                self.market_cartera_api()
+                return
+            if path == "/subastas/api/gov-cartera":
+                self.market_gov_cartera_api()
+                return
+            if path == "/subastas/api/traduccion":
+                self.market_traduccion_api()
+                return
+            if path == "/subastas/api/gov-traduccion":
+                self.market_gov_traduccion_api()
+                return
+            if path == "/subastas/api/radar":
+                self.market_radar_api()
+                return
             if path == "/subastas/api/gov-seguridad":
                 self.market_gov_seguridad_api()
                 return
@@ -763,6 +811,8 @@ class SubastasApiHandler(BaseHTTPRequestHandler):
             ("/subastas/vendedor", "Vendedor"),
             ("/subastas/comprador", "Comprador"),
             ("/subastas/operaciones", "Ordenes y envios"),
+            ("/subastas/cartera", "Cartera"),
+            ("/subastas/radar", "Radar"),
             ("/subastas/gov-seguridad", "Seguridad"),
             ("/subastas/live", "Live"),
             ("/subastas/comunidad", "Comunidad"),
@@ -1096,6 +1146,9 @@ def serve_subastas(store, client, *, host="127.0.0.1", port=0):
     _com_inst = ComunidadStore(store._db, store._clock)
     _live_inst = LiveStore(store._db, store._clock)
     _seg_inst = SeguridadStore(store._db, store._clock)
+    _car_inst = CarteraStore(store._db, store._clock)
+    _trn_inst = TraduccionStore(store._db, store._clock)
+    _rad_inst = RadarMotor(store._db, store._clock, client)
     _ops_inst = OperacionesStore(store._db, store._clock)
     _log_inst = LogisticaStore(store._db, store._clock)
     handler = type(
@@ -1105,6 +1158,18 @@ def serve_subastas(store, client, *, host="127.0.0.1", port=0):
             "store": store,
             "net_client": client,
             "commerce": CommerceStore(store._db, store._clock),
+            "car": _car_inst,
+            "trn": _trn_inst,
+            "rad": _rad_inst,
+            "market_cartera_page": market_cartera_page,
+            "market_gov_cartera_page": market_gov_cartera_page,
+            "market_cartera_api": market_cartera_api,
+            "market_gov_cartera_api": market_gov_cartera_api,
+            "market_gov_traduccion_page": market_gov_traduccion_page,
+            "market_traduccion_api": market_traduccion_api,
+            "market_gov_traduccion_api": market_gov_traduccion_api,
+            "market_radar_page": market_radar_page,
+            "market_radar_api": market_radar_api,
             "seg": _seg_inst,
             "ops": _ops_inst,
             "log": _log_inst,

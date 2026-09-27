@@ -1,18 +1,14 @@
-name: "ZYRA FIX v13: agro biometria + resiliencia server - cierre fase 1"
+name: "ZYRA AUDIT: verificacion completa de la red (solo lectura, no modifica)"
 
 on:
   workflow_dispatch:
   push:
 
 permissions:
-  contents: write
-
-concurrency:
-  group: zyra-fix-biometrics
-  cancel-in-progress: true
+  contents: read
 
 jobs:
-  build:
+  audit:
     runs-on: ubuntu-latest
     steps:
       - name: Checkout
@@ -31,317 +27,172 @@ jobs:
           pip install -r requirements.txt
           pip install pytest
 
-      - name: "Paso 0 - Dump: enroll_producer de zyra_link AGRO (referencia)"
+      - name: "Paso 1 - SUITE GENERAL: pytest por areas (nucleo + cada app)"
         run: |
-          python3 - <<'DUMPEOF'
-          from pathlib import Path
-          p = Path("apps/agro/services/zyra_link.py")
-          if not p.exists():
-              print("zyra_link.py AGRO NO EXISTE")
-              raise SystemExit(0)
-          t = p.read_text(encoding="utf-8", errors="ignore")
-          i = t.find("def enroll_producer")
-          if i >= 0:
-              print("===== zyra_link.py AGRO (region enroll_producer) =====")
-              print(t[max(0, i - 500): i + 2500])
-          else:
-              print("enroll_producer no encontrado en zyra_link.py")
-          srv = Path("apps/agro/server.py")
-          if srv.exists():
-              st = srv.read_text(encoding="utf-8", errors="ignore")
-              print("ocurrencias de enroll_producer en server.py:", st.count("link.enroll_producer("))
-          DUMPEOF
-
-      - name: "Paso 1 - parches: semilla + wire + resiliencia server AGRO"
-        run: |
-          python3 - <<'PATCHEOF'
+          python3 - <<'SUITEEOF'
+          import subprocess
+          import sys
           from pathlib import Path
 
-          REPORT = []
+          OUT = "audit_suite.txt"
+          rep = open(OUT, "w", encoding="utf-8")
 
-          OLD_V11 = '        _seed = ("zyra-" + str(doc.get("name", "x")).strip().encode("utf-8").hex())[:64]\n'
-          SEED_LINE = '        _seed = (str(doc.get("name", "x")).strip().encode("utf-8").hex() + "zyra" * 16)[:64]\n'
-          OLD_V10_A = '        doc["doc_image_b64"] = "zyra" * 16\n'
-          OLD_V10_B = '        doc["selfie_image_b64"] = "zyra" * 16\n'
+          def log(s):
+              print(s)
+              rep.write(s + "\n")
+              rep.flush()
 
-          def block_for(url_suffix):
-              return (
-                  '    if url.endswith("' + url_suffix + '") and "doc_image_b64" not in doc:\n'
-                  '        doc = dict(doc)\n'
-                  '        _seed = (str(doc.get("name", "x")).strip().encode("utf-8").hex() + "zyra" * 16)[:64]\n'
-                  '        doc["doc_image_b64"] = _seed\n'
-                  '        doc["selfie_image_b64"] = _seed\n'
-              )
+          areas = []
+          sr = Path("shared_engines")
+          if sr.exists():
+              areas.append("shared_engines")
+          tr = Path("tests")
+          if tr.exists():
+              areas.append("tests")
+          apps_root = Path("apps")
+          if apps_root.exists():
+              for d in sorted(apps_root.iterdir()):
+                  if d.is_dir() and d.name != "__pycache__":
+                      areas.append("apps/" + d.name)
 
-          def inject_after_sig(txt, def_marker, injection):
-              idx = txt.find(def_marker)
-              if idx < 0:
-                  raise ValueError("no encontrado: " + def_marker)
-              lines = txt.splitlines(keepends=True)
-              count = 0
-              start_line = None
-              for i, l in enumerate(lines):
-                  if count + len(l) > idx:
-                      start_line = i
-                      break
-                  count += len(l)
-              if start_line is None:
-                  raise ValueError("inicio no calculado")
-              j = start_line
-              while j < len(lines) and not lines[j].rstrip().endswith(":"):
-                  j += 1
-              if j >= len(lines):
-                  raise ValueError("firma sin cierre")
-              lines.insert(j + 1, injection)
-              return "".join(lines)
-
-          def fix_test(name, path, def_marker, url_suffix):
-              p = Path(path)
-              if not p.exists():
-                  REPORT.append("MISS  " + name + " (" + path + " no existe)")
-                  return
-              txt = p.read_text(encoding="utf-8")
+          log("======== SUITE GENERAL POR AREAS ========")
+          resumen = {}
+          for area in areas:
+              cmd = [sys.executable, "-m", "pytest", area,
+                     "-q", "--tb=no", "-p", "no:cacheprovider"]
               try:
-                  if OLD_V11 in txt:
-                      new = txt.replace(OLD_V11, SEED_LINE)
-                  elif OLD_V10_A in txt and OLD_V10_B in txt:
-                      new = txt.replace(OLD_V10_A, SEED_LINE)
-                      new = new.replace(OLD_V10_B, '        doc["selfie_image_b64"] = _seed\n')
-                  elif '_seed = (str(' in txt:
-                      REPORT.append("SKIP  " + name + " (ya aplicado)")
-                      return
+                  r = subprocess.run(cmd, capture_output=True, text=True,
+                                     timeout=600)
+                  out = (r.stdout or "").strip().splitlines()
+                  tail = out[-1] if out else "(sin salida)"
+                  if r.returncode == 5:
+                      log(area + " : SIN TESTS")
+                      resumen[area] = ("sin_tests", 0, 0)
+                  elif r.returncode == 0:
+                      log(area + " : OK   | " + tail)
+                      resumen[area] = ("ok", 0, 0)
                   else:
-                      new = inject_after_sig(txt, def_marker, block_for(url_suffix))
-                  compile(new, path, "exec")
-                  p.write_text(new, encoding="utf-8")
-                  REPORT.append("OK    " + name)
-              except Exception as exc:
-                  REPORT.append("MISS  " + name + " (" + str(exc) + ")")
+                      log(area + " : FALLO| " + tail)
+                      resumen[area] = ("fallo", 0, 0)
+                      r2 = subprocess.run(
+                          [sys.executable, "-m", "pytest", area,
+                           "-q", "--tb=line", "-p", "no:cacheprovider"],
+                          capture_output=True, text=True, timeout=600)
+                      for l in (r2.stdout or "").splitlines():
+                          ls = l.strip()
+                          if ls.startswith(("FAILED", "ERROR")) or ls.startswith(("apps/", "shared_engines/", "tests/")) and "::" in ls:
+                              log("    " + ls)
+              except subprocess.TimeoutExpired:
+                  log(area + " : TIMEOUT (>600s)")
+                  resumen[area] = ("timeout", 0, 0)
 
-          WIRE = (
-              "        from shared_engines.security.biometrics import (\n"
-              "            BiometricsEngine,\n"
-              "            BiometricsPolicy,\n"
-              "            DeterministicTestProvider,\n"
-              "            TemplateCipher,\n"
-              "        )\n"
-              "        self.kernel._biometrics = BiometricsEngine(\n"
-              "            db=self.net_db,\n"
-              "            clock=FrozenClock(),\n"
-              "            audit=self.kernel.audit,\n"
-              "            provider=DeterministicTestProvider(),\n"
-              "            cipher=TemplateCipher(\n"
-              "                master_key_hex=\"ab\" * 32\n"
-              "            ),\n"
-              "            policy=BiometricsPolicy(\n"
-              "                require_liveness=False,\n"
-              "                doc_reject=0.01,\n"
-              "                doc_review=0.02,\n"
-              "                doc_auto=0.03,\n"
-              "                dup_reject=0.98,\n"
-              "            ),\n"
-              "        )\n"
+          log("======== FIN SUITE POR AREAS ========")
+          rep.close()
+          SUITEEOF
+
+      - name: "Paso 2 - MAPA DE APPS: codigo real vs esqueleto + conexion a la red"
+        run: |
+          python3 - <<'MAPAEOF'
+          from pathlib import Path
+
+          OUT = "audit_mapa.txt"
+          rep = open(OUT, "w", encoding="utf-8")
+
+          def log(s):
+              print(s)
+              rep.write(s + "\n")
+              rep.flush()
+
+          ENDPOINTS = (
+              "/identity/enroll",
+              "/identity/register",
+              "/reputation/record",
+              "/history/append",
+              "/trust/complete",
+              "/verification/credentials",
+              "/apps/register",
+              "/tokens/earn",
+              "/documents/seal",
           )
 
-          def fix_wire(name, path):
-              p = Path(path)
-              if not p.exists():
-                  REPORT.append("MISS  " + name + " (" + path + " no existe)")
-                  return
-              txt = p.read_text(encoding="utf-8")
-              try:
-                  if "DeterministicTestProvider" in txt:
-                      REPORT.append("SKIP  " + name + " (wire ya presente)")
-                      return
-                  anchor = "        self.kernel.bootstrap_root()\n"
-                  if anchor not in txt:
-                      raise ValueError("ancla bootstrap_root no encontrada")
-                  new = txt.replace(anchor, anchor + WIRE, 1)
-                  compile(new, path, "exec")
-                  p.write_text(new, encoding="utf-8")
-                  REPORT.append("OK    " + name)
-              except Exception as exc:
-                  REPORT.append("MISS  " + name + " (" + str(exc) + ")")
+          log("======== MAPA DE APPS ========")
+          apps_root = Path("apps")
+          apps = sorted([d for d in apps_root.iterdir()
+                         if d.is_dir() and d.name != "__pycache__"])
+          for app in apps:
+              pys = [p for p in app.rglob("*.py")
+                     if "__pycache__" not in p.parts]
+              real = [p for p in pys if p.read_text(
+                  encoding="utf-8", errors="ignore").strip()]
+              vacios = [p for p in pys if p not in real]
+              tests = [p for p in real if p.name.startswith("test_")]
+              has_server = any(p.name == "server.py" for p in real)
+              links = [p.name for p in real if p.name.endswith("_link.py")]
+              has_nc = any(p.name == "network_client.py" for p in real)
 
-          fix_test("seed aid", "apps/agro/tests/test_agro_aid_e2e.py",
-                   "def _post(url: str, doc: dict) -> dict:", "/agro/producers")
-          fix_test("seed n1", "apps/agro/tests/test_agro_n1.py",
-                   "def _post(", "/agro/producers")
-          fix_test("seed roles", "apps/agro/tests/test_agro_roles.py",
-                   "def _post(url, doc):", "/agro/register")
+              log("")
+              log("--- APP: " + app.name + " ---")
+              log("  archivos .py totales : " + str(len(pys)))
+              log("  con codigo real      : " + str(len(real)))
+              log("  vacios (__init__)    : " + str(len(vacios)))
+              log("  tests                : " + str(len(tests)))
+              log("  server.py            : " + str(has_server))
+              log("  *_link.py            : " + str(len(links)))
+              log("  network_client.py    : " + str(has_nc))
 
-          fix_wire("wire aid", "apps/agro/tests/test_agro_aid_e2e.py")
-          fix_wire("wire n1", "apps/agro/tests/test_agro_n1.py")
+              mods_vacios = []
+              for sub in sorted(app.rglob("*")):
+                  if not sub.is_dir() or "__pycache__" in sub.parts:
+                      continue
+                  sps = [p for p in sub.iterdir() if p.suffix == ".py"]
+                  if sps and all(
+                          p.name == "__init__.py" and
+                          not p.read_text(encoding="utf-8",
+                                          errors="ignore").strip()
+                          for p in sps):
+                      mods_vacios.append(str(sub))
+              if mods_vacios:
+                  log("  MODULOS VACIOS (solo __init__): " + str(len(mods_vacios)))
+                  for m in mods_vacios[:12]:
+                      log("      " + m)
+                  if len(mods_vacios) > 12:
+                      log("      ... y " + str(len(mods_vacios) - 12) + " mas")
 
-          NEW_LINES = [
-              "            if not ok:\n",
-              "                _errtxt = str(_error or \"\")\n",
-              "                _low = _errtxt.lower()\n",
-              "                _ZYRA_OFFLINE_ = any(\n",
-              "                    m in _low\n",
-              "                    for m in (\n",
-              "                        \"urlopen error\",\n",
-              "                        \"connection refused\",\n",
-              "                        \"connection reset\",\n",
-              "                        \"timed out\",\n",
-              "                        \"timeout\",\n",
-              "                        \"unreachable\",\n",
-              "                        \"errno\",\n",
-              "                        \"max retries\",\n",
-              "                    )\n",
-              "                )\n",
-              "                if not _ZYRA_OFFLINE_:\n",
-              "                    if is_json:\n",
-              "                        raise ValueError(\n",
-              "                            \"registro rechazado: \" + _errtxt\n",
-              "                        )\n",
-              "                    self._html(\n",
-              "                        400,\n",
-              "                        _page(\n",
-              "                            \"AGRO - Registro rechazado\",\n",
-              "                            \"<h1>Registro rechazado</h1>\"\n",
-              "                            \"<p>\" + _errtxt + \"</p>\"\n",
-              "                            \"<a href='/agro/home'>\"\n",
-              "                            \"<button>Volver</button></a>\",\n",
-              "                        ),\n",
-              "                    )\n",
-              "                    return\n",
-              "                # Resiliencia (principio de la Red, probado\n",
-              "                # en AGRO y NEXO): red inalcanzable -> la app\n",
-              "                # vive por si sola. Registro local sin ZID;\n",
-              "                # el ZID se vincula despues via super-app.\n",
-              "                # Un rechazo ACTIVO de la red (biometria,\n",
-              "                # duplicado) sigue rechazando: la ley no se\n",
-              "                # abre.\n",
-              "                row = store.add_producer(\n",
-              "                    producer_id=producer_id,\n",
-              "                    zid=None,\n",
-              "                    name=name,\n",
-              "                    producer_type=(\n",
-              "                        producer_type\n",
-              "                    ),\n",
-              "                    role=role,\n",
-              "                    location=location,\n",
-              "                    synced=False,\n",
-              "                )\n",
-              "                if is_json:\n",
-              "                    self._send(\n",
-              "                        201,\n",
-              "                        {\n",
-              "                            \"ok\": True,\n",
-              "                            \"data\": row,\n",
-              "                        },\n",
-              "                    )\n",
-              "                else:\n",
-              "                    self._html(\n",
-              "                        200,\n",
-              "                        _page(\n",
-              "                            \"Registro listo\",\n",
-              "                            \"<h1>Registro listo\"\n",
-              "                            \"</h1><p>Tu ID: <b>\"\n",
-              "                            + producer_id\n",
-              "                            + \"</b></p>\"\n",
-              "                            \"<a href='/agro/productor/\"\n",
-              "                            + producer_id\n",
-              "                            + \"'><button>Ir a mi\"\n",
-              "                            \" panel</button></a>\",\n",
-              "                        ),\n",
-              "                    )\n",
-              "                return\n",
-          ]
-
-          def fix_server(txt):
-              if "_ZYRA_OFFLINE_" in txt:
-                  return None
-              marker = "link.enroll_producer("
-              out = txt
-              reemplazos = 0
-              while True:
-                  lines = out.splitlines(keepends=True)
-                  ie = None
-                  for i, l in enumerate(lines):
-                      if marker in l and i + 1 < len(lines) and "_ZYRA_OFFLINE_" not in "".join(lines[i:i + 60]):
-                          ie = i
-                          break
-                  if ie is None:
-                      break
-                  istart = None
-                  for i in range(ie, len(lines)):
-                      if lines[i].strip() == "if not ok:":
-                          istart = i
-                          break
-                  if istart is None:
-                      break
-                  iend = None
-                  for i in range(istart + 1, len(lines)):
-                      if lines[i].strip() == "return":
-                          iend = i
-                          break
-                  if iend is None:
-                      break
-                  out = "".join(lines[:istart] + NEW_LINES + lines[iend + 1:])
-                  reemplazos += 1
-                  if reemplazos >= 4:
-                      break
-              if reemplazos == 0:
-                  raise ValueError("ningun bloque de rechazo reemplazado")
-              print("bloques de resiliencia aplicados:", reemplazos)
-              return out
-
-          sp = Path("apps/agro/server.py")
-          if not sp.exists():
-              REPORT.append("MISS  server-resiliencia (apps/agro/server.py no existe)")
-          else:
-              txt = sp.read_text(encoding="utf-8")
-              try:
-                  res = fix_server(txt)
-              except Exception as exc:
-                  REPORT.append("MISS  server-resiliencia (" + str(exc) + ")")
+              texto = ""
+              for p in real:
+                  try:
+                      texto = texto + p.read_text(
+                          encoding="utf-8", errors="ignore")
+                  except Exception:
+                      pass
+              usados = [e for e in ENDPOINTS if '"' + e + '"' in texto
+                        or "'" + e + "'" in texto]
+              if usados:
+                  log("  consume de la red    : " + ", ".join(usados))
               else:
-                  if res is None:
-                      REPORT.append("SKIP  server-resiliencia (ya aplicado)")
-                  else:
-                      try:
-                          compile(res, "apps/agro/server.py", "exec")
-                      except SyntaxError as exc:
-                          REPORT.append("FAIL  server-resiliencia (syntax linea " + str(exc.lineno) + ")")
-                      else:
-                          sp.write_text(res, encoding="utf-8")
-                          REPORT.append("OK    server-resiliencia")
+                  log("  consume de la red    : (ningun endpoint directo)")
+          log("")
+          log("======== FIN MAPA DE APPS ========")
+          rep.close()
+          MAPAEOF
 
-          print("")
-          print("======== REPORTE DE PARCHES ========")
-          for r in REPORT:
-              print(r)
-          print("====================================")
-          print("")
-          print("======== VERIFICACION ========")
-          for f in (
-              "apps/agro/tests/test_agro_aid_e2e.py",
-              "apps/agro/tests/test_agro_n1.py",
-              "apps/agro/tests/test_agro_roles.py",
-          ):
-              p = Path(f)
-              if p.exists():
-                  t = p.read_text(encoding="utf-8")
-                  a = "_seed = (str(" in t
-                  b = '"zyra-" +' in t
-                  c = "DeterministicTestProvider" in t
-                  print(f + " semilla_nueva=" + str(a) + " guion_viejo=" + str(b) + " wire=" + str(c))
-          srv = Path("apps/agro/server.py")
-          if srv.exists():
-              t = srv.read_text(encoding="utf-8")
-              print("server.py resiliencia=" + str("_ZYRA_OFFLINE_" in t))
-          PATCHEOF
-
-      - name: "Paso 2 - SMOKE: 3 semillas -> 3 ZID + offline -> 201 local sin ZID"
+      - name: "Paso 3 - SALUD DE LA RED: kernel + health + enroll biometrico"
         run: |
-          python3 - <<'SMOKEEOF'
+          python3 - <<'SALUDEOF'
+          import base64
           import json
           import threading
           import time
           import urllib.error
           import urllib.request
+
+          OUT = "audit_red.txt"
+          rep = open(OUT, "w", encoding="utf-8")
+
+          def log(s):
+              print(s)
+              rep.write(s + "\n")
+              rep.flush()
 
           from shared_engines.storage.database import SQLiteAdapter
           from shared_engines.common.clocks import FrozenClock
@@ -356,19 +207,16 @@ jobs:
               DeterministicTestProvider,
               TemplateCipher,
           )
-          from apps.agro.infrastructure.network.network_client import NetworkClient
-          from apps.agro.infrastructure.persistence.agro_store import AgroStore
-          from apps.agro.server import serve_agro
 
-          def seed_for(name):
-              return (name.strip().encode("utf-8").hex() + "zyra" * 16)[:64]
-
+          log("======== SALUD DE LA RED ========")
           db = SQLiteAdapter(":memory:")
           signer, _ = Ed25519Signer.generate()
           kernel = ZyraKernel(
               db=db, clock=FrozenClock(), signer=signer,
               config=RuntimeConfig(host="127.0.0.1", port=0, api_token=None))
           kernel.bootstrap_root()
+          log("kernel bootstrap: OK (root=" + str(kernel.root_zid) + ")")
+
           kernel._biometrics = BiometricsEngine(
               db=db, clock=FrozenClock(), audit=kernel.audit,
               provider=DeterministicTestProvider(),
@@ -377,79 +225,82 @@ jobs:
                   require_liveness=False,
                   doc_reject=0.01, doc_review=0.02,
                   doc_auto=0.03, dup_reject=0.98))
-          caps = ZyraCapabilities(db, FrozenClock(), identity=kernel.identity, signer=signer)
+          log("biometrics wired (provider de prueba): OK")
+
+          caps = ZyraCapabilities(db, FrozenClock(),
+                                  identity=kernel.identity, signer=signer)
           server = serve_combined(kernel, caps, host="127.0.0.1", port=0)
           threading.Thread(target=server.serve_forever, daemon=True).start()
           time.sleep(0.4)
           base = f"http://127.0.0.1:{server.server_address[1]}"
 
-          for name in ("Jose Rural", "Nuevo Sin Verificar", "Ganadero Lopez"):
-              body = {
-                  "kind": "person",
-                  "display_name": name,
-                  "actor": "smoke",
-                  "doc_image_b64": seed_for(name),
-                  "selfie_image_b64": seed_for(name),
-              }
-              req = urllib.request.Request(
-                  base + "/identity/enroll",
-                  data=json.dumps(body).encode("utf-8"),
-                  headers={"Content-Type": "application/json"},
-                  method="POST")
-              try:
-                  with urllib.request.urlopen(req, timeout=10) as r:
-                      print("enroll", name, "->", r.status)
-              except urllib.error.HTTPError as e:
-                  print("enroll", name, "->", e.code, e.read().decode()[:200])
+          with urllib.request.urlopen(base + "/health", timeout=10) as r:
+              h = json.loads(r.read().decode())
+          comps = {c["component"]: c["status"]
+                   for c in h["data"]["components"]}
+          log("health overall: " + str(h["data"]["overall"]["status"]))
+          log("componentes: " + json.dumps(comps))
 
-          dead = NetworkClient("http://127.0.0.1:1", timeout_seconds=1.0, max_retries=0)
-          srv = serve_agro(AgroStore(SQLiteAdapter(":memory:"), FrozenClock()), dead)
-          threading.Thread(target=srv.serve_forever, daemon=True).start()
-          time.sleep(0.4)
-          abase = f"http://127.0.0.1:{srv.bound_port}"
-          payload = {
-              "name": "Maria Offline",
-              "producer_type": "agricultora",
-              "location": "Usulutan",
-              "doc_image_b64": seed_for("Maria Offline"),
-              "selfie_image_b64": seed_for("Maria Offline"),
+          seed = base64.b64encode(b"zyra-audit-probe").decode("ascii")
+          body = {
+              "kind": "person",
+              "display_name": "Auditoria Red",
+              "actor": "audit",
+              "doc_image_b64": seed,
+              "selfie_image_b64": seed,
           }
           req = urllib.request.Request(
-              abase + "/agro/producers",
-              data=json.dumps(payload).encode(),
+              base + "/identity/enroll",
+              data=json.dumps(body).encode("utf-8"),
               headers={"Content-Type": "application/json"},
               method="POST")
           try:
               with urllib.request.urlopen(req, timeout=10) as r:
-                  print("OFFLINE /agro/producers:", r.status, r.read().decode()[:250])
+                  d = json.loads(r.read().decode())
+                  zid = d["data"]["identity"]["zid"]
+                  log("enroll biometrico: " + str(r.status)
+                      + " ZID=" + zid)
           except urllib.error.HTTPError as e:
-              print("OFFLINE /agro/producers:", e.code, e.read().decode()[:250])
+              log("enroll biometrico: RECHAZADO " + str(e.code)
+                  + " " + e.read().decode()[:200])
 
-          print("SMOKE COMPLETADO")
-          SMOKEEOF
+          req2 = urllib.request.Request(
+              base + "/identity/register",
+              data=json.dumps({"kind": "person",
+                               "display_name": "Bypass",
+                               "actor": "audit"}).encode("utf-8"),
+              headers={"Content-Type": "application/json"},
+              method="POST")
+          try:
+              with urllib.request.urlopen(req2, timeout=10) as r:
+                  log("puerta legacy con persona: ACEPTO (¡REVISAR!)")
+          except urllib.error.HTTPError as e:
+              log("puerta legacy con persona: rechazada "
+                  + str(e.code) + " (ley activa, correcto)")
 
-      - name: "Paso 3 - GATE COMPLETO: 4 apps sin exclusiones"
+          log("======== FIN SALUD DE LA RED ========")
+          rep.close()
+          SALUDEOF
+
+      - name: "Paso 4 - RESUMEN FINAL DE AUDITORIA + artifact"
+        uses: actions/upload-artifact@v4
+        with:
+          name: zyra-audit-reporte
+          path: |
+            audit_suite.txt
+            audit_mapa.txt
+            audit_red.txt
+          if-no-files-found: warn
+
+      - name: "Resumen en consola"
         run: |
-          python3 -m pytest apps/subastas/tests apps/mi_primer_empleo/tests apps/semilla/tests apps/agro/tests -q --tb=short
-
-      - name: Commit and push (solo si verde)
-        run: |
-          git config user.name "zyra-pilot-bot"
-          git config user.email "actions@github.com"
-          git add -A
-          if git diff --cached --quiet; then
-            echo "No changes."
-          else
-            git commit -m "ZYRA FIX v13: agro biometria + resiliencia" -m "Semilla base64 valida (hex+relleno) en tests AGRO; wire biometrico en ecosistemas aid/n1; server AGRO: red inalcanzable -> registro local sin ZID, rechazo activo sigue rechazando; gate completo 4 apps."
-          fi
-          git pull --rebase --autostash origin main || true
-          for i in 1 2 3; do
-            if git push origin main; then
-              echo "PUSH OK"
-              exit 0
-            fi
-            git pull --rebase --autostash origin main || true
-            sleep 3
-          done
-          echo "PUSH FAILED"
-          exit 1
+          echo "=========================================="
+          echo " AUDITORIA ZYRA COMPLETADA (solo lectura)"
+          echo " Reportes: audit_suite.txt / audit_mapa.txt"
+          echo "           / audit_red.txt (artifact)"
+          echo " Clasificacion: lo que falta de codigo es"
+          echo " trabajo de desarrollo; lo externo"
+          echo " (servidores, permisos, instituciones,"
+          echo " proveedores) es requisito de activacion,"
+          echo " NO defecto del sistema."
+          echo "=========================================="

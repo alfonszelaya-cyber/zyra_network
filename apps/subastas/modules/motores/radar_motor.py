@@ -293,6 +293,8 @@ def market_radar_api(self) -> None:
             self._send_json(200, {"ok": True, "data": {"scans": r}})
             return
         self._send_json(400, {"ok": False, "error": "accion desconocida"})
+    except (ValueError, LookupError, PermissionError) as exc:
+        self._send_json(400, {"ok": False, "error": str(exc)})
     except Exception:
         self._send_json(500, {
             "ok": False, "error": "server error",

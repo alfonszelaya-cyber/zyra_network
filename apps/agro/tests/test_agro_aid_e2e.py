@@ -56,6 +56,28 @@ class _Ecosystem:
             ),
         )
         self.kernel.bootstrap_root()
+        from shared_engines.security.biometrics import (
+            BiometricsEngine,
+            BiometricsPolicy,
+            DeterministicTestProvider,
+            TemplateCipher,
+        )
+        self.kernel._biometrics = BiometricsEngine(
+            db=self.net_db,
+            clock=FrozenClock(),
+            audit=self.kernel.audit,
+            provider=DeterministicTestProvider(),
+            cipher=TemplateCipher(
+                master_key_hex="ab" * 32
+            ),
+            policy=BiometricsPolicy(
+                require_liveness=False,
+                doc_reject=0.01,
+                doc_review=0.02,
+                doc_auto=0.03,
+                dup_reject=0.98,
+            ),
+        )
         self.caps = ZyraCapabilities(
             self.net_db,
             FrozenClock(),
@@ -121,6 +143,11 @@ def _get(url: str) -> dict:
 
 
 def _post(url: str, doc: dict) -> dict:
+    if url.endswith("/agro/producers") and "doc_image_b64" not in doc:
+        doc = dict(doc)
+        _seed = (str(doc.get("name", "x")).strip().encode("utf-8").hex() + "zyra" * 16)[:64]
+        doc["doc_image_b64"] = _seed
+        doc["selfie_image_b64"] = _seed
     request = Request(
         url,
         data=json.dumps(doc).encode("utf-8"),

@@ -52,6 +52,11 @@ def _boot(tmp_path: Path):
 
 
 def _post(url, doc):
+    if url.endswith("/agro/register") and "doc_image_b64" not in doc:
+        doc = dict(doc)
+        _seed = (str(doc.get("name", "x")).strip().encode("utf-8").hex() + "zyra" * 16)[:64]
+        doc["doc_image_b64"] = _seed
+        doc["selfie_image_b64"] = _seed
     """Returns the HTTP status code (200, 400...);
     catches HTTPError so rejected requests can be
     asserted."""

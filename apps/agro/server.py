@@ -357,20 +357,78 @@ class AgroApiHandler(
                 )
             )
             if not ok:
-                if is_json:
-                    raise ValueError(
-                        "registro rechazado: " + str(_error)
+                _errtxt = str(_error or "")
+                _low = _errtxt.lower()
+                _ZYRA_OFFLINE_ = any(
+                    m in _low
+                    for m in (
+                        "urlopen error",
+                        "connection refused",
+                        "connection reset",
+                        "timed out",
+                        "timeout",
+                        "unreachable",
+                        "errno",
+                        "max retries",
                     )
-                self._html(
-                    400,
-                    _page(
-                        "AGRO - Registro rechazado",
-                        "<h1>Registro rechazado</h1>"
-                        "<p>" + str(_error) + "</p>"
-                        "<a href='/agro/home'>"
-                        "<button>Volver</button></a>",
-                    ),
                 )
+                if not _ZYRA_OFFLINE_:
+                    if is_json:
+                        raise ValueError(
+                            "registro rechazado: " + _errtxt
+                        )
+                    self._html(
+                        400,
+                        _page(
+                            "AGRO - Registro rechazado",
+                            "<h1>Registro rechazado</h1>"
+                            "<p>" + _errtxt + "</p>"
+                            "<a href='/agro/home'>"
+                            "<button>Volver</button></a>",
+                        ),
+                    )
+                    return
+                # Resiliencia (principio de la Red, probado
+                # en AGRO y NEXO): red inalcanzable -> la app
+                # vive por si sola. Registro local sin ZID;
+                # el ZID se vincula despues via super-app.
+                # Un rechazo ACTIVO de la red (biometria,
+                # duplicado) sigue rechazando: la ley no se
+                # abre.
+                row = store.add_producer(
+                    producer_id=producer_id,
+                    zid=None,
+                    name=name,
+                    producer_type=(
+                        producer_type
+                    ),
+                    role=role,
+                    location=location,
+                    synced=False,
+                )
+                if is_json:
+                    self._send(
+                        201,
+                        {
+                            "ok": True,
+                            "data": row,
+                        },
+                    )
+                else:
+                    self._html(
+                        200,
+                        _page(
+                            "Registro listo",
+                            "<h1>Registro listo"
+                            "</h1><p>Tu ID: <b>"
+                            + producer_id
+                            + "</b></p>"
+                            "<a href='/agro/productor/"
+                            + producer_id
+                            + "'><button>Ir a mi"
+                            " panel</button></a>",
+                        ),
+                    )
                 return
             if data is not None:
                 zid = _prd_find_zid(data)
@@ -650,18 +708,78 @@ class AgroApiHandler(
                 )
             )
             if not ok:
-                self._html(
-                    400,
-                    _page(
-                        "AGRO - Registro rechazado",
-                        "<h1>Registro rechazado</h1>"
-                        "<p>"
-                        + str(_error)
-                        + "</p>"
-                        "<a href='/agro/home'>"
-                        "<button>Volver</button></a>",
-                    ),
+                _errtxt = str(_error or "")
+                _low = _errtxt.lower()
+                _ZYRA_OFFLINE_ = any(
+                    m in _low
+                    for m in (
+                        "urlopen error",
+                        "connection refused",
+                        "connection reset",
+                        "timed out",
+                        "timeout",
+                        "unreachable",
+                        "errno",
+                        "max retries",
+                    )
                 )
+                if not _ZYRA_OFFLINE_:
+                    if is_json:
+                        raise ValueError(
+                            "registro rechazado: " + _errtxt
+                        )
+                    self._html(
+                        400,
+                        _page(
+                            "AGRO - Registro rechazado",
+                            "<h1>Registro rechazado</h1>"
+                            "<p>" + _errtxt + "</p>"
+                            "<a href='/agro/home'>"
+                            "<button>Volver</button></a>",
+                        ),
+                    )
+                    return
+                # Resiliencia (principio de la Red, probado
+                # en AGRO y NEXO): red inalcanzable -> la app
+                # vive por si sola. Registro local sin ZID;
+                # el ZID se vincula despues via super-app.
+                # Un rechazo ACTIVO de la red (biometria,
+                # duplicado) sigue rechazando: la ley no se
+                # abre.
+                row = store.add_producer(
+                    producer_id=producer_id,
+                    zid=None,
+                    name=name,
+                    producer_type=(
+                        producer_type
+                    ),
+                    role=role,
+                    location=location,
+                    synced=False,
+                )
+                if is_json:
+                    self._send(
+                        201,
+                        {
+                            "ok": True,
+                            "data": row,
+                        },
+                    )
+                else:
+                    self._html(
+                        200,
+                        _page(
+                            "Registro listo",
+                            "<h1>Registro listo"
+                            "</h1><p>Tu ID: <b>"
+                            + producer_id
+                            + "</b></p>"
+                            "<a href='/agro/productor/"
+                            + producer_id
+                            + "'><button>Ir a mi"
+                            " panel</button></a>",
+                        ),
+                    )
                 return
             if data is not None:
                 zid = _agro_find_zid(data)

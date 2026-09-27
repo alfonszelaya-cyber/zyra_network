@@ -36,13 +36,12 @@ class ZyraLink:
     def register_producer_zid(
         self, display_name: str
     ) -> tuple[bool, dict | None, str | None]:
-        return self._client.post(
-            "/identity/register",
-            {
-                "kind": "person",
-                "display_name": display_name,
-                "actor": "agro",
-            },
+        """LAW: person registration requires biometric
+        enrollment. Legacy door rejected here; use
+        enroll_producer with document + selfie."""
+        raise ValueError(
+            "registro de productor requiere biometria:"
+            " use enroll_producer con documento y selfie"
         )
 
     def enroll_producer(

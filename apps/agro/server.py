@@ -243,6 +243,97 @@ class AgroApiHandler(
                 },
             )
             return
+        if s == ["gobierno", "seguridad"]:
+            from apps.agro.modules.gobierno.seguridad_alimentaria.food_security_service import (
+                FoodSecurityService,
+            )
+            st_data = FoodSecurityService(
+                type(self).store
+            ).national_status()
+            rows = ""
+            for x in st_data["products"]:
+                rows = rows + "<li>" + x["product"] + ": " + str(x["quantity"]) + " producidas</li>"
+            if not rows:
+                rows = "<li>Sin produccion registrada</li>"
+            body = (
+                "<h1>Seguridad alimentaria</h1>"
+                "<p>Productores: " + str(st_data["producers_total"])
+                + " - verificados: " + str(st_data["producers_verified"]) + "</p>"
+                "<ul>" + rows + "</ul>"
+                "<a href='/agro/gobierno'><button>Volver</button></a>"
+            )
+            self._html(200, _page("AGRO - Seguridad alimentaria", body))
+            return
+        if s == ["gobierno", "beneficiados"]:
+            from apps.agro.modules.gobierno.apoyos.government_aid_service import (
+                GovernmentAidService,
+            )
+            rep = GovernmentAidService(
+                type(self).store
+            ).beneficiaries_report()
+            b = ""
+            for r in rep["beneficiados"]:
+                b = b + "<li>" + r["name"] + " (" + str(r["aid_count"]) + " ayudas)</li>"
+            if not b:
+                b = "<li>Ninguno aun</li>"
+            nb = ""
+            for r in rep["no_beneficiados"]:
+                nb = nb + "<li>" + r["name"] + " - sin ayudas (" + r["role"] + ")</li>"
+            if not nb:
+                nb = "<li>Todos beneficiados</li>"
+            body = (
+                "<h1>Ayudas: beneficiados y pendientes</h1>"
+                "<p>Total ayudas: " + str(rep["aid_total"]) + "</p>"
+                "<h2>Beneficiados</h2><ul>" + b + "</ul>"
+                "<h2>No beneficiados (a quienes ayudar)</h2><ul>" + nb + "</ul>"
+                "<a href='/agro/gobierno'><button>Volver</button></a>"
+            )
+            self._html(200, _page("AGRO - Beneficiarios", body))
+            return
+        if s == ["gobierno", "riesgos"]:
+            areas = self._ZYRA_AREAS_V2()
+            rows = ""
+            for p in type(self).store.list_producers():
+                for r in areas.open_risks(
+                    producer_id=str(p.get("producer_id"))
+                ):
+                    rows = rows + "<li>" + str(p.get("name")) + ": " + str(r.get("risk_type")) + " (" + str(r.get("severity")) + ")</li>"
+            if not rows:
+                rows = "<li>Sin riesgos abiertos</li>"
+            body = (
+                "<h1>Riesgos abiertos</h1>"
+                "<ul>" + rows + "</ul>"
+                "<a href='/agro/gobierno'><button>Volver</button></a>"
+            )
+            self._html(200, _page("AGRO - Riesgos", body))
+            return
+        if s == ["mercado"]:
+            prods = type(self).store.list_productions()
+            rows = ""
+            for p in prods:
+                rows = rows + "<li>" + str(p.get("product")) + " - " + str(p.get("quantity")) + " " + str(p.get("unit")) + "</li>"
+            if not rows:
+                rows = "<li>Sin produccion disponible</li>"
+            body = (
+                "<h1>Mercado AGRO</h1>"
+                "<h2>Produccion disponible</h2><ul>" + rows + "</ul>"
+                "<h2>Comprar / exportar</h2>"
+                "<p>Registre su empresa en la Red (ZID de organizacion) y contacte al productor.</p>"
+                "<a href='/agro'><button>Inicio</button></a>"
+            )
+            self._html(200, _page("AGRO - Mercado", body))
+            return
+        if len(s) == 2 and s[0] == "areas":
+            a = self._ZYRA_AREAS_V2()
+            self._send(200, {"ok": True, "data": {
+                "lands": a.lands_of(producer_id=s[1]),
+                "sales": a.sales_of(producer_id=s[1]),
+                "risks": a.open_risks(producer_id=s[1]),
+                "machinery": a.machinery_of(producer_id=s[1]),
+                "inventory": a.inventory_of(producer_id=s[1]),
+                "water": a.water_sources_of(producer_id=s[1]),
+            }})
+            return
         if not s or s == ["home"]:
             self._home()
             return
@@ -267,6 +358,56 @@ class AgroApiHandler(
             },
         )
 
+    def _ZYRA_AREAS_V2(self):
+        store = type(self).store
+        from apps.agro.infrastructure.persistence.agro_area_store import (
+            AgroAreaStore,
+        )
+        return AgroAreaStore(store._db, store._clock)
+
+    def _ZYRA_EVENTS_V2(self):
+        store = type(self).store
+        from apps.agro.services.agro_events import (
+            AgroEventService,
+        )
+        return AgroEventService(
+            store=store,
+            link=type(self).link,
+        )
+
+    def _ZYRA_PAYLOAD_V2(self, is_json):
+        if is_json:
+            return self._read_json()
+        return self._read_form()
+
+    def _ZYRA_MENUS_V2(self):
+        items = []
+        names = (
+            "atencion_al_cliente",
+            "comercializacion",
+            "ejecutivo",
+            "gobierno",
+            "insumos_y_apoyos",
+            "operaciones",
+            "produccion",
+            "productores",
+            "recursos_y_activos",
+            "riesgo",
+            "seguridad",
+        )
+        for name in names:
+            try:
+                mod = __import__(
+                    "apps.agro.modules." + name + ".menu",
+                    fromlist=["menu"],
+                )
+                fn = getattr(mod, "menu", None)
+                if callable(fn):
+                    items.append(fn())
+            except Exception:
+                continue
+        return items
+
     def _post(self, s: list[str]) -> None:
         store = type(self).store
         link = type(self).link
@@ -277,6 +418,121 @@ class AgroApiHandler(
             "application/json"
             in content_type
         )
+        if s == ["land"]:
+            doc = self._ZYRA_PAYLOAD_V2(is_json)
+            pid = self._req(doc, "producer_id")
+            row = self._ZYRA_AREAS_V2().add_land(
+                producer_id=pid,
+                location=self._req(doc, "location"),
+                size_hectares=float(doc.get("size_hectares") or 0),
+                land_use=str(doc.get("land_use") or ""),
+            )
+            self._ZYRA_EVENTS_V2().asset_registered(
+                producer_id=pid,
+                asset_type="tierra",
+                detail=str(row["land_id"]),
+            )
+            self._send(201, {"ok": True, "data": row})
+            return
+        if s == ["machinery"]:
+            doc = self._ZYRA_PAYLOAD_V2(is_json)
+            pid = self._req(doc, "producer_id")
+            row = self._ZYRA_AREAS_V2().add_machinery(
+                producer_id=pid,
+                machine_type=self._req(doc, "machine_type"),
+                description=str(doc.get("description") or ""),
+            )
+            self._ZYRA_EVENTS_V2().asset_registered(
+                producer_id=pid,
+                asset_type="maquinaria",
+                detail=str(row["machine_id"]),
+            )
+            self._send(201, {"ok": True, "data": row})
+            return
+        if s == ["inventory"]:
+            doc = self._ZYRA_PAYLOAD_V2(is_json)
+            pid = self._req(doc, "producer_id")
+            row = self._ZYRA_AREAS_V2().add_inventory_item(
+                producer_id=pid,
+                item_name=self._req(doc, "item_name"),
+                quantity=float(doc.get("quantity") or 0),
+                unit=str(doc.get("unit") or ""),
+            )
+            self._ZYRA_EVENTS_V2().asset_registered(
+                producer_id=pid,
+                asset_type="inventario",
+                detail=str(doc.get("item_name", "")),
+            )
+            self._send(201, {"ok": True, "data": row})
+            return
+        if s == ["water"]:
+            doc = self._ZYRA_PAYLOAD_V2(is_json)
+            pid = self._req(doc, "producer_id")
+            row = self._ZYRA_AREAS_V2().add_water_source(
+                producer_id=pid,
+                source_type=self._req(doc, "source_type"),
+                capacity_liters=float(doc.get("capacity_liters") or 0),
+            )
+            self._ZYRA_EVENTS_V2().asset_registered(
+                producer_id=pid,
+                asset_type="agua",
+                detail=str(doc.get("source_type", "")),
+            )
+            self._send(201, {"ok": True, "data": row})
+            return
+        if s == ["sale"]:
+            doc = self._ZYRA_PAYLOAD_V2(is_json)
+            pid = self._req(doc, "producer_id")
+            row = self._ZYRA_AREAS_V2().create_sale(
+                producer_id=pid,
+                buyer=self._req(doc, "buyer"),
+                product=self._req(doc, "product"),
+                quantity=float(doc.get("quantity") or 0),
+                unit=str(doc.get("unit") or ""),
+                price=float(doc.get("price") or 0),
+            )
+            seq = self._ZYRA_EVENTS_V2().sale_created(
+                producer_id=pid,
+                sale_id=str(row["sale_id"]),
+                detail=str(row.get("product", "")),
+            )
+            out = dict(row)
+            out["network_seq"] = seq
+            self._send(201, {"ok": True, "data": out})
+            return
+        if s == ["sale", "complete"]:
+            doc = self._ZYRA_PAYLOAD_V2(is_json)
+            sid = self._req(doc, "sale_id")
+            row = self._ZYRA_AREAS_V2().complete_sale(sale_id=sid)
+            self._ZYRA_EVENTS_V2().sale_completed(
+                producer_id=str(row.get("producer_id", "")),
+                sale_id=sid,
+            )
+            self._send(200, {"ok": True, "data": row})
+            return
+        if s == ["risk"]:
+            doc = self._ZYRA_PAYLOAD_V2(is_json)
+            pid = self._req(doc, "producer_id")
+            row = self._ZYRA_AREAS_V2().report_risk(
+                producer_id=pid,
+                risk_type=self._req(doc, "risk_type"),
+                severity=str(doc.get("severity") or "media"),
+                detail=str(doc.get("detail") or ""),
+            )
+            self._ZYRA_EVENTS_V2().risk_detected(
+                producer_id=pid,
+                risk_type=str(row.get("risk_type", "")),
+                detail=str(row.get("detail", "")),
+            )
+            self._send(201, {"ok": True, "data": row})
+            return
+        if s == ["risk", "resolve"]:
+            doc = self._ZYRA_PAYLOAD_V2(is_json)
+            row = self._ZYRA_AREAS_V2().resolve_risk(
+                risk_id=self._req(doc, "risk_id"),
+            )
+            self._send(200, {"ok": True, "data": row})
+            return
         if s == ["producers"]:
             if is_json:
                 doc = self._read_json()
@@ -1188,85 +1444,47 @@ class AgroApiHandler(
         row = store.get_producer(
             producer_id
         )
-        zid = row.get("zid")
-        verified = row.get("verified")
-        if verified:
+        if not row or not row.get("name"):
+            self._html(
+                404,
+                _page(
+                    "AGRO - Productor",
+                    "<h1>Productor no encontrado</h1>"
+                    "<a href='/agro'><button>Volver</button></a>",
+                ),
+            )
+            return
+        if row.get("verified"):
             badge = "✅ VERIFICADO"
-            extra = ""
         else:
-            badge = (
-                "⚠️ Sin verificar"
-                " (sin bonos)"
-            )
-            extra = (
-                "<form method='POST'"
-                " action='/agro/producers/verify'>"
-                "<input type='hidden'"
-                " name='producer_id'"
-                f" value='{producer_id}'>"
-                "<button>Verificarme para"
-                " recibir bonos</button>"
-                "</form>"
-            )
-        mine = [
-            p
-            for p in (
-                store.list_productions()
-            )
-            if p["producer_id"]
-            == producer_id
-        ]
-        history = "".join(
-            "<li>• "
-            + p["product"]
-            + ": "
-            + str(p["quantity"])
-            + " "
-            + p["unit"]
-            + "</li>"
-            for p in mine
-        )
-        if not history:
-            history = (
-                "<li>Sin registros</li>"
-            )
+            badge = "⚠️ Sin verificar (sin bonos)"
         body = (
-            "<h1>Mi Panel — "
-            + str(row.get("name"))
-            + "</h1>"
-            "<p>"
-            + badge
-            + " · Rol: "
-            + str(row.get("role"))
-            + "</p>"
-            "<h2>Registrar mi cosecha"
-            "</h2>"
-            "<div class='card'>"
-            "<form method='POST'"
-            " action='/agro/production'>"
-            "<input type='hidden'"
-            " name='producer_id'"
-            f" value='{producer_id}'>"
-            "<input name='product'"
-            " placeholder='Producto'>"
-            "<input name='quantity'"
-            " placeholder='Cantidad'>"
-            "<select name='unit'>"
-            "<option value='quintal'>"
-            "quintal</option>"
-            "<option value='libra'>"
-            "libra</option>"
-            "</select>"
-            "<button>Guardar en la"
-            " Red</button>"
+            "<h1>Mi Panel — " + str(row.get("name")) + "</h1>"
+            "<p>" + badge + " · Rol: " + str(row.get("role")) + "</p>"
+            "<div class='card'><h2>1) Registrar mi cosecha</h2>"
+            "<form method='POST' action='/agro/production'>"
+            "<input type='hidden' name='producer_id' value='" + producer_id + "'>"
+            "<input name='product' placeholder='Producto (maiz, frijol...)'>"
+            "<input name='quantity' placeholder='Cantidad'>"
+            "<select name='unit'><option value='quintal'>quintal</option>"
+            "<option value='libra'>libra</option></select>"
+            "<button>Guardar</button>"
             "</form></div>"
-            "<h2>Mi historial</h2><ul>"
-            + history
-            + "</ul>"
-            + extra
-            + "<a href='/agro'><button"
-            " class='gray'>Inicio"
-            "</button></a>"
+            "<div class='card'><h2>2) Vender mi producto</h2>"
+            "<form method='POST' action='/agro/sale'>"
+            "<input type='hidden' name='producer_id' value='" + producer_id + "'>"
+            "<input name='buyer' placeholder='Comprador'>"
+            "<input name='product' placeholder='Producto'>"
+            "<input name='quantity' placeholder='Cantidad'>"
+            "<select name='unit'><option value='quintal'>quintal</option>"
+            "<option value='libra'>libra</option></select>"
+            "<input name='price' placeholder='Precio total'>"
+            "<button>Vender</button>"
+            "</form></div>"
+            "<div class='card'><h2>3) Ayuda del Gobierno</h2>"
+            "<a href='/agro/ayudas/" + producer_id + "'><button>Ver mis ayudas</button></a>"
+            "</div>"
+            "<a href='/agro'><button class='gray'>Inicio</button></a>"
         )
         self._html(
             200,
@@ -1274,69 +1492,67 @@ class AgroApiHandler(
         )
 
     def _screen_government(self) -> None:
-        summary = type(
-            self
-        ).store.summary()
-        total = summary["producers_total"]
-        verified = summary[
-            "producers_verified"
-        ]
-        by_role = summary[
-            "producers_by_role"
-        ]
-        by_product = summary[
-            "productions_by_product"
-        ]
-        roles_html = "".join(
-            "<li>• "
-            + k
-            + ": "
-            + str(v)
-            + "</li>"
-            for k, v in by_role.items()
+        store = type(self).store
+        summary = store.summary()
+        from apps.agro.modules.gobierno.seguridad_alimentaria.food_security_service import (
+            FoodSecurityService,
         )
-        if not roles_html:
-            roles_html = (
-                "<li>Sin datos</li>"
-            )
-        products_html = "".join(
-            "<li>• "
-            + k
-            + ": "
-            + str(v)
-            + " quintales</li>"
-            for k, v in (
-                by_product.items()
-            )
+        from apps.agro.modules.gobierno.apoyos.government_aid_service import (
+            GovernmentAidService,
         )
-        if not products_html:
-            products_html = (
-                "<li>Sin cosechas"
-                " registradas</li>"
-            )
+        fs = FoodSecurityService(store).national_status()
+        ay = GovernmentAidService(store).beneficiaries_report()
+        areas = self._ZYRA_AREAS_V2()
+        riesgos = ""
+        for p in store.list_producers():
+            for r in areas.open_risks(
+                producer_id=str(p.get("producer_id"))
+            ):
+                riesgos = riesgos + "<li>" + str(p.get("name")) + ": " + str(r.get("risk_type")) + " (" + str(r.get("severity")) + ")</li>"
+        if not riesgos:
+            riesgos = "<li>Sin riesgos abiertos</li>"
+        prod_rows = ""
+        for x in fs["products"]:
+            prod_rows = prod_rows + "<li>" + x["product"] + ": " + str(x["quantity"]) + "</li>"
+        if not prod_rows:
+            prod_rows = "<li>Sin cosechas registradas</li>"
+        roles_html = ""
+        for k, v in (summary.get("producers_by_role") or {}).items():
+            roles_html = roles_html + "<li>" + str(k) + ": " + str(v) + "</li>"
+        ben = ""
+        for r in ay["beneficiados"]:
+            ben = ben + "<li>" + r["name"] + " (" + str(r["aid_count"]) + ")</li>"
+        if not ben:
+            ben = "<li>Ninguno aun</li>"
+        noben = ""
+        for r in ay["no_beneficiados"]:
+            noben = noben + "<li>" + r["name"] + "</li>"
+        if not noben:
+            noben = "<li>Todos beneficiados</li>"
+        modulos = ""
+        for m in self._ZYRA_MENUS_V2():
+            modulos = modulos + "<li><b>" + str(m.get("title")) + "</b>:"
+            for it in m.get("items", []):
+                modulos = modulos + " <a href='" + str(it.get("path")) + "'>" + str(it.get("label")) + "</a>"
+            modulos = modulos + "</li>"
         body = (
-            "<h1>🏛️ AGRO — Vista"
-            " Gobierno</h1>"
-            "<h2>Soberania alimentaria"
-            " nacional</h2>"
+            "<h1>🏛️ AGRO — Vista Gobierno</h1>"
+            "<h2>Soberania alimentaria nacional</h2>"
             "<div class='card'>"
-            "<span class='big'>"
-            + str(total)
-            + "</span> productores<br>"
-            "<span class='big'>"
-            + str(verified)
-            + "</span> verificados"
+            "<span class='big'>" + str(summary.get("producers_total")) + "</span> productores<br>"
+            "<span class='big'>" + str(summary.get("producers_verified")) + "</span> verificados"
             "</div>"
-            "<h2>Por rol</h2><ul>"
-            + roles_html
-            + "</ul>"
-            "<h2>Produccion nacional"
-            "</h2><ul>"
-            + products_html
-            + "</ul>"
-            "<a href='/agro'><button"
-            " class='gray'>Inicio"
-            "</button></a>"
+            "<div class='card'><h2>Seguridad alimentaria</h2><ul>" + prod_rows + "</ul>"
+            "<a href='/agro/gobierno/seguridad'><button>Ver detalle</button></a></div>"
+            "<div class='card'><h2>Ayudas (" + str(ay["aid_total"]) + " total)</h2>"
+            "<h3>Beneficiados</h3><ul>" + ben + "</ul>"
+            "<h3>No beneficiados (a quienes ayudar)</h3><ul>" + noben + "</ul>"
+            "<a href='/agro/gobierno/beneficiados'><button>Ver detalle</button></a></div>"
+            "<div class='card'><h2>Riesgos abiertos</h2><ul>" + riesgos + "</ul>"
+            "<a href='/agro/gobierno/riesgos'><button>Ver detalle</button></a></div>"
+            "<div class='card'><h2>Por rol</h2><ul>" + roles_html + "</ul></div>"
+            "<div class='card'><h2>Modulos de la Red AGRO</h2><ul>" + modulos + "</ul></div>"
+            "<a href='/agro'><button class='gray'>Inicio</button></a>"
         )
         self._html(
             200,
@@ -1344,47 +1560,31 @@ class AgroApiHandler(
         )
 
     def _screen_bank(self) -> None:
-        producers = type(
-            self
-        ).store.list_producers()
-        rows = ""
+        store = type(self).store
+        producers = store.list_producers()
+        total = len(producers)
+        verified = 0
         for p in producers:
-            if p["verified"]:
-                estado = (
-                    "✅ verificado"
-                    " (elegible para"
-                    " credito)"
-                )
-            else:
-                estado = (
-                    "⚠️ sin verificar"
-                )
-            rows = (
-                rows
-                + "<li>• "
-                + str(p["name"])
-                + " - "
-                + str(p["role"])
-                + " - "
-                + estado
-                + "</li>"
-            )
+            if p.get("verified"):
+                verified = verified + 1
+        prods = store.list_productions()
+        rows = ""
+        for p in prods:
+            rows = rows + "<li>" + str(p.get("product")) + " - " + str(p.get("quantity")) + " " + str(p.get("unit")) + "</li>"
         if not rows:
-            rows = (
-                "<li>Sin productores</li>"
-            )
+            rows = "<li>Sin produccion disponible</li>"
         body = (
-            "<h1>🏦 AGRO — Vista Banco"
-            "</h1>"
-            "<p>Elegibilidad de credito:"
-            " basada en verificacion de"
-            " la Red.</p>"
-            "<ul>"
-            + rows
-            + "</ul>"
-            "<a href='/agro'><button"
-            " class='gray'>Inicio"
-            "</button></a>"
+            "<h1>Banco AGRO</h1>"
+            "<p>Productores: " + str(total) + " - verificados: " + str(verified) + "</p>"
+            "<div class='card'><h2>Credito agricola</h2>"
+            "<p>credito para productores verificados con ZID en la Red.</p>"
+            "<a href='/agro/gobierno/beneficiados'><button>Beneficiarios de apoyo</button></a>"
+            "</div>"
+            "<div class='card'><h2>Produccion para compra / exportacion</h2>"
+            "<ul>" + rows + "</ul>"
+            "<a href='/agro/mercado'><button>Ir al mercado</button></a>"
+            "</div>"
+            "<a href='/agro'><button class='gray'>Inicio</button></a>"
         )
         self._html(
             200,

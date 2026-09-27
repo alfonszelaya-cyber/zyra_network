@@ -4,6 +4,7 @@ created WITH ZID, listing created via the FORM route
 API, close picks winner, reputation with
 evidence."""
 from __future__ import annotations
+import base64 as _b64t
 
 import json
 import threading
@@ -58,6 +59,28 @@ class _Ecosystem:
             config=config,
         )
         self.kernel.bootstrap_root()
+        from shared_engines.security.biometrics import (
+            BiometricsEngine,
+            BiometricsPolicy,
+            DeterministicTestProvider,
+            TemplateCipher,
+        )
+        self.kernel._biometrics = BiometricsEngine(
+            db=self.net_db,
+            clock=FrozenClock(),
+            audit=self.kernel.audit,
+            provider=DeterministicTestProvider(),
+            cipher=TemplateCipher(
+                master_key_hex="ab" * 32
+            ),
+            policy=BiometricsPolicy(
+                require_liveness=False,
+                doc_reject=0.01,
+                doc_review=0.02,
+                doc_auto=0.03,
+                dup_reject=0.98,
+            ),
+        )
         self.caps = ZyraCapabilities(
             self.net_db,
             net_clock,
@@ -149,7 +172,9 @@ def test_marketplace_full_journey(
         reg = eco.link.register_app()
         assert reg[0] is True
         reg_s = eco.link.register_account(
-            "Vendedor Uno"
+            "Vendedor Uno",
+            doc_image_b64=_b64t.b64encode(b"zyra-identity-Vendedor Uno").decode("ascii"),
+            selfie_image_b64=_b64t.b64encode(b"zyra-identity-Vendedor Uno").decode("ascii"),
         )
         assert reg_s[0] is True
         seller_zid = str(

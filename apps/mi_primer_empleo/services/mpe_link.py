@@ -34,13 +34,12 @@ class MpeLink:
     def register_user(
         self, display_name: str
     ) -> tuple[bool, dict | None, str | None]:
-        return self._client.post(
-            "/identity/register",
-            {
-                "kind": "person",
-                "display_name": display_name,
-                "actor": "mpe",
-            },
+        """LAW: person registration requires biometric
+        enrollment. Legacy door is rejected here;
+        use enroll_user with document + selfie."""
+        raise ValueError(
+            "registro de persona requiere biometria:"
+            " use enroll_user con documento y selfie"
         )
 
     def enroll_user(

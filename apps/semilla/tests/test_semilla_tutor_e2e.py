@@ -3,6 +3,7 @@ Challenge and certify use the JSON API; advance
 posts a form and reads the JSON response. No
 untested network GET is asserted."""
 from __future__ import annotations
+import base64 as _b64t
 
 import json
 import re
@@ -38,6 +39,28 @@ class _Eco:
             config=RuntimeConfig(host="127.0.0.1", port=0, api_token=None),
         )
         self.kernel.bootstrap_root()
+        from shared_engines.security.biometrics import (
+            BiometricsEngine,
+            BiometricsPolicy,
+            DeterministicTestProvider,
+            TemplateCipher,
+        )
+        self.kernel._biometrics = BiometricsEngine(
+            db=self.net_db,
+            clock=FrozenClock(),
+            audit=self.kernel.audit,
+            provider=DeterministicTestProvider(),
+            cipher=TemplateCipher(
+                master_key_hex="ab" * 32
+            ),
+            policy=BiometricsPolicy(
+                require_liveness=False,
+                doc_reject=0.01,
+                doc_review=0.02,
+                doc_auto=0.03,
+                dup_reject=0.98,
+            ),
+        )
         self.caps = ZyraCapabilities(
             self.net_db,
             FrozenClock(),
@@ -79,6 +102,11 @@ class _Eco:
 
 
 def _pf(url: str, doc: dict) -> str:
+    doc = dict(doc)
+    if "role" in doc and "doc_image_b64" not in doc:
+        _seed = ("zyra-identity-" + str(doc.get("name", "usuario"))).encode("utf-8")
+        doc["doc_image_b64"] = _b64t.b64encode(_seed).decode("ascii")
+        doc["selfie_image_b64"] = _b64t.b64encode(_seed).decode("ascii")
     request = Request(
         url,
         data=(

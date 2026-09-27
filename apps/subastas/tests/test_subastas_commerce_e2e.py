@@ -127,11 +127,24 @@ def _h(url: str) -> str:
 
 
 def _accounts(eco) -> None:
-    eco.store.add_account(
-        account_id="SBS-seller01", zid=None, name="Vendedor Uno"
+    """Cuentas CON ZID real antes de reputacion e
+    historial (ley de la red)."""
+    from shared_engines.identity.contracts import IdentityKind
+    z_sell = eco.kernel.identity.register_identity(
+        kind=IdentityKind.PERSON,
+        display_name="Vendedor Uno",
+        actor="test-super-app",
+    )
+    z_buy = eco.kernel.identity.register_identity(
+        kind=IdentityKind.PERSON,
+        display_name="Comprador Uno",
+        actor="test-super-app",
     )
     eco.store.add_account(
-        account_id="SBS-buyer001", zid=None, name="Comprador Uno"
+        account_id="SBS-seller01", zid=z_sell.zid, name="Vendedor Uno"
+    )
+    eco.store.add_account(
+        account_id="SBS-buyer001", zid=z_buy.zid, name="Comprador Uno"
     )
 
 

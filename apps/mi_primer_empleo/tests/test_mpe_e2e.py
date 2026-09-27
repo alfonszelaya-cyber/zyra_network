@@ -3,6 +3,7 @@
 panel shows it, worker applies, government summary
 reflects it."""
 from __future__ import annotations
+import base64 as _b64t
 
 import json
 import re
@@ -58,6 +59,28 @@ class _Ecosystem:
             config=config,
         )
         self.kernel.bootstrap_root()
+        from shared_engines.security.biometrics import (
+            BiometricsEngine,
+            BiometricsPolicy,
+            DeterministicTestProvider,
+            TemplateCipher,
+        )
+        self.kernel._biometrics = BiometricsEngine(
+            db=self.net_db,
+            clock=FrozenClock(),
+            audit=self.kernel.audit,
+            provider=DeterministicTestProvider(),
+            cipher=TemplateCipher(
+                master_key_hex="ab" * 32
+            ),
+            policy=BiometricsPolicy(
+                require_liveness=False,
+                doc_reject=0.01,
+                doc_review=0.02,
+                doc_auto=0.03,
+                dup_reject=0.98,
+            ),
+        )
         self.caps = ZyraCapabilities(
             self.net_db,
             net_clock,
@@ -123,6 +146,11 @@ class _Ecosystem:
 
 
 def _post_form(url: str, doc: dict) -> str:
+    doc = dict(doc)
+    if doc.get("role") == "trabajador" and "doc_image_b64" not in doc:
+        _seed = ("zyra-identity-" + str(doc.get("name", "trabajador"))).encode("utf-8")
+        doc["doc_image_b64"] = _b64t.b64encode(_seed).decode("ascii")
+        doc["selfie_image_b64"] = _b64t.b64encode(_seed).decode("ascii")
     request = Request(
         url,
         data=(

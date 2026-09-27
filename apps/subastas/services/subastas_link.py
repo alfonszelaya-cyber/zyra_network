@@ -85,24 +85,37 @@ class SubastasLink:
 
     def register_account(
         self, name: str,
+        *,
+        doc_image_b64: str | None = None,
+        selfie_image_b64: str | None = None,
     ) -> tuple[bool, dict | None]:
+        """LAW: a person is born ONLY via /identity/enroll
+        (document + selfie). The legacy /identity/register
+        door refuses persons, so it is never attempted."""
+        if not doc_image_b64 or not selfie_image_b64:
+            return (
+                False,
+                {
+                    "error": "biometria_requerida",
+                    "message": (
+                        "registro de persona requiere"
+                        " documento y selfie"
+                    ),
+                },
+            )
         payloads = (
             {
-                "name": name,
-                "display_name": name,
                 "kind": "person",
-            },
-            {
-                "name": name,
                 "display_name": name,
+                "actor": "subastas",
+                "doc_image_b64": doc_image_b64,
+                "selfie_image_b64": selfie_image_b64,
             },
-            {"name": name},
-            {"display_name": name},
         )
         for payload in payloads:
             ok, data, _err = (
                 self._client.post(
-                    "/identity/register",
+                    "/identity/enroll",
                     payload,
                 )
             )
@@ -120,8 +133,8 @@ class SubastasLink:
                         {"zid": zid},
                     )
         return (
-        False,
-        None,
+            False,
+            None,
         )
 
     def give_reputation(

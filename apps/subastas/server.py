@@ -1058,7 +1058,7 @@ class SubastasApiHandler(BaseHTTPRequestHandler):
     def _revision_html(self) -> str:
         summary = self.commerce.summary()
         return "".join([
-            "<html><body><h1>Revision ZYRA MARKET</h1>",
+            "<html><body><h1>Revision SUBASTAS</h1>",
             "<p>ordenes: %s</p>" % str(summary["orders_total"]),
             "<p>entregadas: %s</p>" % str(summary["orders_delivered"]),
             "<p>oportunidades radar: %s</p>" % str(summary["opportunities"]),

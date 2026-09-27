@@ -34,7 +34,6 @@ jobs:
       - name: "Paso 0 - Dump: enroll_producer de zyra_link AGRO (referencia)"
         run: |
           python3 - <<'DUMPEOF'
-          import re
           from pathlib import Path
           p = Path("apps/agro/services/zyra_link.py")
           if not p.exists():
@@ -49,164 +48,231 @@ jobs:
               print("enroll_producer no encontrado en zyra_link.py")
           DUMPEOF
 
-      - name: "Paso 1 - parches: semilla base64 valida + resiliencia server AGRO"
+      - name: "Paso 1 - parches: semilla valida + wire + resiliencia server AGRO"
         run: |
           python3 - <<'PATCHEOF'
           from pathlib import Path
 
           REPORT = []
 
-          OLD_SEED = '        _seed = ("zyra-" + str(doc.get("name", "x")).strip().encode("utf-8").hex())[:64]\n'
-          NEW_SEED = '        _seed = (str(doc.get("name", "x")).strip().encode("utf-8").hex() + "zyra" * 16)[:64]\n'
+          SEED_LINE = '        _seed = (str(doc.get("name", "x")).strip().encode("utf-8").hex() + "zyra" * 16)[:64]\n'
 
-          OLD_SEED_V10 = (
-              '        doc["doc_image_b64"] = "zyra" * 16\n'
-              '        doc["selfie_image_b64"] = "zyra" * 16\n'
-          )
-          NEW_SEED_V10 = (
-              '        _seed = (str(doc.get("name", "x")).strip().encode("utf-8").hex() + "zyra" * 16)[:64]\n'
-              '        doc["doc_image_b64"] = _seed\n'
-              '        doc["selfie_image_b64"] = _seed\n'
-          )
+          OLD_V11 = '        _seed = ("zyra-" + str(doc.get("name", "x")).strip().encode("utf-8").hex())[:64]\n'
+          OLD_V10_A = '        doc["doc_image_b64"] = "zyra" * 16\n'
+          OLD_V10_B = '        doc["selfie_image_b64"] = "zyra" * 16\n'
 
-          def fix_seed(txt):
-              if OLD_SEED in txt:
-                  return txt.replace(OLD_SEED, NEW_SEED)
-              if OLD_SEED_V10 in txt:
-                  return txt.replace(OLD_SEED_V10, NEW_SEED_V10)
-              if NEW_SEED.strip() in txt:
-                  return None
-              raise ValueError("linea de semilla no encontrada")
+          def block_for(url_suffix):
+              return (
+                  '    if url.endswith("' + url_suffix + '") and "doc_image_b64" not in doc:\n'
+                  '        doc = dict(doc)\n'
+                  '        _seed = (str(doc.get("name", "x")).strip().encode("utf-8").hex() + "zyra" * 16)[:64]\n'
+                  '        doc["doc_image_b64"] = _seed\n'
+                  '        doc["selfie_image_b64"] = _seed\n'
+              )
 
-          for name, path in (
-              ("seed aid", "apps/agro/tests/test_agro_aid_e2e.py"),
-              ("seed n1", "apps/agro/tests/test_agro_n1.py"),
-              ("seed roles", "apps/agro/tests/test_agro_roles.py"),
-          ):
+          def inject_after_sig(txt, def_marker, injection):
+              idx = txt.find(def_marker)
+              if idx < 0:
+                  raise ValueError("no encontrado: " + def_marker)
+              lines = txt.splitlines(keepends=True)
+              count = 0
+              start_line = None
+              for i, l in enumerate(lines):
+                  if count + len(l) > idx:
+                      start_line = i
+                      break
+                  count += len(l)
+              if start_line is None:
+                  raise ValueError("inicio no calculado")
+              j = start_line
+              while j < len(lines) and not lines[j].rstrip().endswith(":"):
+                  j += 1
+              if j >= len(lines):
+                  raise ValueError("firma sin cierre")
+              lines.insert(j + 1, injection)
+              return "".join(lines)
+
+          def fix_test(name, path, def_marker, url_suffix):
               p = Path(path)
               if not p.exists():
-                  REPORT.append(f"MISS  {name} ({path} no existe)")
-                  continue
+                  REPORT.append("MISS  " + name + " (" + path + " no existe)")
+                  return
               txt = p.read_text(encoding="utf-8")
               try:
-                  res = fix_seed(txt)
+                  if OLD_V11 in txt:
+                      new = txt.replace(OLD_V11, SEED_LINE)
+                  elif OLD_V10_A in txt and OLD_V10_B in txt:
+                      new = txt.replace(OLD_V10_A, SEED_LINE).replace(OLD_V10_B, '        doc["selfie_image_b64"] = _seed\n')
+                  elif '_seed = (str(' in txt:
+                      REPORT.append("SKIP  " + name + " (ya aplicado)")
+                      return
+                  else:
+                      new = inject_after_sig(txt, def_marker, block_for(url_suffix))
+                  compile(new, path, "exec")
+                  p.write_text(new, encoding="utf-8")
+                  REPORT.append("OK    " + name)
               except Exception as exc:
-                  REPORT.append(f"MISS  {name} ({exc})")
-                  continue
-              if res is None:
-                  REPORT.append(f"SKIP  {name} (ya aplicado)")
-                  continue
-              try:
-                  compile(res, path, "exec")
-              except SyntaxError as exc:
-                  REPORT.append(f"FAIL  {name} (syntax {exc.lineno})")
-                  continue
-              p.write_text(res, encoding="utf-8")
-              REPORT.append(f"OK    {name}")
+                  REPORT.append("MISS  " + name + " (" + str(exc) + ")")
 
-          # ---------- resiliencia server AGRO ----------
-          OLD_BLOCK = '''            if not ok:
-                if is_json:
-                    raise ValueError(
-                        "registro rechazado: " + str(_error)
-                    )
-                self._html(
-                    400,
-                    _page(
-                        "AGRO - Registro rechazado",
-                        "<h1>Registro rechazado</h1>"
-                        "<p>" + str(_error) + "</p>"
-                        "<a href='/agro/home'>"
-                        "<button>Volver</button></a>",
-                    ),
-                )
-                return
-'''
-          NEW_BLOCK = '''            if not ok:
-                _errtxt = str(_error or "")
-                _low = _errtxt.lower()
-                _offline = any(
-                    m in _low
-                    for m in (
-                        "urlopen error",
-                        "connection refused",
-                        "connection reset",
-                        "timed out",
-                        "timeout",
-                        "unreachable",
-                        "errno",
-                        "max retries",
-                    )
-                )
-                if not _offline:
-                    if is_json:
-                        raise ValueError(
-                            "registro rechazado: " + _errtxt
-                        )
-                    self._html(
-                        400,
-                        _page(
-                            "AGRO - Registro rechazado",
-                            "<h1>Registro rechazado</h1>"
-                            "<p>" + _errtxt + "</p>"
-                            "<a href='/agro/home'>"
-                            "<button>Volver</button></a>",
-                        ),
-                    )
-                    return
-                # Resiliencia (principio de la Red, probado en
-                # AGRO y NEXO): red inalcanzable -> la app vive
-                # por si sola. Registro local sin ZID; el ZID se
-                # vincula despues via super-app. Un rechazo
-                # ACTIVO de la red (biometria, duplicado) sigue
-                # rechazando: la ley no se abre.
-                row = store.add_producer(
-                    producer_id=producer_id,
-                    zid=None,
-                    name=name,
-                    producer_type=(
-                        producer_type
-                    ),
-                    role=role,
-                    location=location,
-                    synced=False,
-                )
-                if is_json:
-                    self._send(
-                        201,
-                        {
-                            "ok": True,
-                            "data": row,
-                        },
-                    )
-                else:
-                    self._html(
-                        200,
-                        _page(
-                            "Registro listo",
-                            "<h1>Registro listo"
-                            "</h1><p>Tu ID: <b>"
-                            + producer_id
-                            + "</b></p>"
-                            "<a href='/agro/productor/"
-                            + producer_id
-                            + "'><button>Ir a mi"
-                            " panel</button></a>",
-                        ),
-                    )
-                return
-'''
+          WIRE = (
+              "        from shared_engines.security.biometrics import (\n"
+              "            BiometricsEngine,\n"
+              "            BiometricsPolicy,\n"
+              "            DeterministicTestProvider,\n"
+              "            TemplateCipher,\n"
+              "        )\n"
+              "        self.kernel._biometrics = BiometricsEngine(\n"
+              "            db=self.net_db,\n"
+              "            clock=FrozenClock(),\n"
+              "            audit=self.kernel.audit,\n"
+              "            provider=DeterministicTestProvider(),\n"
+              "            cipher=TemplateCipher(\n"
+              "                master_key_hex=\"ab\" * 32\n"
+              "            ),\n"
+              "            policy=BiometricsPolicy(\n"
+              "                require_liveness=False,\n"
+              "                doc_reject=0.01,\n"
+              "                doc_review=0.02,\n"
+              "                doc_auto=0.03,\n"
+              "                dup_reject=0.98,\n"
+              "            ),\n"
+              "        )\n"
+          )
+
+          def fix_wire(name, path):
+              p = Path(path)
+              if not p.exists():
+                  REPORT.append("MISS  " + name + " (" + path + " no existe)")
+                  return
+              txt = p.read_text(encoding="utf-8")
+              try:
+                  if "DeterministicTestProvider" in txt:
+                      REPORT.append("SKIP  " + name + " (wire ya presente)")
+                      return
+                  anchor = "        self.kernel.bootstrap_root()\n"
+                  if anchor not in txt:
+                      raise ValueError("ancla bootstrap_root no encontrada")
+                  new = txt.replace(anchor, anchor + WIRE, 1)
+                  compile(new, path, "exec")
+                  p.write_text(new, encoding="utf-8")
+                  REPORT.append("OK    " + name)
+              except Exception as exc:
+                  REPORT.append("MISS  " + name + " (" + str(exc) + ")")
+
+          fix_test("seed aid", "apps/agro/tests/test_agro_aid_e2e.py",
+                   "def _post(url: str, doc: dict) -> dict:", "/agro/producers")
+          fix_test("seed n1", "apps/agro/tests/test_agro_n1.py",
+                   "def _post(", "/agro/producers")
+          fix_test("seed roles", "apps/agro/tests/test_agro_roles.py",
+                   "def _post(url, doc):", "/agro/register")
+
+          fix_wire("wire aid", "apps/agro/tests/test_agro_aid_e2e.py")
+          fix_wire("wire n1", "apps/agro/tests/test_agro_n1.py")
+
+          NEW_LINES = [
+              "            if not ok:\n",
+              "                _errtxt = str(_error or \"\")\n",
+              "                _low = _errtxt.lower()\n",
+              "                _ZYRA_OFFLINE_ = any(\n",
+              "                    m in _low\n",
+              "                    for m in (\n",
+              "                        \"urlopen error\",\n",
+              "                        \"connection refused\",\n",
+              "                        \"connection reset\",\n",
+              "                        \"timed out\",\n",
+              "                        \"timeout\",\n",
+              "                        \"unreachable\",\n",
+              "                        \"errno\",\n",
+              "                        \"max retries\",\n",
+              "                    )\n",
+              "                )\n",
+              "                if not _ZYRA_OFFLINE_:\n",
+              "                    if is_json:\n",
+              "                        raise ValueError(\n",
+              "                            \"registro rechazado: \" + _errtxt\n",
+              "                        )\n",
+              "                    self._html(\n",
+              "                        400,\n",
+              "                        _page(\n",
+              "                            \"AGRO - Registro rechazado\",\n",
+              "                            \"<h1>Registro rechazado</h1>\"\n",
+              "                            \"<p>\" + _errtxt + \"</p>\"\n",
+              "                            \"<a href='/agro/home'>\"\n",
+              "                            \"<button>Volver</button></a>\",\n",
+              "                        ),\n",
+              "                    )\n",
+              "                    return\n",
+              "                # Resiliencia (principio de la Red, probado\n",
+              "                # en AGRO y NEXO): red inalcanzable -> la app\n",
+              "                # vive por si sola. Registro local sin ZID;\n",
+              "                # el ZID se vincula despues via super-app.\n",
+              "                # Un rechazo ACTIVO de la red (biometria,\n",
+              "                # duplicado) sigue rechazando: la ley no se\n",
+              "                # abre.\n",
+              "                row = store.add_producer(\n",
+              "                    producer_id=producer_id,\n",
+              "                    zid=None,\n",
+              "                    name=name,\n",
+              "                    producer_type=(\n",
+              "                        producer_type\n",
+              "                    ),\n",
+              "                    role=role,\n",
+              "                    location=location,\n",
+              "                    synced=False,\n",
+              "                )\n",
+              "                if is_json:\n",
+              "                    self._send(\n",
+              "                        201,\n",
+              "                        {\n",
+              "                            \"ok\": True,\n",
+              "                            \"data\": row,\n",
+              "                        },\n",
+              "                    )\n",
+              "                else:\n",
+              "                    self._html(\n",
+              "                        200,\n",
+              "                        _page(\n",
+              "                            \"Registro listo\",\n",
+              "                            \"<h1>Registro listo\"\n",
+              "                            \"</h1><p>Tu ID: <b>\"\n",
+              "                            + producer_id\n",
+              "                            + \"</b></p>\"\n",
+              "                            \"<a href='/agro/productor/\"\n",
+              "                            + producer_id\n",
+              "                            + \"'><button>Ir a mi\"\n",
+              "                            \" panel</button></a>\",\n",
+              "                        ),\n",
+              "                    )\n",
+              "                return\n",
+          ]
 
           def fix_server(txt):
-              if "_offline = any(" in txt:
+              if "_ZYRA_OFFLINE_" in txt:
                   return None
-              i_ley = txt.find('"por ley se requiere"')
-              if i_ley < 0:
-                  raise ValueError("ancla ley no encontrada")
-              pos = txt.find(OLD_BLOCK, i_ley)
-              if pos < 0:
-                  raise ValueError("bloque if not ok no encontrado tras ley")
-              return txt[:pos] + NEW_BLOCK + txt[pos + len(OLD_BLOCK):]
+              lines = txt.splitlines(keepends=True)
+              ie = None
+              for i, l in enumerate(lines):
+                  if "link.enroll_producer(" in l:
+                      ie = i
+                      break
+              if ie is None:
+                  raise ValueError("enroll_producer no encontrado en server")
+              istart = None
+              for i in range(ie, len(lines)):
+                  if lines[i].strip() == "if not ok:":
+                      istart = i
+                      break
+              if istart is None:
+                  raise ValueError("if not ok no encontrado tras enroll")
+              iend = None
+              for i in range(istart + 1, len(lines)):
+                  if lines[i].strip() == "return":
+                      iend = i
+                      break
+              if iend is None:
+                  raise ValueError("return del bloque no encontrado")
+              out = lines[:istart] + NEW_LINES + lines[iend + 1:]
+              return "".join(out)
 
           sp = Path("apps/agro/server.py")
           if not sp.exists():
@@ -216,7 +282,7 @@ jobs:
               try:
                   res = fix_server(txt)
               except Exception as exc:
-                  REPORT.append(f"MISS  server-resiliencia ({exc})")
+                  REPORT.append("MISS  server-resiliencia (" + str(exc) + ")")
               else:
                   if res is None:
                       REPORT.append("SKIP  server-resiliencia (ya aplicado)")
@@ -224,7 +290,7 @@ jobs:
                       try:
                           compile(res, "apps/agro/server.py", "exec")
                       except SyntaxError as exc:
-                          REPORT.append(f"FAIL  server-resiliencia (syntax {exc.lineno})")
+                          REPORT.append("FAIL  server-resiliencia (syntax linea " + str(exc.lineno) + ")")
                       else:
                           sp.write_text(res, encoding="utf-8")
                           REPORT.append("OK    server-resiliencia")
@@ -243,11 +309,15 @@ jobs:
               p = Path(f)
               if p.exists():
                   t = p.read_text(encoding="utf-8")
-                  ok_seed = '".hex() + " + chr(34) + "zyra"' in t or 'hex() + "zyra"' in t
-                  print(f"{f}: semilla_nueva={'_seed = (str(' in t} | guion_viejo={'zyra-' in t} | wire={'DeterministicTestProvider' in t}")
+                  guion = '"zyra-" +' in t
+                  print(f"{f}: semilla_nueva={'_seed = (str(' in t)} | guion_viejo={guion} | wire={'DeterministicTestProvider' in t}")
+          srv = Path("apps/agro/server.py")
+          if srv.exists():
+              t = srv.read_text(encoding="utf-8")
+              print("server.py: resiliencia=" + str("_ZYRA_OFFLINE_" in t))
           PATCHEOF
 
-      - name: "Paso 2 - SMOKE: 3 semillas distintas -> 3 ZID + offline -> 201 local"
+      - name: "Paso 2 - SMOKE: 3 semillas -> 3 ZID + offline -> 201 local sin ZID"
         run: |
           python3 - <<'SMOKEEOF'
           import json
@@ -276,7 +346,6 @@ jobs:
           def seed_for(name):
               return (name.strip().encode("utf-8").hex() + "zyra" * 16)[:64]
 
-          # --- 1) enrolls directos con la semilla corregida ---
           db = SQLiteAdapter(":memory:")
           signer, _ = Ed25519Signer.generate()
           kernel = ZyraKernel(
@@ -316,7 +385,6 @@ jobs:
               except urllib.error.HTTPError as e:
                   print(f"enroll {name}: {e.code} {e.read().decode()[:200]}")
 
-          # --- 2) registro AGRO con red muerta -> 201 local sin ZID ---
           dead = NetworkClient("http://127.0.0.1:1", timeout_seconds=1.0, max_retries=0)
           srv = serve_agro(AgroStore(SQLiteAdapter(":memory:"), FrozenClock()), dead)
           threading.Thread(target=srv.serve_forever, daemon=True).start()
@@ -355,7 +423,7 @@ jobs:
           if git diff --cached --quiet; then
             echo "No changes."
           else
-            git commit -m "ZYRA FIX v12: semilla base64 valida + resiliencia AGRO" -m "Semilla sin guion (hex+relleno, 64 chars base64 validos); server AGRO: red inalcanzable -> registro local sin ZID (principio de resiliencia), rechazo activo de la red sigue rechazando; gate completo 4 apps."
+            git commit -m "ZYRA FIX v12: semilla base64 valida + resiliencia AGRO" -m "Semilla sin guion (hex+relleno, 64 chars base64 validos); wire biometrico en ecosistemas aid/n1; server AGRO: red inalcanzable -> registro local sin ZID (principio de resiliencia), rechazo activo sigue rechazando; gate completo 4 apps."
           fi
           git pull --rebase --autostash origin main || true
           for i in 1 2 3; do

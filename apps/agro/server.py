@@ -546,6 +546,102 @@ class AgroApiHandler(
                 raise ValueError(str(exc))
             self._send(200, {"ok": True, "data": snap})
             return
+        if len(s) == 3 and s[0] == "asset" and s[1] == "history":
+            from apps.agro.modules.recursos_y_activos.inventarios.inventory_service import (
+                asset_history_of_db,
+            )
+            rows = asset_history_of_db(
+                type(self).store._db, s[2]
+            )
+            self._send(
+                200,
+                {"ok": True, "data": {"history": rows}},
+            )
+            return
+        if len(s) == 3 and s[0] == "asset" and s[1] == "values":
+            from apps.agro.modules.recursos_y_activos.valoracion.valuation_service import (
+                valuations_of_db,
+            )
+            rows = valuations_of_db(
+                type(self).store._db, s[2]
+            )
+            self._send(
+                200,
+                {"ok": True, "data": {"valuations": rows}},
+            )
+            return
+        if len(s) == 2 and s[0] == "equipment":
+            from apps.agro.modules.recursos_y_activos.equipos.equipment_service import (
+                equipment_of_db,
+            )
+            rows = equipment_of_db(
+                type(self).store._db, s[1]
+            )
+            self._send(
+                200,
+                {"ok": True, "data": {"equipment": rows}},
+            )
+            return
+        if len(s) == 2 and s[0] == "infrastructure":
+            from apps.agro.modules.recursos_y_activos.infraestructura.infrastructure_service import (
+                infrastructure_of_db,
+            )
+            rows = infrastructure_of_db(
+                type(self).store._db, s[1]
+            )
+            self._send(
+                200,
+                {"ok": True, "data": {"infrastructure": rows}},
+            )
+            return
+        if len(s) == 3 and s[0] == "risk" and s[1] == "climate":
+            from apps.agro.modules.riesgo.riesgo_climatico.climate_risk_service import (
+                climate_events_of_db,
+            )
+            rows = climate_events_of_db(
+                type(self).store._db, s[2]
+            )
+            self._send(
+                200,
+                {"ok": True, "data": {"events": rows}},
+            )
+            return
+        if len(s) == 2 and s[0] == "alerts":
+            from apps.agro.modules.riesgo.alertas.risk_alert_service import (
+                open_alerts_of_db,
+            )
+            rows = open_alerts_of_db(
+                type(self).store._db, s[1]
+            )
+            self._send(
+                200,
+                {"ok": True, "data": {"alerts": rows}},
+            )
+            return
+        if len(s) == 2 and s[0] == "responses":
+            from apps.agro.modules.riesgo.respuesta.response_service import (
+                responses_of_db,
+            )
+            rows = responses_of_db(
+                type(self).store._db, s[1]
+            )
+            self._send(
+                200,
+                {"ok": True, "data": {"responses": rows}},
+            )
+            return
+        if len(s) == 3 and s[0] == "risk" and s[1] == "evals":
+            from apps.agro.modules.riesgo.riesgo_productivo.productive_risk_service import (
+                evals_of_db,
+            )
+            rows = evals_of_db(
+                type(self).store._db, s[2]
+            )
+            self._send(
+                200,
+                {"ok": True, "data": {"evals": rows}},
+            )
+            return
         if not s or s == ["home"]:
             self._home()
             return
@@ -797,6 +893,17 @@ class AgroApiHandler(
             ("shipment",): "shipment.create",
             ("shipment", "update"): "shipment.update",
             ("market", "price"): "market.price.add",
+            ("equipment",): "equipment.create",
+            ("infrastructure",): "infrastructure.create",
+            ("asset", "log"): "asset.log",
+            ("asset", "value"): "asset.value",
+            ("risk", "climate"): "risk.climate.evaluate",
+            ("risk", "productive"): "risk.productive.evaluate",
+            ("risk", "impact"): "risk.impact.calculate",
+            ("risk", "recovery"): "risk.recovery",
+            ("alert", "resolve"): "alert.resolve",
+            ("response",): "response.create",
+            ("response", "update"): "response.update",
             ("production",): "production.register",
         }.get(tuple(s))
         if _ZV6_OP is not None:
@@ -890,6 +997,191 @@ class AgroApiHandler(
                 )
                 return
         self._ZYRA_AUDIT_V6(_ZV6_PATH, "allowed")
+        if s == ["equipment"]:
+            doc = self._ZYRA_PAYLOAD_V2(is_json)
+            pid = self._req(doc, "producer_id")
+            from apps.agro.modules.recursos_y_activos.equipos.equipment_service import (
+                register_equipment_db,
+            )
+            row = register_equipment_db(
+                type(self).store._db,
+                producer_id=pid,
+                kind=self._req(doc, "kind"),
+                identifier=doc.get("identifier"),
+            )
+            self._send(201, {"ok": True, "data": row})
+            return
+        if s == ["infrastructure"]:
+            doc = self._ZYRA_PAYLOAD_V2(is_json)
+            pid = self._req(doc, "producer_id")
+            from apps.agro.modules.recursos_y_activos.infraestructura.infrastructure_service import (
+                register_infrastructure_db,
+            )
+            row = register_infrastructure_db(
+                type(self).store._db,
+                producer_id=pid,
+                kind=self._req(doc, "kind"),
+                location=doc.get("location"),
+            )
+            self._send(201, {"ok": True, "data": row})
+            return
+        if s == ["asset", "log"]:
+            doc = self._ZYRA_PAYLOAD_V2(is_json)
+            pid = self._req(doc, "producer_id")
+            from apps.agro.modules.recursos_y_activos.inventarios.inventory_service import (
+                asset_log_db,
+            )
+            row = asset_log_db(
+                type(self).store._db,
+                producer_id=pid,
+                asset_kind=self._req(doc, "asset_kind"),
+                asset_id=self._req(doc, "asset_id"),
+                action=self._req(doc, "action"),
+                detail=str(doc.get("detail") or ""),
+                actor=_ZV6_ACTOR,
+            )
+            self._send(201, {"ok": True, "data": row})
+            return
+        if s == ["asset", "value"]:
+            doc = self._ZYRA_PAYLOAD_V2(is_json)
+            pid = self._req(doc, "producer_id")
+            from apps.agro.modules.recursos_y_activos.valoracion.valuation_service import (
+                value_asset_db,
+            )
+            row = value_asset_db(
+                type(self).store._db,
+                producer_id=pid,
+                asset_kind=self._req(doc, "asset_kind"),
+                asset_id=self._req(doc, "asset_id"),
+                amount=float(doc.get("amount") or 0),
+                currency=self._req(doc, "currency"),
+                actor=_ZV6_ACTOR,
+            )
+            self._send(201, {"ok": True, "data": row})
+            return
+        if s == ["risk", "climate"]:
+            doc = self._ZYRA_PAYLOAD_V2(is_json)
+            pid = self._req(doc, "producer_id")
+            from apps.agro.modules.riesgo.riesgo_climatico.climate_risk_service import (
+                evaluate_climate_db,
+            )
+            row = evaluate_climate_db(
+                type(self).store._db,
+                producer_id=pid,
+                event_type=self._req(doc, "event_type"),
+                severity=self._req(doc, "severity"),
+                detail=str(doc.get("detail") or ""),
+            )
+            if row["alert"]:
+                from apps.agro.modules.riesgo.alertas.risk_alert_service import (
+                    create_alert_db,
+                )
+                alert = create_alert_db(
+                    type(self).store._db,
+                    producer_id=pid,
+                    risk_type=str(row["event_type"]),
+                    severity=str(row["severity"]),
+                    target=pid,
+                    detail="auto: clima " + str(row["event_id"]),
+                )
+                row["alert_id"] = alert["alert_id"]
+            self._send(201, {"ok": True, "data": row})
+            return
+        if s == ["risk", "productive"]:
+            doc = self._ZYRA_PAYLOAD_V2(is_json)
+            pid = self._req(doc, "producer_id")
+            from apps.agro.modules.riesgo.riesgo_productivo.productive_risk_service import (
+                evaluate_productive_db,
+            )
+            row = evaluate_productive_db(
+                type(self).store._db,
+                producer_id=pid,
+                losses=float(doc.get("losses") or 0),
+                production=float(doc.get("production") or 0),
+            )
+            if row["level"] == "high":
+                from apps.agro.modules.riesgo.alertas.risk_alert_service import (
+                    create_alert_db,
+                )
+                alert = create_alert_db(
+                    type(self).store._db,
+                    producer_id=pid,
+                    risk_type="productive",
+                    severity="high",
+                    target=pid,
+                    detail="auto: perdidas " + str(row["eval_id"]),
+                )
+                row["alert_id"] = alert["alert_id"]
+            self._send(201, {"ok": True, "data": row})
+            return
+        if s == ["risk", "impact"]:
+            doc = self._ZYRA_PAYLOAD_V2(is_json)
+            pid = self._req(doc, "producer_id")
+            from apps.agro.modules.riesgo.impacto.impact_service import (
+                calculate_impact_db,
+            )
+            row = calculate_impact_db(
+                type(self).store._db,
+                producer_id=pid,
+                affected_units=float(doc.get("affected_units") or 0),
+                total_units=float(doc.get("total_units") or 0),
+            )
+            self._send(201, {"ok": True, "data": row})
+            return
+        if s == ["risk", "recovery"]:
+            doc = self._ZYRA_PAYLOAD_V2(is_json)
+            pid = self._req(doc, "producer_id")
+            from apps.agro.modules.riesgo.resiliencia.resilience_service import (
+                recovery_score_db,
+            )
+            row = recovery_score_db(
+                type(self).store._db,
+                producer_id=pid,
+                risk_id=str(doc.get("risk_id") or ""),
+                recovered=float(doc.get("recovered") or 0),
+                affected=float(doc.get("affected") or 0),
+            )
+            self._send(201, {"ok": True, "data": row})
+            return
+        if s == ["alert", "resolve"]:
+            doc = self._ZYRA_PAYLOAD_V2(is_json)
+            from apps.agro.modules.riesgo.alertas.risk_alert_service import (
+                resolve_alert_db,
+            )
+            row = resolve_alert_db(
+                type(self).store._db,
+                alert_id=self._req(doc, "alert_id"),
+                resolution=str(doc.get("resolution") or ""),
+            )
+            self._send(200, {"ok": True, "data": row})
+            return
+        if s == ["response"]:
+            doc = self._ZYRA_PAYLOAD_V2(is_json)
+            pid = self._req(doc, "producer_id")
+            from apps.agro.modules.riesgo.respuesta.response_service import (
+                create_response_db,
+            )
+            row = create_response_db(
+                type(self).store._db,
+                producer_id=pid,
+                risk_id=self._req(doc, "risk_id"),
+                actions=list(doc.get("actions") or []),
+                actor=_ZV6_ACTOR,
+            )
+            self._send(201, {"ok": True, "data": row})
+            return
+        if s == ["response", "update"]:
+            doc = self._ZYRA_PAYLOAD_V2(is_json)
+            from apps.agro.modules.riesgo.respuesta.response_service import (
+                update_response_db,
+            )
+            row = update_response_db(
+                type(self).store._db,
+                response_id=self._req(doc, "response_id"),
+                status=self._req(doc, "status"),
+            )
+            self._send(200, {"ok": True, "data": row})
+            return
         if s == ["sale", "publish"]:
             doc = self._ZYRA_PAYLOAD_V2(is_json)
             pid = self._req(doc, "producer_id")

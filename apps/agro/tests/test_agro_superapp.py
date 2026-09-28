@@ -789,3 +789,298 @@ def test_commerce_market_exports_shipments(
         },
     )
     assert st == 200, str(body)
+
+
+# ====== RUN E: GPT-5 recursos + GPT-6 riesgo ======
+
+
+def test_resources_valuation_history(
+    tmp_path: Path,
+) -> None:
+    dead = NetworkClient(
+        "http://127.0.0.1:1",
+        timeout_seconds=1.0,
+        max_retries=0,
+    )
+    srv = serve_agro(
+        AgroStore(
+            SQLiteAdapter(":memory:"), FrozenClock()
+        ),
+        dead,
+    )
+    threading.Thread(
+        target=srv.serve_forever, daemon=True
+    ).start()
+    time.sleep(0.4)
+    base = f"http://127.0.0.1:{srv.bound_port}"
+    pid = _register(base, "Irene Recursos")
+
+    st, body = _pj(base + "/agro/equipment", {
+        "producer_id": pid,
+        "kind": "bomba riego",
+        "identifier": "B-01",
+    })
+    assert st == 201, str(body)
+    st, body = _gjp(
+        base + "/agro/equipment/" + pid
+    )
+    assert len(body["data"]["equipment"]) == 1
+
+    st, body = _pj(
+        base + "/agro/infrastructure",
+        {
+            "producer_id": pid,
+            "kind": "bodega",
+            "location": "Norte",
+        },
+    )
+    assert st == 201, str(body)
+    st, body = _gjp(
+        base + "/agro/infrastructure/" + pid
+    )
+    assert len(
+        body["data"]["infrastructure"]
+    ) == 1
+
+    st, body = _pj(
+        base + "/agro/asset/log",
+        {
+            "producer_id": pid,
+            "asset_kind": "equipment",
+            "asset_id": "EQP-test",
+            "action": "mantenimiento",
+            "detail": "cambio de motor",
+        },
+    )
+    assert st == 201, str(body)
+    st, body = _gjp(
+        base + "/agro/asset/history/" + pid
+    )
+    hist = body["data"]["history"]
+    assert len(hist) == 1
+    assert hist[0]["action"] == "mantenimiento"
+
+    st, body = _pj(
+        base + "/agro/asset/value",
+        {
+            "producer_id": pid,
+            "asset_kind": "land",
+            "asset_id": "LND-test",
+            "amount": 5000,
+            "currency": "USD",
+        },
+    )
+    assert st == 201, str(body)
+    assert body["data"]["amount"] == 5000.0
+    st, body = _pj(
+        base + "/agro/asset/value",
+        {
+            "producer_id": pid,
+            "asset_kind": "land",
+            "asset_id": "LND-test",
+            "amount": -100,
+            "currency": "USD",
+        },
+    )
+    assert st == 400, "valor negativo 400"
+    st, body = _gjp(
+        base + "/agro/asset/values/" + pid
+    )
+    assert len(
+        body["data"]["valuations"]
+    ) == 1
+
+
+def test_risk_alerts_responses_full(
+    tmp_path: Path,
+) -> None:
+    dead = NetworkClient(
+        "http://127.0.0.1:1",
+        timeout_seconds=1.0,
+        max_retries=0,
+    )
+    srv = serve_agro(
+        AgroStore(
+            SQLiteAdapter(":memory:"), FrozenClock()
+        ),
+        dead,
+    )
+    threading.Thread(
+        target=srv.serve_forever, daemon=True
+    ).start()
+    time.sleep(0.4)
+    base = f"http://127.0.0.1:{srv.bound_port}"
+    pid = _register(base, "Jorge Riesgo")
+
+    st, body = _pj(
+        base + "/agro/risk/climate",
+        {
+            "producer_id": pid,
+            "event_type": "sequia",
+            "severity": "high",
+            "detail": "sin lluvia 30 dias",
+        },
+    )
+    assert st == 201, str(body)
+    assert body["data"]["alert"] is True
+    assert body["data"]["alert_id"]
+    st, body = _pj(
+        base + "/agro/risk/climate",
+        {
+            "producer_id": pid,
+            "event_type": "lluvia",
+            "severity": "low",
+        },
+    )
+    assert st == 201
+    assert body["data"]["alert"] is False
+
+    st, body = _pj(
+        base + "/agro/risk/productive",
+        {
+            "producer_id": pid,
+            "losses": 60,
+            "production": 100,
+        },
+    )
+    assert st == 201, str(body)
+    assert body["data"]["level"] == "high"
+    assert body["data"]["alert_id"]
+    st, body = _pj(
+        base + "/agro/risk/productive",
+        {
+            "producer_id": pid,
+            "losses": 10,
+            "production": 100,
+        },
+    )
+    assert st == 201
+    assert body["data"]["level"] == "low"
+
+    st, body = _pj(
+        base + "/agro/risk/impact",
+        {
+            "producer_id": pid,
+            "affected_units": 2,
+            "total_units": 4,
+        },
+    )
+    assert st == 201, str(body)
+    assert body["data"]["impact"] == 0.5
+    st, body = _pj(
+        base + "/agro/risk/impact",
+        {
+            "producer_id": pid,
+            "affected_units": 1,
+            "total_units": 0,
+        },
+    )
+    assert st == 400, "total cero 400"
+
+    st, body = _gjp(
+        base + "/agro/alerts/" + pid
+    )
+    alerts = body["data"]["alerts"]
+    assert len(alerts) == 2, str(alerts)
+    alert_id = alerts[0]["alert_id"]
+
+    st, body = _pj(
+        base + "/agro/response",
+        {
+            "producer_id": pid,
+            "risk_id": alert_id,
+            "actions": [
+                "bombeo de emergencia",
+                "rippo suplementario",
+            ],
+        },
+    )
+    assert st == 201, str(body)
+    response_id = body["data"]["response_id"]
+    assert body["data"]["status"] == "planned"
+
+    st, body = _pj(
+        base + "/agro/response",
+        {
+            "producer_id": pid,
+            "risk_id": alert_id,
+            "actions": [],
+        },
+    )
+    assert st == 400, "sin acciones 400"
+
+    st, body = _pj(
+        base + "/agro/response/update",
+        {
+            "response_id": response_id,
+            "status": "volar",
+        },
+    )
+    assert st == 400, "estado invalido 400"
+    st, body = _pj(
+        base + "/agro/response/update",
+        {
+            "response_id": response_id,
+            "status": "in_progress",
+        },
+    )
+    assert st == 200, str(body)
+
+    st, body = _pj(
+        base + "/agro/risk/recovery",
+        {
+            "producer_id": pid,
+            "risk_id": alert_id,
+            "recovered": 50,
+            "affected": 100,
+        },
+    )
+    assert st == 201, str(body)
+    assert body["data"]["recovery_score"] == 0.5
+    st, body = _pj(
+        base + "/agro/risk/recovery",
+        {
+            "producer_id": pid,
+            "risk_id": alert_id,
+            "recovered": 10,
+            "affected": 0,
+        },
+    )
+    assert st == 400, "affected cero 400"
+
+    st, body = _pj(
+        base + "/agro/alert/resolve",
+        {
+            "alert_id": alert_id,
+            "resolution": "sequia mitigada",
+        },
+        role="gobierno",
+    )
+    assert st == 200, str(body)
+    assert body["data"]["status"] == "resolved"
+    st, body = _pj(
+        base + "/agro/alert/resolve",
+        {
+            "alert_id": alert_id,
+            "resolution": "",
+        },
+        role="gobierno",
+    )
+    assert st == 400, "resolucion vacia 400"
+
+    st, body = _gjp(
+        base + "/agro/responses/" + pid
+    )
+    resps = body["data"]["responses"]
+    assert len(resps) == 1
+    assert resps[0]["status"] == "in_progress"
+
+    st, body = _gjp(
+        base + "/agro/risk/climate/" + pid
+    )
+    assert len(body["data"]["events"]) == 2
+
+    st, body = _gjp(
+        base + "/agro/risk/evals/" + pid
+    )
+    assert len(body["data"]["evals"]) >= 3

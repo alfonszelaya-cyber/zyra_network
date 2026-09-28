@@ -285,3 +285,40 @@ OPERATIONS.update({
         OPERATOR, ADMINISTRATOR,
     ),
 })
+
+
+# ---- additive RUN E: ops recursos y riesgo ----
+OPERATIONS.update({
+    "equipment.create": (
+        PRODUCER, GOVERNMENT, ADMINISTRATOR,
+    ),
+    "infrastructure.create": (
+        PRODUCER, GOVERNMENT, ADMINISTRATOR,
+    ),
+    "asset.log": (
+        PRODUCER, GOVERNMENT, ADMINISTRATOR,
+    ),
+    "asset.value": (
+        PRODUCER, GOVERNMENT, ADMINISTRATOR,
+    ),
+    "risk.climate.evaluate": (
+        PRODUCER, GOVERNMENT, OPERATOR,
+        ADMINISTRATOR,
+    ),
+    "risk.productive.evaluate": (
+        PRODUCER, GOVERNMENT, ADMINISTRATOR,
+    ),
+    "risk.impact.calculate": (
+        PRODUCER, GOVERNMENT, ADMINISTRATOR,
+    ),
+    "risk.recovery": (
+        PRODUCER, GOVERNMENT, ADMINISTRATOR,
+    ),
+    "alert.resolve": STAFF_ROLES,
+    "response.create": (
+        PRODUCER, GOVERNMENT, ADMINISTRATOR,
+    ),
+    "response.update": (
+        PRODUCER, GOVERNMENT, ADMINISTRATOR,
+    ),
+})

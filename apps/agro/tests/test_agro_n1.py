@@ -160,7 +160,12 @@ def _post(
             "Content-Type":
             "application/json",
             "X-ZYRA-Actor-Role":
-            "agricultor",
+            (
+                "gobierno"
+                if ("/verify" in url
+                    or "/government/" in url)
+                else "agricultor"
+            ),
         },
         method="POST",
     )

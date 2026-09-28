@@ -187,3 +187,339 @@ def test_areas_events_on_network(tmp_path: Path) -> None:
     assert st == 201, str(body)
     assert body["data"]["network_seq"] is not None, (
         "evento de venta no llego a la Red")
+
+
+# ====== PLUS: perfil/units/docs/planes/incidents ======
+
+
+def _pj(url, doc, role="agricultor"):
+    req = urllib.request.Request(
+        url,
+        data=json.dumps(doc).encode(),
+        headers={
+            "Content-Type": "application/json",
+            "X-ZYRA-Actor-Role": role,
+        },
+        method="POST",
+    )
+    try:
+        with urllib.request.urlopen(
+            req, timeout=10
+        ) as r:
+            return r.status, json.loads(
+                r.read().decode()
+            )
+    except urllib.error.HTTPError as e:
+        try:
+            return e.code, json.loads(
+                e.read().decode()
+            )
+        except Exception:
+            return e.code, {}
+
+
+def _gjp(url):
+    try:
+        with urllib.request.urlopen(
+            url, timeout=10
+        ) as r:
+            return r.status, json.loads(
+                r.read().decode()
+            )
+    except urllib.error.HTTPError as e:
+        try:
+            return e.code, json.loads(
+                e.read().decode()
+            )
+        except Exception:
+            return e.code, {}
+
+
+def _govj(url, doc):
+    return _pj(url, doc, role="gobierno")
+
+
+def test_plus_profile_units_docs_plans(
+    tmp_path: Path,
+) -> None:
+    dead = NetworkClient(
+        "http://127.0.0.1:1",
+        timeout_seconds=1.0,
+        max_retries=0,
+    )
+    srv = serve_agro(
+        AgroStore(
+            SQLiteAdapter(":memory:"), FrozenClock()
+        ),
+        dead,
+    )
+    threading.Thread(
+        target=srv.serve_forever, daemon=True
+    ).start()
+    time.sleep(0.4)
+    base = f"http://127.0.0.1:{srv.bound_port}"
+    pid = _register(base, "Elena PLUS")
+
+    st, body = _pj(
+        base + "/agro/perfil",
+        {
+            "producer_id": pid,
+            "phone": "12345678",
+            "location": "Norte",
+            "notes": "cafe",
+        },
+    )
+    assert st == 200, str(body)
+    assert body["data"]["changed"]
+    st, body = _gjp(
+        base + "/agro/perfil/" + pid
+    )
+    assert body["data"]["phone"] == "12345678"
+    st, body = _gjp(
+        base + "/agro/perfil/"
+        + pid + "/history"
+    )
+    assert len(
+        body["data"]["history"]
+    ) >= 1
+
+    st, body = _pj(
+        base + "/agro/perfil",
+        {"producer_id": pid, "phone": "abc"},
+    )
+    assert st == 400, "telefono invalido 400"
+
+    st, body = _pj(base + "/agro/unit", {
+        "producer_id": pid, "name": "Finca Uno",
+    })
+    assert st == 201, str(body)
+    unit_id = body["data"]["unit_id"]
+
+    st, body = _pj(base + "/agro/plan", {
+        "producer_id": pid,
+        "unit_id": unit_id,
+        "crop": "cafe",
+        "planned_quantity": 100,
+    })
+    assert st == 201, str(body)
+    plan_id = body["data"]["plan_id"]
+    st, body = _pj(
+        base + "/agro/plan/cost",
+        {
+            "plan_id": plan_id,
+            "concept": "insumos",
+            "amount": 500,
+            "currency": "GTQ",
+        },
+    )
+    assert st == 201, str(body)
+    st, body = _pj(
+        base + "/agro/plan/cost",
+        {
+            "plan_id": plan_id,
+            "concept": "jornales",
+            "amount": 100,
+            "currency": "USD",
+        },
+    )
+    assert st == 201, str(body)
+    st, body = _gjp(
+        base + "/agro/plans/"
+        + plan_id + "/costs"
+    )
+    d = body["data"]
+    assert d["total_by_currency"]["GTQ"] == 500.0
+    assert d["total_by_currency"]["USD"] == 100.0
+
+    st, body = _pj(
+        base + "/agro/unit/close",
+        {
+            "unit_id": unit_id,
+            "reason": "venta de tierra",
+            "producer_id": pid,
+        },
+    )
+    assert st == 200, str(body)
+    st, body = _gjp(
+        base + "/agro/units/"
+        + pid + "/capacity"
+    )
+    d = body["data"]
+    assert d["units_total"] == 1
+    assert d["units_active"] == 0
+
+    st, body = _pj(
+        base + "/agro/document",
+        {
+            "producer_id": pid,
+            "doc_kind": "pasaporte",
+            "content_b64": "abc",
+        },
+    )
+    assert st == 400, "tipo invalido 400"
+    st, body = _pj(base + "/agro/document", {
+        "producer_id": pid,
+        "doc_kind": "dui",
+        "content_b64": "c2VtYXBh",
+    })
+    assert st == 201, str(body)
+    doc_id = body["data"]["doc_id"]
+    assert body["data"]["content_sha256"]
+    st, body = _gjp(base + "/agro/docs/" + pid)
+    assert len(
+        body["data"]["documents"]
+    ) == 1
+    st, body = _govj(
+        base + "/agro/document/verify",
+        {
+            "doc_id": doc_id,
+            "approve": "false",
+            "note": "ilegible",
+        },
+    )
+    assert st == 200, str(body)
+    assert body["data"]["status"] == "rejected"
+    st, body = _govj(
+        base + "/agro/document/verify",
+        {
+            "doc_id": doc_id,
+            "approve": "true",
+            "note": "ok",
+        },
+    )
+    assert st == 200, str(body)
+    assert body["data"]["status"] == "verified"
+    assert body["data"]["expiry_at"]
+
+
+def test_plus_plans_stages_incidents_timeline(
+    tmp_path: Path,
+) -> None:
+    dead = NetworkClient(
+        "http://127.0.0.1:1",
+        timeout_seconds=1.0,
+        max_retries=0,
+    )
+    srv = serve_agro(
+        AgroStore(
+            SQLiteAdapter(":memory:"), FrozenClock()
+        ),
+        dead,
+    )
+    threading.Thread(
+        target=srv.serve_forever, daemon=True
+    ).start()
+    time.sleep(0.4)
+    base = f"http://127.0.0.1:{srv.bound_port}"
+    pid = _register(base, "Fabio Etapas")
+    st, body = _pj(base + "/agro/unit", {
+        "producer_id": pid, "name": "Parcela",
+    })
+    unit_id = body["data"]["unit_id"]
+    st, body = _pj(base + "/agro/plan", {
+        "producer_id": pid,
+        "unit_id": unit_id,
+        "crop": "frijol",
+        "planned_quantity": 100,
+    })
+    assert st == 201, str(body)
+    plan_id = body["data"]["plan_id"]
+
+    st, body = _pj(base + "/agro/plan", {
+        "producer_id": pid,
+        "unit_id": "UNI-fantasma",
+        "crop": "maiz",
+        "planned_quantity": 10,
+    })
+    assert st in (400, 404), "unidad fantasma"
+    assert body.get("ok") is False
+
+    for expected in (
+        "planted", "growing", "harvested"
+    ):
+        st, body = _pj(
+            base + "/agro/plan/advance",
+            {"plan_id": plan_id},
+        )
+        assert st == 200, str(body)
+        assert (
+            body["data"]["to_stage"]
+            == expected
+        )
+    st, body = _pj(
+        base + "/agro/plan/advance",
+        {"plan_id": plan_id},
+    )
+    assert st == 400, "pasado harvested 400"
+
+    st, body = _gjp(base + "/agro/plans/" + pid)
+    plans = body["data"]["plans"]
+    assert len(plans) == 1
+    assert plans[0]["status"] == "harvested"
+
+    st, body = _pj(base + "/agro/incident", {
+        "producer_id": pid,
+        "kind": "plaga",
+        "severity": "critica",
+        "detail": "mosca blanca",
+    })
+    assert st == 201, str(body)
+    assert body["data"]["escalated"] is True
+    inc_id = body["data"]["incident_id"]
+    st, body = _pj(base + "/agro/incident", {
+        "producer_id": pid,
+        "kind": "x",
+        "severity": "ultra",
+    })
+    assert st == 400, "severidad invalida 400"
+    st, body = _govj(
+        base + "/agro/incident/resolve",
+        {"incident_id": inc_id},
+    )
+    assert st == 400, "sin accion 400"
+    st, body = _govj(
+        base + "/agro/incident/resolve",
+        {
+            "incident_id": inc_id,
+            "action": "fumigacion total",
+        },
+    )
+    assert st == 200, str(body)
+    assert body["data"]["status"] == "resolved"
+
+    st, body = _gjp(
+        base + "/agro/incidents/"
+        + pid + "/stats"
+    )
+    stats = body["data"]
+    assert stats["total"] == 1
+    assert stats["by_status"]["resolved"] == 1
+
+    _pj(base + "/agro/production", {
+        "producer_id": pid,
+        "product": "frijol",
+        "quantity": 80,
+        "unit": "quintal",
+    })
+    st, body = _gjp(base + "/agro/yield/" + pid)
+    d = body["data"]
+    assert d["planned_harvested"] == 100.0
+    assert d["produced"] == 80.0
+    assert d["efficiency"] == 0.8
+    assert d["expected_remaining"] == 20.0
+
+    st, body = _gjp(
+        base + "/agro/plans/"
+        + pid + "/timeline"
+    )
+    tl = body["data"]["timelines"]
+    assert len(tl) >= 1
+    kinds = [
+        x["kind"] for x in tl[0]["timeline"]
+    ]
+    assert "stage" in kinds
+
+    st, body = _gjp(
+        base + "/agro/production/report"
+    )
+    assert body["data"]["total_records"] >= 1

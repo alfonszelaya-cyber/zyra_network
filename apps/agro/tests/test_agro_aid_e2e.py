@@ -152,7 +152,8 @@ def _post(url: str, doc: dict) -> dict:
         url,
         data=json.dumps(doc).encode("utf-8"),
         headers={
-            "Content-Type": "application/json"
+            "Content-Type": "application/json",
+            "X-ZYRA-Actor-Role": "gobierno"
         },
         method="POST",
     )
@@ -169,7 +170,8 @@ def _post_status(url: str, doc: dict) -> int:
         url,
         data=json.dumps(doc).encode("utf-8"),
         headers={
-            "Content-Type": "application/json"
+            "Content-Type": "application/json",
+            "X-ZYRA-Actor-Role": "gobierno"
         },
         method="POST",
     )

@@ -207,3 +207,40 @@ class OperationMatrixTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)
+
+
+# ---- additive PLUS: grupos y ops nuevas ----
+STAFF_ROLES = frozenset({
+    GOVERNMENT, OPERATOR, ADMINISTRATOR,
+})
+ANY_PRODUCER = frozenset({
+    PRODUCER, GOVERNMENT, ADMINISTRATOR,
+})
+
+OPERATIONS.update({
+    "land.create": ANY_PRODUCER,
+    "machinery.create": ANY_PRODUCER,
+    "inventory.create": ANY_PRODUCER,
+    "water.create": ANY_PRODUCER,
+    "unit.create": ANY_PRODUCER,
+    "unit.close": ANY_PRODUCER,
+    "profile.update": ANY_PRODUCER,
+    "document.register": (PRODUCER,),
+    "document.verify": STAFF_ROLES,
+    "plan.create": ANY_PRODUCER,
+    "plan.advance": ANY_PRODUCER,
+    "plan.cancel": ANY_PRODUCER,
+    "plan.cost.add": ANY_PRODUCER,
+    "incident.report": ANY_PRODUCER,
+    "incident.resolve": STAFF_ROLES,
+    "sale.create": (
+        PRODUCER, COMPANY, GOVERNMENT,
+        ADMINISTRATOR,
+    ),
+    "sale.complete": ANY_PRODUCER,
+    "risk.report": ANY_PRODUCER,
+    "risk.resolve": ANY_PRODUCER,
+    "security.unblock": STAFF_ROLES,
+})
+assert "producers.verify" in OPERATIONS
+assert "aid.approve" in OPERATIONS

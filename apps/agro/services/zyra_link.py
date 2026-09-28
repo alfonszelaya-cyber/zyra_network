@@ -105,3 +105,21 @@ class ZyraLink:
                 },
             },
         )
+
+    def quote_to_usd(
+        self, *, requester_zid: str,
+        amount: str, currency: str,
+    ) -> tuple[bool, dict | None, str | None]:
+        """Conector al motor transversal de la
+        Red: cotizacion firmada en vivo hacia
+        USD. AGRO nunca convierte por su cuenta."""
+        return self._client.post(
+            "/currency/quote",
+            {
+                "base": str(
+                    currency or "USD"
+                ).upper(),
+                "quote_ccy": "USD",
+                "requester_zid": requester_zid,
+            },
+        )

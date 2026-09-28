@@ -334,6 +334,149 @@ class AgroApiHandler(
                 "water": a.water_sources_of(producer_id=s[1]),
             }})
             return
+        if s == ["audit", "verify"]:
+            self._send(
+                200,
+                {
+                    "ok": True,
+                    "data": (
+                        self._ZYRA_AUDIT_VERIFY_V6()
+                    ),
+                },
+            )
+            return
+        if s == ["audit", "list"]:
+            from apps.agro.modules.seguridad.auditoria.audit_service import (
+                _agro_audit_chain_list,
+            )
+            from urllib.parse import (
+                parse_qs, urlparse as _up6,
+            )
+            qs = parse_qs(_up6(self.path).query)
+            limit = int(qs.get("limit", ["50"])[0])
+            offset = int(qs.get("offset", ["0"])[0])
+            rows = _agro_audit_chain_list(
+                type(self).store._db,
+                limit=limit, offset=offset,
+            )
+            self._send(
+                200,
+                {
+                    "ok": True,
+                    "data": {
+                        "entries": rows,
+                        "limit": limit,
+                        "offset": offset,
+                    },
+                },
+            )
+            return
+        if len(s) == 2 and s[0] == "perfil":
+            row = self._ZYRA_FN_V6(
+                "apps.agro.modules.productores.perfil.profile_service",
+                "get_profile_db",
+            )(type(self).store._db, s[1])
+            self._send(200, {"ok": True, "data": row})
+            return
+        if len(s) == 3 and s[0] == "perfil" and s[2] == "history":
+            rows = self._ZYRA_FN_V6(
+                "apps.agro.modules.productores.perfil.profile_service",
+                "get_profile_history_db",
+            )(type(self).store._db, s[1])
+            self._send(
+                200,
+                {"ok": True, "data": {"history": rows}},
+            )
+            return
+        if len(s) == 2 and s[0] == "units":
+            units = self._ZYRA_FN_V6(
+                "apps.agro.modules.productores.unidades_productivas.unit_service",
+                "units_of_db",
+            )(type(self).store._db, s[1])
+            self._send(
+                200,
+                {"ok": True, "data": {"units": units}},
+            )
+            return
+        if len(s) == 3 and s[0] == "units" and s[2] == "capacity":
+            rep = self._ZYRA_FN_V6(
+                "apps.agro.modules.productores.unidades_productivas.unit_service",
+                "unit_capacity_report_db",
+            )(type(self).store._db, s[1])
+            self._send(200, {"ok": True, "data": rep})
+            return
+        if len(s) == 2 and s[0] == "docs":
+            docs = self._ZYRA_FN_V6(
+                "apps.agro.modules.productores.documentos.document_service",
+                "documents_plus_of_db",
+            )(type(self).store._db, s[1])
+            self._send(
+                200,
+                {"ok": True, "data": {"documents": docs}},
+            )
+            return
+        if len(s) == 2 and s[0] == "plans":
+            plans = self._ZYRA_FN_V6(
+                "apps.agro.modules.produccion.planificacion.planning_service",
+                "plans_plus_of_db",
+            )(type(self).store._db, s[1])
+            self._send(
+                200,
+                {"ok": True, "data": {"plans": plans}},
+            )
+            return
+        if len(s) == 3 and s[0] == "plans" and s[2] == "timeline":
+            tl = self._ZYRA_FN_V6(
+                "apps.agro.modules.produccion.seguimiento.tracking_service",
+                "timeline_of_db",
+            )(type(self).store._db, s[1])
+            self._send(
+                200,
+                {"ok": True, "data": {"timelines": tl}},
+            )
+            return
+        if len(s) == 3 and s[0] == "plans" and s[2] == "costs":
+            cs = self._ZYRA_FN_V6(
+                "apps.agro.modules.produccion.planificacion.planning_service",
+                "plan_costs_summary_db",
+            )(type(self).store._db, s[1])
+            self._send(200, {"ok": True, "data": cs})
+            return
+        if len(s) == 2 and s[0] == "incidents":
+            inc = self._ZYRA_FN_V6(
+                "apps.agro.modules.operaciones.incidencias.incident_service",
+                "open_incidents_plus_db",
+            )(type(self).store._db, s[1])
+            self._send(
+                200,
+                {"ok": True, "data": {"incidents": inc}},
+            )
+            return
+        if len(s) == 3 and s[0] == "incidents" and s[2] == "stats":
+            st = self._ZYRA_FN_V6(
+                "apps.agro.modules.operaciones.incidencias.incident_service",
+                "incident_stats_db",
+            )(type(self).store._db, s[1])
+            self._send(200, {"ok": True, "data": st})
+            return
+        if len(s) == 2 and s[0] == "yield":
+            rep = self._ZYRA_FN_V6(
+                "apps.agro.modules.produccion.rendimiento.yield_service",
+                "report_plus_db",
+            )(
+                type(self).store._db,
+                type(self).store,
+                s[1],
+            )
+            self._send(200, {"ok": True, "data": rep})
+            return
+        if s == ["production", "report"]:
+            from apps.agro.modules.produccion.reportes.production_report import (
+                national_report,
+            )
+            rep = national_report(type(self).store)
+            self._send(200, {"ok": True, "data": rep})
+            return
         if not s or s == ["home"]:
             self._home()
             return
@@ -408,6 +551,126 @@ class AgroApiHandler(
                 continue
         return items
 
+    def _ZYRA_MATRIX_V6(self):
+        from apps.agro.security.operation_matrix import (
+            OperationMatrix,
+        )
+        return OperationMatrix()
+
+    def _ZYRA_FN_V6(self, dotted, fn_name):
+        mod = __import__(
+            dotted, fromlist=[fn_name]
+        )
+        return getattr(mod, fn_name)
+
+    def _ZYRA_AUDIT_V6(self, operation, outcome, detail=""):
+        from apps.agro.modules.seguridad.auditoria.audit_service import (
+            _agro_audit_chain_record,
+        )
+        try:
+            _agro_audit_chain_record(
+                type(self).store._db,
+                actor_id=(
+                    self.headers.get(
+                        "X-ZYRA-Actor-Id"
+                    ) or "anon"
+                ),
+                role=(
+                    self.headers.get(
+                        "X-ZYRA-Actor-Role"
+                    ) or "-"
+                ),
+                operation=operation,
+                outcome=outcome,
+                detail=detail,
+            )
+        except Exception:
+            pass
+
+    def _ZYRA_AUDIT_VERIFY_V6(self):
+        from apps.agro.modules.seguridad.auditoria.audit_service import (
+            _agro_audit_chain_verify,
+        )
+        return _agro_audit_chain_verify(
+            type(self).store._db
+        )
+
+    def _ZYRA_RATE_V6(self, actor):
+        import time as _t
+        table = getattr(
+            type(self), "_zyra_rate_v6", None
+        )
+        if table is None:
+            table = {}
+            type(self)._zyra_rate_v6 = table
+        now = _t.time()
+        hits = [
+            x for x in table.get(actor, [])
+            if now - x < 3600.0
+        ]
+        hits.append(now)
+        table[actor] = hits
+        return len(hits)
+
+    def _ZYRA_IS_BLOCKED_V6(self, actor):
+        db = type(self).store._db
+        for name in ("query_one", "query"):
+            fn = getattr(db, name, None)
+            if callable(fn):
+                try:
+                    row = fn(
+                        "SELECT reason FROM"
+                        " agro_blocked_actors"
+                        " WHERE actor = ?",
+                        (actor,),
+                    )
+                except Exception:
+                    row = None
+                if row:
+                    try:
+                        return str(row["reason"])
+                    except Exception:
+                        try:
+                            return str(row[0])
+                        except Exception:
+                            return "bloqueado"
+        return None
+
+    def _ZYRA_BLOCK_V6(self, actor, reason):
+        import time as _t
+        db = type(self).store._db
+        db.execute(
+            "CREATE TABLE IF NOT EXISTS"
+            " agro_blocked_actors ("
+            " actor TEXT PRIMARY KEY,"
+            " reason TEXT NOT NULL,"
+            " at TEXT NOT NULL)"
+        )
+        ts = _t.strftime(
+            "%Y-%m-%dT%H:%M:%SZ", _t.gmtime()
+        )
+        db.execute(
+            "INSERT OR REPLACE INTO"
+            " agro_blocked_actors (actor,"
+            " reason, at) VALUES (?, ?, ?)",
+            (actor, str(reason), ts),
+        )
+
+    def _ZYRA_UNBLOCK_V6(self, actor):
+        db = type(self).store._db
+        db.execute(
+            "CREATE TABLE IF NOT EXISTS"
+            " agro_blocked_actors ("
+            " actor TEXT PRIMARY KEY,"
+            " reason TEXT NOT NULL,"
+            " at TEXT NOT NULL)"
+        )
+        db.execute(
+            "DELETE FROM agro_blocked_actors"
+            " WHERE actor = ?",
+            (actor,),
+        )
+
     def _post(self, s: list[str]) -> None:
         store = type(self).store
         link = type(self).link
@@ -418,6 +681,327 @@ class AgroApiHandler(
             "application/json"
             in content_type
         )
+        _ZV6_ACTOR = (
+            self.headers.get("X-ZYRA-Actor-Id")
+            or "anon"
+        )
+        _ZV6_PATH = "/agro/" + "/".join(s)
+        _ZV6_OP = {
+            ("producers", "verify"): "producers.verify",
+            ("aid", "eligibility"): "aid.eligibility",
+            ("government", "approve"): "aid.approve",
+            ("government", "assign"): "aid.assign",
+            ("government", "deliver"): "aid.deliver",
+            ("land",): "land.create",
+            ("machinery",): "machinery.create",
+            ("inventory",): "inventory.create",
+            ("water",): "water.create",
+            ("unit",): "unit.create",
+            ("unit", "close"): "unit.close",
+            ("perfil",): "profile.update",
+            ("document",): "document.register",
+            ("document", "verify"): "document.verify",
+            ("plan",): "plan.create",
+            ("plan", "advance"): "plan.advance",
+            ("plan", "cancel"): "plan.cancel",
+            ("plan", "cost"): "plan.cost.add",
+            ("incident",): "incident.report",
+            ("incident", "resolve"): "incident.resolve",
+            ("sale",): "sale.create",
+            ("sale", "complete"): "sale.complete",
+            ("risk",): "risk.report",
+            ("risk", "resolve"): "risk.resolve",
+            ("security", "unblock"): "security.unblock",
+            ("production",): "production.register",
+        }.get(tuple(s))
+        if _ZV6_OP is not None:
+            _ZV6_BLOCKED = None
+            if _ZV6_OP != "security.unblock":
+                _ZV6_BLOCKED = (
+                    self._ZYRA_IS_BLOCKED_V6(
+                        _ZV6_ACTOR
+                    )
+                )
+            if _ZV6_BLOCKED is not None:
+                self._send(
+                    403,
+                    {
+                        "ok": False,
+                        "error": {
+                            "type": "actor_blocked",
+                            "message": (
+                                "actor bloqueado: "
+                                + _ZV6_BLOCKED
+                            ),
+                        },
+                    },
+                )
+                return
+            _ZV6_ROLE_RAW = (
+                self.headers.get(
+                    "X-ZYRA-Actor-Role"
+                ) or ""
+            ).strip()
+            _ZV6_MAP = {
+                "agricultor": "producer",
+                "ganadero": "producer",
+                "productor": "producer",
+                "gobierno": "government",
+                "banco": "company",
+                "institucion": "company",
+                "empresa": "company",
+                "operador": "operator",
+                "admin": "administrator",
+            }
+            _ZV6_ROLE = _ZV6_MAP.get(
+                _ZV6_ROLE_RAW, _ZV6_ROLE_RAW
+            )
+            try:
+                _ZV6_OK = self._ZYRA_MATRIX_V6().check(
+                    operation=_ZV6_OP,
+                    role=_ZV6_ROLE,
+                    subject_id=_ZV6_ACTOR,
+                )
+                _ZV6_MSG = (
+                    "rol sin permiso: " + _ZV6_ROLE
+                    + " / " + _ZV6_OP
+                )
+            except ValueError:
+                _ZV6_OK = False
+                _ZV6_MSG = (
+                    "operacion desconocida: "
+                    + _ZV6_OP
+                )
+            if not _ZV6_OK:
+                _denies = self._ZYRA_RATE_V6(
+                    _ZV6_ACTOR
+                )
+                self._ZYRA_AUDIT_V6(
+                    _ZV6_PATH, "denied",
+                    detail=(
+                        "role=" + _ZV6_ROLE
+                        + " denies="
+                        + str(_denies)
+                    ),
+                )
+                if _denies >= 10:
+                    self._ZYRA_BLOCK_V6(
+                        _ZV6_ACTOR,
+                        "10+ denegados en 1h",
+                    )
+                    self._ZYRA_AUDIT_V6(
+                        _ZV6_PATH,
+                        "actor_blocked",
+                    )
+                self._send(
+                    403,
+                    {
+                        "ok": False,
+                        "error": {
+                            "type": "forbidden",
+                            "message": _ZV6_MSG,
+                        },
+                    },
+                )
+                return
+        self._ZYRA_AUDIT_V6(_ZV6_PATH, "allowed")
+        if s == ["perfil"]:
+            doc = self._ZYRA_PAYLOAD_V2(is_json)
+            pid = self._req(doc, "producer_id")
+            row = self._ZYRA_FN_V6(
+                "apps.agro.modules.productores.perfil.profile_service",
+                "update_profile_db",
+            )(
+                type(self).store._db,
+                producer_id=pid,
+                phone=str(doc.get("phone") or ""),
+                location=str(doc.get("location") or ""),
+                notes=str(doc.get("notes") or ""),
+                actor=_ZV6_ACTOR,
+            )
+            self._send(200, {"ok": True, "data": row})
+            return
+        if s == ["unit"]:
+            doc = self._ZYRA_PAYLOAD_V2(is_json)
+            pid = self._req(doc, "producer_id")
+            row = self._ZYRA_FN_V6(
+                "apps.agro.modules.productores.unidades_productivas.unit_service",
+                "register_unit_db",
+            )(
+                type(self).store._db,
+                producer_id=pid,
+                name=self._req(doc, "name"),
+                unit_type=str(
+                    doc.get("unit_type") or "agricola"
+                ),
+                land_id=doc.get("land_id"),
+            )
+            self._ZYRA_EVENTS_V2().asset_registered(
+                producer_id=pid,
+                asset_type="unidad",
+                detail=str(row["unit_id"]),
+            )
+            self._send(201, {"ok": True, "data": row})
+            return
+        if s == ["unit", "close"]:
+            doc = self._ZYRA_PAYLOAD_V2(is_json)
+            row = self._ZYRA_FN_V6(
+                "apps.agro.modules.productores.unidades_productivas.unit_service",
+                "close_unit_db",
+            )(
+                type(self).store._db,
+                unit_id=self._req(doc, "unit_id"),
+                reason=str(doc.get("reason") or ""),
+                closed_by=(
+                    str(doc.get("producer_id") or "anon")
+                ),
+            )
+            self._send(200, {"ok": True, "data": row})
+            return
+        if s == ["document"]:
+            doc = self._ZYRA_PAYLOAD_V2(is_json)
+            pid = self._req(doc, "producer_id")
+            row = self._ZYRA_FN_V6(
+                "apps.agro.modules.productores.documentos.document_service",
+                "register_doc_plus_db",
+            )(
+                type(self).store._db,
+                producer_id=pid,
+                doc_kind=self._req(doc, "doc_kind"),
+                content_b64=str(
+                    doc.get("content_b64") or ""
+                ),
+            )
+            self._send(201, {"ok": True, "data": row})
+            return
+        if s == ["document", "verify"]:
+            doc = self._ZYRA_PAYLOAD_V2(is_json)
+            row = self._ZYRA_FN_V6(
+                "apps.agro.modules.productores.documentos.document_service",
+                "verify_doc_plus_db",
+            )(
+                type(self).store._db,
+                doc_id=self._req(doc, "doc_id"),
+                reviewer=str(
+                    doc.get("reviewer") or "gobierno"
+                ),
+                approve=str(
+                    doc.get("approve", "true")
+                ).lower() == "true",
+                note=str(doc.get("note") or ""),
+            )
+            self._send(200, {"ok": True, "data": row})
+            return
+        if s == ["plan"]:
+            doc = self._ZYRA_PAYLOAD_V2(is_json)
+            pid = self._req(doc, "producer_id")
+            row = self._ZYRA_FN_V6(
+                "apps.agro.modules.produccion.planificacion.planning_service",
+                "create_plan_db",
+            )(
+                type(self).store._db,
+                producer_id=pid,
+                unit_id=self._req(doc, "unit_id"),
+                crop=self._req(doc, "crop"),
+                target=float(
+                    doc.get("planned_quantity") or 0
+                ),
+            )
+            self._send(201, {"ok": True, "data": row})
+            return
+        if s == ["plan", "advance"]:
+            doc = self._ZYRA_PAYLOAD_V2(is_json)
+            row = self._ZYRA_FN_V6(
+                "apps.agro.modules.produccion.planificacion.planning_service",
+                "advance_plan_plus_db",
+            )(
+                type(self).store._db,
+                plan_id=self._req(doc, "plan_id"),
+                detail=str(doc.get("detail") or ""),
+            )
+            self._send(200, {"ok": True, "data": row})
+            return
+        if s == ["plan", "cancel"]:
+            doc = self._ZYRA_PAYLOAD_V2(is_json)
+            row = self._ZYRA_FN_V6(
+                "apps.agro.modules.produccion.planificacion.planning_service",
+                "cancel_plan_db",
+            )(
+                type(self).store._db,
+                plan_id=self._req(doc, "plan_id"),
+                reason=str(doc.get("reason") or ""),
+                actor=_ZV6_ACTOR,
+            )
+            self._send(200, {"ok": True, "data": row})
+            return
+        if s == ["plan", "cost"]:
+            doc = self._ZYRA_PAYLOAD_V2(is_json)
+            row = self._ZYRA_FN_V6(
+                "apps.agro.modules.produccion.planificacion.planning_service",
+                "add_plan_cost_db",
+            )(
+                type(self).store._db,
+                plan_id=self._req(doc, "plan_id"),
+                concept=self._req(doc, "concept"),
+                amount=float(doc.get("amount") or 0),
+                currency=self._req(doc, "currency"),
+                actor=_ZV6_ACTOR,
+            )
+            self._send(201, {"ok": True, "data": row})
+            return
+        if s == ["incident"]:
+            doc = self._ZYRA_PAYLOAD_V2(is_json)
+            pid = self._req(doc, "producer_id")
+            row = self._ZYRA_FN_V6(
+                "apps.agro.modules.operaciones.incidencias.incident_service",
+                "report_incident_plus_db",
+            )(
+                type(self).store._db,
+                producer_id=pid,
+                unit_id=doc.get("unit_id"),
+                kind=self._req(doc, "kind"),
+                severity=str(
+                    doc.get("severity") or "media"
+                ),
+                detail=str(doc.get("detail") or ""),
+            )
+            self._ZYRA_EVENTS_V2().incident_created(
+                producer_id=pid,
+                incident_id=str(row["incident_id"]),
+                detail=str(row.get("kind", "")),
+            )
+            self._send(201, {"ok": True, "data": row})
+            return
+        if s == ["incident", "resolve"]:
+            doc = self._ZYRA_PAYLOAD_V2(is_json)
+            row = self._ZYRA_FN_V6(
+                "apps.agro.modules.operaciones.incidencias.incident_service",
+                "resolve_incident_plus_db",
+            )(
+                type(self).store._db,
+                incident_id=self._req(doc, "incident_id"),
+                action=str(doc.get("action") or ""),
+            )
+            self._send(200, {"ok": True, "data": row})
+            return
+        if s == ["security", "unblock"]:
+            doc = self._ZYRA_PAYLOAD_V2(is_json)
+            self._ZYRA_UNBLOCK_V6(
+                self._req(doc, "actor")
+            )
+            self._ZYRA_AUDIT_V6(
+                "/agro/security/unblock",
+                "allowed",
+                detail=str(doc.get("actor")),
+            )
+            self._send(
+                200,
+                {
+                    "ok": True,
+                    "data": {"unblocked": True},
+                },
+            )
+            return
         if s == ["land"]:
             doc = self._ZYRA_PAYLOAD_V2(is_json)
             pid = self._req(doc, "producer_id")

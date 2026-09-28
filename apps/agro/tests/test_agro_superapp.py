@@ -40,7 +40,10 @@ def _post(base, path, doc):
     req = urllib.request.Request(
         base + path,
         data=json.dumps(doc).encode(),
-        headers={"Content-Type": "application/json"},
+        headers={
+                          "Content-Type": "application/json",
+                          "X-ZYRA-Actor-Role": "agricultor",
+                      },
         method="POST")
     try:
         with urllib.request.urlopen(req, timeout=10) as r:

@@ -158,7 +158,9 @@ def _post(
         data=json.dumps(doc).encode("utf-8"),
         headers={
             "Content-Type":
-            "application/json"
+            "application/json",
+            "X-ZYRA-Actor-Role":
+            "agricultor",
         },
         method="POST",
     )

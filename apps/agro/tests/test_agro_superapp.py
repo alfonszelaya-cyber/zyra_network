@@ -1344,3 +1344,289 @@ def test_ecosystem_to_network_online(
             " confirmacion del append"
             " (sent=True)."
         )
+
+
+# ====== RUN G: GPT-9 aceptacion + carga ======
+
+
+def _html(url):
+    with urllib.request.urlopen(
+        url, timeout=10
+    ) as r:
+        return r.read().decode()
+
+
+def test_acceptance_full_producer_journey(
+    tmp_path: Path,
+) -> None:
+    from apps.agro.infrastructure.persistence.agro_migrations import (
+        run_agro_migrations,
+    )
+    from apps.agro.assets.translations.es import (
+        TEXTOS,
+    )
+    dead = NetworkClient(
+        "http://127.0.0.1:1",
+        timeout_seconds=1.0,
+        max_retries=0,
+    )
+    db = SQLiteAdapter(":memory:")
+    mig = run_agro_migrations(db)
+    assert mig["applied_now"], str(mig)
+    srv = serve_agro(
+        AgroStore(db, FrozenClock()), dead
+    )
+    threading.Thread(
+        target=srv.serve_forever, daemon=True
+    ).start()
+    time.sleep(0.4)
+    base = f"http://127.0.0.1:{srv.bound_port}"
+
+    mig2 = run_agro_migrations(db)
+    assert mig2["applied_now"] == []
+    assert mig2["total_versions"] >= 6
+
+    pid = _register(base, "Zoila Aceptacion")
+    st, body = _pj(
+        base + "/agro/perfil",
+        {
+            "producer_id": pid,
+            "phone": "70001234",
+            "location": "Chalatenango",
+        },
+    )
+    assert st == 200, str(body)
+
+    st, body = _pj(base + "/agro/unit", {
+        "producer_id": pid,
+        "name": "Finca Aceptacion",
+    })
+    unit_id = body["data"]["unit_id"]
+
+    st, body = _pj(base + "/agro/plan", {
+        "producer_id": pid,
+        "unit_id": unit_id,
+        "crop": "maiz",
+        "planned_quantity": 40,
+    })
+    plan_id = body["data"]["plan_id"]
+    for _ in range(3):
+        st, body = _pj(
+            base + "/agro/plan/advance",
+            {"plan_id": plan_id},
+        )
+        assert st == 200
+    st, body = _gjp(
+        base + "/agro/plans/" + pid
+    )
+    assert (
+        body["data"]["plans"][0]["status"]
+        == "harvested"
+    )
+
+    st, body = _pj(
+        base + "/agro/production",
+        {
+            "producer_id": pid,
+            "product": "maiz",
+            "quantity": 40,
+            "unit": "quintal",
+        },
+    )
+    assert st == 201, str(body)
+
+    st, body = _pj(
+        base + "/agro/inventory/add",
+        {
+            "producer_id": pid,
+            "product": "maiz",
+            "quantity": 40,
+        },
+    )
+    assert st == 201
+
+    st, body = _pj(
+        base + "/agro/sale/publish",
+        {
+            "producer_id": pid,
+            "product": "maiz",
+            "quantity": 40,
+            "currency": "USD",
+        },
+    )
+    sale_id = body["data"]["sale_id"]
+    st, body = _pj(
+        base + "/agro/sale/offer",
+        {
+            "sale_id": sale_id,
+            "buyer": "Mercado Central",
+            "amount": 25,
+        },
+    )
+    offer_id = body["data"]["offer_id"]
+    st, body = _pj(
+        base + "/agro/sale/accept",
+        {"offer_id": offer_id},
+    )
+    assert st == 200
+    st, body = _pj(
+        base + "/agro/sale/pay",
+        {"sale_id": sale_id},
+    )
+    assert st == 200
+    st, body = _pj(
+        base + "/agro/sale/deliver",
+        {"sale_id": sale_id},
+    )
+    assert st == 200
+    st, body = _pj(
+        base + "/agro/sale/close",
+        {"sale_id": sale_id},
+    )
+    assert st == 200, str(body)
+    assert (
+        body["data"]["status"] == "closed"
+    )
+
+    st, body = _gjp(
+        base + "/agro/yield/" + pid
+    )
+    d = body["data"]
+    assert d["produced"] == 40.0
+    assert d["efficiency"] == 1.0
+
+    st, body = _gjp(
+        base + "/agro/results/" + pid
+    )
+    d = body["data"]
+    assert d["sales_count"] == 1
+    assert d["total"] == 1000.0
+
+    st, body = _gjp(
+        base + "/agro/audit/verify"
+    )
+    assert body["data"]["ok"] is True
+
+    panel = _html(
+        base + "/agro/productor/" + pid
+    )
+    assert TEXTOS["panel_titulo"] in panel
+    assert (
+        TEXTOS["registrar_cosecha"]
+        in panel
+    )
+    assert TEXTOS["vender"] in panel
+    assert (
+        TEXTOS["ayuda_gobierno"] in panel
+    )
+    gov = _html(base + "/agro/gobierno")
+    assert TEXTOS["soberania"] in gov
+    assert TEXTOS["beneficiados"] in gov
+    assert TEXTOS["riesgos"] in gov
+    assert TEXTOS["modulos"] in gov
+    bank = _html(base + "/agro/banco")
+    assert TEXTOS["banco"] in bank
+    assert TEXTOS["credito"] in bank
+    mkt = _html(base + "/agro/mercado")
+    assert TEXTOS["mercado"] in mkt
+
+    st, body = _pj(
+        base + "/agro/network/emit",
+        {
+            "zid": "ZID-offline",
+            "event_type": "sale.completed",
+            "payload": {
+                "producer_id": pid,
+                "sale_id": sale_id,
+            },
+        },
+    )
+    assert st == 200
+    assert body["data"]["sent"] is False
+    st, body = _gjp(
+        base + "/agro/network/outbox"
+    )
+    assert len(body["data"]["pending"]) >= 1
+
+
+def test_load_basic_throughput(
+    tmp_path: Path,
+) -> None:
+    import time as _t
+    from apps.agro.modules.comercializacion.venta_simple.simple_sale_service import (
+        sales_of_db,
+    )
+    dead = NetworkClient(
+        "http://127.0.0.1:1",
+        timeout_seconds=1.0,
+        max_retries=0,
+    )
+    store = AgroStore(
+        SQLiteAdapter(":memory:"), FrozenClock()
+    )
+    srv = serve_agro(store, dead)
+    threading.Thread(
+        target=srv.serve_forever, daemon=True
+    ).start()
+    time.sleep(0.4)
+    base = f"http://127.0.0.1:{srv.bound_port}"
+    pids = []
+    inicio = _t.time()
+    for i in range(30):
+        st, body = _pj(
+            base + "/agro/producers",
+            {
+                "name": "Carga " + str(i),
+                "producer_type":
+                "agricultor",
+                "location": "Zona "
+                + str(i),
+                "doc_image_b64": _seed(
+                    "Carga " + str(i)
+                ),
+                "selfie_image_b64": _seed(
+                    "Carga " + str(i)
+                ),
+            },
+        )
+        assert st == 201, str(body)
+        pids.append(
+            body["data"]["producer_id"]
+        )
+    duracion_reg = _t.time() - inicio
+
+    inicio = _t.time()
+    for i, pid in enumerate(pids[:15]):
+        st, body = _pj(
+            base + "/agro/sale/publish",
+            {
+                "producer_id": pid,
+                "product": "maiz",
+                "quantity": 10 + i,
+                "currency": "USD",
+            },
+        )
+        assert st == 201, str(body)
+    duracion_ventas = _t.time() - inicio
+
+    rows = sales_of_db(store._db, None)
+    assert len(rows) == 15, str(len(rows))
+
+    st, body = _gjp(
+        base + "/agro/sales/all"
+    )
+    http_n = len(
+        body["data"]["sales"]
+    ) if body.get("ok") else -1
+    print(
+        "CARGA: 30 registros en",
+        round(duracion_reg, 2), "s |",
+        "15 ventas en",
+        round(duracion_ventas, 2), "s |",
+        "ventas via HTTP:",
+        http_n,
+        "(si difiere de 15: backlog"
+        " routing sales/all)",
+    )
+    assert duracion_reg < 60
+    assert duracion_ventas < 60

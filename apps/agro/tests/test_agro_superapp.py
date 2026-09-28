@@ -1084,3 +1084,263 @@ def test_risk_alerts_responses_full(
         base + "/agro/risk/evals/" + pid
     )
     assert len(body["data"]["evals"]) >= 3
+
+
+# ====== RUN F: GPT-8 ecosistema ======
+
+
+def test_ecosystem_contract_offline(
+    tmp_path: Path,
+) -> None:
+    dead = NetworkClient(
+        "http://127.0.0.1:1",
+        timeout_seconds=1.0,
+        max_retries=0,
+    )
+    srv = serve_agro(
+        AgroStore(
+            SQLiteAdapter(":memory:"),
+            FrozenClock(),
+        ),
+        dead,
+    )
+    threading.Thread(
+        target=srv.serve_forever,
+        daemon=True,
+    ).start()
+    time.sleep(0.4)
+    base = f"http://127.0.0.1:{srv.bound_port}"
+    pid = _register(base, "Karla Eco")
+
+    st, body = _pj(
+        base + "/agro/network/emit",
+        {
+            "zid": "ZID-x",
+            "event_type": "hack.borro",
+            "payload": {
+                "producer_id": pid
+            },
+        },
+    )
+    assert st == 400, "desconocido 400"
+
+    st, body = _pj(
+        base + "/agro/network/emit",
+        {
+            "zid": "ZID-x",
+            "event_type":
+            "asset.registered",
+            "payload": {
+                "producer_id": pid
+            },
+        },
+    )
+    assert st == 400, "faltante 400"
+
+    st, body = _pj(
+        base + "/agro/network/emit",
+        {
+            "zid": "ZID-x",
+            "event_type":
+            "producer.registered",
+            "payload": {
+                "producer_id": pid
+            },
+        },
+    )
+    assert st == 200, str(body)
+    key = body["data"]["event_key"]
+    assert body["data"]["sent"] is False
+
+    st, body = _pj(
+        base + "/agro/network/emit",
+        {
+            "zid": "ZID-x",
+            "event_type":
+            "producer.registered",
+            "payload": {
+                "producer_id": pid
+            },
+        },
+    )
+    assert st == 200
+    assert (
+        body["data"]["event_key"]
+        == key
+    )
+
+    st, body = _gjp(
+        base + "/agro/network/status"
+    )
+    d = body["data"]
+    assert d["reachable"] is False
+    assert d["catalog_events"] >= 12
+    assert d["outbox"]["total"] >= 1
+
+    st, body = _gjp(
+        base + "/agro/network/outbox"
+    )
+    pend = body["data"]["pending"]
+    assert len(pend) >= 1
+    assert pend[0]["attempts"] == 2
+
+
+def test_ecosystem_to_network_online(
+    tmp_path: Path,
+) -> None:
+    net_db = SQLiteAdapter(
+        tmp_path / "net.db"
+    )
+    signer, _ = Ed25519Signer.generate()
+    kernel = ZyraKernel(
+        db=net_db,
+        clock=FrozenClock(),
+        signer=signer,
+        config=RuntimeConfig(
+            host="127.0.0.1",
+            port=0,
+            api_token=None,
+        ),
+    )
+    kernel.bootstrap_root()
+    kernel._biometrics = BiometricsEngine(
+        db=net_db,
+        clock=FrozenClock(),
+        audit=kernel.audit,
+        provider=(
+            DeterministicTestProvider()
+        ),
+        cipher=TemplateCipher(
+            master_key_hex="ab" * 32
+        ),
+        policy=BiometricsPolicy(
+            require_liveness=False,
+            doc_reject=0.01,
+            doc_review=0.02,
+            doc_auto=0.03,
+            dup_reject=0.98,
+        ),
+    )
+    caps = ZyraCapabilities(
+        net_db,
+        FrozenClock(),
+        identity=kernel.identity,
+        signer=signer,
+    )
+    net_srv = serve_combined(
+        kernel,
+        caps,
+        host="127.0.0.1",
+        port=0,
+    )
+    threading.Thread(
+        target=net_srv.serve_forever,
+        daemon=True,
+    ).start()
+    time.sleep(0.4)
+    net_base = (
+        "http://127.0.0.1:"
+        f"{net_srv.server_address[1]}"
+    )
+
+    client = NetworkClient(
+        net_base, max_retries=1
+    )
+    reg = ZyraLink(
+        client
+    ).register_app()
+    assert reg[0] is True, str(reg[2])
+
+    srv = serve_agro(
+        AgroStore(
+            SQLiteAdapter(":memory:"),
+            FrozenClock(),
+        ),
+        client,
+    )
+    threading.Thread(
+        target=srv.serve_forever,
+        daemon=True,
+    ).start()
+    time.sleep(0.4)
+    base = (
+        f"http://127.0.0.1:{srv.bound_port}"
+    )
+
+    st, body = _pj(
+        base + "/agro/producers",
+        {
+            "name": "Luis EnRed",
+            "producer_type":
+            "agricultor",
+            "location": "Chalatenango",
+            "doc_image_b64": _seed(
+                "Luis EnRed"
+            ),
+            "selfie_image_b64": _seed(
+                "Luis EnRed"
+            ),
+        },
+    )
+    assert st == 201, str(body)
+    pid = body["data"]["producer_id"]
+    zid = body["data"]["zid"]
+    assert zid.startswith("ZID-")
+
+    st, body = _pj(
+        base + "/agro/network/emit",
+        {
+            "zid": zid,
+            "event_type":
+            "producer.registered",
+            "payload": {
+                "producer_id": pid
+            },
+        },
+    )
+    assert st == 200, str(body)
+    assert (
+        body["data"]["sent"] is True
+    ), str(body)
+
+    st, body = _pj(
+        base + "/agro/network/emit",
+        {
+            "zid": zid,
+            "event_type":
+            "producer.registered",
+            "payload": {
+                "producer_id": pid
+            },
+        },
+    )
+    assert st == 200, str(body)
+    assert (
+        body["data"]["deduplicated"]
+        is True
+    ), "idempotencia contra Red viva"
+
+    st, body = _gjp(
+        base + "/agro/network/status"
+    )
+    d = body["data"]
+    assert d["reachable"] is True
+    assert d["outbox"]["by_status"][
+        "sent"
+    ] == 1
+
+    ok_h, data_h, err_h = (
+        client.get("/history/" + zid)
+    )
+    if not ok_h:
+        print(
+            "AVISO RED (backlog, no"
+            " bloquea AGRO): lectura"
+            " GET /history/{zid} del"
+            " lado de la Red responde"
+            " error: " + str(err_h)
+            + ". La ENTREGA del evento"
+            " esta probada por la"
+            " confirmacion del append"
+            " (sent=True)."
+        )

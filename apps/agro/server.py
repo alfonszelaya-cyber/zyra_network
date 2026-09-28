@@ -642,6 +642,28 @@ class AgroApiHandler(
                 {"ok": True, "data": {"evals": rows}},
             )
             return
+        if s == ["network", "status"]:
+            st_row = type(self).link.network_status()
+            from apps.agro.services.zyra_link import (
+                outbox_stats_db,
+            )
+            st_row["outbox"] = outbox_stats_db(
+                type(self).store._db
+            )
+            self._send(200, {"ok": True, "data": st_row})
+            return
+        if s == ["network", "outbox"]:
+            from apps.agro.services.zyra_link import (
+                outbox_pending_db,
+            )
+            rows = outbox_pending_db(
+                type(self).store._db, limit=20
+            )
+            self._send(
+                200,
+                {"ok": True, "data": {"pending": rows}},
+            )
+            return
         if not s or s == ["home"]:
             self._home()
             return
@@ -904,6 +926,7 @@ class AgroApiHandler(
             ("alert", "resolve"): "alert.resolve",
             ("response",): "response.create",
             ("response", "update"): "response.update",
+            ("network", "emit"): "network.emit",
             ("production",): "production.register",
         }.get(tuple(s))
         if _ZV6_OP is not None:
@@ -1179,6 +1202,27 @@ class AgroApiHandler(
                 type(self).store._db,
                 response_id=self._req(doc, "response_id"),
                 status=self._req(doc, "status"),
+            )
+            self._send(200, {"ok": True, "data": row})
+            return
+        if s == ["network", "emit"]:
+            doc = self._ZYRA_PAYLOAD_V2(is_json)
+            zid = self._req(doc, "zid")
+            et = self._req(doc, "event_type")
+            payload = doc.get("payload")
+            if not isinstance(payload, dict):
+                raise ValueError(
+                    "payload debe ser objeto"
+                )
+            row = self._ZYRA_COM_D(
+                "apps.agro.services.zyra_link",
+                "emit_event_db",
+            )(
+                type(self).store._db,
+                type(self).link,
+                zid=zid,
+                event_type=et,
+                payload=payload,
             )
             self._send(200, {"ok": True, "data": row})
             return

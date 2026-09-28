@@ -322,3 +322,12 @@ OPERATIONS.update({
         PRODUCER, GOVERNMENT, ADMINISTRATOR,
     ),
 })
+
+
+# ---- additive RUN F: ops ecosistema ----
+OPERATIONS.update({
+    "network.emit": (
+        PRODUCER, COMPANY, GOVERNMENT,
+        OPERATOR, ADMINISTRATOR,
+    ),
+})

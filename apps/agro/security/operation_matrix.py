@@ -244,3 +244,44 @@ OPERATIONS.update({
 })
 assert "producers.verify" in OPERATIONS
 assert "aid.approve" in OPERATIONS
+
+
+# ---- additive RUN D: ops comerciales ----
+OPERATIONS.update({
+    "sale.publish": (
+        PRODUCER, GOVERNMENT, ADMINISTRATOR,
+    ),
+    "sale.offer": (
+        PRODUCER, COMPANY, GOVERNMENT,
+        ADMINISTRATOR,
+    ),
+    "sale.accept": (
+        PRODUCER, GOVERNMENT, ADMINISTRATOR,
+    ),
+    "sale.pay": (
+        PRODUCER, COMPANY, GOVERNMENT,
+        ADMINISTRATOR,
+    ),
+    "sale.deliver": (
+        PRODUCER, GOVERNMENT, ADMINISTRATOR,
+    ),
+    "inventory.add": (
+        PRODUCER, GOVERNMENT, ADMINISTRATOR,
+    ),
+    "export.create": (
+        PRODUCER, COMPANY, GOVERNMENT,
+        ADMINISTRATOR,
+    ),
+    "shipment.create": (
+        PRODUCER, COMPANY, GOVERNMENT,
+        ADMINISTRATOR,
+    ),
+    "shipment.update": (
+        PRODUCER, COMPANY, GOVERNMENT,
+        ADMINISTRATOR,
+    ),
+    "market.price.add": (
+        PRODUCER, COMPANY, GOVERNMENT,
+        OPERATOR, ADMINISTRATOR,
+    ),
+})

@@ -477,6 +477,75 @@ class AgroApiHandler(
             rep = national_report(type(self).store)
             self._send(200, {"ok": True, "data": rep})
             return
+        if len(s) == 2 and s[0] == "sales":
+            rows = self._ZYRA_COM_D(
+                "apps.agro.modules.comercializacion.venta_simple.simple_sale_service",
+                "sales_of_db",
+            )(type(self).store._db, s[1])
+            self._send(
+                200,
+                {"ok": True, "data": {"sales": rows}},
+            )
+            return
+        if s == ["sales", "all"]:
+            rows = self._ZYRA_COM_D(
+                "apps.agro.modules.comercializacion.venta_simple.simple_sale_service",
+                "sales_of_db",
+            )(type(self).store._db, None)
+            self._send(
+                200,
+                {"ok": True, "data": {"sales": rows}},
+            )
+            return
+        if len(s) == 3 and s[0] == "sales" and s[2] == "offers":
+            rows = self._ZYRA_COM_D(
+                "apps.agro.modules.comercializacion.venta_simple.simple_sale_service",
+                "offers_of_db",
+            )(type(self).store._db, s[1])
+            self._send(
+                200,
+                {"ok": True, "data": {"offers": rows}},
+            )
+            return
+        if len(s) == 2 and s[0] == "inventory":
+            rows = self._ZYRA_COM_D(
+                "apps.agro.modules.comercializacion.venta_simple.simple_sale_service",
+                "inventory_of_db",
+            )(type(self).store._db, s[1])
+            self._send(
+                200,
+                {"ok": True, "data": {"inventory": rows}},
+            )
+            return
+        if len(s) == 2 and s[0] == "exports":
+            rows = self._ZYRA_COM_D(
+                "apps.agro.modules.comercializacion.exportacion.export_service",
+                "exports_of_db",
+            )(type(self).store._db, s[1])
+            self._send(
+                200,
+                {"ok": True, "data": {"exports": rows}},
+            )
+            return
+        if len(s) == 2 and s[0] == "results":
+            rep = self._ZYRA_COM_D(
+                "apps.agro.modules.comercializacion.resultados.commercial_results",
+                "results_for_db",
+            )(type(self).store._db, s[1])
+            self._send(200, {"ok": True, "data": rep})
+            return
+        if len(s) == 3 and s[0] == "market" and s[1] == "price":
+            from apps.agro.modules.comercializacion.mercado.market_service import (
+                market_snapshot_db,
+            )
+            try:
+                snap = market_snapshot_db(
+                    type(self).store._db, s[2]
+                )
+            except LookupError as exc:
+                raise ValueError(str(exc))
+            self._send(200, {"ok": True, "data": snap})
+            return
         if not s or s == ["home"]:
             self._home()
             return
@@ -671,6 +740,12 @@ class AgroApiHandler(
             (actor,),
         )
 
+    def _ZYRA_COM_D(self, dotted, fn_name):
+        mod = __import__(
+            dotted, fromlist=[fn_name]
+        )
+        return getattr(mod, fn_name)
+
     def _post(self, s: list[str]) -> None:
         store = type(self).store
         link = type(self).link
@@ -712,6 +787,16 @@ class AgroApiHandler(
             ("risk",): "risk.report",
             ("risk", "resolve"): "risk.resolve",
             ("security", "unblock"): "security.unblock",
+            ("sale", "publish"): "sale.publish",
+            ("sale", "offer"): "sale.offer",
+            ("sale", "accept"): "sale.accept",
+            ("sale", "pay"): "sale.pay",
+            ("sale", "deliver"): "sale.deliver",
+            ("inventory", "add"): "inventory.add",
+            ("export",): "export.create",
+            ("shipment",): "shipment.create",
+            ("shipment", "update"): "shipment.update",
+            ("market", "price"): "market.price.add",
             ("production",): "production.register",
         }.get(tuple(s))
         if _ZV6_OP is not None:
@@ -805,6 +890,153 @@ class AgroApiHandler(
                 )
                 return
         self._ZYRA_AUDIT_V6(_ZV6_PATH, "allowed")
+        if s == ["sale", "publish"]:
+            doc = self._ZYRA_PAYLOAD_V2(is_json)
+            pid = self._req(doc, "producer_id")
+            row = self._ZYRA_COM_D(
+                "apps.agro.modules.comercializacion.venta_simple.simple_sale_service",
+                "publish_sale_db",
+            )(
+                type(self).store._db,
+                producer_id=pid,
+                product=self._req(doc, "product"),
+                quantity=float(doc.get("quantity") or 0),
+                unit=str(doc.get("unit") or "quintal"),
+                currency=str(doc.get("currency") or "USD"),
+            )
+            self._send(201, {"ok": True, "data": row})
+            return
+        if s == ["sale", "offer"]:
+            doc = self._ZYRA_PAYLOAD_V2(is_json)
+            row = self._ZYRA_COM_D(
+                "apps.agro.modules.comercializacion.venta_simple.simple_sale_service",
+                "place_offer_db",
+            )(
+                type(self).store._db,
+                sale_id=self._req(doc, "sale_id"),
+                buyer=self._req(doc, "buyer"),
+                amount=float(doc.get("amount") or 0),
+                currency=str(doc.get("currency") or "USD"),
+            )
+            self._send(201, {"ok": True, "data": row})
+            return
+        if s == ["sale", "accept"]:
+            doc = self._ZYRA_PAYLOAD_V2(is_json)
+            row = self._ZYRA_COM_D(
+                "apps.agro.modules.comercializacion.venta_simple.simple_sale_service",
+                "accept_offer_db",
+            )(
+                type(self).store._db,
+                offer_id=self._req(doc, "offer_id"),
+                actor=_ZV6_ACTOR,
+            )
+            self._send(200, {"ok": True, "data": row})
+            return
+        if s == ["sale", "pay"]:
+            doc = self._ZYRA_PAYLOAD_V2(is_json)
+            row = self._ZYRA_COM_D(
+                "apps.agro.modules.comercializacion.venta_simple.simple_sale_service",
+                "pay_sale_db",
+            )(
+                type(self).store._db,
+                sale_id=self._req(doc, "sale_id"),
+                actor=_ZV6_ACTOR,
+            )
+            self._send(200, {"ok": True, "data": row})
+            return
+        if s == ["sale", "deliver"]:
+            doc = self._ZYRA_PAYLOAD_V2(is_json)
+            row = self._ZYRA_COM_D(
+                "apps.agro.modules.comercializacion.venta_simple.simple_sale_service",
+                "deliver_sale_db",
+            )(
+                type(self).store._db,
+                sale_id=self._req(doc, "sale_id"),
+                actor=_ZV6_ACTOR,
+            )
+            self._send(200, {"ok": True, "data": row})
+            return
+        if s == ["sale", "close"]:
+            doc = self._ZYRA_PAYLOAD_V2(is_json)
+            row = self._ZYRA_COM_D(
+                "apps.agro.modules.comercializacion.venta_simple.simple_sale_service",
+                "close_sale_db",
+            )(
+                type(self).store._db,
+                sale_id=self._req(doc, "sale_id"),
+                actor=_ZV6_ACTOR,
+            )
+            self._send(200, {"ok": True, "data": row})
+            return
+        if s == ["inventory", "add"]:
+            doc = self._ZYRA_PAYLOAD_V2(is_json)
+            pid = self._req(doc, "producer_id")
+            row = self._ZYRA_COM_D(
+                "apps.agro.modules.comercializacion.venta_simple.simple_sale_service",
+                "inventory_add_db",
+            )(
+                type(self).store._db,
+                producer_id=pid,
+                product=self._req(doc, "product"),
+                quantity=float(doc.get("quantity") or 0),
+                unit=str(doc.get("unit") or "quintal"),
+            )
+            self._send(201, {"ok": True, "data": row})
+            return
+        if s == ["export"]:
+            doc = self._ZYRA_PAYLOAD_V2(is_json)
+            pid = self._req(doc, "producer_id")
+            row = self._ZYRA_COM_D(
+                "apps.agro.modules.comercializacion.exportacion.export_service",
+                "create_export_db",
+            )(
+                type(self).store._db,
+                producer_id=pid,
+                product=self._req(doc, "product"),
+                destination=self._req(doc, "destination"),
+                quantity=float(doc.get("quantity") or 0),
+            )
+            self._send(201, {"ok": True, "data": row})
+            return
+        if s == ["shipment"]:
+            doc = self._ZYRA_PAYLOAD_V2(is_json)
+            row = self._ZYRA_COM_D(
+                "apps.agro.modules.comercializacion.logistica.logistics_adapter",
+                "create_shipment_db",
+            )(
+                type(self).store._db,
+                sale_id=self._req(doc, "sale_id"),
+                origin=self._req(doc, "origin"),
+                destination=self._req(doc, "destination"),
+                cargo=self._req(doc, "cargo"),
+            )
+            self._send(201, {"ok": True, "data": row})
+            return
+        if s == ["shipment", "update"]:
+            doc = self._ZYRA_PAYLOAD_V2(is_json)
+            row = self._ZYRA_COM_D(
+                "apps.agro.modules.comercializacion.logistica.logistics_adapter",
+                "mark_shipment_db",
+            )(
+                type(self).store._db,
+                shipment_id=self._req(doc, "shipment_id"),
+                status=self._req(doc, "status"),
+            )
+            self._send(200, {"ok": True, "data": row})
+            return
+        if s == ["market", "price"]:
+            doc = self._ZYRA_PAYLOAD_V2(is_json)
+            row = self._ZYRA_COM_D(
+                "apps.agro.modules.comercializacion.mercado.market_service",
+                "add_price_db",
+            )(
+                type(self).store._db,
+                product=self._req(doc, "product"),
+                price=float(doc.get("price") or 0),
+                actor=_ZV6_ACTOR,
+            )
+            self._send(201, {"ok": True, "data": row})
+            return
         if s == ["perfil"]:
             doc = self._ZYRA_PAYLOAD_V2(is_json)
             pid = self._req(doc, "producer_id")

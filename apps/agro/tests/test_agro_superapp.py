@@ -523,3 +523,269 @@ def test_plus_plans_stages_incidents_timeline(
         base + "/agro/production/report"
     )
     assert body["data"]["total_records"] >= 1
+
+
+# ====== RUN D: GPT-3 comercializacion ======
+
+
+def test_commerce_full_cycle(tmp_path: Path) -> None:
+    dead = NetworkClient(
+        "http://127.0.0.1:1",
+        timeout_seconds=1.0,
+        max_retries=0,
+    )
+    srv = serve_agro(
+        AgroStore(
+            SQLiteAdapter(":memory:"), FrozenClock()
+        ),
+        dead,
+    )
+    threading.Thread(
+        target=srv.serve_forever, daemon=True
+    ).start()
+    time.sleep(0.4)
+    base = f"http://127.0.0.1:{srv.bound_port}"
+    pid = _register(base, "Gustavo Vende")
+
+    st, body = _pj(
+        base + "/agro/inventory/add",
+        {
+            "producer_id": pid,
+            "product": "cafe",
+            "quantity": 100,
+            "unit": "quintal",
+        },
+    )
+    assert st == 201, str(body)
+
+    st, body = _pj(
+        base + "/agro/sale/publish",
+        {
+            "producer_id": pid,
+            "product": "cafe",
+            "quantity": 50,
+            "unit": "quintal",
+            "currency": "USD",
+        },
+    )
+    assert st == 201, str(body)
+    sale_id = body["data"]["sale_id"]
+    assert body["data"]["status"] == "listed"
+    assert body["data"]["remaining"] == 50.0
+
+    st, body = _pj(
+        base + "/agro/sale/publish",
+        {
+            "producer_id": pid,
+            "product": "cafe",
+            "quantity": -5,
+        },
+    )
+    assert st == 400, "cantidad negativa 400"
+
+    st, body = _pj(
+        base + "/agro/sale/offer",
+        {
+            "sale_id": sale_id,
+            "buyer": "Exportador X",
+            "amount": 180,
+            "currency": "USD",
+        },
+    )
+    assert st == 201, str(body)
+    offer_id = body["data"]["offer_id"]
+
+    st, body = _pj(
+        base + "/agro/sale/offer",
+        {
+            "sale_id": sale_id,
+            "buyer": "Y",
+            "amount": 100,
+            "currency": "GTQ",
+        },
+    )
+    assert st == 400, "moneda distinta 400"
+
+    st, body = _pj(
+        base + "/agro/sale/offer",
+        {
+            "sale_id": sale_id,
+            "buyer": "Z",
+            "amount": -3,
+        },
+    )
+    assert st == 400, "oferta negativa 400"
+
+    st, body = _pj(
+        base + "/agro/sale/accept",
+        {"offer_id": offer_id},
+    )
+    assert st == 200, str(body)
+    assert body["data"]["total"] == 9000.0
+
+    st, body = _pj(
+        base + "/agro/sale/pay",
+        {"sale_id": sale_id},
+    )
+    assert st == 200, str(body)
+    assert body["data"]["status"] == "paid"
+    assert body["data"]["total"] == 9000.0
+
+    st, body = _pj(
+        base + "/agro/sale/close",
+        {"sale_id": sale_id},
+    )
+    assert st == 400, "cierre sin entrega 400"
+
+    st, body = _pj(
+        base + "/agro/sale/deliver",
+        {"sale_id": sale_id},
+    )
+    assert st == 200, str(body)
+    assert body["data"]["status"] == "delivered"
+
+    st, body = _pj(
+        base + "/agro/sale/close",
+        {"sale_id": sale_id},
+    )
+    assert st == 200, str(body)
+    assert body["data"]["status"] == "closed"
+    assert (
+        body["data"]["inventory_deducted"][
+            "quantity"
+        ]
+        == 50.0
+    )
+
+    st, body = _gjp(
+        base + "/agro/inventory/" + pid
+    )
+    inv = body["data"]["inventory"]
+    assert len(inv) == 1
+    assert inv[0]["quantity"] == 50.0
+
+    st, body = _gjp(
+        base + "/agro/results/" + pid
+    )
+    d = body["data"]
+    assert d["sales_count"] == 1, str(d)
+    assert d["total"] == 9000.0, str(d)
+
+    st, body = _pj(
+        base + "/agro/sale/pay",
+        {"sale_id": sale_id},
+    )
+    assert st == 400, "re-pago 400"
+
+    st, body = _pj(
+        base + "/agro/sale/offer",
+        {
+            "sale_id": sale_id,
+            "buyer": "Tarde",
+            "amount": 10,
+        },
+    )
+    assert st == 400, "oferta sobre cerrada 400"
+
+
+def test_commerce_market_exports_shipments(
+    tmp_path: Path,
+) -> None:
+    dead = NetworkClient(
+        "http://127.0.0.1:1",
+        timeout_seconds=1.0,
+        max_retries=0,
+    )
+    srv = serve_agro(
+        AgroStore(
+            SQLiteAdapter(":memory:"), FrozenClock()
+        ),
+        dead,
+    )
+    threading.Thread(
+        target=srv.serve_forever, daemon=True
+    ).start()
+    time.sleep(0.4)
+    base = f"http://127.0.0.1:{srv.bound_port}"
+    pid = _register(base, "Hilda Exporta")
+
+    for p_ in (10, 12, 14):
+        st, body = _pj(
+            base + "/agro/market/price",
+            {
+                "product": "cafe",
+                "price": p_,
+            },
+        )
+        assert st == 201, str(body)
+
+    st, body = _gjp(
+        base + "/agro/market/price/cafe"
+    )
+    d = body["data"]
+    assert d["minimum"] == 10.0
+    assert d["maximum"] == 14.0
+    assert d["average"] == 12.0
+
+    st, body = _gjp(
+        base + "/agro/market/price/oregano"
+    )
+    assert st == 400, "sin precios 400"
+
+    st, body = _pj(
+        base + "/agro/export",
+        {
+            "producer_id": pid,
+            "product": "cafe",
+            "destination": "Belgica",
+            "quantity": 30,
+        },
+    )
+    assert st == 201, str(body)
+    assert body["data"]["status"] == "planned"
+    st, body = _gjp(
+        base + "/agro/exports/" + pid
+    )
+    assert len(body["data"]["exports"]) == 1
+
+    st, body = _pj(
+        base + "/agro/sale/publish",
+        {
+            "producer_id": pid,
+            "product": "cafe",
+            "quantity": 20,
+            "currency": "USD",
+        },
+    )
+    sale_id = body["data"]["sale_id"]
+    st, body = _pj(
+        base + "/agro/shipment",
+        {
+            "sale_id": sale_id,
+            "origin": "Finca",
+            "destination": "Puerto",
+            "cargo": "20 qq cafe",
+        },
+    )
+    assert st == 201, str(body)
+    assert body["data"]["engine"] == (
+        "zyra_network.logistics"
+    )
+    shipment_id = body["data"]["shipment_id"]
+
+    st, body = _pj(
+        base + "/agro/shipment/update",
+        {
+            "shipment_id": shipment_id,
+            "status": "volando",
+        },
+    )
+    assert st == 400, "estado invalido 400"
+    st, body = _pj(
+        base + "/agro/shipment/update",
+        {
+            "shipment_id": shipment_id,
+            "status": "in_transit",
+        },
+    )
+    assert st == 200, str(body)

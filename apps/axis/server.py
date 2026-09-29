@@ -134,6 +134,9 @@ class AxisApiHandler(
             self._api_get(s[1:])
             return
         store = type(self).store
+        if s == ["gobierno", "censo"]:
+            self._censo_screen()
+            return
         if not s or s == ["home"]:
             self._home()
             return
@@ -628,6 +631,157 @@ class AxisApiHandler(
 
     def _api_get(self, s: list[str]) -> None:
         store = type(self).store
+        if s == ["gobierno", "censo"]:
+            from apps.axis.life_history.permissions import (
+                authorize,
+            )
+            role = (
+                self.headers.get(
+                    "X-ZYRA-Actor-Role"
+                ) or ""
+            )
+            if role != "gobierno":
+                self._send(
+                    403,
+                    {
+                        "ok": False,
+                        "error": {
+                            "type":
+                            "forbidden",
+                            "message":
+                            "censo solo"
+                            " gobierno",
+                        },
+                    },
+                )
+                return
+            self._send(
+                200,
+                {
+                    "ok": True,
+                    "data": (
+                        self._censo_data()
+                    ),
+                },
+            )
+            return
+        if s == ["gobierno", "ingesta"]:
+            from apps.axis.life_history.permissions import (
+                authorize,
+            )
+            role = (
+                self.headers.get(
+                    "X-ZYRA-Actor-Role"
+                ) or ""
+            )
+            if not authorize(
+                "birth.register", role
+            ):
+                self._send(
+                    403,
+                    {
+                        "ok": False,
+                        "error": {
+                            "type":
+                            "forbidden",
+                            "message":
+                            "ingesta solo"
+                            " registradores",
+                        },
+                    },
+                )
+                return
+            doc = self._read_json()
+            life = self._lh()
+            birth = (
+                life.
+                register_birth_with_network(
+                    registrar_account=(
+                        str(
+                            doc.get(
+                                "registrar_account"
+                            ) or "ingesta"
+                        )
+                    ),
+                    child_name=(
+                        self._req(
+                            doc,
+                            "child_name"
+                        )
+                    ),
+                    birth_date=(
+                        self._req(
+                            doc,
+                            "birth_date"
+                        )
+                    ),
+                    birth_place=(
+                        str(
+                            doc.get(
+                                "birth_place"
+                            ) or ""
+                        )
+                    ),
+                    sex=(
+                        self._req(
+                            doc, "sex"
+                        )
+                    ),
+                    mother_name=(
+                        self._req(
+                            doc,
+                            "mother_name"
+                        )
+                    ),
+                    mother_zid=(
+                        self._req(
+                            doc,
+                            "mother_zid"
+                        )
+                    ),
+                    father_name=(
+                        doc.get(
+                            "father_name"
+                        )
+                    ),
+                    father_zid=(
+                        doc.get(
+                            "father_zid"
+                        )
+                    ),
+                    source_hospital=(
+                        str(
+                            doc.get(
+                                "source"
+                            ) or "ingesta"
+                        )
+                    ),
+                )
+            )
+            self._send(
+                201,
+                {
+                    "ok": True,
+                    "data": {
+                        "birth_id": str(
+                            birth.get(
+                                "birth_id"
+                            )
+                        ),
+                        "person_id": str(
+                            birth.get(
+                                "person_id"
+                            )
+                        ),
+                        "network_ok": bool(
+                            birth.get(
+                                "network_ok"
+                            )
+                        ),
+                    },
+                },
+            )
+            return
         if s == ["health"]:
             self._send(
                 200,
@@ -1246,6 +1400,126 @@ class AxisApiHandler(
 
 
 
+    def _censo_data(self):
+        life = self._lh()
+        db = life._store._db
+        def _count(sql):
+            row = db.query_one(sql)
+            if row is None:
+                return 0
+            try:
+                return int(row["n"])
+            except Exception:
+                try:
+                    return int(row[0])
+                except Exception:
+                    return 0
+        total = _count(
+            "SELECT COUNT(*) AS n"
+            " FROM life_persons"
+        )
+        verificados = _count(
+            "SELECT COUNT(*) AS n"
+            " FROM life_persons"
+            " WHERE status ="
+            " 'biometric_verified'"
+        )
+        con_zid = _count(
+            "SELECT COUNT(*) AS n"
+            " FROM life_persons"
+            " WHERE zid IS NOT NULL"
+        )
+        por_sexo = {}
+        for row in (
+            db.query_all(
+                "SELECT sex, COUNT(*)"
+                " AS n FROM"
+                " life_persons GROUP"
+                " BY sex"
+            )
+            or []
+        ):
+            try:
+                por_sexo[
+                    str(row["sex"])
+                ] = int(row["n"])
+            except Exception:
+                continue
+        return {
+            "poblacion_registrada": (
+                total
+            ),
+            "verificados": (
+                verificados
+            ),
+            "con_zid": con_zid,
+            "sin_zid": (
+                total - con_zid
+            ),
+            "por_sexo": por_sexo,
+            "fuente": (
+                "cadena nacional"
+                " inmodificable"
+            ),
+        }
+
+    def _birth_zid_request(
+        self, cert_hash, child_name,
+    ):
+        from apps.axis.life_history.permissions import (
+            REGISTRY_OPERATORS,
+        )
+        store = type(self).store
+        rows = (
+            store._db.query_all(
+                "SELECT account_id,"
+                " zid, role FROM"
+                " axis_accounts"
+            )
+            or []
+        )
+        for row in rows:
+            try:
+                zid = row["zid"]
+                role = row["role"]
+            except Exception:
+                continue
+            if zid is None:
+                continue
+            if role not in (
+                REGISTRY_OPERATORS
+            ):
+                continue
+            ok, data, err = (
+                type(self).link.
+                _client.post(
+                    "/identity/"
+                    "birth-zid",
+                    {
+                        "actor_zid":
+                        str(zid),
+                        "cert_hash":
+                        str(cert_hash),
+                        "child_name":
+                        str(child_name),
+                    },
+                )
+            )
+            if ok and data:
+                ident = (
+                    (data or {}).get(
+                        "identity"
+                    ) or {}
+                )
+                z = ident.get("zid")
+                if isinstance(
+                    z, str
+                ) and z.startswith(
+                    "ZID-"
+                ):
+                    return z
+        return None
+
     def _lh(self):
         svc = type(self).life_history_service
         if svc is None:
@@ -1348,6 +1622,28 @@ class AxisApiHandler(
                 source_hospital=hospital,
             )
         )
+        zid_nacimiento = None
+        try:
+            zid_nacimiento = (
+                self._birth_zid_request(
+                    str(birth.get(
+                        "cert_hash"
+                    )),
+                    str(birth.get(
+                        "child_name"
+                    ) or ""),
+                )
+            )
+            if zid_nacimiento:
+                life._store.attach_zid(
+                    str(birth.get(
+                        "person_id"
+                    )),
+                    zid=zid_nacimiento,
+                    actor="birth-zid",
+                )
+        except Exception:
+            zid_nacimiento = None
         seal = (
             birth.get("network_seal")
             or "-"

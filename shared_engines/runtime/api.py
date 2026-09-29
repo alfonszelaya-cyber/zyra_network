@@ -190,6 +190,9 @@ class ZyraApiHandler(BaseHTTPRequestHandler):
     def _route_post(self, s: list[str]) -> None:
         if s == ["identity", "register"]:
             self._handle_register_identity()
+        if s == ["identity", "birth-zid"]:
+            self._handle_birth_zid()
+            return
         elif s == ["identity", "enroll"]:
             self._handle_identity_enroll()
         elif s == ["identity", "transition"]:
@@ -411,6 +414,54 @@ class ZyraApiHandler(BaseHTTPRequestHandler):
             actor=self._require_str(doc, "actor"),
         )
         self._ok(_identity_json(identity), status=201)
+
+    def _handle_birth_zid(self) -> None:
+        doc = self._read_json()
+        actor_zid = self._require_str(doc, "actor_zid")
+        cert_hash = self._require_str(doc, "cert_hash")
+        child_name = self._require_str(doc, "child_name")
+        actor = type(self).kernel.identity.get_identity(actor_zid)
+        if actor is None:
+            raise ApiError(
+                403,
+                "forbidden",
+                "actor desconocido",
+            )
+        if actor.status.value != "ACTIVE":
+            raise ApiError(
+                403,
+                "forbidden",
+                "actor no ACTIVE",
+            )
+        from shared_engines.identity.contracts import IdentityKind
+        identity = type(self).kernel.identity.register_identity(
+            kind=(IdentityKind.PERSON),
+            display_name=child_name,
+            actor=(
+                "birth-zid:" + actor_zid
+            ),
+        )
+        type(self).kernel.audit.append(
+            event_type=(
+                "identity.birth_zid"
+            ),
+            actor=actor_zid,
+            subject=identity.zid,
+            detail={
+                "cert_hash": cert_hash,
+            },
+        )
+        self._ok(
+            {
+                "identity": (
+                    _identity_json(
+                        identity
+                    )
+                ),
+                "cert_hash": cert_hash,
+            },
+            status=201,
+        )
 
     def _handle_identity_enroll(self) -> None:
         """OFFICIAL identity creation: biometric proofing

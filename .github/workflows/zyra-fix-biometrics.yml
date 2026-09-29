@@ -1,18 +1,24 @@
-name: "AGRO SCAN TOTAL: clasificacion de cada archivo vivo/importado/duplicado/vacio (solo lectura)"
+name: "AGRO LIMPIEZA TOTAL: escaneo corregido + borrar todo lo no esencial + GATE"
 
 on:
   workflow_dispatch:
   push:
 
 permissions:
-  contents: read
+  contents: write
+
+concurrency:
+  group: agro-complete
+  cancel-in-progress: true
 
 jobs:
-  scan:
+  build:
     runs-on: ubuntu-latest
     steps:
       - name: Checkout
         uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
 
       - name: Setup Python 3.11
         uses: actions/setup-python@v5
@@ -25,302 +31,233 @@ jobs:
           pip install -r requirements.txt
           pip install pytest
 
-      - name: "Paso 1 - ESCAN TOTAL: cada archivo clasificado + duplicados exactos + candidatos a borrar"
+      - name: "Paso 1 - escaneo CORREGIDO (imports dinamicos incluidos) + reporte antes de borrar"
         run: |
           python3 - <<'SCANEOF'
-          import hashlib
+          import json
           import re
-          from collections import defaultdict
           from pathlib import Path
 
-          OUT = "agro_scan_total.txt"
-          rep = open(OUT, "w", encoding="utf-8")
-
-          def log(s):
-              print(s)
-              rep.write(s + "\n")
-              rep.flush()
-
           app = Path("apps/agro")
-
-          # 1) recolectar todos los .py
           archivos = {}
           for p in sorted(app.rglob("*.py")):
               if "__pycache__" in p.parts:
                   continue
-              t = p.read_text(
+              archivos[p] = p.read_text(
                   encoding="utf-8", errors="ignore")
-              archivos[p] = t
-
-          log("total archivos .py: " + str(len(archivos)))
-
-          # 2) contenido (para detectar codigo real vs vacio)
-          con_codigo = {
-              p: t for p, t in archivos.items()
-              if t.strip()
-          }
-          vacios = {
-              p for p, t in archivos.items()
-              if not t.strip()
-          }
-
-          # 3) grafo de imports (quien importa a quien)
-          def resolve_rel(src, ndots, modpath):
-              d = src.parent
-              for _ in range(ndots - 1):
-                  d = d.parent
-              target = d
-              if modpath:
-                  target = d / modpath.replace(".", "/")
-              for c in (target.with_suffix(".py"),
-                        target / "__init__.py"):
-                  if c.exists():
-                      return c
-              return None
 
           def resolve_abs(mod):
-              base = Path(
-                  mod.replace(".", "/"))
+              base = Path(mod.replace(".", "/"))
               for c in (base.with_suffix(".py"),
                         base / "__init__.py"):
                   if c.exists():
                       return c
               return None
 
-          importado_por = defaultdict(set)
+          # grafos: imports estaticos + DINAMICOS
+          # (cualquier string "apps.agro.x.y" en
+          # cualquier archivo se resuelve como
+          # import potencial - cubre _ZYRA_FN_V6,
+          # _ZYRA_COM_D, helpers de server, etc.)
+          deps = {}
           for src, t in archivos.items():
+              s = set()
               for m in re.finditer(
-                  r'^\s*from\s+((?:\.)+)([\w\.]*)\s+import\s+(.+)$',
+                  r'^\s*from\s+((?:\.)+)([\w\.]*)\s+import',
                   t, re.M):
                   ndots = len(m.group(1))
+                  d = src.parent
+                  for _ in range(ndots - 1):
+                      d = d.parent
                   mod = m.group(2)
-                  cands = []
                   if mod:
-                      cands.append(
-                          resolve_rel(src, ndots, mod))
-                  for nm in [
-                      x.strip().split(" as ")[0].strip()
-                      for x in m.group(3).split(",")]:
-                      cands.append(resolve_rel(
-                          src, ndots,
-                          (mod + "." + nm)
-                          if mod else nm))
-                  for c in cands:
-                      if c and c != src:
-                          importado_por[c].add(src)
+                      c = resolve_abs_rel(d, mod) if False else None
+                      target = d / mod.replace(".", "/")
+                      for c2 in (
+                          target.with_suffix(".py"),
+                          target / "__init__.py"):
+                          if c2.exists():
+                              s.add(c2)
+                  continue
               for m in re.finditer(
-                  r'^\s*from\s+(apps\.agro[\w\.]*)\s+import\s+(.+)$',
-                  t, re.M):
-                  mod = m.group(1)
-                  cands = [resolve_abs(mod)]
-                  for nm in [
-                      x.strip().split(" as ")[0].strip()
-                      for x in m.group(2).split(",")]:
-                      cands.append(
-                          resolve_abs(mod + "." + nm))
-                  for c in cands:
-                      if c and c != src:
-                          importado_por[c].add(src)
-              for m in re.finditer(
-                  r'__import__\(\s*"(apps\.agro[\w\.]*)"',
+                  r'"(apps\.agro[\w\.]*)"',
                   t):
                   c = resolve_abs(m.group(1))
                   if c and c != src:
-                      importado_por[c].add(src)
+                      s.add(c)
+              for m in re.finditer(
+                  r'^\s*from\s+(apps\.agro[\w\.]*)\s+import',
+                  t, re.M):
+                  c = resolve_abs(m.group(1))
+                  if c and c != src:
+                      s.add(c)
               for m in re.finditer(
                   r'^\s*import\s+(apps\.agro[\w\.]*)',
                   t, re.M):
                   c = resolve_abs(m.group(1))
                   if c and c != src:
-                      importado_por[c].add(src)
+                      s.add(c)
+              deps[src] = s
 
-          # 4) alcanzables desde server.py
-          def alcanzables():
-              seen = set()
-              work = [app / "server.py"]
-              while work:
-                  f = work.pop(0)
-                  if f in seen or f not in archivos:
-                      continue
-                  seen.add(f)
-                  for src in list(seen):
-                      pass
-                  for imp in importado_por.get(f, set()):
-                      work.append(imp)
-                  # caminar hacia adelante: quienes
-                  # este archivo importa
-                  t = archivos[f]
-                  for m in re.finditer(
-                      r'^\s*from\s+((?:\.)+)([\w\.]*)\s+import\s+(.+)$',
-                      t, re.M):
-                      ndots = len(m.group(1))
-                      mod = m.group(2)
-                      cands = []
-                      if mod:
-                          c = resolve_rel(f, ndots, mod)
-                          if c:
-                              cands.append(c)
-                      for nm in [
-                          x.strip().split(" as ")[0].strip()
-                          for x in m.group(3).split(",")]:
-                          c2 = resolve_rel(
-                              f, ndots,
-                              (mod + "." + nm)
-                              if mod else nm)
-                          if c2:
-                              cands.append(c2)
-                      for c in cands:
-                          if c:
-                              work.append(c)
-                  for m in re.finditer(
-                      r'^\s*from\s+(apps\.agro[\w\.]*)\s+import',
-                      t, re.M):
-                      c = resolve_abs(m.group(1))
-                      if c:
-                          work.append(c)
-                  for m in re.finditer(
-                      r'__import__\(\s*"(apps\.agro[\w\.]*)"',
-                      t):
-                      c = resolve_abs(m.group(1))
-                      if c:
-                          work.append(c)
-                  for m in re.finditer(
-                      r'^\s*import\s+(apps\.agro[\w\.]*)',
-                      t, re.M):
-                      c = resolve_abs(m.group(1))
-                      if c:
-                          work.append(c)
-              return seen
+          def resolve_abs_rel(d, mod):
+              return None
 
-          vivos = alcanzables()
-
-          # 5) duplicados exactos por hash
-          por_hash = defaultdict(list)
-          for p, t in con_codigo.items():
-              h = hashlib.sha256(
-                  t.encode()).hexdigest()
-              por_hash[h].append(p)
-          dup_exactos = {
-              h: ps for h, ps in por_hash.items()
-              if len(ps) > 1
-          }
-
-          # 6) nombres duplicados (mismo basename con codigo)
-          por_nombre = defaultdict(list)
-          for p in con_codigo:
-              por_nombre[p.name].append(p)
-          dups_nombre = {
-              n: ps for n, ps in por_nombre.items()
-              if len(ps) > 1
-          }
-
-          # 7) carpetas paralelas (directorios solo-__init__)
-          carpetas_huerfanas = []
-          for sub in sorted(app.rglob("*")):
-              if not sub.is_dir() or "__pycache__" in sub.parts:
-                  continue
-              pys = list(sub.iterdir())
-              pys = [p for p in pys if p.suffix == ".py"]
-              if not pys:
-                  continue
-              if all(
-                  p.name == "__init__.py"
-                  and not p.read_text(
-                      encoding="utf-8",
-                      errors="ignore").strip()
-                  for p in pys
-              ):
-                  # paralela a otra con codigo?
-                  hermano = None
-                  for otro in con_codigo:
-                      if otro.parent == sub.parent and (
-                          otro.parent.name == sub.parent.name
-                      ):
-                          pass
-                  carpetas_huerfanas.append(sub)
-
-          log("======== ESCAN TOTAL AGRO ========")
-          log("archivos .py: " + str(len(archivos)))
-          log("  con codigo : " + str(len(con_codigo)))
-          log("  vacios (__init__) : "
-              + str(len(vacios)))
-          log("  VIVOS desde server: "
-              + str(len(vivos & set(con_codigo))))
-          log("  importados (usados por otro): "
-              + str(len([
-                  p for p in con_codigo
-                  if p in importado_por
-                  and p not in vivos])))
-          log("")
-
-          log("======== DUPLICADOS EXACTOS (contenido identico) ========")
-          if not dup_exactos:
-              log("  NINGUNO")
-          for h, ps in dup_exactos.items():
-              log("  HASH " + h[:10] + ":")
-              for p in ps:
-                  log("      " + str(p.relative_to(app)))
-
-          log("")
-          log("======== NOMBRES DUPLICADOS (mismo nombre, distinto contenido) ========")
-          for n in sorted(dups_nombre):
-              log("  " + n + " x"
-                  + str(len(dups_nombre[n]))
-                  + ":")
-              for p in sorted(dups_nombre[n]):
-                  marca = "VIVO" if p in vivos else (
-                      "importado"
-                      if p in importado_por
-                      else "sin-uso")
-                  log("      ["
-                      + marca + "] "
-                      + str(p.relative_to(app)))
-
-          log("")
-          log("======== CARPETAS SOLO-__init__ (paralelas) ========")
-          for c in carpetas_huerfanas:
-              log("  " + str(c.relative_to(app)))
-
-          log("")
-          log("======== CANDIDATOS A ELIMINAR (con codigo, sin uso, no vivos, no importados, sin tests que los usen) ========")
-          tests = {
-              p for p in con_codigo
+          # closures desde server.py y desde cada test
+          roots = [app / "server.py"]
+          roots += [
+              p for p in archivos
               if "tests" in p.parts
-          }
-          candidatos = []
-          for p in con_codigo:
-              if p in vivos or p in importado_por:
+              and p.name.startswith("test_")
+          ]
+          keep = set()
+          work = list(roots)
+          while work:
+              f = work.pop(0)
+              if f in keep or f not in archivos:
                   continue
-              if p in tests:
-                  continue
-              # main.py raiz de app: huérfano conocido
-              candidatos.append(p)
-          for p in sorted(candidatos):
-              log("  " + str(p.relative_to(app)))
+              keep.add(f)
+              for d in deps.get(f, set()):
+                  work.append(d)
 
-          log("")
-          log("======== ARCHIVOS VACIOS (solo __init__) ========")
-          log("total: " + str(len(vacios))
-              + " (estructura de la arquitectura,"
-              " se conservan como scaffold)")
-          rep.close()
+          # __init__.py de carpetas con archivos keep
+          for p in list(keep):
+              d = p.parent
+              while d != app.parent:
+                  ini = d / "__init__.py"
+                  if ini.exists() and ini in archivos:
+                      keep.add(ini)
+                  if d == app:
+                      break
+                  d = d.parent
+
+          borrar = [
+              p for p in archivos if p not in keep
+          ]
+          reporte = {
+              "total": len(archivos),
+              "keep": sorted(
+                  str(p.relative_to(app))
+                  for p in keep),
+              "borrar": sorted(
+                  str(p.relative_to(app))
+                  for p in borrar),
+          }
+          Path("limpieza_reporte.json").write_text(
+              json.dumps(reporte, indent=1),
+              encoding="utf-8")
+          print("KEEP:", len(keep))
+          print("BORRAR:", len(borrar))
+          print("--- KEEP ---")
+          for k in reporte["keep"]:
+              print("  " + k)
+          print("--- BORRAR (primeros 80) ---")
+          for k in reporte["borrar"][:80]:
+              print("  " + k)
           SCANEOF
 
-      - name: "Paso 2 - veredicto por categoria + artifact"
-        uses: actions/upload-artifact@v4
-        with:
-          name: agro-scan-total
-          path: agro_scan_total.txt
-          if-no-files-found: warn
-
-      - name: "Resumen"
+      - name: "Paso 2 - BORRAR todo lo no esencial + carpetas vacias resultantes"
         run: |
-          echo "=============================================="
-          echo " ESCAN TOTAL AGRO (solo lectura)"
-          echo " Revisa el log y el artifact:"
-          echo "  - DUPLICADOS EXACTOS (contenido identico)"
-          echo "  - NOMBRES duplicados con marca VIVO/importado/sin-uso"
-          echo "  - Carpetas solo-__init__ paralelas"
-          echo "  - CANDIDATOS a eliminar (con codigo, sin uso)"
-          echo " Con ese reporte decidimos que se borra."
-          echo "=============================================="
+          python3 - <<'DELEOF'
+          import json
+          import shutil
+          from pathlib import Path
+
+          rep = json.loads(
+              Path("limpieza_reporte.json")
+              .read_text(encoding="utf-8"))
+          app = Path("apps/agro")
+          keep = {
+              app / k for k in rep["keep"]
+          }
+          borrar = [
+              app / k for k in rep["borrar"]
+          ]
+
+          n = 0
+          for p in borrar:
+              if p.exists():
+                  p.unlink()
+                  n += 1
+          print("archivos .py borrados:", n)
+
+          # carpetas vacias tras el borrado
+          carpetas = 0
+          for d in sorted(
+              app.rglob("*"), reverse=True
+          ):
+              if not d.is_dir() or "__pycache__" in d.parts:
+                  continue
+              resto = [
+                  x for x in d.iterdir()
+                  if x.name != "__pycache__"
+              ]
+              if not resto:
+                  shutil.rmtree(d)
+                  carpetas += 1
+          for pc in app.rglob("__pycache__"):
+              shutil.rmtree(pc, ignore_errors=True)
+          print("carpetas vacias eliminadas:", carpetas)
+
+          # verificacion dura
+          for k in keep:
+              assert k.exists(), "KEEP perdido: " + str(k)
+          restantes = len(list(app.rglob("*.py")))
+          print("archivos .py restantes en AGRO:",
+                restantes)
+          DELEOF
+
+      - name: "Paso 3 - server compila e importa (interprete fresco)"
+        run: |
+          python3 -c "
+          import apps.agro.server as s
+          assert hasattr(s, 'serve_agro')
+          print('OK server importa tras limpieza')
+          from apps.agro.services.zyra_link import ZyraLink, emit_event_db
+          from apps.agro.security.operation_matrix import OperationMatrix, OPERATIONS
+          assert 'network.emit' in OPERATIONS
+          from apps.agro.infrastructure.persistence.agro_store import run_agro_migrations
+          from apps.agro.constants.business.constants import TEXTOS
+          from apps.agro.shared.utils import render_page
+          print('OK todos los simbolos consolidados vivos')
+          "
+
+      - name: "Paso 4 - GATE: 4 apps completas (la prueba final de que la limpieza no rompio nada)"
+        run: |
+          python3 -m pytest apps/agro/tests apps/subastas/tests apps/mi_primer_empleo/tests apps/semilla/tests -q --tb=short
+
+      - name: "Paso 5 - inventario final"
+        run: |
+          python3 -c "
+          from pathlib import Path
+          app = Path('apps/agro')
+          pys = [p for p in app.rglob('*.py') if '__pycache__' not in p.parts]
+          con_codigo = [p for p in pys if p.read_text(encoding='utf-8', errors='ignore').strip()]
+          print('ARQUITECTURA LIMPIA AGRO:')
+          print('  archivos .py totales:', len(pys))
+          print('  con codigo:', len(con_codigo))
+          print('  vacios (__init__):', len(pys) - len(con_codigo))
+          dirs = set(p.parent for p in pys)
+          print('  carpetas:', len(dirs))
+          "
+
+      - name: Commit and push (solo si verde)
+        run: |
+          git config user.name "zyra-pilot-bot"
+          git config user.email "actions@github.com"
+          git add -A
+          if git diff --cached --quiet; then
+            echo "No changes."
+          else
+            git commit -m "AGRO LIMPIEZA TOTAL: solo lo esencial" -m "Escaneo corregido con imports dinamicos (strings apps.agro.* en server). KEEP = server + transitivos + tests + __init__ de sus paquetes. BORRADO: todo .py sin uso, carpetas que quedaron vacias (incluye executive paralela, routers, registry sin uso, configs sin uso, scaffolds). Verificacion: server importa fresco, simbolos consolidados presentes, GATE 4 apps verde. Nada se pierde: git history conserva todo."
+          fi
+          git pull --rebase --autostash origin main || true
+          for i in 1 2 3; do
+            if git push origin main; then
+              echo "PUSH OK"
+              exit 0
+            fi
+            git pull --rebase --autostash origin main || true
+            sleep 3
+          done
+          echo "PUSH FAILED"
+          exit 1

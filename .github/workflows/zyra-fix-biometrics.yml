@@ -1,37 +1,516 @@
-name: "AXIS: dump de serve_axis actual (solo lectura)"
+name: "AXIS SYNC FINAL: reemplazo exacto de serve_axis + rutas + guardia + tests"
 
 on:
   workflow_dispatch:
   push:
 
 permissions:
-  contents: read
+  contents: write
+
+concurrency:
+  group: axis-work
+  cancel-in-progress: true
 
 jobs:
-  dump:
+  build:
     runs-on: ubuntu-latest
     steps:
       - name: Checkout
         uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
 
-      - name: Dump de la region serve_axis
+      - name: Setup Python 3.11
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install dependencies
         run: |
-          python3 - <<'DMPEOF'
+          python3 -m pip install --upgrade pip
+          pip install -r requirements.txt
+          pip install pytest
+
+      - name: "Paso 1 - reemplazo EXACTO de serve_axis (el bloque real que me mostraste)"
+        run: |
+          python3 - <<'SWEOF'
+          import ast
           from pathlib import Path
           p = Path("apps/axis/server.py")
           t = p.read_text(encoding="utf-8")
-          idx = t.find("def serve_axis(")
-          print("def serve_axis encontrado en posicion:", idx)
-          if idx < 0:
-              print("NO EXISTE def serve_axis en el archivo")
+
+          VIEJO = (
+              "def serve_axis(\n"
+              "    store: AxisStore,\n"
+              "    client: NetworkClient,\n"
+              "    *,\n"
+              "    host: str = \"127.0.0.1\",\n"
+              "    port: int = 0,\n"
+              "    life_history_service=None,\n"
+              ") -> AxisServer:\n"
+              "    AxisApiHandler.store = store\n"
+              "    AxisApiHandler.link = AxisLink(client)\n"
+              "    AxisApiHandler.life_history_service = life_history_service\n"
+              "    return AxisServer((host, port))\n"
+          )
+          NUEVO = (
+              "def serve_axis(\n"
+              "    store: AxisStore,\n"
+              "    client: NetworkClient,\n"
+              "    *,\n"
+              "    host: str = \"127.0.0.1\",\n"
+              "    port: int = 0,\n"
+              "    life_history_service=None,\n"
+              "    verify_service=None,\n"
+              ") -> AxisServer:\n"
+              "    if life_history_service is None:\n"
+              "        from apps.axis.life_history.integration import build_life_history\n"
+              "        life_history_service = build_life_history(\n"
+              "            db=store._db,\n"
+              "            clock=store._clock,\n"
+              "            network_client=client,\n"
+              "        )\n"
+              "    AxisApiHandler.store = store\n"
+              "    AxisApiHandler.link = AxisLink(client)\n"
+              "    AxisApiHandler.life_history_service = life_history_service\n"
+              "    AxisApiHandler.verify_service = verify_service\n"
+              "    return AxisServer((host, port))\n"
+          )
+
+          if NUEVO in t:
+              print("SKIP: serve_axis ya actualizado")
           else:
-              fin = t.find("class AxisServer", idx)
-              if fin < 0:
-                  fin = len(t)
-              bloque = t[idx:fin]
-              lines = bloque.splitlines()
-              print("=== serve_axis actual ("
-                    + str(len(lines)) + " lineas) ===")
-              for i, l in enumerate(lines, 1):
-                  print(f"{i:3d}| {l}")
-          DMPEOF
+              count = t.count(VIEJO)
+              assert count == 1, (
+                  "bloque serve_axis hallado "
+                  + str(count) + " veces (esperaba 1)")
+              t = t.replace(VIEJO, NUEVO, 1)
+              ast.parse(t)
+              p.write_text(t, encoding="utf-8")
+              assert NUEVO in p.read_text(encoding="utf-8")
+              print("OK serve_axis reemplazado"
+                    " (exacto + AST valido)")
+          SWEOF
+
+      - name: "Paso 2 - verificacion con interprete FRESCO (simula arranque real)"
+        run: |
+          python3 -c "
+          from shared_engines.storage.database import SQLiteAdapter
+          from shared_engines.common.clocks import SystemClock
+          from apps.axis.infrastructure.persistence.axis_store import AxisStore
+          from apps.axis.infrastructure.network.network_client import NetworkClient
+          from apps.axis.server import serve_axis, AxisApiHandler
+          store = AxisStore(SQLiteAdapter(':memory:'), SystemClock())
+          client = NetworkClient('http://127.0.0.1:1', timeout_seconds=1.0, max_retries=0)
+          srv = serve_axis(store, client)
+          assert hasattr(AxisApiHandler, 'life_history_service')
+          assert AxisApiHandler.life_history_service is not None, 'auto-wire no asigno life_history'
+          print('OK: serve_axis funciona con auto-wire real (life_history asignado)')
+          "
+
+      - name: "Paso 3 - rutas audit/verify + verify generate/redeem"
+        run: |
+          python3 - <<'RTEOF'
+          import ast
+          from pathlib import Path
+          p = Path("apps/axis/server.py")
+          t = p.read_text(encoding="utf-8")
+          if '"audit", "verify"' not in t:
+              ancla = '        if s == ["health"]:\n'
+              assert ancla in t, "ancla health"
+              GET = (
+                  '        if s == ["audit", "verify"]:\n'
+                  "            life = type(self).life_history_service\n"
+                  "            if life is None:\n"
+                  '                self._send(503, {"ok": False, "error": {"type": "not_wired"}})\n'
+                  "                return\n"
+                  "            ok_b, count = life._store.births_chain_verify()\n"
+                  '            self._send(200, {"ok": True, "data": {"births_chain": {"ok": ok_b, "checked": count}}})\n'
+                  "            return\n"
+                  "        if len(s) == 3 and s[0] == \"audit\" and s[1] == \"verify\":\n"
+                  "            life = type(self).life_history_service\n"
+                  "            if life is None:\n"
+                  '                self._send(503, {"ok": False, "error": {"type": "not_wired"}})\n'
+                  "                return\n"
+                  "            pid = s[2]\n"
+                  '            self._send(200, {"ok": True, "data": {"person_id": pid, "events_chain_ok": life._store.events_verify(pid), "events": len(life._store.events_of(pid))}})\n'
+                  "            return\n"
+              )
+              t = t.replace(ancla, GET + ancla, 1)
+              print("OK rutas GET audit")
+          if '"verify", "generate"' not in t:
+              ancla = '        if s == ["emergencies"]:\n'
+              assert ancla in t, "ancla emergencies"
+              POST = (
+                  '        if s == ["verify", "generate"]:\n'
+                  "            svc = type(self).verify_service\n"
+                  "            if svc is None:\n"
+                  '                self._send(503, {"ok": False, "error": {"type": "not_wired"}})\n'
+                  "                return\n"
+                  "            from apps.axis.life_history.public_verify import NotAuthorizedError\n"
+                  "            try:\n"
+                  "                code = svc.generate_code(\n"
+                  "                    subject_zid=self._req(doc, \"subject_zid\"),\n"
+                  "                    operator_account=self._req(doc, \"operator_account\"),\n"
+                  "                    operator_role=self._req(doc, \"operator_role\"),\n"
+                  "                )\n"
+                  "            except NotAuthorizedError as exc:\n"
+                  '                self._send(403, {"ok": False, "error": {"type": "forbidden", "message": str(exc)}})\n'
+                  "                return\n"
+                  '            self._send(201, {"ok": True, "data": code})\n'
+                  "            return\n"
+                  '        if s == ["verify", "redeem"]:\n'
+                  "            svc = type(self).verify_service\n"
+                  "            if svc is None:\n"
+                  '                self._send(503, {"ok": False, "error": {"type": "not_wired"}})\n'
+                  "                return\n"
+                  "            from apps.axis.life_history.public_verify import (\n"
+                  "                NotAuthorizedError, CodeNotFoundError,\n"
+                  "                CodeAlreadyUsedError, CodeExpiredError)\n"
+                  "            try:\n"
+                  "                cert = svc.redeem_code(\n"
+                  "                    code=self._req(doc, \"code\"),\n"
+                  "                    requester=self._req(doc, \"requester\"),\n"
+                  "                    requester_role=self._req(doc, \"requester_role\"),\n"
+                  "                )\n"
+                  "            except NotAuthorizedError as exc:\n"
+                  '                self._send(403, {"ok": False, "error": {"type": "forbidden", "message": str(exc)}})\n'
+                  "                return\n"
+                  "            except CodeNotFoundError as exc:\n"
+                  '                self._send(404, {"ok": False, "error": {"type": "not_found", "message": str(exc)}})\n'
+                  "                return\n"
+                  "            except CodeAlreadyUsedError as exc:\n"
+                  '                self._send(409, {"ok": False, "error": {"type": "already_used", "message": str(exc)}})\n'
+                  "                return\n"
+                  "            except CodeExpiredError as exc:\n"
+                  '                self._send(410, {"ok": False, "error": {"type": "expired", "message": str(exc)}})\n'
+                  "                return\n"
+                  '            self._send(200, {"ok": True, "data": cert})\n'
+                  "            return\n"
+              )
+              t = t.replace(ancla, POST + ancla, 1)
+              print("OK rutas POST verify")
+          ast.parse(t)
+          p.write_text(t, encoding="utf-8")
+          final = p.read_text(encoding="utf-8")
+          for req in ('"audit", "verify"', '"verify", "generate"', '"verify", "redeem"'):
+              assert req in final, req
+          print("OK rutas (AST valido)")
+          RTEOF
+
+      - name: "Paso 4 - guardia DENTRO de birth-register"
+        run: |
+          python3 - <<'GDGEOF'
+          import ast
+          from pathlib import Path
+          p = Path("apps/axis/server.py")
+          t = p.read_text(encoding="utf-8")
+          if "_zax_auth" in t:
+              print("SKIP guardia")
+              raise SystemExit(0)
+          ancla = '        if s == ["birth-register"]:\n'
+          assert ancla in t, "ancla"
+          GUARD = (
+              "        from apps.axis.life_history.access_control import authorize as _zax_auth\n"
+              "        _zax_role = (self.headers.get(\"X-ZYRA-Actor-Role\") or \"\").strip()\n"
+              "        if not _zax_role:\n"
+              "            _zax_reg = str(doc.get(\"registrar_account\") or \"\")\n"
+              "            if _zax_reg:\n"
+              "                try:\n"
+              "                    _zax_role = str(type(self).store.get_account(_zax_reg).get(\"role\"))\n"
+              "                except LookupError:\n"
+              "                    _zax_role = \"\"\n"
+              "        try:\n"
+              "            _zax_ok = _zax_auth(\"birth.register\", _zax_role)\n"
+              "        except ValueError:\n"
+              "            _zax_ok = False\n"
+              "        if not _zax_ok:\n"
+              "            self._html(403, _page(\"AXIS - Rechazado\", \"<h1>Sin autorizacion</h1><p>Solo registradores civiles (rol: \" + (_zax_role or \"ninguno\") + \").</p><a href='/axis'><button>Volver</button></a>\"))\n"
+              "            return\n"
+          )
+          t = t.replace(ancla, ancla + GUARD, 1)
+          ast.parse(t)
+          p.write_text(t, encoding="utf-8")
+          i = t.find(ancla)
+          assert i < t.find("_zax_auth", i) < t.find("_birth_register(", i)
+          print("OK guardia dentro de birth-register")
+          GDGEOF
+
+      - name: "Paso 5 - tests AX (imports locales, rol gobierno en header)"
+        run: |
+          python3 - <<'TSEOF'
+          import ast
+          import textwrap
+          from pathlib import Path
+
+          p = Path("apps/axis/tests/test_axis.py")
+          t = p.read_text(encoding="utf-8")
+          if "test_axz_" in t:
+              print("SKIP tests")
+              raise SystemExit(0)
+
+          EXTRA = textwrap.dedent('''\
+
+
+              # ====== AX-1/2/3 ======
+
+
+              def _axz_seed(name):
+                  import base64 as _b64
+                  return _b64.b64encode(("axis-bio-" + name).encode()).decode("ascii")
+
+
+              def _axz_boot(with_verify=False, net_base=None):
+                  import threading
+                  import time as _time
+                  from apps.axis.infrastructure.persistence.axis_store import AxisStore
+                  from apps.axis.infrastructure.network.network_client import NetworkClient
+                  from apps.axis.server import serve_axis
+                  from apps.axis.life_history.integration import build_life_history
+                  from shared_engines.storage.database import SQLiteAdapter
+                  from shared_engines.common.clocks import SystemClock
+                  db = SQLiteAdapter(":memory:")
+                  store = AxisStore(db, SystemClock())
+                  if net_base:
+                      client = NetworkClient(net_base, max_retries=1)
+                  else:
+                      client = NetworkClient("http://127.0.0.1:1", timeout_seconds=1.0, max_retries=0)
+                  life = build_life_history(db=db, clock=SystemClock(), network_client=client)
+                  verify = None
+                  if with_verify:
+                      from apps.axis.life_history.public_verify import PublicVerifyService
+                      verify = PublicVerifyService(life=life, network_db=SQLiteAdapter(":memory:"), master_key_hex="ab" * 32)
+                  srv = serve_axis(store, client, life_history_service=life, verify_service=verify)
+                  threading.Thread(target=srv.serve_forever, daemon=True).start()
+                  _time.sleep(0.4)
+                  return store, life, client, ("http://127.0.0.1:" + str(srv.bound_port))
+
+
+              def _axz_form(url, form, role="gobierno"):
+                  import urllib.error
+                  import urllib.parse
+                  import urllib.request
+                  headers = {}
+                  if role:
+                      headers["X-ZYRA-Actor-Role"] = role
+                  req = urllib.request.Request(url, data=urllib.parse.urlencode(form).encode(), method="POST", headers=headers)
+                  try:
+                      with urllib.request.urlopen(req, timeout=10) as r:
+                          return r.status, r.read().decode()
+                  except urllib.error.HTTPError as e:
+                      return e.code, e.read().decode("utf-8", "replace")
+
+
+              def _axz_json(method, url, doc=None, role="gobierno"):
+                  import json as _json
+                  import urllib.error
+                  import urllib.request
+                  headers = {"Content-Type": "application/json"}
+                  if role:
+                      headers["X-ZYRA-Actor-Role"] = role
+                  data = _json.dumps(doc).encode() if doc is not None else None
+                  req = urllib.request.Request(url, data=data, method=method, headers=headers)
+                  try:
+                      with urllib.request.urlopen(req, timeout=10) as r:
+                          return r.status, _json.loads(r.read().decode())
+                  except urllib.error.HTTPError as e:
+                      try:
+                          return e.code, _json.loads(e.read().decode())
+                      except Exception:
+                          return e.code, {}
+
+
+              def test_axz_law_blocks_register_person():
+                  from apps.axis.services.axis_link import AxisLink
+                  from apps.axis.infrastructure.network.network_client import NetworkClient
+                  link = AxisLink(NetworkClient("http://127.0.0.1:1"))
+                  try:
+                      link.register_person("X")
+                  except ValueError as exc:
+                      assert "biometria" in str(exc)
+                      return
+                  raise AssertionError("ley no aplicada")
+
+
+              def test_axz_birth_requires_registrar():
+                  store, life, _c, base = _axz_boot()
+                  st, body = _axz_form(
+                      base + "/axis/birth-register",
+                      {"registrar_account": "AX-fantasma",
+                       "child_name": "X", "birth_date": "2025-01-01",
+                       "birth_place": "SS", "sex": "F",
+                       "mother_name": "M", "mother_zid": "ZID-fake"},
+                      role=None)
+                  assert st == 403, body[:200]
+
+
+              def test_axz_full_government_flow(tmp_path=None):
+                  import base64 as _b64
+                  import re as _re
+                  import threading
+                  import time as _time
+                  from apps.axis.infrastructure.persistence.axis_store import AxisStore
+                  from apps.axis.infrastructure.network.network_client import NetworkClient
+                  from apps.axis.server import serve_axis
+                  from apps.axis.life_history.integration import build_life_history
+                  from apps.axis.services.axis_link import AxisLink
+                  from shared_engines.storage.database import SQLiteAdapter
+                  from shared_engines.common.clocks import FrozenClock, SystemClock
+                  from shared_engines.runtime.config import RuntimeConfig
+                  from shared_engines.runtime.kernel import ZyraKernel
+                  from shared_engines.runtime.capabilities import ZyraCapabilities
+                  from shared_engines.runtime.combined_api import serve_combined
+                  from shared_engines.verification.signatures import Ed25519Signer
+                  from shared_engines.security.biometrics import (
+                      BiometricsEngine, BiometricsPolicy,
+                      DeterministicTestProvider, TemplateCipher)
+                  net_db = SQLiteAdapter(":memory:")
+                  signer, _ = Ed25519Signer.generate()
+                  kernel = ZyraKernel(db=net_db, clock=FrozenClock(), signer=signer,
+                      config=RuntimeConfig(host="127.0.0.1", port=0, api_token=None))
+                  kernel.bootstrap_root()
+                  kernel._biometrics = BiometricsEngine(
+                      db=net_db, clock=FrozenClock(), audit=kernel.audit,
+                      provider=DeterministicTestProvider(),
+                      cipher=TemplateCipher(master_key_hex="ab" * 32),
+                      policy=BiometricsPolicy(require_liveness=False,
+                          doc_reject=0.01, doc_review=0.02,
+                          doc_auto=0.03, dup_reject=0.98))
+                  caps = ZyraCapabilities(net_db, FrozenClock(),
+                      identity=kernel.identity, signer=signer)
+                  net_srv = serve_combined(kernel, caps, host="127.0.0.1", port=0)
+                  threading.Thread(target=net_srv.serve_forever, daemon=True).start()
+                  _time.sleep(0.4)
+                  net_base = "http://127.0.0.1:" + str(net_srv.server_address[1])
+                  client = NetworkClient(net_base, max_retries=1)
+                  assert AxisLink(client).register_app()[0] is True
+                  seed_m = _b64.b64encode(b"axis-bio-madre-gov").decode("ascii")
+                  ok_m, data_m, err_m = client.post("/identity/enroll",
+                      {"kind": "person", "display_name": "Madre Gov",
+                       "actor": "axis", "doc_image_b64": seed_m,
+                       "selfie_image_b64": seed_m})
+                  assert ok_m, str(err_m)
+                  zid_madre = ((data_m or {}).get("identity") or {}).get("zid")
+                  assert isinstance(zid_madre, str) and zid_madre.startswith("ZID-")
+                  ok_t, _td, err_t = client.post("/identity/transition",
+                      {"zid": zid_madre, "to_status": "ACTIVE",
+                       "actor": "axis", "reason": "onboarding"})
+                  assert ok_t, str(err_t)
+                  store = AxisStore(SQLiteAdapter(":memory:"), SystemClock())
+                  life = build_life_history(db=store._db, clock=SystemClock(), network_client=client)
+                  srv = serve_axis(store, client, life_history_service=life)
+                  threading.Thread(target=srv.serve_forever, daemon=True).start()
+                  _time.sleep(0.4)
+                  base = "http://127.0.0.1:" + str(srv.bound_port)
+                  st, html = _axz_form(base + "/axis/birth-register",
+                      {"registrar_account": "AX-gob-x",
+                       "child_name": "Bebe Censo",
+                       "birth_date": "2025-09-01",
+                       "birth_place": "SS", "sex": "F",
+                       "mother_name": "Madre Gov",
+                       "mother_zid": zid_madre})
+                  assert st == 200, html[:800]
+                  baby = life._store._db.query_one(
+                      "SELECT person_id, zid FROM life_persons"
+                      " WHERE full_name = 'Bebe Censo'")
+                  assert baby is not None and baby["zid"], (
+                      "bebe debe nacer con ZID automatico")
+                  st, body = _axz_json("GET", base + "/axis/api/audit/verify")
+                  assert st == 200 and body["data"]["births_chain"]["ok"]
+                  st, body = _axz_json("GET",
+                      base + "/axis/api/gobierno/censo", role="gobierno")
+                  assert st == 200, str(body)
+                  d = body["data"]
+                  assert d["poblacion_registrada"] >= 1
+                  assert d["con_zid"] >= 1
+                  st, body = _axz_json("GET",
+                      base + "/axis/api/gobierno/censo", role=None)
+                  assert st == 403, "censo 403"
+                  st, body = _axz_json("POST",
+                      base + "/axis/api/gobierno/ingesta",
+                      {"registrar_account": "AX-gob-x",
+                       "child_name": "Bebe Ingesta",
+                       "birth_date": "2025-09-02",
+                       "birth_place": "SS", "sex": "M",
+                       "mother_name": "Madre Gov",
+                       "mother_zid": zid_madre,
+                       "source": "ministerio-salud"})
+                  assert st == 201, str(body)
+                  st, body = _axz_json("GET",
+                      base + "/axis/api/gobierno/censo", role="gobierno")
+                  assert body["data"]["poblacion_registrada"] >= 2
+                  st, body = _axz_json("POST",
+                      base + "/axis/api/verify/generate",
+                      {"subject_zid": zid_madre,
+                       "operator_account": "AX-gob-x",
+                       "operator_role": "paciente"}, role=None)
+                  assert st == 403, str(body)
+                  st, body = _axz_json("POST",
+                      base + "/axis/api/verify/generate",
+                      {"subject_zid": zid_madre,
+                       "operator_account": "AX-gob-x",
+                       "operator_role": "gobierno"})
+                  assert st == 201, str(body)
+                  code = body["data"]["code"]
+                  st, body = _axz_json("POST",
+                      base + "/axis/api/verify/redeem",
+                      {"code": code, "requester": "Empleador X",
+                       "requester_role": "empleador"}, role=None)
+                  assert st == 200, str(body)
+                  assert body["data"]["finding"] == "SIN_REGISTROS_REPORTADOS"
+                  st, body = _axz_json("POST",
+                      base + "/axis/api/verify/redeem",
+                      {"code": code, "requester": "Otro",
+                       "requester_role": "empleador"}, role=None)
+                  assert st == 409, "re-uso 409"
+          ''')
+          t = t.rstrip("\n") + "\n" + EXTRA
+          ast.parse(t)
+          p.write_text(t, encoding="utf-8")
+          final = p.read_text(encoding="utf-8")
+          for req in ("test_axz_law_blocks_register_person",
+                      "test_axz_full_government_flow"):
+              assert req in final, "falta " + req
+          print("OK tests (AST valido)")
+          TSEOF
+
+      - name: "Paso 6 - verificacion interprete FRESCO (arranca server real)"
+        run: |
+          python3 -c "
+          from shared_engines.storage.database import SQLiteAdapter
+          from shared_engines.common.clocks import SystemClock
+          from apps.axis.infrastructure.persistence.axis_store import AxisStore
+          from apps.axis.infrastructure.network.network_client import NetworkClient
+          from apps.axis.server import serve_axis, AxisApiHandler
+          store = AxisStore(SQLiteAdapter(':memory:'), SystemClock())
+          client = NetworkClient('http://127.0.0.1:1', timeout_seconds=1.0, max_retries=0)
+          srv = serve_axis(store, client)
+          assert AxisApiHandler.life_history_service is not None, 'auto-wire fallo'
+          print('OK FRESCO: serve_axis arranca con auto-wire real')
+          "
+
+      - name: "Paso 7 - GATE: 4 apps completas"
+        run: |
+          python3 -m pytest apps/axis/tests apps/axis/life_history/tests apps/subastas/tests apps/semilla/tests -q --tb=short
+
+      - name: Commit and push (solo si verde)
+        run: |
+          git config user.name "zyra-pilot-bot"
+          git config user.email "actions@github.com"
+          git add -A
+          if git diff --cached --quiet; then
+            echo "No changes."
+          else
+            git commit -m "AXIS SYNC FINAL: reemplazo exacto de serve_axis" -m "El bloque serve_axis real fue dumpeado y reemplazado EXACTO (12 lineas conocidas -> version con verify_service + auto-wire). Verificacion con interprete fresco que ARRANCA el server real (serve_axis asigna life_history automaticamente). Rutas audit/verify + verify publico + guardia birth-register + tests con rol gobierno. Todo AST-validado antes de escribir."
+          fi
+          git pull --rebase --autostash origin main || true
+          for i in 1 2 3; do
+            if git push origin main; then
+              echo "PUSH OK"
+              exit 0
+            fi
+            git pull --rebase --autostash origin main || true
+            sleep 3
+          done
+          echo "PUSH FAILED"
+          exit 1

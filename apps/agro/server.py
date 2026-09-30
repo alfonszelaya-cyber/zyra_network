@@ -477,7 +477,7 @@ class AgroApiHandler(
             rep = national_report(type(self).store)
             self._send(200, {"ok": True, "data": rep})
             return
-        if len(s) == 2 and s[0] == "sales":
+        if len(s) == 2 and s[0] == "sales" and s[1] != "all":
             rows = self._ZYRA_COM_D(
                 "apps.agro.modules.comercializacion.venta_simple.simple_sale_service",
                 "sales_of_db",

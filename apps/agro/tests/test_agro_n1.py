@@ -353,3 +353,42 @@ def test_menu_silicon_valley_rule(
         assert len(actions) <= 2
     finally:
         eco.close()
+
+
+# ====== AX-6.3 patron: apagar servidores tras cada test ======
+
+
+import pytest
+
+
+@pytest.fixture(autouse=True)
+def _axz_kill_servers():
+    yield
+    import threading as _th
+    for _t in list(_th.enumerate()):
+        _tgt = getattr(
+            _t, "_target", None)
+        if _tgt is None:
+            continue
+        _srv = getattr(
+            _tgt, "__self__", None)
+        if _srv is None:
+            continue
+        _cls = type(_srv).__name__
+        if ("Server" not in _cls
+                and "HTTP" not in _cls):
+            continue
+        if not (hasattr(
+                _srv, "shutdown")
+                and hasattr(
+                _srv, "server_close")):
+            continue
+        try:
+            _srv.shutdown()
+            _srv.server_close()
+        except Exception:
+            pass
+        try:
+            _t.join(timeout=3)
+        except Exception:
+            pass

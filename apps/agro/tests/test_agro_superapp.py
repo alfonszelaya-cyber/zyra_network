@@ -1615,9 +1615,10 @@ def test_load_basic_throughput(
     st, body = _gjp(
         base + "/agro/sales/all"
     )
+    assert body.get("ok"), (
+        str(body)[:200])
     http_n = len(
-        body["data"]["sales"]
-    ) if body.get("ok") else -1
+        body["data"]["sales"])
     print(
         "CARGA: 30 registros en",
         round(duracion_reg, 2), "s |",
@@ -1628,5 +1629,48 @@ def test_load_basic_throughput(
         "(si difiere de 15: backlog"
         " routing sales/all)",
     )
+    assert http_n == 15, (
+        "sales/all devolvio "
+        + str(http_n)
+        + " != 15")
     assert duracion_reg < 60
     assert duracion_ventas < 60
+
+
+# ====== AX-6.3 patron: apagar servidores tras cada test ======
+
+
+import pytest
+
+
+@pytest.fixture(autouse=True)
+def _axz_kill_servers():
+    yield
+    import threading as _th
+    for _t in list(_th.enumerate()):
+        _tgt = getattr(
+            _t, "_target", None)
+        if _tgt is None:
+            continue
+        _srv = getattr(
+            _tgt, "__self__", None)
+        if _srv is None:
+            continue
+        _cls = type(_srv).__name__
+        if ("Server" not in _cls
+                and "HTTP" not in _cls):
+            continue
+        if not (hasattr(
+                _srv, "shutdown")
+                and hasattr(
+                _srv, "server_close")):
+            continue
+        try:
+            _srv.shutdown()
+            _srv.server_close()
+        except Exception:
+            pass
+        try:
+            _t.join(timeout=3)
+        except Exception:
+            pass

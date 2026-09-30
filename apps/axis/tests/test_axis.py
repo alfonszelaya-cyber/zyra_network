@@ -233,7 +233,7 @@ def test_screens_served(
         db.close()
 
 
-# ====== AX-1/2/3 ======
+# ====== AX-1/2/3 (DIAG) ======
 
 
 def _axz_step(label):
@@ -248,7 +248,7 @@ def _axz_warn(label, st, body):
           + " " + str(body), flush=True)
 
 
-def _axz_boot(with_verify=False, net_base=None):
+def _axz_boot(net_base=None):
     import threading
     import time as _time
     from apps.axis.infrastructure.persistence.axis_store import AxisStore
@@ -264,10 +264,7 @@ def _axz_boot(with_verify=False, net_base=None):
     else:
         client = NetworkClient("http://127.0.0.1:1", timeout_seconds=1.0, max_retries=0)
     life = build_life_history(db=db, clock=SystemClock(), network_client=client)
-    verify = None
-    if with_verify:
-        verify = _axz_make_verify(life)
-    srv = serve_axis(store, client, life_history_service=life, verify_service=verify)
+    srv = serve_axis(store, client, life_history_service=life)
     threading.Thread(target=srv.serve_forever, daemon=True).start()
     _time.sleep(0.4)
     return store, life, client, ("http://127.0.0.1:" + str(srv.bound_port))
@@ -309,6 +306,7 @@ def _axz_form(url, form, role="gobierno", timeout=30):
 
 def _axz_json(method, url, doc=None, role="gobierno", timeout=30):
     import json as _json
+    import re as _re
     import urllib.error
     import urllib.request
     headers = {"Content-Type": "application/json"}
@@ -321,9 +319,14 @@ def _axz_json(method, url, doc=None, role="gobierno", timeout=30):
         try:
             return _json.loads(crudo)
         except Exception:
-            return {"_raw": crudo[:200]
-                    + " ...TAIL... "
-                    + crudo[-1200:]}
+            m = _re.search(
+                r"<p>(.*?)</p>",
+                crudo, _re.S)
+            msg = (m.group(1).strip()
+                   if m else "")
+            return {"_err": msg
+                    or "(sin <p> en body)",
+                    "_head": crudo[:100]}
 
     try:
         with urllib.request.urlopen(req, timeout=timeout) as r:
@@ -445,7 +448,7 @@ def test_axz_full_government_flow(tmp_path=None):
     st, body = _axz_json("GET",
         base + "/axis/api/gobierno/censo", role=None)
     assert st == 403, "censo 403"
-    _axz_step("6 ingesta (diagnostico, no bloquea)")
+    _axz_step("6 ingesta (diagnostico)")
     st, body = _axz_json("POST",
         base + "/axis/api/gobierno/ingesta",
         {"registrar_account": "AX-gob-x",

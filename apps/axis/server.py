@@ -97,6 +97,8 @@ class AxisApiHandler(
                 ),
             )
         except Exception as exc:
+            import traceback as _zax_tb
+            _zax_tb.print_exc()
             self._html(
                 500,
                 _page(

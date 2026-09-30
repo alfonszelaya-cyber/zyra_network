@@ -1,18 +1,18 @@
-name: "AGRO audit paso 2: verificar /agro/sales/all en vivo (SOLO LECTURA - decide cierre del backlog #2)"
+name: "AGRO: fix sales/all (sombra de rutas) + guardia dura en test + limpieza hilos sobrantes"
 
 on:
   workflow_dispatch:
   push:
 
 permissions:
-  contents: read
+  contents: write
 
 concurrency:
-  group: agro-audit
+  group: agro-work
   cancel-in-progress: true
 
 jobs:
-  audit:
+  build:
     runs-on: ubuntu-latest
     steps:
       - name: Checkout
@@ -31,50 +31,216 @@ jobs:
           pip install -r requirements.txt
           pip install pytest
 
-      - name: "1. Dump: implementacion exacta de la ruta sales/all (server.py 470-510) + sales_of_db"
+      - name: "Paso A - FIX server.py: /sales/all no debe ser eclipsada por la ruta generica /sales/<id>"
         run: |
-          python3 - <<'D1EOF'
+          python3 - <<'FIXEOF'
+          import ast
           from pathlib import Path
-          lines = Path(
-              "apps/agro/server.py"
-          ).read_text(encoding="utf-8").splitlines()
-          print("=== server.py 470-510 (ruta sales/all exacta) ===")
-          for n in range(469, min(510, len(lines))):
-              print(str(n + 1).rjust(5)
-                    + ": " + lines[n])
-          print()
-          f = Path(
-              "apps/agro/modules/comercializacion/"
-              "venta_simple/simple_sale_service.py")
-          if f.exists():
-              lines = f.read_text(
-                  encoding="utf-8").splitlines()
-              ini = None
-              for i, l in enumerate(lines):
-                  if "def sales_of_db" in l:
-                      ini = i
-                      break
-              if ini is not None:
-                  print("=== sales_of_db (desde "
-                        + str(ini + 1) + ") ===")
-                  for n in range(ini,
-                                 min(ini + 30,
-                                     len(lines))):
-                      print(str(n + 1).rjust(5)
-                            + ": " + lines[n])
-          D1EOF
+          p = Path("apps/agro/server.py")
+          t = p.read_text(encoding="utf-8")
+          if 's[0] == "sales" and s[1] != "all"' in t:
+              print("SKIP (fix ya presente)")
+              raise SystemExit(0)
+          VIEJO = (
+              '        if len(s) == 2 and '
+              's[0] == "sales":\n'
+          )
+          NUEVO = (
+              '        if len(s) == 2 and '
+              's[0] == "sales" and '
+              's[1] != "all":\n'
+          )
+          cnt = t.count(VIEJO)
+          assert cnt == 1, (
+              "ancla hallada " + str(cnt)
+              + " veces (esperaba 1)")
+          t = t.replace(VIEJO, NUEVO, 1)
+          ast.parse(t)
+          p.write_text(t, encoding="utf-8")
+          t2 = p.read_text(encoding="utf-8")
+          assert NUEVO in t2
+          assert 'if s == ["sales", "all"]:' in t2
+          print("OK fix server.py: /sales/all"
+                " ya no eclipsada (AST valido)")
+          FIXEOF
 
-      - name: "2. Test real de carga AGRO (imprime 'ventas via HTTP: N' - EL DATO QUE DECIDE)"
+      - name: "Paso B - test: convertir el aviso en guardia dura (assert 15 ventas via HTTP)"
         run: |
-          python3 -m pytest apps/agro/tests/test_agro_superapp.py -q -s --tb=short 2>&1 | tee /tmp/agro.txt | tail -25
+          python3 - <<'TSEOF'
+          import ast
+          from pathlib import Path
+          p = Path(
+              "apps/agro/tests/test_agro_superapp.py")
+          t = p.read_text(encoding="utf-8")
+          if 'assert http_n == 15' in t:
+              print("SKIP test (assert ya presente)")
+              raise SystemExit(0)
+          VIEJO1 = (
+              '    http_n = len(\n'
+              '        body["data"]["sales"]\n'
+              '    ) if body.get("ok") else -1\n'
+          )
+          NUEVO1 = (
+              '    assert body.get("ok"), (\n'
+              '        str(body)[:200])\n'
+              '    http_n = len(\n'
+              '        body["data"]["sales"])\n'
+          )
+          cnt = t.count(VIEJO1)
+          assert cnt == 1, (
+              "ancla http_n hallada "
+              + str(cnt) + " (esperaba 1)")
+          t = t.replace(VIEJO1, NUEVO1, 1)
+          VIEJO2 = (
+              '        "(si difiere de 15: backlog"\n'
+              '        " routing sales/all)",\n'
+              '    )\n'
+          )
+          NUEVO2 = (
+              '        "(si difiere de 15: backlog"\n'
+              '        " routing sales/all)",\n'
+              '    )\n'
+              '    assert http_n == 15, (\n'
+              '        "sales/all devolvio "\n'
+              '        + str(http_n)\n'
+              '        + " != 15")\n'
+          )
+          cnt = t.count(VIEJO2)
+          assert cnt == 1, (
+              "ancla print hallada "
+              + str(cnt) + " (esperaba 1)")
+          t = t.replace(VIEJO2, NUEVO2, 1)
+          ast.parse(t)
+          p.write_text(t, encoding="utf-8")
+          t2 = p.read_text(encoding="utf-8")
+          assert "assert http_n == 15" in t2
+          print("OK test guardia dura (AST valido)")
+          TSEOF
+
+      - name: "Paso C - limpieza hilos: fixture _axz_kill_servers en cada test AGRO que arranca servidores (patron probado de AXIS)"
+        run: |
+          python3 - <<'CLEOF'
+          import ast
+          import textwrap
+          from pathlib import Path
+          FIXTURE = textwrap.dedent('''\
+
+
+              # ====== AX-6.3 patron: apagar servidores tras cada test ======
+
+
+              import pytest
+
+
+              @pytest.fixture(autouse=True)
+              def _axz_kill_servers():
+                  yield
+                  import threading as _th
+                  for _t in list(_th.enumerate()):
+                      _tgt = getattr(
+                          _t, "_target", None)
+                      if _tgt is None:
+                          continue
+                      _srv = getattr(
+                          _tgt, "__self__", None)
+                      if _srv is None:
+                          continue
+                      _cls = type(_srv).__name__
+                      if ("Server" not in _cls
+                              and "HTTP" not in _cls):
+                          continue
+                      if not (hasattr(
+                              _srv, "shutdown")
+                              and hasattr(
+                              _srv, "server_close")):
+                          continue
+                      try:
+                          _srv.shutdown()
+                          _srv.server_close()
+                      except Exception:
+                          pass
+                      try:
+                          _t.join(timeout=3)
+                      except Exception:
+                          pass
+          ''')
+          tocados = 0
+          for f in sorted(
+              Path("apps/agro/tests").rglob("test_*.py")):
+              t = f.read_text(encoding="utf-8")
+              if "serve_forever" not in t:
+                  continue
+              if "_axz_kill_servers" in t:
+                  print("SKIP " + str(f)
+                        + " (fixture ya presente)")
+                  continue
+              nuevo = t.rstrip("\n") + "\n" + FIXTURE
+              ast.parse(nuevo)
+              f.write_text(nuevo, encoding="utf-8")
+              assert "_axz_kill_servers" in f.read_text(
+                  encoding="utf-8")
+              tocados += 1
+              print("OK fixture agregada a "
+                    + str(f))
+          print("archivos tocados: " + str(tocados))
+          assert tocados >= 1, (
+              "ningun test AGRO arranca servidores?"
+              " inesperado")
+          print("OK limpieza de hilos cableada")
+          CLEOF
+
+      - name: "Paso D - verificacion EN VIVO: 'ventas via HTTP: 15' + hilos en 0"
+        run: |
+          python3 -m pytest apps/agro/tests/test_agro_superapp.py -q -s --tb=short 2>&1 | tee /tmp/agro.txt | tail -12
           echo "=============================="
-          echo "LINEAS CARGA/HTTP DEL TEST:"
           grep -E "CARGA|ventas via HTTP" /tmp/agro.txt || true
+          grep -q "ventas via HTTP:" /tmp/agro.txt
+          N=$(grep -oE "ventas via HTTP: [0-9]+" /tmp/agro.txt | grep -oE "[0-9]+" | head -1)
+          echo "HTTP_N=$N"
+          test "$N" = "15" || { echo "FALLO: sales/all devolvio $N (esperaba 15)"; exit 1; }
+          echo "OK: /agro/sales/all devuelve 15 via HTTP"
+          echo "HILOS:"
+          grep -A 3 "leftover threads" /tmp/agro.txt || echo "(sin reporte de hilos o 0)"
 
-      - name: "3. Resultado del archivo completo de tests AGRO (contexto)"
+      - name: "Paso E - GATE AGRO completo"
         run: |
-          python3 -m pytest apps/agro/tests -q --tb=line 2>&1 | tail -5
+          python3 -m pytest apps/agro/tests -q -s --tb=short 2>&1 | tee /tmp/agro_gate.txt | tail -6
+          echo "HILOS FINALES:"
+          grep -A 5 "leftover threads" /tmp/agro_gate.txt || echo "(0 - sin leftover threads)"
 
-      - name: "Contexto"
+      - name: "Paso F - GATE 4 apps estandar"
         run: |
-          git log --oneline -3
+          python3 -m pytest apps/axis/tests apps/axis/life_history/tests apps/subastas/tests apps/semilla/tests -q --tb=short 2>&1 | tail -4
+
+      - name: "Paso G - SOLO SI FALLO: diagnostico al Resumen"
+        if: failure()
+        run: |
+          {
+            echo "## DIAGNOSTICO AGRO"
+            echo '```'
+            python3 -m pytest apps/agro/tests/test_agro_superapp.py -vv --tb=long 2>&1 | tail -60 || true
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+        shell: bash
+
+      - name: Commit and push (solo si verde)
+        run: |
+          git config user.name "zyra-pilot-bot"
+          git config user.email "actions@github.com"
+          git add -A
+          if git diff --cached --quiet; then
+            echo "No changes."
+          else
+            git commit -m "AGRO: fix sales/all eclipsada por ruta generica + guardia dura + limpieza hilos (fixture AX-6.3)" -m "Pendiente #2 del backlog CERRADO: server.py line 480 'if len(s)==2 and s[0]==sales' atrapaba /sales/all antes de la ruta dedicada (line 490) -> producer_id='all' -> 0 filas ('ventas via HTTP: 0'). FIX: excluir s[1]!='all' en la generica; la dedicada entra. Test de carga: el aviso se convierte en assert duro (http_n==15 + body ok). Limpieza: fixture autouse _axz_kill_servers (patron probado en AXIS) agregada a cada test AGRO que arranca servidores -> los 'leftover threads' deben bajar a 0."
+          fi
+          git pull --rebase --autostash origin main || true
+          for i in 1 2 3; do
+            if git push origin main; then
+              echo "PUSH OK"
+              exit 0
+            fi
+            git pull --rebase --autostash origin main || true
+            sleep 3
+          done
+          echo "PUSH FAILED"
+          exit 1

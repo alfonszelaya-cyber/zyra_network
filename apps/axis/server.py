@@ -696,6 +696,7 @@ class AxisApiHandler(
             raise ValueError(
                 "Content-Length required"
             )
+        self.connection.settimeout(15.0)
         raw = self.rfile.read(
             int(length_header)
         ).decode("utf-8")
@@ -720,6 +721,7 @@ class AxisApiHandler(
             raise ValueError(
                 "Content-Length required"
             )
+        self.connection.settimeout(15.0)
         raw = self.rfile.read(
             int(length_header)
         )

@@ -1,4 +1,4 @@
-name: "RED-1 paso 1: capturar la excepcion real del 500 de /history/{zid} (SOLO LECTURA)"
+name: "RED-1 paso 2: reproducir rama exacta en-proceso + serializacion (SOLO LECTURA)"
 
 on:
   workflow_dispatch:
@@ -31,9 +31,9 @@ jobs:
           pip install -r requirements.txt
           pip install pytest
 
-      - name: "1. reproducir con ZID REAL + capturar la excepcion EN PROCESO (sin HTTP, imposible que se esconda)"
+      - name: "1. En-proceso: timeline(keyword) + dumps del payload de la rama + _ok"
         run: |
-          python3 - <<'REPEOF'
+          python3 - <<'PROEOF'
           import base64, json, threading, time
           import traceback
           import urllib.request
@@ -90,13 +90,13 @@ jobs:
               base + "/identity/enroll",
               data=json.dumps({
                   "kind": "person",
-                  "display_name": "User Hist",
+                  "display_name": "User Red12",
                   "actor": "audit",
                   "doc_image_b64": base64.b64encode(
-                      b"red1-history-user"
+                      b"red12-history-user"
                       ).decode("ascii"),
                   "selfie_image_b64": base64.b64encode(
-                      b"red1-history-user"
+                      b"red12-history-user"
                       ).decode("ascii"),
               }).encode(),
               method="POST",
@@ -104,109 +104,165 @@ jobs:
                   "application/json"})
           with urllib.request.urlopen(
               req, timeout=15) as r:
-              crudo = r.read().decode()
-          print("ENROLL BODY COMPLETO (forma real):")
-          print(crudo[:800])
-          try:
-              body = json.loads(crudo)
-          except Exception:
-              body = {}
-          zid = None
-          for ruta in (
-              body,
-              (body or {}).get("data") or {},
-              ((body or {}).get("data") or {}
-               ).get("identity") or {},
-              (body or {}).get("identity") or {},
-          ):
-              v = (ruta or {}).get("zid")
-              if isinstance(v, str) and v:
-                  zid = v
-                  break
-          print("ZID EXTRAIDO=" + str(zid))
-          assert zid, (
-              "no se pudo extraer zid; ver BODY arriba")
+              body = json.loads(r.read().decode())
+          zid = ((body.get("data") or {}).get(
+              "identity") or {}).get("zid")
+          print("ZID=" + str(zid))
+          assert zid
 
           print()
-          print("### GET HTTP /history/" + zid)
+          print("### A. timeline EN-PROCESO (keyword, como el server)")
+          try:
+              tl = caps.history.timeline(zid=zid)
+              print("timeline OK: " + str(len(list(tl)))
+                    + " entradas (nuevo zid = 0 esperado)")
+          except Exception:
+              print("timeline FALLO:")
+              traceback.print_exc()
+
+          print()
+          print("### B. append un evento (para probar serializacion con contenido)")
+          try:
+              entry = caps.history.append(
+                  zid=zid,
+                  entry_type="network.history.appended",
+                  actor_app="audit",
+                  payload={"prueba": "red1",
+                           "valor": 123})
+              print("append OK: seq="
+                    + str(getattr(entry, "entry_seq",
+                        "?")))
+          except Exception:
+              print("append FALLO:")
+              traceback.print_exc()
+
+          print()
+          print("### C. serializar EXACTO como la rama _route_get")
+          try:
+              tl = caps.history.timeline(zid=zid)
+              replica = [
+                  {
+                      "seq": e.entry_seq,
+                      "type": e.entry_type,
+                      "actor": e.actor_app,
+                      "payload": e.payload,
+                      "hash": e.content_hash,
+                  }
+                  for e in tl
+              ]
+              crudo = json.dumps(replica)
+              print("json.dumps RAMA OK ("
+                    + str(len(crudo)) + " bytes)")
+          except TypeError as te:
+              print("CAUSA CONFIRMADA DEL 500:")
+              print("json.dumps TypeError -> "
+                    + str(te))
+              traceback.print_exc()
+          except Exception as exc:
+              print("CAUSA CONFIRMADA (otro tipo):")
+              traceback.print_exc()
+
+          print()
+          print("### D. que serializa _ok (codigo real)")
+          from shared_engines.runtime import api as _api
+          import inspect
+          src = inspect.getsource(
+              _api.ZyraApiHandler._ok)
+          print(src)
+          PROEOF
+
+      - name: "2. HTTP con el mismo zid para correlacionar (500 vs causa en-proceso)"
+        run: |
+          python3 - <<'HTTPEOF'
+          import base64, json, threading, time
+          import urllib.error, urllib.request
+          from shared_engines.storage.database import (
+              SQLiteAdapter)
+          from shared_engines.common.clocks import (
+              FrozenClock)
+          from shared_engines.runtime.config import (
+              RuntimeConfig)
+          from shared_engines.runtime.kernel import (
+              ZyraKernel)
+          from shared_engines.runtime.capabilities import (
+              ZyraCapabilities)
+          from shared_engines.runtime.combined_api import (
+              serve_combined)
+          from shared_engines.verification.signatures import (
+              Ed25519Signer)
+          from shared_engines.security.biometrics import (
+              BiometricsEngine, BiometricsPolicy,
+              DeterministicTestProvider, TemplateCipher)
+          net_db = SQLiteAdapter(":memory:")
+          signer, _ = Ed25519Signer.generate()
+          kernel = ZyraKernel(
+              db=net_db, clock=FrozenClock(),
+              signer=signer,
+              config=RuntimeConfig(
+                  host="127.0.0.1", port=0,
+                  api_token=None))
+          kernel.bootstrap_root()
+          kernel._biometrics = BiometricsEngine(
+              db=net_db, clock=FrozenClock(),
+              audit=kernel.audit,
+              provider=DeterministicTestProvider(),
+              cipher=TemplateCipher(
+                  master_key_hex="ab" * 32),
+              policy=BiometricsPolicy(
+                  require_liveness=False,
+                  doc_reject=0.01, doc_review=0.02,
+                  doc_auto=0.03, dup_reject=0.98))
+          caps = ZyraCapabilities(
+              net_db, FrozenClock(),
+              identity=kernel.identity,
+              signer=signer)
+          srv = serve_combined(
+              kernel, caps,
+              host="127.0.0.1", port=0)
+          threading.Thread(
+              target=srv.serve_forever,
+              daemon=True).start()
+          time.sleep(0.4)
+          base = ("http://127.0.0.1:"
+              + str(srv.server_address[1]))
+          req = urllib.request.Request(
+              base + "/identity/enroll",
+              data=json.dumps({
+                  "kind": "person",
+                  "display_name": "User HTTP",
+                  "actor": "audit",
+                  "doc_image_b64": base64.b64encode(
+                      b"http-history-user"
+                      ).decode("ascii"),
+                  "selfie_image_b64": base64.b64encode(
+                      b"http-history-user"
+                      ).decode("ascii"),
+              }).encode(),
+              method="POST",
+              headers={"Content-Type":
+                  "application/json"})
+          with urllib.request.urlopen(
+              req, timeout=15) as r:
+              body = json.loads(r.read().decode())
+          zid = ((body.get("data") or {}).get(
+              "identity") or {}).get("zid")
+          print("ZID=" + str(zid))
           try:
               with urllib.request.urlopen(
                   base + "/history/" + zid,
                   timeout=15) as r:
-                  print("STATUS=" + str(r.status))
-                  print("BODY=" + r.read().decode(
-                      "utf-8", "replace")[:400])
+                  print("GET /history -> "
+                        + str(r.status)
+                        + " " + r.read().decode(
+                            "utf-8",
+                            "replace")[:300])
           except urllib.error.HTTPError as e:
-              print("STATUS=" + str(e.code))
-              print("BODY=" + e.read().decode(
-                  "utf-8", "replace")[:400])
-
-          print()
-          print("### LLAMADA EN PROCESO: caps.history.timeline(zid)")
-          try:
-              tl = caps.history.timeline(zid)
-              print("TIMELINE OK: "
-                    + json.dumps(
-                        list(tl)[:3],
-                        default=str)[:400])
-              print("CONCLUSION: con ZID real"
-                    " la funcion NO falla;"
-                    " el 500 es de la ruta"
-                    " (parseo/branch), no del motor")
-          except Exception as exc:
-              print("EXCEPCION REAL CAPTURADA:")
-              traceback.print_exc()
-
-          print()
-          print("### variantes en-proceso con entradas problematicas")
-          for prueba in ("None", "",
-              "ZID-noexiste-123"):
-              try:
-                  caps.history.timeline(prueba)
-                  print("timeline(" + repr(prueba)
-                        + ") -> sin excepcion")
-              except Exception as exc:
-                  print("timeline(" + repr(prueba)
-                        + ") -> "
-                        + type(exc).__name__
-                        + ": " + str(exc)[:150])
-          REPEOF
-
-      - name: "2. codigo real de la rama history (capabilities_api GET + timeline de LifeHistory)"
-        run: |
-          python3 - <<'DMPEOF'
-          from pathlib import Path
-          p = Path(
-              "shared_engines/runtime/capabilities_api.py")
-          lines = p.read_text(
-              encoding="utf-8").splitlines()
-          print("=== capabilities_api.py 180-210 (rama GET history) ===")
-          for n in range(179, min(210, len(lines))):
-              print(str(n + 1).rjust(5) + ": "
-                    + lines[n])
-          print()
-          print("=== capabilities_api.py 340-380 (POST history/append) ===")
-          for n in range(339, min(380, len(lines))):
-              print(str(n + 1).rjust(5) + ": "
-                    + lines[n])
-          q = Path(
-              "shared_engines/network/life_history.py")
-          lines = q.read_text(
-              encoding="utf-8").splitlines()
-          ini = None
-          for i, l in enumerate(lines):
-              if "def timeline" in l:
-                  ini = i
-                  break
-          if ini is not None:
-              print()
-              print("=== life_history.py timeline (desde linea "
-                    + str(ini + 1) + ") ===")
-              for n in range(ini,
-                             min(ini + 35, len(lines))):
-                  print(str(n + 1).rjust(5) + ": "
-                        + lines[n])
-          DMPEOF
+              print("GET /history -> "
+                    + str(e.code)
+                    + " " + e.read().decode(
+                        "utf-8",
+                        "replace")[:300])
+          HTTPEOF
 
       - name: "Contexto"
         run: |

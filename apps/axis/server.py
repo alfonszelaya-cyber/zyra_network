@@ -958,6 +958,57 @@ class AxisApiHandler(
     ) -> None:
         store = type(self).store
         doc = self._read_json()
+        if s == ["network", "sync"]:
+            from apps.axis.life_history.permissions import (
+                authorize,
+            )
+            role = (
+                self.headers.get(
+                    "X-ZYRA-Actor-Role"
+                ) or ""
+            )
+            if not authorize(
+                "network.sync", role
+            ):
+                self._send(
+                    403,
+                    {
+                        "ok": False,
+                        "error": {
+                            "type": "forbidden",
+                            "message":
+                            "sync solo"
+                            " gobierno/registro",
+                        },
+                    },
+                )
+                return
+            bridge = (
+                type(self).outbox_bridge
+            )
+            if bridge is None:
+                self._send(
+                    503,
+                    {
+                        "ok": False,
+                        "error": {
+                            "type":
+                            "not_wired",
+                        },
+                    },
+                )
+                return
+            result = (
+                bridge.sync_pending()
+            )
+            self._send(
+                200,
+                {
+                    "ok": True,
+                    "data": result,
+                },
+            )
+            return
         if s == ["gobierno", "ingesta"]:
             from apps.axis.life_history.permissions import (
                 authorize,
@@ -2135,6 +2186,7 @@ def serve_axis(
     port: int = 0,
     life_history_service=None,
     verify_service=None,
+    outbox_bridge=None,
 ) -> AxisServer:
     if life_history_service is None:
         from apps.axis.life_history.integration import build_life_history
@@ -2147,4 +2199,5 @@ def serve_axis(
     AxisApiHandler.link = AxisLink(client)
     AxisApiHandler.life_history_service = life_history_service
     AxisApiHandler.verify_service = verify_service
+    AxisApiHandler.outbox_bridge = outbox_bridge
     return AxisServer((host, port))

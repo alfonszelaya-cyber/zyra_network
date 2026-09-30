@@ -510,3 +510,175 @@ def test_axz_full_government_flow(tmp_path=None):
          "requester_role": "empleador"}, role=None)
     assert st == 409, "REUSO " + str(st) + " " + str(body)
     _axz_step("12 FIN ESTRICTO: AX-1/2/3 funcionalmente cerrados")
+
+
+# ====== AX-4 (ECOSISTEMA) ======
+
+
+def _axz4_fake_outbox():
+    class _Fake:
+        def __init__(self):
+            self.items = []
+
+        def enqueue(self, event):
+            self.items.append(event)
+            return True
+    return _Fake()
+
+
+def test_axz_network_sync_catalog():
+    import base64 as _b64
+    import threading
+    import time as _time
+    from apps.axis.infrastructure.persistence.axis_store import AxisStore
+    from apps.axis.infrastructure.network.network_client import NetworkClient
+    from apps.axis.server import serve_axis, AxisApiHandler
+    from apps.axis.life_history.integration import build_life_history
+    from apps.axis.life_history.outbox_bridge import (
+        EVENT_CATALOG, validate_event_type,
+        OutboxBridge)
+    from apps.axis.services.axis_link import AxisLink
+    from shared_engines.storage.database import SQLiteAdapter
+    from shared_engines.common.clocks import FrozenClock, SystemClock
+    from shared_engines.runtime.config import RuntimeConfig
+    from shared_engines.runtime.kernel import ZyraKernel
+    from shared_engines.runtime.capabilities import ZyraCapabilities
+    from shared_engines.runtime.combined_api import serve_combined
+    from shared_engines.verification.signatures import Ed25519Signer
+    from shared_engines.security.biometrics import (
+        BiometricsEngine, BiometricsPolicy,
+        DeterministicTestProvider, TemplateCipher)
+
+    _axz_step("AX4-1 catalogo tipado")
+    esperados = {
+        "birth_registered",
+        "zid_biometric_upgrade",
+        "health_exam", "health_result",
+        "health_appointment",
+        "justice_case", "justice_status",
+        "security_incident",
+        "security_status",
+        "emergency", "evidence",
+    }
+    assert esperados.issubset(
+        set(EVENT_CATALOG.keys())), str(
+        sorted(EVENT_CATALOG.keys()))
+    assert validate_event_type(
+        "birth_registered") is True
+    assert validate_event_type(
+        "no_existe") is False
+
+    _axz_step("AX4-2 red real + axis")
+    net_db = SQLiteAdapter(":memory:")
+    signer, _ = Ed25519Signer.generate()
+    kernel = ZyraKernel(db=net_db, clock=FrozenClock(), signer=signer,
+        config=RuntimeConfig(host="127.0.0.1", port=0, api_token=None))
+    kernel.bootstrap_root()
+    kernel._biometrics = BiometricsEngine(
+        db=net_db, clock=FrozenClock(), audit=kernel.audit,
+        provider=DeterministicTestProvider(),
+        cipher=TemplateCipher(master_key_hex="ab" * 32),
+        policy=BiometricsPolicy(require_liveness=False,
+            doc_reject=0.01, doc_review=0.02,
+            doc_auto=0.03, dup_reject=0.98))
+    caps = ZyraCapabilities(net_db, FrozenClock(),
+        identity=kernel.identity, signer=signer)
+    net_srv = serve_combined(kernel, caps, host="127.0.0.1", port=0)
+    threading.Thread(target=net_srv.serve_forever, daemon=True).start()
+    _time.sleep(0.4)
+    net_base = "http://127.0.0.1:" + str(net_srv.server_address[1])
+    client = NetworkClient(net_base, timeout_seconds=10, max_retries=1)
+    assert AxisLink(client).register_app()[0] is True
+
+    store = AxisStore(SQLiteAdapter(":memory:"), SystemClock())
+    life = build_life_history(db=store._db, clock=SystemClock(), network_client=client)
+
+    AxisApiHandler.outbox_bridge = None
+    srv0 = serve_axis(store, client, life_history_service=life)
+    threading.Thread(target=srv0.serve_forever, daemon=True).start()
+    _time.sleep(0.4)
+    base0 = "http://127.0.0.1:" + str(srv0.bound_port)
+    st, body = _axz_json("POST",
+        base0 + "/axis/api/network/sync",
+        {}, role="gobierno")
+    assert st == 503, "sin bridge " + str(st) + " " + str(body)
+    _axz_step("AX4-3 sync sin bridge 503 OK")
+
+    fake = _axz4_fake_outbox()
+    bridge = OutboxBridge(
+        life=life, outbox=fake,
+        clock=SystemClock())
+    srv = serve_axis(store, client,
+        life_history_service=life,
+        outbox_bridge=bridge)
+    threading.Thread(target=srv.serve_forever, daemon=True).start()
+    _time.sleep(0.4)
+    base = "http://127.0.0.1:" + str(srv.bound_port)
+
+    seed_m = _b64.b64encode(
+        b"axis-bio-madre-outbox").decode("ascii")
+    ok_m, data_m, err_m = client.post(
+        "/identity/enroll",
+        {"kind": "person",
+         "display_name": "Madre Outbox",
+         "actor": "axis",
+         "doc_image_b64": seed_m,
+         "selfie_image_b64": seed_m})
+    assert ok_m, str(err_m)
+    zid_madre = ((data_m or {}).get(
+        "identity") or {}).get("zid")
+    assert isinstance(zid_madre, str) and zid_madre.startswith("ZID-")
+    ok_t, _td, err_t = client.post(
+        "/identity/transition",
+        {"zid": zid_madre,
+         "to_status": "ACTIVE",
+         "actor": "axis",
+         "reason": "onboarding"})
+    assert ok_t, str(err_t)
+
+    _axz_step("AX4-4 nacimiento (fuente de eventos)")
+    st, html = _axz_form(base + "/axis/birth-register",
+        {"registrar_account": "AX-gob-x",
+         "child_name": "Bebe Outbox",
+         "birth_date": "2025-09-04",
+         "birth_place": "SS", "sex": "F",
+         "mother_name": "Madre Outbox",
+         "mother_zid": zid_madre})
+    assert st == 200, html[:500]
+    baby = life._store._db.query_one(
+        "SELECT person_id FROM life_persons"
+        " WHERE full_name = 'Bebe Outbox'")
+    assert baby is not None
+    evs = life._store.events_of(
+        str(baby["person_id"]))
+    print("AXZ-STEP AX4 eventos tras"
+          " nacimiento = " + str(len(evs)),
+          flush=True)
+
+    _axz_step("AX4-5 sync 1 (emision)")
+    st, body = _axz_json("POST",
+        base + "/axis/api/network/sync",
+        {}, role="gobierno")
+    assert st == 200, "sync1 " + str(st) + " " + str(body)
+    d = body["data"]
+    assert "emitted" in d and "skipped" in d, str(body)
+    if evs:
+        assert d["emitted"] >= 1, str(body)
+    print("AXZ-RESULT SYNC1=" + str(d), flush=True)
+
+    _axz_step("AX4-6 sync 2 (dedup)")
+    st, body = _axz_json("POST",
+        base + "/axis/api/network/sync",
+        {}, role="gobierno")
+    assert st == 200, "sync2 " + str(st) + " " + str(body)
+    assert body["data"]["emitted"] == 0, str(body)
+    if evs:
+        assert body["data"]["skipped"] >= 1, str(body)
+    print("AXZ-RESULT SYNC2=" + str(body["data"]), flush=True)
+
+    _axz_step("AX4-7 sync sin rol 403")
+    st, body = _axz_json("POST",
+        base + "/axis/api/network/sync",
+        {}, role=None)
+    assert st == 403, "sin rol " + str(st) + " " + str(body)
+    _axz_step("AX4-8 FIN: AX-4 cerrado (catalogo + sync e2e)")

@@ -14,6 +14,17 @@ _EVENT_TO_LIFE = {
     "security_status": "life.security.event",
 }
 
+# AX-4: catalogo tipado completo (9 eventos AXIS + emergency/evidence).
+_EVENT_TO_LIFE["emergency"] = "life.emergency.event"
+_EVENT_TO_LIFE["evidence"] = "life.evidence.event"
+
+EVENT_CATALOG = _EVENT_TO_LIFE
+
+
+def validate_event_type(event_type):
+    """True si el tipo esta en el catalogo (validacion antes de emitir)."""
+    return str(event_type) in EVENT_CATALOG
+
 
 class OutboxBridge:
     def __init__(self, *, life, outbox, clock):

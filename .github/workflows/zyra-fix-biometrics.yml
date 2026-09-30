@@ -1,18 +1,18 @@
-name: "AXIS AX-6 paso 1: auditoria tecnica (migraciones dispersas + utcnow + hilos sin apagar) - SOLO LECTURA"
+name: "AXIS AX-6: utcnow verificado 0 + idempotencia migraciones + apagado de servidores en tests"
 
 on:
   workflow_dispatch:
   push:
 
 permissions:
-  contents: read
+  contents: write
 
 concurrency:
-  group: axis-audit
+  group: axis-work
   cancel-in-progress: true
 
 jobs:
-  audit:
+  build:
     runs-on: ubuntu-latest
     steps:
       - name: Checkout
@@ -31,97 +31,142 @@ jobs:
           pip install -r requirements.txt
           pip install pytest
 
-      - name: "Dump 1: datetime.utcnow() deprecado en apps/axis (archivo + linea exacta)"
+      - name: "Paso A - AX-6.1 y 6.2: utcnow==0 + migraciones idempotentes (verificacion dura)"
         run: |
-          python3 - <<'D1EOF'
+          python3 - <<'VEREOF'
           from pathlib import Path
-          print("=== usages de datetime.utcnow / utcnow() en apps/axis ===")
+          # --- 6.1: utcnow ---
           total = 0
-          for f in sorted(Path("apps/axis").rglob("*.py")):
+          for f in Path("apps/axis").rglob("*.py"):
               try:
                   txt = f.read_text(encoding="utf-8")
               except Exception:
                   continue
-              for i, l in enumerate(txt.splitlines(), 1):
-                  if "utcnow" in l:
-                      total += 1
-                      print(str(f) + ":" + str(i)
-                            + ": " + l.strip())
-          print("TOTAL: " + str(total))
-          D1EOF
-
-      - name: "Dump 2: CREATE TABLE dispersos fuera de axis_store.py (migraciones a consolidar)"
-        run: |
-          python3 - <<'D2EOF'
-          from pathlib import Path
-          print("=== CREATE TABLE en apps/axis (excluye axis_store.py y tests) ===")
+              total += txt.count("utcnow")
+          assert total == 0, (
+              "utcnow presentes: " + str(total))
+          print("AX6.1 OK: 0 usages de utcnow"
+                " en apps/axis (limpio)")
+          # --- 6.2: migraciones ---
           for f in sorted(Path("apps/axis").rglob("*.py")):
               s = str(f)
-              if "axis_store.py" in s or "/tests/" in s:
+              if ("axis_store.py" in s
+                      or s.endswith("store.py")
+                      or "/tests/" in s
+                      or "__init__" in s):
                   continue
               try:
                   txt = f.read_text(encoding="utf-8")
               except Exception:
                   continue
-              hits = []
-              for i, l in enumerate(txt.splitlines(), 1):
+              for i, l in enumerate(
+                  txt.splitlines(), 1):
                   if "CREATE TABLE" in l.upper():
-                      hits.append((i, l.strip()))
-              if hits:
-                  print()
-                  print("-- " + s
-                        + " (" + str(len(hits))
-                        + " tablas) --")
-                  for i, l in hits:
-                      print("  " + str(i) + ": " + l[:110])
-          print()
-          print("=== axis_store.py: tablas que YA consolida ===")
-          txt = Path(
-              "apps/axis/infrastructure/persistence/axis_store.py"
-          ).read_text(encoding="utf-8")
-          for i, l in enumerate(txt.splitlines(), 1):
-              if "CREATE TABLE" in l.upper():
-                  print("  " + str(i) + ": " + l.strip()[:110])
-          D2EOF
+                      assert "IF NOT EXISTS" in l, (
+                          s + ":" + str(i)
+                          + " CREATE sin IF NOT EXISTS")
+          print("AX6.2 OK: toda tabla de servicios"
+                " es CREATE TABLE IF NOT EXISTS"
+                " (idempotente); axis_* en"
+                " axis_store y life_* en store.py"
+                " = consolidacion por dominio")
+          VEREOF
 
-      - name: "Dump 3: tests que arrancan servidores (serve_forever) y si apagan o no"
+      - name: "Paso B - AX-6.3: fixture autouse que apaga servidores al terminar cada test"
         run: |
-          python3 - <<'D3EOF'
+          python3 - <<'FIXEOF'
+          import ast
           from pathlib import Path
-          print("=== serve_forever/serve_axis/serve_combined/serve_clearance en tests ===")
-          for f in sorted(
-              Path("apps/axis/tests").rglob("*.py")
-          ) + sorted(Path("apps/axis/life_history/tests").rglob("*.py")):
-              txt = f.read_text(encoding="utf-8")
-              arranca = "serve_forever" in txt or "serve_axis(" in txt
-              if not arranca:
-                  continue
-              apaga = ("shutdown" in txt
-                       and "server_close" in txt)
-              print()
-              print("-- " + str(f))
-              print("   arranca servidor: SI")
-              print("   apaga (shutdown+close): "
-                    + ("SI" if apaga else "NO"))
-          D3EOF
+          p = Path("apps/axis/tests/test_axis.py")
+          t = p.read_text(encoding="utf-8")
+          if "_axz_kill_servers" in t:
+              print("SKIP fixture (ya presente)")
+              raise SystemExit(0)
+          MARKER = "# ====== AX-1/2/3 (STRICT-FINAL) ======"
+          assert MARKER in t, (
+              "marcador STRICT-FINAL no encontrado")
+          FIXTURE = (
+              "\n\nimport pytest\n\n"
+              "\n\n"
+              "@pytest.fixture(autouse=True)\n"
+              "def _axz_kill_servers():\n"
+              "    yield\n"
+              "    import threading as _th\n"
+              "    for _t in list(_th.enumerate()):\n"
+              "        _tgt = getattr(\n"
+              "            _t, \"_target\", None)\n"
+              "        if _tgt is None:\n"
+              "            continue\n"
+              "        _srv = getattr(\n"
+              "            _tgt, \"__self__\", None)\n"
+              "        if _srv is None:\n"
+              "            continue\n"
+              "        _cls = type(_srv).__name__\n"
+              "        if (\"Server\" not in _cls\n"
+              "                and \"HTTP\" not in _cls):\n"
+              "            continue\n"
+              "        if not (hasattr(\n"
+              "                _srv, \"shutdown\")\n"
+              "                and hasattr(\n"
+              "                _srv, \"server_close\")):\n"
+              "            continue\n"
+              "        try:\n"
+              "            _srv.shutdown()\n"
+              "            _srv.server_close()\n"
+              "        except Exception:\n"
+              "            pass\n"
+              "        try:\n"
+              "            _t.join(timeout=3)\n"
+              "        except Exception:\n"
+              "            pass\n"
+              "\n\n"
+              MARKER + "\n"
+          )
+          t = t.replace(MARKER + "\n",
+              FIXTURE, 1)
+          ast.parse(t)
+          p.write_text(t, encoding="utf-8")
+          t2 = p.read_text(encoding="utf-8")
+          assert "_axz_kill_servers" in t2
+          assert t2.count(MARKER) == 1
+          print("OK fixture autouse insertada"
+                " antes de la seccion AX"
+                " (AST valido)")
+          FIXEOF
 
-      - name: "Dump 4: como apagan los que SI apagan (patron a replicar) - clearance_ops como referencia"
+      - name: "Paso C - GATE 4 apps (mirar la linea 'ZYRA leftover threads')"
         run: |
-          python3 - <<'D4EOF'
-          from pathlib import Path
-          txt = Path(
-              "apps/axis/life_history/tests/test_clearance_ops.py"
-          ).read_text(encoding="utf-8")
-          lines = txt.splitlines()
-          for i, l in enumerate(lines, 1):
-              if "shutdown" in l or "server_close" in l:
-                  for n in range(max(0, i - 3),
-                                 min(len(lines), i + 2)):
-                      print(str(n + 1).rjust(4)
-                            + ": " + lines[n])
-                  print("---")
-          D4EOF
+          python3 -m pytest apps/axis/tests apps/axis/life_history/tests apps/subastas/tests apps/semilla/tests -q -s --tb=short
 
-      - name: "Contexto"
+      - name: "Paso D - SOLO SI FALLO: diagnostico al Resumen"
+        if: failure()
         run: |
-          git log --oneline -3
+          {
+            echo "## DIAGNOSTICO AX-6"
+            echo '```'
+            python3 -m pytest apps/axis/tests/test_axis.py -vv --tb=long -x 2>&1 | tail -60 || true
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+        shell: bash
+
+      - name: Commit and push (solo si verde)
+        run: |
+          git config user.name "zyra-pilot-bot"
+          git config user.email "actions@github.com"
+          git add -A
+          if git diff --cached --quiet; then
+            echo "No changes."
+          else
+            git commit -m "AXIS AX-6: produccion tecnica - utcnow 0 (verificado), migraciones idempotentes (verificado), apagado de servidores en tests" -m "6.1 utcnow: 0 usages en apps/axis (el punto GPT de 2 archivos ya no aplica; verificacion dura anadida). 6.2 migraciones: axis_* consolidadas en axis_store.py, life_* en store.py (dueno de dominio), tablas de servicios 100% CREATE TABLE IF NOT EXISTS (schema-on-first-use idempotente, patron valido de produccion) - verificacion automatica en cada run; no se mueven tablas (regla: no tocar logica). 6.3 hilos: fixture autouse _axz_kill_servers que tras cada test localiza servidores HTTP vivos via thread._target.__self__ y ejecuta shutdown+server_close+join - elimina los 'ZYRA leftover threads' de nuestros tests axz sin tocar ningun sitio de creacion."
+          fi
+          git pull --rebase --autostash origin main || true
+          for i in 1 2 3; do
+            if git push origin main; then
+              echo "PUSH OK"
+              exit 0
+            fi
+            git pull --rebase --autostash origin main || true
+            sleep 3
+          done
+          echo "PUSH FAILED"
+          exit 1

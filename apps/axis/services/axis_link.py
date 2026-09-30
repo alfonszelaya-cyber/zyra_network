@@ -36,15 +36,14 @@ class AxisLink:
     def register_person(
         self, display_name: str
     ) -> tuple[
-        bool, dict | None, str | None
+        bool, dict | None,
+        str | None
     ]:
-        return self._client.post(
-            "/identity/register",
-            {
-                "kind": "person",
-                "display_name": display_name,
-                "actor": "axis",
-            },
+        raise ValueError(
+            "registro de persona"
+            " requiere biometria:"
+            " use enroll_person con"
+            " documento y selfie"
         )
 
     def enroll_person(

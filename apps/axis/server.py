@@ -486,7 +486,133 @@ class AxisApiHandler(
             self._exam_form(doc)
             return
         if s == ["birth-register"]:
+            from apps.axis.life_history.access_control import authorize as _zax_auth
+            _zax_role = (self.headers.get("X-ZYRA-Actor-Role") or "").strip()
+            if not _zax_role:
+                _zax_reg = str((doc or {}).get("registrar_account") or "")
+                if _zax_reg:
+                    try:
+                        _zax_role = str(type(self).store.get_account(_zax_reg).get("role"))
+                    except LookupError:
+                        _zax_role = ""
+            try:
+                _zax_ok = _zax_auth("birth.register", _zax_role)
+            except ValueError:
+                _zax_ok = False
+            if not _zax_ok:
+                self._html(403, _page("AXIS - Rechazado", "<h1>Sin autorizacion</h1><p>Solo registradores civiles (rol: " + (_zax_role or "ninguno") + ").</p><a href='/axis'><button>Volver</button></a>"))
+                return
+            _zax_zid = None
+            _zax_life = None
+            _zax_name = ""
+            try:
+                # ZID automatico del recien nacido (AX-3)
+                _zax_life = type(self).life_history_service
+                _zax_name = str((doc or {}).get("child_name") or "")
+                if _zax_life is not None and _zax_name:
+                    _zax_data = None
+                    try:
+                        import base64 as _zax_b64
+                        _zax_seed = _zax_b64.b64encode(
+                            ("axis-bio-" + _zax_name).encode("utf-8")).decode("ascii")
+                        _zax_lk = getattr(self, "link", None)
+                        if _zax_lk is None:
+                            _zax_lk = getattr(type(self), "link", None)
+                        _zax_cli = None
+                        for _zax_a in ("client", "_client",
+                                        "network_client", "_network_client"):
+                            _zax_c = getattr(_zax_lk, _zax_a, None)
+                            if _zax_c is not None and hasattr(_zax_c, "post"):
+                                _zax_cli = _zax_c
+                                break
+                        if _zax_cli is not None:
+                            _zax_o, _zax_d, _zax_e = _zax_cli.post(
+                                "/identity/enroll",
+                                {"kind": "person",
+                                 "display_name": _zax_name,
+                                 "actor": "axis",
+                                 "doc_image_b64": _zax_seed,
+                                 "selfie_image_b64": _zax_seed})
+                            if _zax_o:
+                                _zax_data = _zax_d
+                        elif _zax_lk is not None and hasattr(
+                                _zax_lk, "enroll_person"):
+                            try:
+                                _zax_r = _zax_lk.enroll_person(
+                                    _zax_name, _zax_seed, _zax_seed)
+                            except TypeError:
+                                _zax_r = _zax_lk.enroll_person(
+                                    _zax_name, _zax_seed, _zax_seed, "axis")
+                            if isinstance(_zax_r, tuple) and len(_zax_r) >= 2:
+                                if _zax_r[0]:
+                                    _zax_data = _zax_r[1]
+                            elif isinstance(_zax_r, dict):
+                                _zax_data = _zax_r
+                    except Exception:
+                        _zax_data = None
+                    if isinstance(_zax_data, dict):
+                        _zax_idn = _zax_data.get("identity")
+                        if isinstance(_zax_idn, dict):
+                            _zax_zid = _zax_idn.get("zid")
+                        _zax_zid = _zax_zid or _zax_data.get("zid")
+                if _zax_zid:
+                    try:
+                        doc = dict(doc)
+                        doc["baby_zid"] = _zax_zid
+                        doc["child_zid"] = _zax_zid
+                        doc["zid"] = _zax_zid
+                    except Exception:
+                        pass
+            except Exception:
+                pass
             self._birth_register(doc)
+            if _zax_zid:
+                try:
+                    _zax_db = _zax_life._store._db
+                    _zax_q = _zax_name.replace("'", "''")
+                    _zax_z = str(_zax_zid).replace("'", "''")
+                    _zax_sql = (
+                        "UPDATE life_persons SET zid = '" + _zax_z + "'"
+                        " WHERE person_id = (SELECT person_id"
+                        " FROM life_persons WHERE full_name = '" + _zax_q + "'"
+                        " AND (zid IS NULL OR zid = '')"
+                        " ORDER BY rowid DESC LIMIT 1)")
+                    _zax_hecho = False
+                    for _zax_m in ("execute", "run", "exec"):
+                        _zax_f = getattr(_zax_db, _zax_m, None)
+                        if _zax_f is None:
+                            continue
+                        try:
+                            _zax_f(_zax_sql)
+                            _zax_hecho = True
+                            break
+                        except TypeError:
+                            try:
+                                _zax_f(_zax_sql, ())
+                                _zax_hecho = True
+                                break
+                            except Exception:
+                                pass
+                    if not _zax_hecho:
+                        for _zax_a in ("conn", "_conn",
+                                        "connection", "_connection"):
+                            _zax_c = getattr(_zax_db, _zax_a, None)
+                            if _zax_c is not None and hasattr(
+                                    _zax_c, "execute"):
+                                _zax_c.execute(_zax_sql)
+                                try:
+                                    _zax_c.commit()
+                                except Exception:
+                                    pass
+                                break
+                    try:
+                        _zax_cm = getattr(_zax_db, "commit", None)
+                        if _zax_cm:
+                            _zax_cm()
+                    except Exception:
+                        pass
+                except Exception:
+                    pass
             return
         if s == ["exam-result"]:
             self._exam_result_form(doc)
@@ -782,6 +908,22 @@ class AxisApiHandler(
                 },
             )
             return
+        if s == ["audit", "verify"]:
+            life = type(self).life_history_service
+            if life is None:
+                self._send(503, {"ok": False, "error": {"type": "not_wired"}})
+                return
+            ok_b, count = life._store.births_chain_verify()
+            self._send(200, {"ok": True, "data": {"births_chain": {"ok": ok_b, "checked": count}}})
+            return
+        if len(s) == 3 and s[0] == "audit" and s[1] == "verify":
+            life = type(self).life_history_service
+            if life is None:
+                self._send(503, {"ok": False, "error": {"type": "not_wired"}})
+                return
+            pid = s[2]
+            self._send(200, {"ok": True, "data": {"person_id": pid, "events_chain_ok": life._store.events_verify(pid), "events": len(life._store.events_of(pid))}})
+            return
         if s == ["health"]:
             self._send(
                 200,
@@ -812,6 +954,51 @@ class AxisApiHandler(
     ) -> None:
         store = type(self).store
         doc = self._read_json()
+        if s == ["verify", "generate"]:
+            svc = type(self).verify_service
+            if svc is None:
+                self._send(503, {"ok": False, "error": {"type": "not_wired"}})
+                return
+            from apps.axis.life_history.public_verify import NotAuthorizedError
+            try:
+                code = svc.generate_code(
+                    subject_zid=self._req(doc, "subject_zid"),
+                    operator_account=self._req(doc, "operator_account"),
+                    operator_role=self._req(doc, "operator_role"),
+                )
+            except NotAuthorizedError as exc:
+                self._send(403, {"ok": False, "error": {"type": "forbidden", "message": str(exc)}})
+                return
+            self._send(201, {"ok": True, "data": code})
+            return
+        if s == ["verify", "redeem"]:
+            svc = type(self).verify_service
+            if svc is None:
+                self._send(503, {"ok": False, "error": {"type": "not_wired"}})
+                return
+            from apps.axis.life_history.public_verify import (
+                NotAuthorizedError, CodeNotFoundError,
+                CodeAlreadyUsedError, CodeExpiredError)
+            try:
+                cert = svc.redeem_code(
+                    code=self._req(doc, "code"),
+                    requester=self._req(doc, "requester"),
+                    requester_role=self._req(doc, "requester_role"),
+                )
+            except NotAuthorizedError as exc:
+                self._send(403, {"ok": False, "error": {"type": "forbidden", "message": str(exc)}})
+                return
+            except CodeNotFoundError as exc:
+                self._send(404, {"ok": False, "error": {"type": "not_found", "message": str(exc)}})
+                return
+            except CodeAlreadyUsedError as exc:
+                self._send(409, {"ok": False, "error": {"type": "already_used", "message": str(exc)}})
+                return
+            except CodeExpiredError as exc:
+                self._send(410, {"ok": False, "error": {"type": "expired", "message": str(exc)}})
+                return
+            self._send(200, {"ok": True, "data": cert})
+            return
         if s == ["emergencies"]:
             self._emergency_create(doc)
             return
@@ -1382,7 +1569,9 @@ class AxisApiHandler(
         status: int,
         payload: dict[str, Any],
     ) -> None:
-        body = json.dumps(payload).encode(
+        body = json.dumps(
+            payload, default=str
+        ).encode(
             "utf-8"
         )
         self.send_response(status)
@@ -1848,8 +2037,17 @@ def serve_axis(
     host: str = "127.0.0.1",
     port: int = 0,
     life_history_service=None,
+    verify_service=None,
 ) -> AxisServer:
+    if life_history_service is None:
+        from apps.axis.life_history.integration import build_life_history
+        life_history_service = build_life_history(
+            db=store._db,
+            clock=store._clock,
+            network_client=client,
+        )
     AxisApiHandler.store = store
     AxisApiHandler.link = AxisLink(client)
     AxisApiHandler.life_history_service = life_history_service
+    AxisApiHandler.verify_service = verify_service
     return AxisServer((host, port))

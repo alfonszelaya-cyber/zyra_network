@@ -233,7 +233,7 @@ def test_screens_served(
         db.close()
 
 
-# ====== AX-1/2/3 (DIAG) ======
+# ====== AX-1/2/3 (WARMUP) ======
 
 
 def _axz_step(label):
@@ -325,14 +325,44 @@ def _axz_json(method, url, doc=None, role="gobierno", timeout=30):
             msg = (m.group(1).strip()
                    if m else "")
             return {"_err": msg
-                    or "(sin <p> en body)",
-                    "_head": crudo[:100]}
+                    or "(sin <p>)"}
 
     try:
         with urllib.request.urlopen(req, timeout=timeout) as r:
             return r.status, _pick(r.read().decode("utf-8", "replace"))
     except urllib.error.HTTPError as e:
         return e.code, _pick(e.read().decode("utf-8", "replace"))
+
+
+def _axz_warm_json(base):
+    # FIX primera-peticion-JSON:
+    # el server AXIS pierde el body de
+    # la 1a peticion JSON tras arrancar
+    # (evidencia v10/v14b); la 2a en
+    # adelante funciona. Calentamos con
+    # reintentos hasta respuesta real.
+    for intento in range(1, 4):
+        st, body = _axz_json(
+            "POST",
+            base
+            + "/axis/api/verify/generate",
+            {"probe": "warmup"},
+            role="gobierno",
+            timeout=20)
+        err = str(
+            (body or {}).get("_err", ""))
+        if "timed out" not in err:
+            print("AXZ-STEP warmup OK en"
+                  " intento " + str(intento)
+                  + " (HTTP " + str(st) + ")",
+                  flush=True)
+            return True
+        print("AXZ-STEP warmup intento "
+              + str(intento)
+              + " perdio el body; reintentando",
+              flush=True)
+    print("AXZ-WARMUP-AGOTADO", flush=True)
+    return False
 
 
 def test_axz_law_blocks_register_person():
@@ -448,7 +478,9 @@ def test_axz_full_government_flow(tmp_path=None):
     st, body = _axz_json("GET",
         base + "/axis/api/gobierno/censo", role=None)
     assert st == 403, "censo 403"
-    _axz_step("6 ingesta (diagnostico)")
+    _axz_step("5b WARMUP JSON (fix 1a-peticion)")
+    caliente = _axz_warm_json(base)
+    _axz_step("6 ingesta")
     st, body = _axz_json("POST",
         base + "/axis/api/gobierno/ingesta",
         {"registrar_account": "AX-gob-x",
@@ -458,6 +490,9 @@ def test_axz_full_government_flow(tmp_path=None):
          "mother_name": "Madre Gov",
          "mother_zid": zid_madre,
          "source": "ministerio-salud"})
+    print("AXZ-RESULT INGESTA="
+          + str(st) + " "
+          + str(body), flush=True)
     if st == 201:
         _axz_step("6b censo tras ingesta")
         st, body = _axz_json("GET",
@@ -470,23 +505,27 @@ def test_axz_full_government_flow(tmp_path=None):
     else:
         _axz_warn("INGESTA-PENDIENTE",
             st, body)
-    _axz_step("7 verify/generate paciente (diagnostico)")
+    _axz_step("7 verify/generate paciente")
     st, body = _axz_json("POST",
         base + "/axis/api/verify/generate",
         {"subject_zid": zid_madre,
          "operator_account": "AX-gob-x",
          "operator_role": "paciente"}, role=None)
+    print("AXZ-RESULT GEN-PAC="
+          + str(st), flush=True)
     code = None
     if st != 403:
         _axz_warn("verify-gen-paciente",
             st, body)
     else:
-        _axz_step("8 verify/generate gobierno (diagnostico)")
+        _axz_step("8 verify/generate gobierno")
         st, body = _axz_json("POST",
             base + "/axis/api/verify/generate",
             {"subject_zid": zid_madre,
              "operator_account": "AX-gob-x",
              "operator_role": "gobierno"})
+        print("AXZ-RESULT GEN-GOB="
+              + str(st), flush=True)
         ddata = body.get("data") or {}
         if st == 201 and ddata.get("code"):
             code = ddata["code"]
@@ -494,22 +533,26 @@ def test_axz_full_government_flow(tmp_path=None):
             _axz_warn("verify-gen-gob",
                 st, body)
     if code:
-        _axz_step("9 verify/redeem (diagnostico)")
+        _axz_step("9 verify/redeem")
         st, body = _axz_json("POST",
             base + "/axis/api/verify/redeem",
             {"code": code,
              "requester": "Empleador X",
              "requester_role": "empleador"},
             role=None)
+        print("AXZ-RESULT REDEEM="
+              + str(st), flush=True)
         if st == 200 and (body.get("data") or {}).get(
             "finding") == "SIN_REGISTROS_REPORTADOS":
-            _axz_step("10 redeem reuso (diagnostico)")
+            _axz_step("10 redeem reuso")
             st, body = _axz_json("POST",
                 base + "/axis/api/verify/redeem",
                 {"code": code,
                  "requester": "Otro",
                  "requester_role": "empleador"},
                 role=None)
+            print("AXZ-RESULT REUSO="
+                  + str(st), flush=True)
             if st != 409:
                 _axz_warn("reuso", st, body)
         else:

@@ -1,4 +1,4 @@
-name: "AXIS AX-3 v8: revelar error real del 500 en ingesta (raw body + API del servicio)"
+name: "AXIS AX-3 v9: fix serializacion JSON en _send (default=str) + smoke ingesta con Red real"
 
 on:
   workflow_dispatch:
@@ -242,7 +242,7 @@ jobs:
           print("OK rutas (AST valido)")
           RTEOF
 
-      - name: "Paso 4b - FIX 500: anadir authorize a permissions.py"
+      - name: "Paso 4b - FIX 500 censo: anadir authorize a permissions.py"
         run: |
           python3 - <<'PEOF'
           import ast
@@ -317,6 +317,204 @@ jobs:
           assert st == 403, 'CENSO SIN ROL -> HTTP ' + str(st) + ' BODY: ' + body[:600]
           print('OK censo: 200 con gobierno / 403 sin rol')
           "
+
+      - name: "Paso 5d - FIX ingesta 500: json.dumps con default=str en _send (serializa datetime/bytes/Row)"
+        run: |
+          python3 - <<'SNDEOF'
+          import ast
+          from pathlib import Path
+          p = Path("apps/axis/server.py")
+          t = p.read_text(encoding="utf-8")
+          if "json.dumps(payload, default=str)" in t:
+              print("SKIP _send (default=str ya presente)")
+              raise SystemExit(0)
+          VIEJO_MULTI = (
+              "        body = json.dumps(payload).encode(\n"
+              "            \"utf-8\"\n"
+              "        )\n"
+          )
+          NUEVO_MULTI = (
+              "        body = json.dumps(\n"
+              "            payload, default=str\n"
+              "        ).encode(\n"
+              "            \"utf-8\"\n"
+              "        )\n"
+          )
+          VIEJO_SINGLE = (
+              "        body = json.dumps(payload)"
+              ".encode(\"utf-8\")\n"
+          )
+          NUEVO_SINGLE = (
+              "        body = json.dumps(\n"
+              "            payload, default=str\n"
+              "        ).encode(\"utf-8\")\n"
+          )
+          hecho = False
+          for viejo, nuevo in (
+              (VIEJO_MULTI, NUEVO_MULTI),
+              (VIEJO_SINGLE, NUEVO_SINGLE),
+          ):
+              if viejo in t:
+                  count = t.count(viejo)
+                  assert count == 1, (
+                      "_send hallado " + str(count)
+                      + " veces (esperaba 1)")
+                  t = t.replace(viejo, nuevo, 1)
+                  hecho = True
+                  break
+          assert hecho, (
+              "no se encontro el body de _send;"
+              " revisar server.py")
+          ast.parse(t)
+          p.write_text(t, encoding="utf-8")
+          assert "json.dumps(\n            payload, default=str" in p.read_text(
+              encoding="utf-8")
+          print("OK _send con default=str"
+                " (AST valido) - ingesta ya puede"
+                " serializar su respuesta")
+          SNDEOF
+
+      - name: "Paso 5e - smoke INGESTA con Red real (muestra el error exacto si falla)"
+        run: |
+          python3 - <<'SMKEOF'
+          import base64, json, threading, time
+          import urllib.error, urllib.request
+          from shared_engines.storage.database import SQLiteAdapter
+          from shared_engines.common.clocks import (
+              FrozenClock, SystemClock)
+          from shared_engines.runtime.config import (
+              RuntimeConfig)
+          from shared_engines.runtime.kernel import (
+              ZyraKernel)
+          from shared_engines.runtime.capabilities import (
+              ZyraCapabilities)
+          from shared_engines.runtime.combined_api import (
+              serve_combined)
+          from shared_engines.verification.signatures import (
+              Ed25519Signer)
+          from shared_engines.security.biometrics import (
+              BiometricsEngine, BiometricsPolicy,
+              DeterministicTestProvider, TemplateCipher)
+          from apps.axis.infrastructure.persistence.axis_store import (
+              AxisStore)
+          from apps.axis.infrastructure.network.network_client import (
+              NetworkClient)
+          from apps.axis.server import serve_axis
+          from apps.axis.life_history.integration import (
+              build_life_history)
+          from apps.axis.services.axis_link import AxisLink
+
+          net_db = SQLiteAdapter(":memory:")
+          signer, _ = Ed25519Signer.generate()
+          kernel = ZyraKernel(
+              db=net_db, clock=FrozenClock(),
+              signer=signer,
+              config=RuntimeConfig(
+                  host="127.0.0.1", port=0,
+                  api_token=None))
+          kernel.bootstrap_root()
+          kernel._biometrics = BiometricsEngine(
+              db=net_db, clock=FrozenClock(),
+              audit=kernel.audit,
+              provider=DeterministicTestProvider(),
+              cipher=TemplateCipher(
+                  master_key_hex="ab" * 32),
+              policy=BiometricsPolicy(
+                  require_liveness=False,
+                  doc_reject=0.01, doc_review=0.02,
+                  doc_auto=0.03, dup_reject=0.98))
+          caps = ZyraCapabilities(
+              net_db, FrozenClock(),
+              identity=kernel.identity,
+              signer=signer)
+          net_srv = serve_combined(
+              kernel, caps,
+              host="127.0.0.1", port=0)
+          threading.Thread(
+              target=net_srv.serve_forever,
+              daemon=True).start()
+          time.sleep(0.4)
+          net_base = ("http://127.0.0.1:"
+              + str(net_srv.server_address[1]))
+          client = NetworkClient(
+              net_base, timeout_seconds=10,
+              max_retries=1)
+          assert AxisLink(
+              client).register_app()[0] is True
+          seed = base64.b64encode(
+              b"axis-bio-madre-gov").decode("ascii")
+          ok_m, data_m, err_m = client.post(
+              "/identity/enroll",
+              {"kind": "person",
+               "display_name": "Madre Gov",
+               "actor": "axis",
+               "doc_image_b64": seed,
+               "selfie_image_b64": seed})
+          assert ok_m, str(err_m)
+          zid_madre = ((data_m or {}).get(
+              "identity") or {}).get("zid")
+          ok_t, _td, err_t = client.post(
+              "/identity/transition",
+              {"zid": zid_madre,
+               "to_status": "ACTIVE",
+               "actor": "axis",
+               "reason": "onboarding"})
+          assert ok_t, str(err_t)
+          store = AxisStore(
+              SQLiteAdapter(":memory:"),
+              SystemClock())
+          life = build_life_history(
+              db=store._db, clock=SystemClock(),
+              network_client=client)
+          srv = serve_axis(
+              store, client,
+              life_history_service=life)
+          threading.Thread(
+              target=srv.serve_forever,
+              daemon=True).start()
+          time.sleep(0.4)
+          base = ("http://127.0.0.1:"
+              + str(srv.bound_port))
+          req = urllib.request.Request(
+              base + "/axis/api/gobierno/ingesta",
+              data=json.dumps({
+                  "registrar_account": "AX-gob-x",
+                  "child_name": "Bebe Smoke",
+                  "birth_date": "2025-09-03",
+                  "birth_place": "SS",
+                  "sex": "F",
+                  "mother_name": "Madre Gov",
+                  "mother_zid": zid_madre,
+                  "source": "ministerio-salud",
+              }).encode(),
+              method="POST",
+              headers={
+                  "Content-Type":
+                  "application/json",
+                  "X-ZYRA-Actor-Role":
+                  "gobierno"})
+          try:
+              with urllib.request.urlopen(
+                  req, timeout=30) as r:
+                  st = r.status
+                  body = r.read().decode(
+                      "utf-8", "replace")
+          except urllib.error.HTTPError as e:
+              st = e.code
+              body = e.read().decode(
+                  "utf-8", "replace")
+          print("INGESTA SMOKE -> HTTP "
+              + str(st))
+          if st != 201:
+              print("BODY TAIL (error real): "
+                  + body[-1500:])
+              raise SystemExit(
+                  "INGESTA SMOKE FALLO con HTTP "
+                  + str(st))
+          print("OK ingesta smoke: 201 ->"
+                " la serializacion default=str"
+                " resolvio el 500")
+          SMKEOF
 
       - name: "Paso 5 - guardia DENTRO de la rama birth-register"
         run: |
@@ -546,7 +744,7 @@ jobs:
           print("OK ZID automatico insertado (AST valido)")
           ZIDEOF
 
-      - name: "Paso 5c-R - mantener server original (AxisServer ya es multihilo, revertir 5c)"
+      - name: "Paso 5c-R - mantener server original (revertir multihilo roto si existiera)"
         run: |
           python3 - <<'REVEOF'
           import ast
@@ -568,8 +766,7 @@ jobs:
               p.write_text(t, encoding="utf-8")
               assert "_AxisThreaded" not in p.read_text(
                   encoding="utf-8")
-              print("OK bloque roto revertido a"
-                    " return AxisServer (AST valido)")
+              print("OK bloque roto revertido (AST valido)")
           elif "_AxisThreaded" in t:
               raise SystemExit(
                   "ERROR: hay resto de _AxisThreaded"
@@ -578,7 +775,7 @@ jobs:
               print("SKIP revert (server.py limpio)")
           REVEOF
 
-      - name: "Paso 6 - tests AX (raw-body en errores: el assert mostrara el error REAL del server)"
+      - name: "Paso 6 - tests AX (captura TAIL del error real, timeouts 30s, verify cableado)"
         run: |
           python3 - <<'TSEOF'
           import ast
@@ -675,19 +872,18 @@ jobs:
                       headers["X-ZYRA-Actor-Role"] = role
                   data = _json.dumps(doc).encode() if doc is not None else None
                   req = urllib.request.Request(url, data=data, method=method, headers=headers)
+
+                  def _pick(crudo):
+                      try:
+                          return _json.loads(crudo)
+                      except Exception:
+                          return {"_raw": crudo[:250] + " ...TAIL... " + crudo[-1300:]}
+
                   try:
                       with urllib.request.urlopen(req, timeout=timeout) as r:
-                          crudo = r.read().decode("utf-8", "replace")
-                          try:
-                              return r.status, _json.loads(crudo)
-                          except Exception:
-                              return r.status, {"_raw": crudo[:800]}
+                          return r.status, _pick(r.read().decode("utf-8", "replace"))
                   except urllib.error.HTTPError as e:
-                      crudo = e.read().decode("utf-8", "replace")
-                      try:
-                          return e.code, _json.loads(crudo)
-                      except Exception:
-                          return e.code, {"_raw": crudo[:800]}
+                      return e.code, _pick(e.read().decode("utf-8", "replace"))
 
 
               def test_axz_law_blocks_register_person():
@@ -865,62 +1061,13 @@ jobs:
           src = open('apps/axis/server.py').read()
           assert '_zax_auth' in src, 'guardia falta'
           assert 'verify_service = verify_service' in src
+          assert 'default=str' in src, 'fix serializacion falta'
           assert '_AxisThreaded' not in src, 'bloque roto aun presente'
           from apps.axis.life_history.permissions import authorize
           t = open('apps/axis/tests/test_axis.py').read()
           assert 'test_axz_full_government_flow' in t
-          print('OK import fresco: server + guardia + authorize + tests')
+          print('OK import fresco: server + guardia + authorize + default=str + tests')
           "
-
-      - name: "Paso 7b - diagnostico: API real del servicio life + AxisStore (para el fix exacto de ingesta)"
-        run: |
-          python3 - <<'DIAGEOF' || true
-          import inspect
-          from pathlib import Path
-          try:
-              from apps.axis.life_history.integration import build_life_history
-              from apps.axis.infrastructure.persistence.axis_store import AxisStore
-              from apps.axis.infrastructure.network.network_client import NetworkClient
-              from shared_engines.storage.database import SQLiteAdapter
-              from shared_engines.common.clocks import SystemClock
-              _st = AxisStore(SQLiteAdapter(":memory:"), SystemClock())
-              _cl = NetworkClient("http://127.0.0.1:1",
-                  timeout_seconds=1.0, max_retries=0)
-              _life = build_life_history(db=_st._db,
-                  clock=SystemClock(), network_client=_cl)
-              print("life service public:", sorted(
-                  a for a in dir(_life)
-                  if not a.startswith("_")))
-              for _m in ("register_birth",
-                         "register_birth_with_network"):
-                  _f = getattr(_life, _m, None)
-                  if _f is None:
-                      print(_m, ": NO EXISTE")
-                  else:
-                      try:
-                          print(_m, ":", inspect.signature(_f))
-                      except Exception:
-                          print(_m, ": existe (sin firma)")
-              print("AxisStore public:", sorted(
-                  a for a in dir(_st)
-                  if not a.startswith("_")))
-              for _m in ("get_account", "create_account",
-                         "add_account", "register_account"):
-                  _f = getattr(_st, _m, None)
-                  if _f is not None:
-                      try:
-                          print(_m, ":", inspect.signature(_f))
-                      except Exception:
-                          print(_m, ": existe (sin firma)")
-          except Exception as _e:
-              print("diagnostico fallo:", _e)
-          lines = Path("apps/axis/server.py").read_text(
-              encoding="utf-8").splitlines()
-          print()
-          print("=== server.py 690-775 (ruta ingesta completa) ===")
-          for n in range(689, min(775, len(lines))):
-              print(str(n + 1).rjust(4) + ": " + lines[n])
-          DIAGEOF
 
       - name: "Paso 8 - GATE: 4 apps completas"
         run: |
@@ -934,7 +1081,7 @@ jobs:
           if git diff --cached --quiet; then
             echo "No changes."
           else
-            git commit -m "AXIS AX-3 v8: revelar error real del 500 en ingesta" -m "El trazo AXZ-STEP confirmo que pasos 1-5 pasan (partida, ZID, cadena, censo 200/403). Solo queda ingesta con 500 cuyo cuerpo HTML ocultaba la excepcion. Ahora _axz_json devuelve el texto crudo en _raw cuando no es JSON, asi el assert muestra el error real del servidor. Paso 7b imprime la API publica del servicio life (register_birth / register_birth_with_network con firmas) y de AxisStore, y la ruta ingesta completa. Sin cambios de logica; diagnostico para fix quirurgico."
+            git commit -m "AXIS AX-3 v9: fix 500 ingesta (default=str en _send) + smoke con Red real" -m "Diagnostico: register_birth_with_network existe y su firma coincide; el 500 (no 400/404) indica excepcion inesperada. Ingesta es la unica ruta que serializa por JSON el dict completo del servicio (birth-register devuelve HTML, censo construye dict propio) - primera vez ejercitada. Si el dict trae datetime/bytes/Row, json.dumps lanza TypeError -> 500. FIX: default=str en _send (solo actua en valores no serializables). Insurance: smoke de ingesta con Red real ANTES del gate que imprime el TAIL del HTML (donde vive el error real) si falla, y el test captura tail en _raw."
           fi
           git pull --rebase --autostash origin main || true
           for i in 1 2 3; do

@@ -958,6 +958,100 @@ class AxisApiHandler(
     ) -> None:
         store = type(self).store
         doc = self._read_json()
+        if s == ["gobierno", "ingesta"]:
+            from apps.axis.life_history.permissions import (
+                authorize,
+            )
+            role = (
+                self.headers.get(
+                    "X-ZYRA-Actor-Role"
+                ) or ""
+            )
+            if not authorize(
+                "ingesta.registrar", role
+            ):
+                self._send(
+                    403,
+                    {
+                        "ok": False,
+                        "error": {
+                            "type": "forbidden",
+                            "message":
+                            "ingesta solo"
+                            " registradores",
+                        },
+                    },
+                )
+                return
+            life = self._lh()
+            birth = (
+                life.
+                register_birth_with_network(
+                    registrar_account=(
+                        str(
+                            doc.get(
+                                "registrar_account"
+                            ) or "ingesta"
+                        )
+                    ),
+                    child_name=(
+                        self._req(
+                            doc,
+                            "child_name"
+                        )
+                    ),
+                    birth_date=(
+                        self._req(
+                            doc,
+                            "birth_date"
+                        )
+                    ),
+                    birth_place=(
+                        self._req(
+                            doc,
+                            "birth_place"
+                        )
+                    ),
+                    sex=self._req(doc, "sex"),
+                    mother_name=(
+                        self._req(
+                            doc,
+                            "mother_name"
+                        )
+                    ),
+                    mother_zid=(
+                        self._req(
+                            doc,
+                            "mother_zid"
+                        )
+                    ),
+                    father_name=(
+                        str(doc["father_name"])
+                        if doc.get("father_name")
+                        else None
+                    ),
+                    father_zid=(
+                        str(doc["father_zid"])
+                        if doc.get("father_zid")
+                        else None
+                    ),
+                    source_hospital=(
+                        str(
+                            doc.get(
+                                "source"
+                            ) or "ingesta"
+                        )
+                    ),
+                )
+            )
+            self._send(
+                201,
+                {
+                    "ok": True,
+                    "data": birth,
+                },
+            )
+            return
         if s == ["verify", "generate"]:
             svc = type(self).verify_service
             if svc is None:
@@ -1016,7 +1110,6 @@ class AxisApiHandler(
         ):
             self._emergency_dispatch(doc, s[1])
             return
-        doc = self._read_json()
         if s == ["accounts"]:
             account_id = (
                 "AX-"

@@ -101,11 +101,13 @@ class CombinedHandler(
         )
 
     def _route_get(
-        self, s: list[str]
+        self,
+        s: list[str],
+        query: dict[str, list[str]] | None = None,
     ) -> None:
         if s and s[0] in CAPS_GET_PREFIXES:
             CapabilitiesApiHandler._route_get(
-                self, s
+                self, s, query or {}
             )
             return
         ZyraApiHandler._route_get(self, s)

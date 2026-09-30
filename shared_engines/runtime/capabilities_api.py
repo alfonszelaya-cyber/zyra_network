@@ -83,6 +83,8 @@ class CapabilitiesApiHandler(
                 str(exc),
             )
         except Exception:
+            import traceback as _cap_tb
+            _cap_tb.print_exc()
             self._error(
                 500,
                 "internal_error",

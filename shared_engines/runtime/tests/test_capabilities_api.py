@@ -334,3 +334,143 @@ def test_search_reputation_and_guard(
         assert exc.value.code == 400
     finally:
         http.close()
+
+
+def test_history_via_serve_combined(
+    tmp_path: Path,
+) -> None:
+    """Regresion RED-1: el camino
+    real de las apps (serve_combined)
+    debe servir GET /history/{zid}
+    sin 500 (override _route_get de
+    CombinedHandler sin query)."""
+    import base64
+    import json as _json
+    import threading
+    import time
+    import urllib.error
+    import urllib.request
+    from shared_engines.storage.database import (
+        SQLiteAdapter)
+    from shared_engines.common.clocks import (
+        FrozenClock)
+    from shared_engines.runtime.config import (
+        RuntimeConfig)
+    from shared_engines.runtime.kernel import (
+        ZyraKernel)
+    from shared_engines.runtime.capabilities import (
+        ZyraCapabilities)
+    from shared_engines.runtime.combined_api import (
+        serve_combined)
+    from shared_engines.verification.signatures import (
+        Ed25519Signer)
+    from shared_engines.security.biometrics import (
+        BiometricsEngine, BiometricsPolicy,
+        DeterministicTestProvider,
+        TemplateCipher)
+    net_db = SQLiteAdapter(":memory:")
+    signer, _ = Ed25519Signer.generate()
+    kernel = ZyraKernel(
+        db=net_db,
+        clock=FrozenClock(),
+        signer=signer,
+        config=RuntimeConfig(
+            host="127.0.0.1",
+            port=0,
+            api_token=None))
+    kernel.bootstrap_root()
+    kernel._biometrics = BiometricsEngine(
+        db=net_db,
+        clock=FrozenClock(),
+        audit=kernel.audit,
+        provider=(
+            DeterministicTestProvider()),
+        cipher=TemplateCipher(
+            master_key_hex="ab" * 32),
+        policy=BiometricsPolicy(
+            require_liveness=False,
+            doc_reject=0.01,
+            doc_review=0.02,
+            doc_auto=0.03,
+            dup_reject=0.98))
+    caps = ZyraCapabilities(
+        net_db, FrozenClock(),
+        identity=kernel.identity,
+        signer=signer)
+    srv = serve_combined(
+        kernel, caps,
+        host="127.0.0.1", port=0)
+    threading.Thread(
+        target=srv.serve_forever,
+        daemon=True).start()
+    time.sleep(0.3)
+    base = ("http://127.0.0.1:"
+            + str(
+                srv.server_address[1]))
+    try:
+        req = urllib.request.Request(
+            base
+            + "/identity/enroll",
+            data=_json.dumps({
+                "kind": "person",
+                "display_name": (
+                    "RegUser"),
+                "actor": "reg",
+                "doc_image_b64": (
+                    base64.b64encode(
+                        b"reg-history"
+                    ).decode("ascii")),
+                "selfie_image_b64": (
+                    base64.b64encode(
+                        b"reg-history"
+                    ).decode("ascii")),
+            }).encode(),
+            method="POST",
+            headers={
+                "Content-Type":
+                "application/json"})
+        with urllib.request.urlopen(
+            req,
+            timeout=15) as r:
+            body = _json.loads(
+                r.read().decode())
+        zid = ((body.get("data")
+                or {}).get("identity")
+               or {}).get("zid")
+        assert zid
+
+        def _get(ruta):
+            try:
+                with urllib.request.urlopen(
+                    base + ruta,
+                    timeout=15
+                ) as r2:
+                    return (r2.status,
+                        _json.loads(
+                            r2.read().decode()))
+            except (
+                urllib.error.HTTPError
+            ) as e2:
+                return (e2.code,
+                    _json.loads(
+                        e2.read().decode()))
+
+        st, resp = _get(
+            "/history/" + zid)
+        assert st == 200, (
+            "history " + str(st)
+            + " " + str(resp))
+        assert resp["data"] == [], (
+            str(resp))
+        st, resp = _get(
+            "/trust/" + zid)
+        assert st == 200, (
+            "trust " + str(st)
+            + " " + str(resp))
+        print("regresion RED-1 OK:"
+              " /history y /trust"
+              " responden 200 via"
+              " serve_combined")
+    finally:
+        srv.shutdown()
+        srv.server_close()

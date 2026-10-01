@@ -148,3 +148,145 @@ def test_unknown_and_unwired(
             adapter_id="kyc-provider",
             payload=b"x",
         )
+
+
+def test_public_source_cache_and_stale(
+    tmp_path: Path,
+) -> None:
+    """AX-SOURCES: cache TTL evita
+    martillar la fuente; si cae,
+    sirve cache con stale=True."""
+    import hashlib
+    from shared_engines.integrations.engine import (
+        PublicSourceClient)
+
+    class _Clock:
+        def __init__(self):
+            self.t = 1000.0
+
+        def now(self):
+            return self.t
+
+    llamadas = {"n": 0}
+    cuerpo = b'{"ok": true}'
+
+    def opener(url: str) -> bytes:
+        llamadas["n"] += 1
+        if llamadas["n"] == 2:
+            raise OSError("down")
+        return cuerpo
+
+    ck = _Clock()
+    cli = PublicSourceClient(
+        clock=ck,
+        ttl_seconds=60.0,
+        opener=opener)
+    b1, stale1 = cli.fetch(
+        "https://fuente.gob/data")
+    assert b1 == cuerpo
+    assert stale1 is False
+    b2, stale2 = cli.fetch(
+        "https://fuente.gob/data")
+    assert b2 == cuerpo
+    assert stale2 is False
+    assert llamadas["n"] == 1, (
+        "cache no uso el TTL")
+    ck.t = 1100.0
+    b3, stale3 = cli.fetch(
+        "https://fuente.gob/data")
+    assert b3 == cuerpo
+    assert stale3 is True
+    assert hashlib.sha256(
+        b3).hexdigest()
+
+
+def test_source_adapters_via_engine(
+    tmp_path: Path,
+) -> None:
+    """AX-SOURCES: fuente publica =
+    adapter en IntegrationsEngine +
+    handler con parser ligero."""
+    import json
+    from shared_engines.integrations.engine import (
+        IntegrationsEngine,
+        parse_geojson_summary)
+
+    geojson = json.dumps({
+        "type": "FeatureCollection",
+        "features": [
+            {"type": "Feature"},
+            {"type": "Feature"},
+        ],
+    }).encode("utf-8")
+
+    engine = IntegrationsEngine(
+        SQLiteAdapter(
+            tmp_path / "src.db"),
+        FrozenClock())
+    engine.register_adapter(
+        adapter_id="marn-geo",
+        kind="http-geo",
+        endpoint=(
+            "https://geoportal"
+            ".marn.gob/arcgis"),
+        max_retries=2,
+    )
+
+    def marn_handler(
+        payload: bytes,
+    ) -> bytes:
+        resumen = (
+            parse_geojson_summary(
+                geojson))
+        return json.dumps(
+            resumen).encode(
+            "utf-8")
+
+    engine.register_handler(
+        adapter_id="marn-geo",
+        handler=marn_handler,
+    )
+    result = engine.invoke(
+        adapter_id="marn-geo",
+        payload=b"query",
+    )
+    assert result.attempts == 1
+    health = engine.health(
+        adapter_id="marn-geo")
+    assert health.calls == 1
+    assert health.failures == 0
+
+
+def test_parsers_lightweight(
+    tmp_path: Path,
+) -> None:
+    """AX-SOURCES: parsers devuelven
+    RESUMEN + sha256 (Red ligera)."""
+    import json
+    from shared_engines.integrations.engine import (
+        parse_json_source,
+        parse_cap_alerts)
+
+    one = json.dumps([
+        {"codigo": "011101"},
+        {"codigo": "011102"},
+    ]).encode("utf-8")
+    r = parse_json_source(one)
+    assert r["items"] == 2
+    assert r["kind"] == "json"
+
+    cap = (
+        "<?xml version='1.0'?>"
+        "<alert>"
+        "<info><event>Lluvia"
+        "</event><severity>Moderate"
+        "</severity></info>"
+        "<info><event>Sequia"
+        "</event><severity>Severe"
+        "</severity></info>"
+        "</alert>"
+    ).encode("utf-8")
+    c = parse_cap_alerts(cap)
+    assert c["count"] == 2
+    assert c["alerts"][0][
+        "event"] == "Lluvia"

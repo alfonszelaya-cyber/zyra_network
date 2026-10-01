@@ -252,3 +252,145 @@ def test_audit_trail_records_access(
         assert count >= 1
     finally:
         net.close()
+
+
+def test_universal_id_maria_and_juan(
+    tmp_path,
+) -> None:
+    """AX-ID: Maria (Guatemala,
+    pasaporte) y Juan (El Salvador,
+    DUI) - campos tipados, edad
+    derivada, niveles, audit."""
+    from shared_engines.network.portable_profile import (
+        ProfileRegistry)
+    from shared_engines.audit.chain import (
+        AuditTrail)
+    from shared_engines.events.outbox import (
+        Outbox)
+    from shared_engines.events.contracts import (
+        EventCatalog)
+    from shared_engines.storage.database import (
+        SQLiteAdapter)
+    from shared_engines.common.clocks import (
+        FrozenClock)
+    db = SQLiteAdapter(
+        tmp_path / "id.db")
+    clock = FrozenClock()
+    audit = AuditTrail(db, clock)
+    outbox = Outbox(db, clock)
+    outbox.ensure_schema()
+    cat = EventCatalog()
+    for et in (
+        "network.profile.updated",
+        "network.profile.accessed",
+    ):
+        cat.register(et)
+    reg = ProfileRegistry(
+        db, clock, audit=audit,
+        outbox=outbox)
+    reg.register_app(
+        app_id="banco-ny",
+        display_name="Banco NY",
+        scopes=(
+            "display_name",
+            "national_id",
+            "id_country",
+            "id_type",
+            "id_number",
+            "nationality",
+            "birth_date",
+            "address",
+        ),
+    )
+    mzid = ("ZID-maria-gt-"
+            "000000000001")
+    reg.set_field(
+        zid=mzid,
+        field="display_name",
+        value="Maria Perez",
+        verified=True)
+    reg.set_field(
+        zid=mzid,
+        field="id_country",
+        value="GT", verified=True)
+    reg.set_field(
+        zid=mzid,
+        field="id_type",
+        value="passport",
+        verified=True)
+    reg.set_field(
+        zid=mzid,
+        field="id_number",
+        value="GT-PASS-8842",
+        verified=True)
+    reg.set_field(
+        zid=mzid,
+        field="nationality",
+        value="GT", verified=True)
+    reg.set_field(
+        zid=mzid,
+        field="birth_date",
+        value="1998-03-15",
+        verified=True)
+    reg.set_field(
+        zid=mzid,
+        field="address",
+        value="Guatemala")
+    jzid = ("ZID-juan-sv-"
+            "000000000001")
+    reg.set_field(
+        zid=jzid,
+        field="display_name",
+        value="Juan Lopez",
+        verified=True)
+    reg.set_field(
+        zid=jzid,
+        field="id_country",
+        value="SV", verified=True)
+    reg.set_field(
+        zid=jzid,
+        field="id_type",
+        value="dui", verified=True)
+    reg.set_field(
+        zid=jzid,
+        field="id_number",
+        value="00000000-0",
+        verified=True)
+    reg.set_field(
+        zid=jzid,
+        field="nationality",
+        value="SV", verified=True)
+    reg.set_field(
+        zid=jzid,
+        field="birth_date",
+        value="1990-06-01",
+        verified=True)
+    v = reg.universal_view(
+        app_id="banco-ny",
+        zid=mzid)
+    assert (v["fields"]
+            ["id_country"]
+            == "GT"), str(v)
+    assert (v["fields"]
+            ["id_type"]
+            == "passport")
+    assert v["age"] >= 24, str(v)
+    assert (v["levels"]
+            ["id_number"]
+            == "VERIFIED")
+    assert (v["levels"]
+            ["address"]
+            == "SELF_DECLARED")
+    vj = reg.universal_view(
+        app_id="banco-ny",
+        zid=jzid)
+    assert (vj["fields"]
+            ["id_type"]
+            == "dui")
+    assert (vj["fields"]
+            ["id_country"]
+            == "SV")
+    assert vj["age"] >= 33
+    print("OK AX-ID: Maria GT pasaporte"
+          " y Juan SV DUI - edad derivada"
+          " y niveles correctos")

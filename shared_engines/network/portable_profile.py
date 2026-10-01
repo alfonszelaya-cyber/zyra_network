@@ -68,6 +68,10 @@ ALL_FIELDS = (
     "display_name",
     "contact",
     "national_id",
+    "id_country",
+    "id_type",
+    "id_number",
+    "nationality",
     "birth_date",
     "address",
 )
@@ -124,6 +128,30 @@ def _source_hash(
     return hashlib.sha256(
         src.encode("utf-8")
     ).hexdigest()
+
+
+
+
+def age_of(birth_date: str) -> int:
+    """AX-ID: edad DERIVADA de
+    birth_date (nunca se guarda).
+    Formato ISO YYYY-MM-DD."""
+    import datetime
+    parts = str(birth_date).split("-")
+    if len(parts) != 3:
+        raise ValueError(
+            "birth_date must be"
+            " YYYY-MM-DD")
+    nac = datetime.date(
+        int(parts[0]),
+        int(parts[1]),
+        int(parts[2]))
+    hoy = datetime.date.today()
+    edad = hoy.year - nac.year
+    if ((hoy.month, hoy.day)
+            < (nac.month, nac.day)):
+        edad -= 1
+    return edad
 
 
 class ProfileRegistry:
@@ -413,3 +441,65 @@ class ProfileRegistry:
             fields=fields,
             levels=levels,
         )
+
+    def universal_view(
+        self,
+        *,
+        app_id: str,
+        zid: str,
+    ) -> dict[str, object]:
+        """AX-ID: EL paquete del
+        verificador (banco, consulado,
+        empleador). Campos universales
+        con nivel + edad DERIVADA +
+        auditoria del acceso."""
+        require_non_empty_str(
+            app_id, "app_id")
+        require_non_empty_str(
+            zid, "zid")
+        scopes = self.app_scopes(
+            app_id)
+        if scopes is None:
+            raise PermissionError(
+                "app not registered:"
+                " " + app_id)
+        vista = self.view_for_app(
+            app_id=app_id, zid=zid)
+        campos: dict[str, str] = {}
+        niveles: dict[str, str] = {}
+        for f in (
+            "display_name",
+            "national_id",
+            "id_country",
+            "id_type",
+            "id_number",
+            "nationality",
+            "birth_date",
+            "address",
+        ):
+            if f in vista.fields:
+                campos[f] = (
+                    vista.fields[f])
+                niveles[f] = (
+                    vista.levels[f])
+        edad = None
+        if "birth_date" in campos:
+            edad = age_of(
+                campos["birth_date"])
+        self._audit.append(
+            event_type=(
+                "network.profile"
+                ".universal_access"),
+            actor=app_id,
+            subject=zid,
+            payload={
+                "fields": sorted(
+                    campos.keys()),
+            },
+        )
+        return {
+            "zid": zid,
+            "fields": campos,
+            "levels": niveles,
+            "age": edad,
+        }

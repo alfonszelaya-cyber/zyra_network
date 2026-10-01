@@ -153,6 +153,36 @@ class CapabilitiesApiHandler(
     ) -> None:
         caps = type(self).caps
         if (
+            len(s) == 3
+            and s[0] == "documents"
+            and s[1] == "list"
+        ):
+            kind_q = ""
+            purpose_q = ""
+            if query:
+                kind_q = (
+                    query.get("kind")
+                    or [""]
+                )[0]
+                purpose_q = (
+                    query.get("purpose")
+                    or [""]
+                )[0]
+            docs = (
+                caps.exchange
+                .list_documents(
+                    owner_zid=s[2],
+                    kind=(
+                        kind_q
+                        or None),
+                    purpose=(
+                        purpose_q
+                        or None),
+                )
+            )
+            self._ok(docs)
+            return
+        if (
             len(s) == 2
             and s[0] == "trust"
         ):
@@ -385,6 +415,41 @@ class CapabilitiesApiHandler(
                             entry.entry_seq
                         ),
                         "content_hash": entry.content_hash,
+                    },
+                },
+            )
+            return
+        if s == ["documents", "register"]:
+            import base64 as _b64
+            ex = (type(self).caps.exchange)
+            rec = (ex.register_document(
+                owner_zid=self._req(
+                    doc, "owner_zid"),
+                title=self._req(doc, "title"),
+                content=_b64.b64decode(
+                    self._req(doc, "content_b64")),
+                doc_kind=self._req(doc, "doc_kind"),
+                purpose=str(doc.get("purpose") or ""),
+                storage_ref=str(
+                    doc.get("storage_ref") or ""),
+                actor_app=self._req(doc, "actor_app"),
+                prev_version=(
+                    str(doc["prev_version"])
+                    if doc.get("prev_version")
+                    else None
+                ),
+            ))
+            self._send(
+                201,
+                {
+                    "ok": True,
+                    "data": {
+                        "document_id": rec["document_id"],
+                        "sha256": rec["sha256"],
+                        "doc_kind": rec["doc_kind"],
+                        "purpose": rec["purpose"],
+                        "storage_ref": rec["storage_ref"],
+                        "prev_version": rec["prev_version"],
                     },
                 },
             )

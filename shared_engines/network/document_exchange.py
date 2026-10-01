@@ -107,6 +107,18 @@ _MIGRATIONS = (
             " (signer_zid, status)",
         ),
     ),
+    Migration(
+        2,
+        "network_document_index",
+        (
+            "CREATE TABLE IF NOT EXISTS document_index ("
+            " document_id TEXT PRIMARY KEY, owner_zid TEXT NOT NULL,"
+            " title TEXT NOT NULL, sha256 TEXT NOT NULL,"
+            " doc_kind TEXT NOT NULL, purpose TEXT NOT NULL, storage_ref TEXT NOT NULL,"
+            " prev_version TEXT, created_at REAL NOT NULL)",
+            "CREATE INDEX IF NOT EXISTS docidx_owner ON document_index (owner_zid, created_at)",
+        ),
+    ),
 )
 
 
@@ -831,4 +843,204 @@ class DocumentExchange:
                 signer_zid=signer_zid,
             ),
             signature,
+        )
+
+    def register_document(
+        self,
+        *,
+        owner_zid: str,
+        title: str,
+        content: bytes,
+        doc_kind: str,
+        purpose: str,
+        storage_ref: str,
+        actor_app: str,
+        prev_version: str | None = None,
+    ) -> dict[str, object]:
+        """AX-DOCS v2: sella e indexa
+        SIN guardar contenido en la
+        Red (ligera: hash + firma +
+        metadata + storage_ref)."""
+        require_non_empty_str(
+            owner_zid, "owner_zid")
+        require_non_empty_str(
+            title, "title")
+        require_non_empty_str(
+            doc_kind, "doc_kind")
+        self._require_app(actor_app)
+        if not content:
+            raise ValueError(
+                "content required")
+        sealed = self.seal_document(
+            owner_zid=owner_zid,
+            title=title,
+            content=content,
+            actor_app=actor_app,
+        )
+        now = self._clock.now()
+        with (
+            self._db.transaction()
+            as cursor
+        ):
+            cursor.execute(
+                "INSERT INTO"
+                " document_index"
+                " (document_id,"
+                " owner_zid, title,"
+                " sha256, doc_kind,"
+                " purpose,"
+                " storage_ref,"
+                " prev_version,"
+                " created_at)"
+                " VALUES (?, ?, ?, ?,"
+                " ?, ?, ?, ?, ?)",
+                (
+                    sealed.document_id,
+                    owner_zid,
+                    title,
+                    sealed.sha256,
+                    doc_kind,
+                    purpose,
+                    storage_ref,
+                    prev_version,
+                    now,
+                ),
+            )
+            self._emit(
+                cursor,
+                event_type=(
+                    "network.document"
+                    ".registered"),
+                aggregate=(
+                    sealed.document_id),
+                payload={
+                    "owner": owner_zid,
+                    "kind": doc_kind,
+                    "purpose": purpose,
+                },
+            )
+        self._audit.append(
+            event_type=(
+                "network.document"
+                ".registered"),
+            actor=actor_app,
+            subject=sealed.document_id,
+            payload={"kind": doc_kind},
+        )
+        return {
+            "document_id": (
+                sealed.document_id),
+            "sha256": sealed.sha256,
+            "doc_kind": doc_kind,
+            "purpose": purpose,
+            "storage_ref": storage_ref,
+            "prev_version": prev_version,
+            "network_signature": (
+                sealed.network_signature),
+            "public_pem": (
+                sealed.public_pem),
+            "proof_id": sealed.proof_id,
+        }
+
+    def list_documents(
+        self,
+        *,
+        owner_zid: str,
+        kind: str | None = None,
+        purpose: str | None = None,
+    ) -> tuple[dict[str, object], ...]:
+        """AX-DOCS v2: el FILTRO
+        (solo indice, sin contenido)."""
+        require_non_empty_str(
+            owner_zid, "owner_zid")
+        sql = (
+            "SELECT document_id,"
+            " owner_zid, title, sha256,"
+            " doc_kind, purpose,"
+            " storage_ref,"
+            " prev_version, created_at"
+            " FROM document_index"
+            " WHERE owner_zid = ?"
+        )
+        params: list[object] = [
+            owner_zid]
+        if kind:
+            sql += " AND doc_kind = ?"
+            params.append(kind)
+        if purpose:
+            sql += " AND purpose = ?"
+            params.append(purpose)
+        sql += " ORDER BY created_at"
+        rows = self._db.query_all(
+            sql, tuple(params))
+        return tuple(
+            {
+                "document_id": str(
+                    r["document_id"]),
+                "owner_zid": str(
+                    r["owner_zid"]),
+                "title": str(
+                    r["title"]),
+                "sha256": str(
+                    r["sha256"]),
+                "doc_kind": str(
+                    r["doc_kind"]),
+                "purpose": str(
+                    r["purpose"]),
+                "storage_ref": str(
+                    r["storage_ref"]),
+                "prev_version": (
+                    str(
+                        r["prev_version"])
+                    if r["prev_version"]
+                    is not None
+                    else None),
+                "created_at": float(
+                    r["created_at"]),
+            }
+            for r in rows
+        )
+
+    def new_version_index(
+        self,
+        *,
+        document_id: str,
+        content: bytes,
+        doc_kind: str,
+        purpose: str,
+        storage_ref: str,
+        actor_app: str,
+        title: str | None = None,
+    ) -> dict[str, object]:
+        """AX-DOCS v2: modificar =
+        anexar version encadenada
+        (la v1 queda verificable)."""
+        require_non_empty_str(
+            document_id,
+            "document_id")
+        prev = self._db.query_one(
+            "SELECT owner_zid, title"
+            " FROM document_index"
+            " WHERE document_id = ?",
+            (document_id,),
+        )
+        if prev is None:
+            raise ValueError(
+                "unknown document: "
+                + document_id)
+        owner = str(
+            prev["owner_zid"])
+        real_title = (
+            title
+            if title
+            else str(prev["title"]))
+        return self.register_document(
+            owner_zid=owner,
+            title=real_title,
+            content=content,
+            doc_kind=doc_kind,
+            purpose=purpose,
+            storage_ref=storage_ref,
+            actor_app=actor_app,
+            prev_version=document_id,
         )

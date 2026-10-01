@@ -400,3 +400,203 @@ def test_reject_and_unauthorized_app(
             )
     finally:
         net.close()
+
+
+def test_register_list_filter_and_versions(
+    tmp_path: Path,
+) -> None:
+    """AX-DOCS v2: registrar,
+    filtrar, versionar; verificacion
+    intacta; Red solo indice."""
+    import hashlib as _hl
+    net = _Net(tmp_path)
+    try:
+        net.profiles.register_app(
+            app_id="marketplace",
+            display_name="Market",
+            scopes=(
+                "display_name",),
+        )
+        owner = (
+            net.identity
+            .register_identity(
+                kind=(
+                    IdentityKind
+                    .PERSON),
+                display_name=(
+                    "docowner"),
+                actor=(
+                    "marketplace"),
+            )
+        )
+        contenido = (
+            b"FACTURA-PDF-001")
+        rec = (
+            net.exchange
+            .register_document(
+                owner_zid=(
+                    owner.zid),
+                title="Factura 001",
+                content=contenido,
+                doc_kind="pdf",
+                purpose=(
+                    "factura-"
+                    "hacienda"),
+                storage_ref=(
+                    "nexo://"
+                    "facturas/001"),
+                actor_app=(
+                    "marketplace"),
+            )
+        )
+        assert rec[
+            "document_id"
+        ].startswith("DOC-")
+        assert rec["sha256"] == (
+            _hl.sha256(
+                contenido
+            ).hexdigest())
+        docs = (
+            net.exchange
+            .list_documents(
+                owner_zid=(
+                    owner.zid))
+        )
+        assert len(docs) == 1
+        assert docs[0][
+            "doc_kind"] == "pdf"
+        assert docs[0][
+            "purpose"
+        ] == "factura-hacienda"
+        assert docs[0][
+            "storage_ref"
+        ] == "nexo://facturas/001"
+        assert (
+            net.exchange
+            .list_documents(
+                owner_zid=(
+                    owner.zid),
+                purpose="otro",
+            ) == ()
+        )
+        assert (
+            net.exchange
+            .list_documents(
+                owner_zid=(
+                    owner.zid),
+                kind="word",
+            ) == ()
+        )
+        v = (
+            net.exchange
+            .verify_document(
+                document_id=(
+                    rec[
+                        "document_id"]),
+                content=contenido,
+            )
+        )
+        assert v.authentic is True
+        v2 = (
+            net.exchange
+            .new_version_index(
+                document_id=(
+                    rec[
+                        "document_id"]),
+                content=(
+                    b"FACTURA-"
+                    b"PDF-001-v2"),
+                doc_kind="pdf",
+                purpose=(
+                    "factura-"
+                    "hacienda"),
+                storage_ref=(
+                    "nexo://"
+                    "facturas/001"
+                    "/v2"),
+                actor_app=(
+                    "marketplace"),
+            )
+        )
+        assert v2["prev_version"] == (
+            rec["document_id"])
+        docs = (
+            net.exchange
+            .list_documents(
+                owner_zid=(
+                    owner.zid))
+        )
+        assert len(docs) == 2
+        v2check = (
+            net.exchange
+            .verify_document(
+                document_id=v2[
+                    "document_id"],
+                content=(
+                    b"FACTURA-"
+                    b"PDF-001-v2"),
+            )
+        )
+        assert (
+            v2check.authentic is True)
+        v1check = (
+            net.exchange
+            .verify_document(
+                document_id=(
+                    rec[
+                        "document_id"]),
+                content=contenido,
+            )
+        )
+        assert (
+            v1check.authentic is True)
+    finally:
+        net.close()
+
+
+def test_register_unauthorized_app(
+    tmp_path: Path,
+) -> None:
+    """AX-DOCS v2: app no registrada
+    -> rechazada; indice vacio."""
+    net = _Net(tmp_path)
+    try:
+        net.profiles.register_app(
+            app_id="marketplace",
+            display_name="Market",
+            scopes=(
+                "display_name",),
+        )
+        owner = (
+            net.identity
+            .register_identity(
+                kind=(
+                    IdentityKind
+                    .PERSON),
+                display_name="o2",
+                actor=(
+                    "marketplace"),
+            )
+        )
+        with pytest.raises(
+            PermissionError
+        ):
+            net.exchange.register_document(
+                owner_zid=(
+                    owner.zid),
+                title="X",
+                content=b"y",
+                doc_kind="json",
+                purpose="p",
+                storage_ref="ref",
+                actor_app="malware",
+            )
+        assert (
+            net.exchange
+            .list_documents(
+                owner_zid=(
+                    owner.zid))
+            == ()
+        )
+    finally:
+        net.close()

@@ -154,6 +154,27 @@ class CapabilitiesApiHandler(
         caps = type(self).caps
         if (
             len(s) == 3
+            and s[0] == "bridge"
+            and s[1] == "subscriptions"
+        ):
+            bridge = getattr(
+                caps, "bridge", None)
+            if bridge is None:
+                self._send(
+                    503,
+                    {
+                        "ok": False,
+                        "error": {
+                        "type":
+                        "not_wired"}})
+                return
+            tipos = (
+                bridge.subscriptions(
+                    app_id=s[2]))
+            self._ok(list(tipos))
+            return
+        if (
+            len(s) == 3
             and s[0] == "documents"
             and s[1] == "list"
         ):
@@ -417,6 +438,27 @@ class CapabilitiesApiHandler(
                         "content_hash": entry.content_hash,
                     },
                 },
+            )
+            return
+        if s == ["bridge", "relay"]:
+            bridge = getattr(
+                type(self).caps, "bridge", None)
+            if bridge is None:
+                self._send(
+                    503,
+                    {
+                        "ok": False,
+                        "error": {
+                        "type":
+                        "not_wired"}})
+                return
+            resultado = (
+                bridge.relay())
+            self._send(
+                200,
+                {
+                    "ok": True,
+                    "data": (resultado)},
             )
             return
         if s == ["documents", "register"]:

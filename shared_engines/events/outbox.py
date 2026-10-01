@@ -454,3 +454,179 @@ class Outbox:
                 row["fingerprint"]
             ),
         )
+
+from shared_engines.common.validation import (
+    require_non_empty_str,
+)
+from shared_engines.events.inbox import (
+    Inbox,
+)
+
+_BRIDGE_MIGRATIONS = (
+    Migration(
+        1,
+        "events_bridge",
+        (
+            "CREATE TABLE IF NOT EXISTS"
+            " bridge_subscriptions ("
+            " app_id TEXT NOT NULL,"
+            " event_type TEXT NOT NULL,"
+            " PRIMARY KEY (app_id,"
+            " event_type))",
+        ),
+    ),
+)
+
+
+class InterAppBridge:
+    """AX-BRIDGE: cartero inter-app
+    de la Red. Drena el outbox fuente
+    y entrega cada evento UNA VEZ a
+    cada app suscrita (Inbox dedup
+    transaccional). Internas y
+    externas entran por la misma
+    puerta: app_id + tipos."""
+
+    def __init__(
+        self,
+        *,
+        db: Database,
+        clock: Clock,
+        source: Outbox,
+    ) -> None:
+        self._db = db
+        self._clock = clock
+        self._source = source
+        self._targets: dict[
+            str,
+            tuple[Inbox,
+            Callable[[Event],
+            None], set[str]],
+        ] = {}
+        MigrationRunner(
+            db,
+            "events.bridge",
+            _BRIDGE_MIGRATIONS,
+        ).run(clock)
+
+    def subscribe(
+        self,
+        *,
+        app_id: str,
+        event_types: tuple[
+            str, ...],
+        inbox: Inbox,
+        handler: Callable[
+            [Event], None],
+    ) -> None:
+        """Registra/actualiza la
+        suscripcion de una app
+        (interna o externa: misma
+        puerta)."""
+        require_non_empty_str(
+            app_id, "app_id")
+        if not event_types:
+            raise ValueError(
+                "event_types"
+                " required")
+        for et in event_types:
+            require_non_empty_str(
+                et, "event_type")
+        with (
+            self._db.transaction()
+            as cursor
+        ):
+            cursor.execute(
+                "DELETE FROM"
+                " bridge_subscriptions"
+                " WHERE app_id = ?",
+                (app_id,),
+            )
+            for et in event_types:
+                cursor.execute(
+                    "INSERT INTO"
+                    " bridge_subscriptions"
+                    " (app_id,"
+                    " event_type)"
+                    " VALUES (?, ?)",
+                    (app_id, et),
+                )
+        self._targets[app_id] = (
+            inbox,
+            handler,
+            set(event_types),
+        )
+
+    def _route(
+        self, event: Event,
+    ) -> int:
+        entregados = 0
+        for app_id in sorted(
+            self._targets):
+            inbox, handler, (
+                tipos
+            ) = self._targets[
+                app_id]
+            if (event.event_type
+                    not in
+                    tipos):
+                continue
+            if inbox.process(
+                event,
+                handler,
+            ):
+                entregados += 1
+        return entregados
+
+    def relay(
+        self,
+        *,
+        batch_size: int = 100,
+    ) -> dict[str, int]:
+        """Drena el outbox fuente
+        y entrega a suscriptores."""
+        duplicados = 0
+        recibidos = 0
+
+        def entregador(
+            event: Event,
+        ) -> None:
+            nonlocal duplicados, recibidos
+            recibidos += 1
+            if self._route(
+                event,
+            ) == 0:
+                duplicados += 1
+
+        drenados = (
+            self._source.
+            dispatch_pending(
+                entregador,
+                batch_size=(
+                    batch_size),
+            )
+        )
+        return {
+            "drained": drenados,
+            "delivered": (
+                recibidos
+                - duplicados),
+            "duplicates": (
+                duplicados),
+        }
+
+    def subscriptions(
+        self,
+        *,
+        app_id: str,
+    ) -> tuple[str, ...]:
+        rows = self._db.query_all(
+            "SELECT event_type FROM"
+            " bridge_subscriptions"
+            " WHERE app_id = ?"
+            " ORDER BY event_type",
+            (app_id,),
+        )
+        return tuple(
+            str(r["event_type"])
+            for r in rows)

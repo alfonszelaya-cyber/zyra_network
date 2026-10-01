@@ -162,3 +162,159 @@ def test_catalog_versions_are_selectable() -> None:
             clock=clock,
             schema_version=1,
         )
+
+
+def test_bridge_deliver_once_and_dedup(
+    tmp_path,
+) -> None:
+    """AX-BRIDGE: la Red reparte ->
+    NEXO recibe UNA vez; simulacion
+    de crash (evento vuelve a
+    PENDING) -> re-relay NO duplica
+    efecto (Inbox dedup)."""
+    from shared_engines.events.outbox import (
+        Outbox, InterAppBridge)
+    from shared_engines.events.inbox import (
+        Inbox)
+    from shared_engines.events.contracts import (
+        EventCatalog)
+    from shared_engines.storage.database import (
+        SQLiteAdapter)
+    from shared_engines.common.clocks import (
+        FrozenClock)
+    cat = EventCatalog()
+    cat.register(
+        "agro.sale.created")
+    db_red = SQLiteAdapter(
+        tmp_path / "red.db")
+    db_nexo = SQLiteAdapter(
+        tmp_path / "nexo.db")
+    clock = FrozenClock()
+    out_red = Outbox(db_red, clock)
+    out_red.ensure_schema()
+    ev = cat.build(
+        "agro.sale.created",
+        aggregate_id="S1",
+        payload={"total": 100},
+        clock=clock)
+    out_red.enqueue(ev)
+    inbox_nexo = Inbox(
+        db_nexo, clock)
+    recibidos = []
+    bridge = InterAppBridge(
+        db=db_red, clock=clock,
+        source=out_red)
+    bridge.subscribe(
+        app_id="nexo",
+        event_types=(
+            "agro.sale"
+            ".created",),
+        inbox=inbox_nexo,
+        handler=(
+            recibidos.append))
+    r1 = bridge.relay()
+    assert r1["drained"] == 1, str(r1)
+    assert r1["delivered"] == 1, str(r1)
+    assert len(recibidos) == 1
+    db_red.execute(
+        "UPDATE events_outbox SET"
+        " state = 'PENDING',"
+        " published_at = NULL"
+        " WHERE event_id = ?",
+        (ev.event_id,))
+    r2 = bridge.relay()
+    assert r2["drained"] == 1
+    assert (r2["delivered"]
+            == 0), str(r2)
+    assert r2["duplicates"] == 1, str(r2)
+    assert len(recibidos) == 1, (
+        "dedup fallo")
+    assert (bridge.subscriptions(
+        app_id="nexo")
+        == ("agro.sale"
+            ".created",))
+
+
+def test_bridge_routes_by_type(
+    tmp_path,
+) -> None:
+    """AX-BRIDGE: cada evento llega
+    solo a quien se suscribio a su
+    tipo (fuente unica por dominio);
+    no suscrito NO recibe."""
+    from shared_engines.events.outbox import (
+        Outbox, InterAppBridge)
+    from shared_engines.events.inbox import (
+        Inbox)
+    from shared_engines.events.contracts import (
+        EventCatalog)
+    from shared_engines.storage.database import (
+        SQLiteAdapter)
+    from shared_engines.common.clocks import (
+        FrozenClock)
+    cat = EventCatalog()
+    cat.register(
+        "life.birth.registered")
+    cat.register(
+        "agro.sale.created")
+    db_s = SQLiteAdapter(
+        tmp_path / "s.db")
+    db_r = SQLiteAdapter(
+        tmp_path / "r.db")
+    clock = FrozenClock()
+    out_s = Outbox(db_s, clock)
+    out_r = Outbox(db_r, clock)
+    out_s.ensure_schema()
+    out_r.ensure_schema()
+    e1 = cat.build(
+        "life.birth.registered",
+        aggregate_id="P1",
+        payload={}, clock=clock)
+    e2 = cat.build(
+        "agro.sale.created",
+        aggregate_id="S2",
+        payload={}, clock=clock)
+    out_s.enqueue(e1)
+    out_s.enqueue(e2)
+    out_r.enqueue(e1)
+    out_r.enqueue(e2)
+    got_axis = []
+    got_nexo = []
+    bridge = InterAppBridge(
+        db=db_r, clock=clock,
+        source=out_r)
+    bridge.subscribe(
+        app_id="axis",
+        event_types=(
+            "life.birth"
+            ".registered",),
+        inbox=Inbox(
+            SQLiteAdapter(
+                tmp_path
+                / "ax.db"),
+            clock),
+        handler=(
+            got_axis.append))
+    bridge.subscribe(
+        app_id="nexo",
+        event_types=(
+            "agro.sale"
+            ".created",),
+        inbox=Inbox(
+            SQLiteAdapter(
+                tmp_path
+                / "nx.db"),
+            clock),
+        handler=(
+            got_nexo.append))
+    bridge.relay()
+    assert len(got_axis) == 1
+    assert (got_axis[0]
+            .event_type
+            == "life.birth"
+            ".registered")
+    assert len(got_nexo) == 1
+    assert (got_nexo[0]
+            .event_type
+            == "agro.sale"
+            ".created")

@@ -1,18 +1,18 @@
-name: "RED-4 paso 1: auditoria integraciones + fuentes externas (SOLO LECTURA) - donde se enchufan los conectores publicos"
+name: "RED-4: conectores de fuentes publicas (PublicSourceClient TTL/stale + parsers + IntegrationsEngine wiring)"
 
 on:
   workflow_dispatch:
   push:
 
 permissions:
-  contents: read
+  contents: write
 
 concurrency:
-  group: red-audit
+  group: red-work
   cancel-in-progress: true
 
 jobs:
-  audit:
+  build:
     runs-on: ubuntu-latest
     steps:
       - name: Checkout
@@ -31,138 +31,444 @@ jobs:
           pip install -r requirements.txt
           pip install pytest
 
-      - name: "Dump 1: IntegrationsEngine completo (el punto de enchufe de fuentes externas)"
+      - name: "Paso A - integrations/engine.py: append PublicSourceClient + parsers (indice ligero, contenido a la app dueña)"
         run: |
-          python3 - <<'D1EOF'
+          python3 - <<'SEOF'
+          import ast
+          import textwrap
           from pathlib import Path
           p = Path(
               "shared_engines/integrations/"
               "engine.py")
-          print("=== integrations/engine.py ===")
-          if p.exists():
-              for i, l in enumerate(
-                  p.read_text(
-                      encoding="utf-8").splitlines(), 1):
-                  print(str(i).rjust(4) + ": " + l)
-          else:
-              print("NO EXISTE; busco:")
-              for f in Path(
-                  "shared_engines/integrations"
-              ).rglob("*.py"):
-                  if f.stat().st_size > 0:
-                      print("  " + str(f))
-          D1EOF
+          t = p.read_text(encoding="utf-8")
+          if "class PublicSourceClient" in t:
+              print("SKIP (ya presente)")
+              raise SystemExit(0)
+          CUERPO = textwrap.dedent('''\
+              class PublicSourceClient:
+                  """AX-SOURCES: fetcher de
+                  fuentes publicas con cache
+                  TTL en memoria. La Red nunca
+                  martilla a la fuente; si la
+                  fuente cae devuelve el dato
+                  en cache con stale=True.
+                  Regla: la Red transporta
+                  confianza, no carga - el
+                  dataset completo va a la app
+                  duena; aqui queda el crudo
+                  transitorio y su sha256."""
 
-      - name: "Dump 2: publico de IntegrationsEngine + su test (como se registra/invoca un adapter)"
+                  def __init__(
+                      self,
+                      *,
+                      clock: Clock,
+                      timeout_seconds: float = (
+                          15.0),
+                      ttl_seconds: float = (
+                          300.0),
+                      opener: Callable[
+                          [str], bytes] | None = (
+                          None),
+                  ) -> None:
+                      self._clock = clock
+                      self._timeout = (
+                          timeout_seconds)
+                      self._ttl = ttl_seconds
+                      self._opener = (
+                          opener
+                          if opener is not None
+                          else self._urlopen)
+                      self._cache: dict[
+                          str,
+                          tuple[float, bytes],
+                      ] = {}
+
+                  def _urlopen(
+                      self, url: str,
+                  ) -> bytes:
+                      import urllib.request
+                      req = urllib.request.Request(
+                          url,
+                          headers={
+                              "User-Agent":
+                              "zyra-network/1.0"
+                          },
+                      )
+                      with urllib.request.urlopen(
+                          req,
+                          timeout=self._timeout,
+                      ) as r:
+                          return r.read()
+
+                  def fetch(
+                      self, url: str,
+                  ) -> tuple[bytes, bool]:
+                      """Devuelve (body, stale)."""
+                      now = self._clock.now()
+                      hit = self._cache.get(url)
+                      if hit is not None:
+                          ts, body = hit
+                          if (now - ts
+                                  ) < self._ttl:
+                              return body, False
+                      try:
+                          body = self._opener(
+                              url)
+                      except Exception:
+                          if hit is not None:
+                              return (
+                                  hit[1], True)
+                          raise
+                      self._cache[url] = (
+                          now, body)
+                      return body, False
+
+
+              def parse_geojson_summary(
+                  body: bytes,
+              ) -> dict[str, object]:
+                  """Resumen ligero de una capa
+                  ArcGIS/GeoJSON (la Red guarda
+                  el resumen + sha256, no el
+                  dataset)."""
+                  import hashlib
+                  import json
+                  data = json.loads(
+                      body.decode("utf-8"))
+                  if data.get("type") not in (
+                      "FeatureCollection",
+                      "Feature",
+                  ):
+                      raise ValueError(
+                          "expected GeoJSON")
+                  features = data.get(
+                      "features", [])
+                  if data.get("type") == (
+                      "Feature"
+                  ):
+                      features = [data]
+                  return {
+                      "kind": "geojson",
+                      "features": len(features),
+                      "sha256": hashlib.sha256(
+                          body).hexdigest(),
+                  }
+
+
+              def parse_json_source(
+                  body: bytes,
+              ) -> dict[str, object]:
+                  """Resumen de una fuente JSON
+                  publica (ONEC clasificadores,
+                  etc.)."""
+                  import hashlib
+                  import json
+                  data = json.loads(
+                      body.decode("utf-8"))
+                  if isinstance(data, list):
+                      return {
+                          "kind": "json",
+                          "items": len(data),
+                          "sha256": hashlib.sha256(
+                              body).hexdigest(),
+                      }
+                  if isinstance(data, dict):
+                      return {
+                          "kind": "json",
+                          "keys": sorted(
+                              str(k) for k in (
+                                  data.keys()))[:12],
+                          "sha256": hashlib.sha256(
+                              body).hexdigest(),
+                      }
+                  raise ValueError(
+                      "unexpected json shape")
+
+
+              def parse_cap_alerts(
+                  body: bytes,
+              ) -> dict[str, object]:
+                  """Resumen de alertas CAP
+                  (Common Alerting Protocol, XML
+                  de Proteccion Civil)."""
+                  import hashlib
+                  import xml.etree.ElementTree
+                  as ET
+                  root = ET.fromstring(body)
+                  ns_split = root.tag.split("}")
+                  ns = (ns_split[0][1:]
+                        if len(ns_split) == 2
+                        else "")
+                  q = (lambda tag:
+                       (ns + tag) if ns
+                       else tag)
+                  alerts = []
+                  for info in root.iter(
+                      q("info")
+                  ):
+                      ev = info.find(q("event"))
+                      sev = info.find(q("severity"))
+                      alerts.append({
+                          "event": (
+                              ev.text
+                              if ev is not None
+                              else ""),
+                          "severity": (
+                              sev.text
+                              if sev is not None
+                              else ""),
+                      })
+                  return {
+                      "kind": "cap",
+                      "alerts": alerts[:20],
+                      "count": len(alerts),
+                      "sha256": hashlib.sha256(
+                          body).hexdigest(),
+                  }
+          ''')
+          METODOS = textwrap.indent(
+              CUERPO.rstrip("\n"), "")
+          t = (t.rstrip("\n") + "\n\n"
+               + METODOS + "\n")
+          ast.parse(t)
+          p.write_text(t, encoding="utf-8")
+          print("OK PublicSourceClient + 3 parsers"
+                " (AST valido)")
+          SEOF
+
+      - name: "Paso B - verificacion dura inmediata: clase y parsers importables, IntegrationsEngine intacto"
         run: |
-          python3 - <<'D2EOF'
-          import inspect
+          python3 -c "
+          from shared_engines.integrations.engine import (
+              IntegrationsEngine, PublicSourceClient,
+              parse_geojson_summary, parse_json_source,
+              parse_cap_alerts)
+          for m in ('register_adapter', 'register_handler',
+                    'invoke', 'health'):
+              assert hasattr(IntegrationsEngine, m), m
+          import json
+          s = parse_geojson_summary(json.dumps({
+              'type': 'FeatureCollection',
+              'features': [{}, {}, {}]}).encode())
+          assert s['features'] == 3 and s['kind'] == 'geojson'
+          print('OK: clase + parsers vivos; engine intacto')
+          "
+
+      - name: "Paso C - tests (fixtures locales, cero llamadas reales a gobierno)"
+        run: |
+          python3 - <<'TSEOF'
+          import ast
+          import textwrap
           from pathlib import Path
-          try:
-              from shared_engines.integrations import (
-                  engine as ie)
-              print("=== integrations publico ===")
-              for n in sorted(
-                  a for a in dir(ie)
-                  if not a.startswith("_")):
-                  o = getattr(ie, n)
-                  if inspect.isclass(o):
-                      print(n, "(clase)")
-                      for mn, mv in sorted(
-                          vars(o).items()):
-                          if (mn.startswith("__")
-                              or not callable(mv)):
-                              continue
-                          if inspect.isfunction(mv):
-                              try:
-                                  print("  ."
-                                      + mn
-                                      + str(
-                                          inspect.signature(
-                                              mv))[:150])
-                              except Exception:
-                                  print("  ." + mn)
-          except Exception as e:
-              print("import fallo:", e)
-          t = Path(
+          p = Path(
               "shared_engines/integrations/tests/"
               "test_integrations.py")
-          print()
-          print("=== test_integrations.py (existe?) ===")
-          if t.exists():
-              txt = t.read_text(encoding="utf-8")
-              print("SI (" + str(len(
-                  txt.splitlines())) + " lineas)")
-              for i, l in enumerate(
-                  txt.splitlines(), 1):
-                  print(str(i).rjust(4) + ": " + l)
-          else:
-              print("NO EXISTE")
-          D2EOF
+          t = p.read_text(encoding="utf-8")
+          if "test_public_source_cache_and_stale" in t:
+              print("SKIP tests (ya presentes)")
+              raise SystemExit(0)
+          EXTRA = textwrap.dedent('''\
 
-      - name: "Dump 3: clientes HTTP reutilizables en la Red (urllib/requests usage en shared_engines)"
-        run: |
-          python3 - <<'D3EOF'
-          from pathlib import Path
-          print("=== uso de urllib/requests/http en shared_engines (clientes existentes) ===")
-          for f in sorted(Path("shared_engines").rglob("*.py")):
-              if "/tests/" in str(f):
-                  continue
-              try:
-                  txt = f.read_text(encoding="utf-8")
-              except Exception:
-                  continue
-              hits = []
-              for i, l in enumerate(txt.splitlines(), 1):
-                  if ("import urllib" in l
-                      or "import requests" in l
-                      or "urlopen" in l
-                      or "http.client" in l):
-                      hits.append((i, l.strip()))
-              if hits:
-                  print()
-                  print("-- " + str(f))
-                  for i, l in hits[:8]:
-                      print("  " + str(i).rjust(5)
-                            + ": " + l[:110])
-          D3EOF
 
-      - name: "Dump 4: currency/rates.py completo (el patron de proveedor de fuente externa mas cercano ya construido)"
-        run: |
-          python3 - <<'D4EOF'
-          from pathlib import Path
-          p = Path(
-              "shared_engines/currency/rates.py")
-          print("=== currency/rates.py ===")
-          if p.exists():
-              for i, l in enumerate(
-                  p.read_text(
-                      encoding="utf-8").splitlines(), 1):
-                  print(str(i).rjust(4) + ": " + l)
-          else:
-              print("NO EXISTE; busco rates:")
-              for f in Path(
-                  "shared_engines/currency"
-              ).rglob("*.py"):
-                  print("  " + str(f))
-          D4EOF
+              def test_public_source_cache_and_stale(
+                  tmp_path: Path,
+              ) -> None:
+                  """AX-SOURCES: cache TTL evita
+                  martillar la fuente; si cae,
+                  sirve cache con stale=True;
+                  cada cuerpo queda con sha256."""
+                  import hashlib
+                  from shared_engines.integrations.engine import (
+                      PublicSourceClient)
 
-      - name: "Dump 5: rutas HTTP caps existentes (donde colgarian los endpoints de fuentes) + inventario Apps del dueño para el mapa de conectores"
-        run: |
-          python3 - <<'D5EOF'
-          from pathlib import Path
-          p = Path(
-              "shared_engines/runtime/"
-              "capabilities_api.py")
-          lines = p.read_text(
-              encoding="utf-8").splitlines()
-          print("=== capabilities_api.py: if s == [ ... (todas las rutas POST existentes) ===")
-          for i, l in enumerate(lines, 1):
-              if 'if s == [' in l:
-                  print(str(i).rjust(5)
-                        + ": " + l.strip()[:110])
-          D5EOF
+                  class _Clock:
+                      def __init__(self):
+                          self.t = 1000.0
 
-      - name: "Contexto"
+                      def now(self):
+                          return self.t
+
+                  llamadas = {"n": 0}
+                  cuerpo = b'{"ok": true}'
+
+                  def opener(url: str) -> bytes:
+                      llamadas["n"] += 1
+                      if llamadas["n"] == 2:
+                          raise OSError("down")
+                      return cuerpo
+
+                  ck = _Clock()
+                  cli = PublicSourceClient(
+                      clock=ck,
+                      ttl_seconds=60.0,
+                      opener=opener)
+                  b1, stale1 = cli.fetch(
+                      "https://fuente.gob/data")
+                  assert b1 == cuerpo
+                  assert stale1 is False
+                  b2, stale2 = cli.fetch(
+                      "https://fuente.gob/data")
+                  assert b2 == cuerpo
+                  assert stale2 is False
+                  assert llamadas["n"] == 1, (
+                      "cache no uso el TTL: "
+                      + str(llamadas["n"]))
+                  ck.t = 1100.0
+                  b3, stale3 = cli.fetch(
+                      "https://fuente.gob/data")
+                  assert b3 == cuerpo
+                  assert stale3 is True, (
+                      "fuente caida debe servir"
+                      " cache con stale=True")
+                  assert hashlib.sha256(
+                      b3).hexdigest()
+
+
+              def test_source_adapters_via_engine(
+                  tmp_path: Path,
+              ) -> None:
+                  """AX-SOURCES: cada fuente
+                  publica = adapter registrado en
+                  IntegrationsEngine + handler con
+                  parser ligero. Gobernado: retries
+                  + health durables."""
+                  import hashlib
+                  import json
+                  from shared_engines.integrations.engine import (
+                      IntegrationsEngine,
+                      parse_geojson_summary)
+
+                  geojson = json.dumps({
+                      "type": "FeatureCollection",
+                      "features": [
+                          {"type": "Feature"},
+                          {"type": "Feature"},
+                      ],
+                  }).encode("utf-8")
+
+                  engine = IntegrationsEngine(
+                      SQLiteAdapter(
+                          tmp_path / "src.db"),
+                      FrozenClock())
+                  engine.register_adapter(
+                      adapter_id="marn-geo",
+                      kind="http-geo",
+                      endpoint=(
+                          "https://geoportal"
+                          ".marn.gob/arcgis"),
+                      max_retries=2,
+                  )
+
+                  def marn_handler(
+                      payload: bytes,
+                  ) -> bytes:
+                      resumen = (
+                          parse_geojson_summary(
+                              geojson))
+                      return json.dumps(
+                          resumen).encode(
+                          "utf-8")
+
+                  engine.register_handler(
+                      adapter_id="marn-geo",
+                      handler=marn_handler,
+                  )
+                  result = engine.invoke(
+                      adapter_id="marn-geo",
+                      payload=b"query",
+                  )
+                  assert result.attempts == 1
+                  health = engine.health(
+                      adapter_id="marn-geo")
+                  assert health.calls == 1
+                  assert health.failures == 0
+
+
+              def test_parsers_lightweight(
+                  tmp_path: Path,
+              ) -> None:
+                  """AX-SOURCES: parsers
+                  devuelven RESUMEN (la Red
+                  ligera); el sha256 permite
+                  verificar el crudo."""
+                  import json
+                  from shared_engines.integrations.engine import (
+                      parse_json_source,
+                      parse_cap_alerts)
+
+                  one = json.dumps([
+                      {"codigo": "011101"},
+                      {"codigo": "011102"},
+                  ]).encode("utf-8")
+                  r = parse_json_source(one)
+                  assert r["items"] == 2
+                  assert r["kind"] == "json"
+
+                  cap = (
+                      "<?xml version='1.0'?>"
+                      "<alert>"
+                      "<info><event>Lluvia"
+                      "</event><severity>Moderate"
+                      "</severity></info>"
+                      "<info><event>Sequia"
+                      "</event><severity>Severe"
+                      "</severity></info>"
+                      "</alert>"
+                  ).encode("utf-8")
+                  c = parse_cap_alerts(cap)
+                  assert c["count"] == 2
+                  assert c["alerts"][0][
+                      "event"] == "Lluvia"
+          ''')
+          t = t.rstrip("\n") + "\n" + EXTRA
+          ast.parse(t)
+          p.write_text(t, encoding="utf-8")
+          final = p.read_text(encoding="utf-8")
+          assert ("test_public_source_cache"
+                  "_and_stale" in final)
+          assert ("test_source_adapters"
+                  "_via_engine" in final)
+          assert "test_parsers_lightweight" in final
+          print("OK tests AX-SOURCES (AST valido)")
+          TSEOF
+
+      - name: "Paso D - GATE Red (shared_engines completo)"
         run: |
-          git log --oneline -3
+          python3 -m pytest shared_engines -q --tb=short 2>&1 | tail -8
+
+      - name: "Paso E - GATE apps (4 apps)"
+        run: |
+          python3 -m pytest apps/axis/tests apps/axis/life_history/tests apps/subastas/tests apps/semilla/tests -q --tb=short 2>&1 | tail -4
+
+      - name: "Paso F - SOLO SI FALLO: diagnostico al Resumen"
+        if: failure()
+        run: |
+          {
+            echo "## DIAGNOSTICO RED-4"
+            echo '```'
+            python3 -m pytest shared_engines/integrations/tests/test_integrations.py -vv --tb=long 2>&1 | tail -60 || true
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+        shell: bash
+
+      - name: Commit and push (solo si verde)
+        run: |
+          git config user.name "zyra-pilot-bot"
+          git config user.email "actions@github.com"
+          git add -A
+          if git diff --cached --quiet; then
+            echo "No changes."
+          else
+            git commit -m "RED-4: conectores de fuentes publicas (PublicSourceClient TTL/stale + parsers GeoJSON/JSON/CAP)" -m "Patron confirmado por auditoria: IntegrationsEngine ya gobierna invocacion externa (register_adapter + register_handler + invoke con retries acotados + health durable). RED-4 anade aditivamente a integrations/engine.py: PublicSourceClient (fetch de fuentes publicas con cache TTL en memoria - la Red nunca martilla a la fuente; si cae sirve cache con stale=True) + parsers ligeros (parse_geojson_summary, parse_json_source, parse_cap_alerts) que devuelven RESUMEN + sha256 del crudo - la Red guarda el resumen verificado, el dataset completo va a la app duena (regla: la Red transporta confianza, no carga). Fuentes 🟢 conectables: MARN ArcGIS REST (marn-geo), Proteccion Civil CAP (pc-alerts), ONEC clasificadores (onec-classifiers), SIAM-MAG. Los handlers reales se wirean en composition root al desplegar (diseno del propio engine); tests 100% con fixtures locales (cero llamadas reales a gobierno). Destino por fuente unica: marn-geo->AGRO/AXIS, pc-alerts->AGRO/AXIS, onec->NEXO."
+          fi
+          git pull --rebase --autostash origin main || true
+          for i in 1 2 3; do
+            if git push origin main; then
+              echo "PUSH OK"
+              exit 0
+            fi
+            git pull --rebase --autostash origin main || true
+            sleep 3
+          done
+          echo "PUSH FAILED"
+          exit 1

@@ -474,3 +474,74 @@ def test_history_via_serve_combined(
     finally:
         srv.shutdown()
         srv.server_close()
+
+
+def test_verification_verdict_signed(tmp_path) -> None:
+    """AX-VERIF: enroll biometrico -> verify_face 1:1 -> veredicto firmado -> firma verificada offline."""
+    import base64
+    import json as _json
+    import threading
+    import time as _time
+    import urllib.error
+    import urllib.request
+    from shared_engines.storage.database import SQLiteAdapter
+    from shared_engines.common.clocks import FrozenClock
+    from shared_engines.runtime.config import RuntimeConfig
+    from shared_engines.runtime.kernel import ZyraKernel
+    from shared_engines.runtime.capabilities import ZyraCapabilities
+    from shared_engines.runtime.combined_api import serve_combined
+    from shared_engines.verification.signatures import Ed25519Signer, Ed25519Verifier
+    from shared_engines.security.biometrics import BiometricsEngine, BiometricsPolicy, DeterministicTestProvider, TemplateCipher
+    from shared_engines.network.portable_profile import ProfileRegistry
+    from shared_engines.audit.chain import AuditTrail
+    from shared_engines.events.outbox import Outbox
+    from shared_engines.common.serialization import canonical_json_dumps
+    net_db = SQLiteAdapter(":memory:")
+    signer, pub = Ed25519Signer.generate()
+    kernel = ZyraKernel(db=net_db, clock=FrozenClock(), signer=signer, config=RuntimeConfig(host="127.0.0.1", port=0, api_token=None))
+    kernel.bootstrap_root()
+    kernel._biometrics = BiometricsEngine(db=net_db, clock=FrozenClock(), audit=kernel.audit, provider=DeterministicTestProvider(), cipher=TemplateCipher(master_key_hex="ab" * 32), policy=BiometricsPolicy(require_liveness=False, doc_reject=0.01, doc_review=0.02, doc_auto=0.03, dup_reject=0.98))
+    caps = ZyraCapabilities(net_db, FrozenClock(), identity=kernel.identity, signer=signer)
+    caps.profiles = ProfileRegistry(net_db, FrozenClock(), audit=AuditTrail(net_db, FrozenClock()), outbox=Outbox(net_db, FrozenClock()))
+    caps.profiles.register_app(app_id="banco-ny", display_name="Banco NY", scopes=("display_name", "national_id", "id_country", "id_type", "id_number", "nationality", "birth_date", "address"))
+    srv = serve_combined(kernel, caps, host="127.0.0.1", port=0)
+    threading.Thread(target=srv.serve_forever, daemon=True).start()
+    _time.sleep(0.3)
+    base = "http://127.0.0.1:" + str(srv.server_address[1])
+
+    def post(ruta, doc):
+        data = _json.dumps(doc).encode()
+        req = urllib.request.Request(base + ruta, data=data, method="POST", headers={"Content-Type": "application/json"})
+        try:
+            with urllib.request.urlopen(req, timeout=15) as r:
+                return r.status, _json.loads(r.read().decode())
+        except urllib.error.HTTPError as e:
+            return e.code, _json.loads(e.read().decode())
+
+    try:
+        selfie = base64.b64encode(b"selfie-pedro-real").decode("ascii")
+        docimg = base64.b64encode(b"doc-pedro-dui").decode("ascii")
+        st, r1 = post("/identity/enroll", {"kind": "person", "display_name": "Pedro Prueba", "actor": "banco-ny", "doc_image_b64": docimg, "selfie_image_b64": selfie})
+        assert st in (200, 201), str(st) + " " + str(r1)
+        zid = ((r1.get("data") or {}).get("identity") or {}).get("zid")
+        assert zid, str(r1)[:300]
+        reg = caps.profiles
+        reg.set_field(zid=zid, field="display_name", value="Pedro Prueba", verified=True)
+        reg.set_field(zid=zid, field="id_country", value="SV", verified=True)
+        reg.set_field(zid=zid, field="id_type", value="dui", verified=True)
+        reg.set_field(zid=zid, field="birth_date", value="1992-04-04", verified=True)
+        st, r2 = post("/verification/person", {"zid": zid, "selfie_b64": selfie, "actor_app": "banco-ny"})
+        assert st == 200, str(st) + " " + str(r2)[:400]
+        d = r2["data"]
+        assert d["verified_person"] is True, str(d)[:200]
+        assert d["fields"]["id_type"] == "dui"
+        assert d["age"] >= 30
+        assert d.get("signature")
+        verde = bytes.fromhex(d["signature"])
+        sin_firma = dict((k, v) for k, v in d.items() if k != "signature")
+        recom = canonical_json_dumps(sin_firma).encode("utf-8")
+        assert Ed25519Verifier(pub).verify(recom, verde) is True
+        print("OK AX-VERIF: veredicto firmado, verificable offline")
+    finally:
+        srv.shutdown()
+        srv.server_close()

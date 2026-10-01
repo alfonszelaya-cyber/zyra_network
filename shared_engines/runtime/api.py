@@ -199,6 +199,18 @@ class ZyraApiHandler(BaseHTTPRequestHandler):
             self._handle_transition()
         elif s == ["verification", "media"]:
             self._handle_register_media()
+        elif s == ["verification", "person"]:
+            import base64 as _b64v
+            bio = getattr(type(self).kernel, "_biometrics", None)
+            if bio is None:
+                raise ApiError(503, "not_wired", "biometrics not configured")
+            zid_v = self._req(doc, "zid")
+            selfie_v = _b64v.b64decode(self._req(doc, "selfie_b64"))
+            reporte = bio.verify_face(zid_v, selfie_image=selfie_v, actor=self._req(doc, "actor_app"))
+            fv = {"match": bool(getattr(reporte, "match", False)), "score": float(getattr(reporte, "score", 0.0))}
+            verd = type(self).caps.profiles.verification_verdict(app_id=self._req(doc, "actor_app"), zid=zid_v, face_verdict=fv, signer=type(self).kernel.signer, clock=type(self).kernel.clock)
+            self._send(200, {"ok": True, "data": verd})
+            return
         elif s == ["verification", "media", "verify"]:
             self._handle_verify_media()
         elif s == ["verification", "credentials"]:

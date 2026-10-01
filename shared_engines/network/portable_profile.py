@@ -503,3 +503,42 @@ class ProfileRegistry:
             "levels": niveles,
             "age": edad,
         }
+
+    def verification_verdict(
+        self,
+        *,
+        app_id: str,
+        zid: str,
+        face_verdict: dict[str, object],
+        signer,
+        clock: Clock,
+    ) -> dict[str, object]:
+        """AX-VERIF: EL veredicto de verificacion para bancos/consulados/empleadores. Une biometria 1:1 + universal_view + FIRMA de la Red (prueba verificable offline). Scope gobierna; acceso auditado."""
+        from shared_engines.common.serialization import canonical_json_dumps
+        import time as _time
+        require_non_empty_str(app_id, "app_id")
+        require_non_empty_str(zid, "zid")
+        base = self.universal_view(app_id=app_id, zid=zid)
+        match = bool(face_verdict.get("match"))
+        score = float(face_verdict.get("score", 0.0))
+        verdict = {
+            "zid": zid,
+            "verified_person": match,
+            "face_score": score,
+            "fields": base["fields"],
+            "levels": base["levels"],
+            "age": base["age"],
+            "verified_at": _time.time(),
+            "issuer": "zyra-network",
+        }
+        payload = canonical_json_dumps(verdict).encode("utf-8")
+        firma = signer.sign(payload)
+        verd = dict(verdict)
+        verd["signature"] = firma.hex()
+        self._audit.append(
+            event_type="network.verification.verdict",
+            actor=app_id,
+            subject=zid,
+            payload={"match": match, "score": score},
+        )
+        return verd

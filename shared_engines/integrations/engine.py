@@ -460,3 +460,375 @@ def parse_cap_alerts(
         "sha256": hashlib.sha256(
             body).hexdigest(),
     }
+
+OFFICIAL_SOURCES: dict[str, dict[
+    str, str]] = {
+    "onec-classifiers": {
+        "base": (
+            "https://onec.bcr.gob.sv"
+            "/clasificadoresv2.api"),
+        "auth": "none",
+        "owner": (
+            "NEXO economic +"
+            " SEMILLA education +"
+            " MPE occupations"),
+    },
+    "marn-geo": {
+        "base": (
+            "https://geoportal"
+            ".marn.gob.sv/server/rest"
+            "/services"),
+        "auth": "none",
+        "owner": (
+            "AGRO risk/climate +"
+            " AXIS geodata"),
+    },
+    "snet-d3": {
+        "base": (
+            "https://srt.snet.gob.sv"
+            "/apidoa/api"),
+        "auth": "token",
+        "owner": "AGRO climate",
+    },
+}
+
+ONEC_ENDPOINTS: tuple[str, ...] = (
+    "/CLAEES2022",
+    "/CNOES2020",
+    "/CNEESA2021",
+    "/CNEESF2021",
+    "/CNEESP2021",
+    "/CGEOES2019",
+    "/NTEES2021",
+)
+
+ARCGIS_SERVICES: dict[
+    str, tuple[str, ...]] = {
+    "marn-geo": (
+        "/sig_ccanales/ATLAS_"
+        "Riesgo/MapServer",
+        "/SIHI/proyecto_"
+        "hidrologia/MapServer",
+        "/SIHI/proyecto_"
+        "hidrogeo/MapServer",
+        "/sig_ccanales/Capas"
+        "VIGEA2022/MapServer",
+        "/sig_ccanales/VIGEA"
+        "Layers/MapServer",
+        "/RISK/Amenaza/"
+        "MapServer",
+        "/Hosted/Distritos_de_"
+        "El_Salvador/"
+        "FeatureServer",
+        "/Hosted/Deslizamientos"
+        "Inundaciones/MapServer",
+        "/aescalante/atlas_"
+        "publicacion/"
+        "MapServer",
+    ),
+}
+
+
+def marn_query_url(
+    service_path: str,
+    layer_id: int,
+    *,
+    where: str = "1=1",
+    out_fields: str = "*",
+    geojson: bool = True,
+) -> str:
+    """AX-SOURCES: query ArcGIS
+    estandar (patron oficial)."""
+    from urllib.parse import (
+        quote,
+    )
+    base = (
+        OFFICIAL_SOURCES[
+            "marn-geo"]["base"])
+    f = ("geojson"
+         if geojson else "json")
+    return (
+        base + service_path
+        + "/" + str(layer_id)
+        + "/query?where="
+        + quote(where)
+        + "&outFields="
+        + quote(out_fields)
+        + "&returnGeometry=true"
+        + "&f=" + f)
+
+
+def service_layers_url(
+    service_path: str,
+) -> str:
+    """AX-SOURCES: metadata del
+    servicio (lista TODAS sus
+    capas con sus ids)."""
+    base = (
+        OFFICIAL_SOURCES[
+            "marn-geo"]["base"])
+    return (base
+            + service_path
+            + "?f=json")
+
+
+_SOURCE_MIGRATIONS = (
+    Migration(
+        1,
+        "integrations_sources",
+        (
+            "CREATE TABLE IF NOT"
+            " EXISTS source_snapshots ("
+            " source_id TEXT NOT NULL,"
+            " url TEXT NOT NULL,"
+            " sha256 TEXT NOT NULL,"
+            " summary_json TEXT NOT"
+            " NULL, fetch_count INTEGER"
+            " NOT NULL DEFAULT 1,"
+            " last_fetched REAL NOT"
+            " NULL, PRIMARY KEY"
+            " (source_id, url))",
+        ),
+    ),
+)
+
+
+class SourceIndex:
+    """AX-SOURCES: indice durable
+    de la Red para datos de fuentes
+    publicas (RESUMEN + sha256 por
+    URL - la Red ligera; el dataset
+    completo va a la app duena)."""
+
+    def __init__(
+        self,
+        db: Database,
+        clock: Clock,
+    ) -> None:
+        self._db = db
+        self._clock = clock
+        MigrationRunner(
+            db,
+            "integrations.sources",
+            _SOURCE_MIGRATIONS,
+        ).run(clock)
+
+    def record(
+        self,
+        *,
+        source_id: str,
+        url: str,
+        sha256: str,
+        summary: dict[
+            str, object],
+    ) -> None:
+        with (
+            self._db.transaction()
+            as cursor
+        ):
+            cursor.execute(
+                "INSERT INTO"
+                " source_snapshots"
+                " (source_id, url,"
+                " sha256,"
+                " summary_json,"
+                " fetch_count,"
+                " last_fetched)"
+                " VALUES (?, ?, ?, ?,"
+                " 1, ?)"
+                " ON CONFLICT"
+                "(source_id, url)"
+                " DO UPDATE SET"
+                " sha256 = excluded"
+                ".sha256,"
+                " summary_json ="
+                " excluded"
+                ".summary_json,"
+                " fetch_count ="
+                " fetch_count + 1,"
+                " last_fetched ="
+                " excluded"
+                ".last_fetched",
+                (
+                    source_id,
+                    url,
+                    sha256,
+                    canonical_json_dumps(
+                        summary),
+                    self._clock.now(),
+                ),
+            )
+
+
+def sweep_onec(
+    client: PublicSourceClient,
+    index: SourceIndex | None = (
+        None),
+) -> dict[str, object]:
+    """AX-SOURCES: barrido de los 7
+    clasificadores ONEC."""
+    base = (OFFICIAL_SOURCES[
+        "onec-classifiers"][
+        "base"])
+    resultados = []
+    ok = 0
+    for ep in ONEC_ENDPOINTS:
+        url = base + ep
+        entrada: dict[
+            str, object] = {
+            "url": url}
+        try:
+            body, stale = (
+                client.fetch(url))
+            resumen = (
+                parse_json_source(
+                    body))
+            entrada["ok"] = True
+            entrada["stale"] = (
+                stale)
+            entrada["summary"] = (
+                resumen)
+            ok += 1
+            if index is not None:
+                index.record(
+                    source_id=(
+                        "onec-"
+                        "classifiers"),
+                    url=url,
+                    sha256=str(
+                        resumen[
+                            "sha256"]),
+                    summary=resumen,
+                )
+        except Exception as exc:
+            entrada["ok"] = False
+            entrada["error"] = (
+                type(exc).__name__
+                + ": "
+                + str(exc)[:100])
+        resultados.append(
+            entrada)
+    return {
+        "source": (
+            "onec-classifiers"),
+        "ok": ok,
+        "total": len(
+            ONEC_ENDPOINTS),
+        "endpoints": resultados,
+    }
+
+
+def sweep_marn(
+    client: PublicSourceClient,
+    index: SourceIndex | None = (
+        None),
+    *,
+    max_layers_per_service: int = (
+        40),
+    pause_seconds: float = 0.1,
+) -> dict[str, object]:
+    """AX-SOURCES: barrido de los 9
+    servicios MARN con
+    DESCUBRIMIENTO automatico de
+    capas (metadata f=json revela
+    cada capa; luego query geojson
+    por capa)."""
+    import time
+    base = (OFFICIAL_SOURCES[
+        "marn-geo"]["base"])
+    resultados = []
+    ok = 0
+    total = 0
+    for svc in (
+        ARCGIS_SERVICES[
+            "marn-geo"]
+    ):
+        meta_url = (
+            service_layers_url(
+                svc))
+        try:
+            meta_body, _ = (
+                client.fetch(
+                    meta_url))
+            import json
+            meta = json.loads(
+                meta_body.decode(
+                    "utf-8"))
+            capas = [
+                int(l["id"])
+                for l in meta.get(
+                    "layers", [])
+            ][:max_layers_per_service]
+        except Exception as exc:
+            resultados.append({
+                "service": svc,
+                "ok": False,
+                "error": (
+                    type(exc).__name__
+                    + ": "
+                    + str(exc)[:100]),
+            })
+            continue
+        for lid in capas:
+            total += 1
+            url = marn_query_url(
+                svc, lid)
+            entrada: dict[
+                str, object
+            ] = {
+                "url": url}
+            try:
+                body, stale = (
+                    client.fetch(
+                        url))
+                resumen = (
+                    parse_geojson_summary(
+                        body))
+                entrada["ok"] = (
+                    True)
+                entrada[
+                    "stale"
+                ] = stale
+                entrada[
+                    "summary"
+                ] = resumen
+                ok += 1
+                if index is (not (
+                        None)):
+                    index.record(
+                        source_id=(
+                            "marn-"
+                            "geo"),
+                        url=url,
+                        sha256=str(
+                            resumen[
+                                "sha256"]),
+                        summary=(
+                            resumen),
+                    )
+            except Exception as exc:
+                entrada["ok"] = (
+                    False)
+                entrada[
+                    "error"
+                ] = (type(exc).__name__
+                    + ": "
+                    + str(exc)[:80])
+            resultados.append(
+                entrada)
+            if (pause_seconds
+                    > 0):
+                time.sleep(
+                    pause_seconds)
+        resultados.append({
+            "service": svc,
+            "layers": len(
+                capas),
+        })
+    return {
+        "source": "marn-geo",
+        "layers_ok": ok,
+        "layers_total": (
+            total),
+        "results": resultados,
+    }

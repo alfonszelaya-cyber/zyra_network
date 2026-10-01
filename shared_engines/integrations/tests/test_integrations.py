@@ -290,3 +290,86 @@ def test_parsers_lightweight(
     assert c["count"] == 2
     assert c["alerts"][0][
         "event"] == "Lluvia"
+
+
+def test_sweep_all_sources(
+    tmp_path,
+) -> None:
+    """AX-SOURCES: barrido completo
+    con fixtures - ONEC 7 endpoints,
+    MARN descubrimiento de capas por
+    servicio, snapshots durables en
+    el indice."""
+    import json
+    from shared_engines.integrations.engine import (
+        PublicSourceClient,
+        SourceIndex,
+        sweep_onec, sweep_marn,
+        ONEC_ENDPOINTS,
+        ARCGIS_SERVICES)
+    from shared_engines.common.clocks import (
+        FrozenClock)
+    from shared_engines.storage.database import (
+        SQLiteAdapter)
+
+    geo = json.dumps({
+        "type": "FeatureCollection",
+        "features": [
+            {"type": "Feature"},
+            {"type": "Feature"},
+        ],
+    }).encode("utf-8")
+    meta = json.dumps({
+        "layers": [
+            {"id": 0,
+             "name": "a"},
+            {"id": 1,
+             "name": "b"},
+        ],
+    }).encode("utf-8")
+    one = json.dumps([
+        {"codigo": "0111101"},
+    ]).encode("utf-8")
+
+    def opener(url: str) -> bytes:
+        if url.endswith("?f=json"):
+            return meta
+        if ("/query" in url):
+            return geo
+        if url.endswith(tuple(
+            ONEC_ENDPOINTS
+        )):
+            return one
+        raise OSError("no simulada")
+
+    cli = PublicSourceClient(
+        clock=FrozenClock(),
+        ttl_seconds=60.0,
+        opener=opener)
+    index = SourceIndex(
+        SQLiteAdapter(
+            tmp_path / "src.db"),
+        FrozenClock())
+    r1 = sweep_onec(cli, index)
+    assert r1["ok"] == 7
+    assert r1["total"] == 7
+    r2 = sweep_marn(
+        cli, index,
+        max_layers_per_service=2,
+        pause_seconds=0)
+    assert r2["layers_total"] == (
+        2 * len(ARCGIS_SERVICES[
+            "marn-geo"]))
+    assert r2["layers_ok"] == (
+        r2["layers_total"])
+    rows = index._db.query_all(
+        "SELECT * FROM"
+        " source_snapshots")
+    assert len(rows) == (7 + 2
+        * len(ARCGIS_SERVICES[
+            "marn-geo"]))
+    print("OK barrido completo:"
+          " 7 ONEC + "
+          + str(r2["layers_total"])
+          + " capas MARN +"
+          " snapshots durables")

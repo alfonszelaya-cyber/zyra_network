@@ -154,6 +154,16 @@ class CapabilitiesApiHandler(
         caps = type(self).caps
         if (
             len(s) == 3
+            and s[0] == "profile"
+            and s[1] == "documents"
+        ):
+            reg = caps.profiles
+            docs = reg.list_documents(zid=s[2])
+            asur = reg.assurance_level(zid=s[2])
+            self._ok({"documents": list(docs), "assurance": asur})
+            return
+        if (
+            len(s) == 3
             and s[0] == "consent"
             and s[1] == "list"
         ):
@@ -468,6 +478,28 @@ class CapabilitiesApiHandler(
                     "ok": True,
                     "data": (resultado)},
             )
+            return
+        if s == ["profile", "documents", "add"]:
+            reg = caps.profiles
+            res = reg.add_document(
+                zid=self._req(doc, "zid"),
+                doc_type=self._req(doc, "doc_type"),
+                doc_number=self._req(doc, "doc_number"),
+                issuing_country=self._req(doc, "issuing_country"),
+                issuing_authority=str(doc.get("issuing_authority", "")),
+                issue_date=str(doc.get("issue_date", "")),
+                expiry_date=str(doc.get("expiry_date", "")),
+                verified=bool(doc.get("verified", False)),
+                verified_by=str(doc.get("verified_by", "")),
+            )
+            self._send(201, {"ok": True, "data": res})
+            return
+        if s == ["profile", "documents", "revoke"]:
+            caps.profiles.revoke_document(
+                zid=self._req(doc, "zid"),
+                document_id=self._req(doc, "document_id"),
+                reason=str(doc.get("reason", "")))
+            self._send(200, {"ok": True})
             return
         if s == ["consent", "grant"]:
             import base64 as _b64c

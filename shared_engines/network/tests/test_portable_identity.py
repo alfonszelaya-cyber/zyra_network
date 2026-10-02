@@ -434,3 +434,43 @@ def test_consent_and_freeze_flow(tmp_path) -> None:
     lista = reg.consents_of(zid=zid)
     assert len(lista) >= 2
     print("OK AX-CONSENT/FREEZE: otorgar, expirar, revocar, congelar, desbloquear con codigo, historial visible")
+
+
+def test_expediente_legal_pedro(tmp_path) -> None:
+    """AX-EXP: Pedro con DUI (SV) + pasaporte (US) en el MISMO ZID. Assurance L2->L4->L5. Revocacion en historial."""
+    from shared_engines.network.portable_profile import (
+        ProfileRegistry)
+    from shared_engines.audit.chain import AuditTrail
+    from shared_engines.events.outbox import Outbox
+    from shared_engines.events.contracts import EventCatalog
+    from shared_engines.storage.database import SQLiteAdapter
+    from shared_engines.common.clocks import FrozenClock
+    db = SQLiteAdapter(tmp_path / "exp.db")
+    clock = FrozenClock()
+    reg = ProfileRegistry(db, clock, audit=AuditTrail(db, clock), outbox=Outbox(db, clock))
+    zid = "ZID-pedro-exp-00000001"
+    reg.set_field(zid=zid, field="display_name", value="Pedro Prueba", verified=True)
+    a0 = reg.assurance_level(zid=zid)
+    assert a0["assurance_level"] == 0, str(a0)
+    d1 = reg.add_document(zid=zid, doc_type="dui", doc_number="00000000-0", issuing_country="SV", issuing_authority="RNPN", issue_date="2015-01-01", expiry_date="2025-01-01", verified=True, verified_by="RNPN")
+    assert d1["document_id"].startswith("DOCX-")
+    a2 = reg.assurance_level(zid=zid)
+    assert a2["assurance_level"] == 2, str(a2)
+    db.execute("INSERT INTO biometric_templates (template_id, identity_zid, modality, template_enc, dims, created_at) VALUES ('T-1', ?, 'face', x'00', 1, 1)", (zid,))
+    a4 = reg.assurance_level(zid=zid)
+    assert a4["assurance_level"] == 4, str(a4)
+    d2 = reg.add_document(zid=zid, doc_type="passport", doc_number="US-PASS-777", issuing_country="US", issuing_authority="U.S. Department of State", issue_date="2024-01-01", expiry_date="2034-01-01", verified=True, verified_by="U.S. Dept of State")
+    a5 = reg.assurance_level(zid=zid)
+    assert a5["assurance_level"] == 5, str(a5)
+    assert a5["countries"] == ["SV", "US"], str(a5)
+    docs = reg.list_documents(zid=zid)
+    assert len(docs) == 2
+    tipos = sorted(d["doc_type"] for d in docs)
+    assert tipos == ["dui", "passport"], str(tipos)
+    reg.revoke_document(zid=zid, document_id=d2["document_id"], reason="perdida")
+    docs2 = reg.list_documents(zid=zid)
+    rev = [d for d in docs2 if d["document_id"] == d2["document_id"]]
+    assert rev[0]["status"] == "REVOKED"
+    a6 = reg.assurance_level(zid=zid)
+    assert a6["assurance_level"] == 2, str(a6)
+    print("OK AX-EXP: Pedro SV-DUI + US-pasaporte en un ZID, assurance 0->2->4->5, revocacion en historial")

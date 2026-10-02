@@ -116,6 +116,21 @@ _MIGRATIONS = (
             " reason TEXT, unfreeze_code TEXT)",
         ),
     ),
+    Migration(
+        4,
+        "network_identity_documents",
+        (
+            "CREATE TABLE IF NOT EXISTS identity_documents ("
+            " document_id TEXT NOT NULL, zid TEXT NOT NULL,"
+            " doc_type TEXT NOT NULL, doc_number TEXT NOT NULL,"
+            " issuing_country TEXT NOT NULL, issuing_authority TEXT,"
+            " issue_date TEXT, expiry_date TEXT, status TEXT NOT NULL,"
+            " verification_status TEXT NOT NULL, verified_by TEXT,"
+            " added_at REAL NOT NULL, PRIMARY KEY (zid, doc_type, doc_number))",
+            "CREATE INDEX IF NOT EXISTS idx_docs_zid ON identity_documents (zid)",
+            "CREATE UNIQUE INDEX IF NOT EXISTS idx_docs_docid ON identity_documents (document_id)",
+        ),
+    ),
 )
 
 
@@ -634,6 +649,55 @@ class ProfileRegistry:
             cursor.execute("DELETE FROM zid_freezes WHERE zid = ?", (zid,))
         self._audit.append(event_type="network.identity.unfrozen", actor=zid, subject=zid, payload={})
         return True
+
+    def add_document(self, *, zid: str, doc_type: str, doc_number: str, issuing_country: str, issuing_authority: str = "", issue_date: str = "", expiry_date: str = "", verified: bool = False, verified_by: str = "") -> dict[str, object]:
+        """AX-EXP: anexa un documento oficial al expediente del ZID."""
+        import secrets
+        require_non_empty_str(zid, "zid")
+        require_non_empty_str(doc_type, "doc_type")
+        require_non_empty_str(doc_number, "doc_number")
+        require_non_empty_str(issuing_country, "issuing_country")
+        document_id = "DOCX-" + secrets.token_hex(5)
+        vstatus = "VERIFIED" if verified else "PENDING"
+        with self._db.transaction() as cursor:
+            cursor.execute("INSERT INTO identity_documents (document_id, zid, doc_type, doc_number, issuing_country, issuing_authority, issue_date, expiry_date, status, verification_status, verified_by, added_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)", (document_id, zid, doc_type, doc_number, issuing_country, issuing_authority, issue_date, expiry_date, "VALID", vstatus, verified_by, self._clock.now()))
+        self._audit.append(event_type="network.document.added", actor=zid, subject=document_id, payload={"type": doc_type, "country": issuing_country})
+        return {"document_id": document_id, "doc_type": doc_type, "status": "VALID", "verification_status": vstatus}
+
+    def list_documents(self, *, zid: str) -> tuple[dict[str, object], ...]:
+        """AX-EXP: todos los documentos del expediente."""
+        rows = self._db.query_all("SELECT * FROM identity_documents WHERE zid = ? ORDER BY added_at", (zid,))
+        return tuple({"document_id": str(r["document_id"]), "doc_type": str(r["doc_type"]), "doc_number": str(r["doc_number"]), "issuing_country": str(r["issuing_country"]), "issuing_authority": str(r["issuing_authority"] or ""), "issue_date": str(r["issue_date"] or ""), "expiry_date": str(r["expiry_date"] or ""), "status": str(r["status"]), "verification_status": str(r["verification_status"]), "verified_by": str(r["verified_by"] or "")} for r in rows)
+
+    def revoke_document(self, *, zid: str, document_id: str, reason: str = "") -> None:
+        """AX-EXP: pasa a REVOKED (robo/perdida) - queda en historial."""
+        require_non_empty_str(document_id, "document_id")
+        with self._db.transaction() as cursor:
+            cursor.execute("UPDATE identity_documents SET status = 'REVOKED' WHERE document_id = ? AND zid = ?", (document_id, zid))
+        self._audit.append(event_type="network.document.revoked", actor=zid, subject=document_id, payload={"reason": reason})
+
+    def assurance_level(self, *, zid: str) -> dict[str, object]:
+        """AX-EXP: L0 self-asserted, L2 documento verificado, L4 documento+biometrica, L5 multiples paises."""
+        docs = self.list_documents(zid=zid)
+        verificados = [d for d in docs if d["verification_status"] == "VERIFIED" and d["status"] == "VALID"]
+        paises = set(d["issuing_country"] for d in verificados)
+        if not verificados:
+            nivel = 0
+        elif len(paises) >= 2:
+            nivel = 5
+        elif self._has_biometric_binding(zid):
+            nivel = 4
+        else:
+            nivel = 2
+        return {"zid": zid, "assurance_level": nivel, "verified_documents": len(verificados), "countries": sorted(paises)}
+
+    def _has_biometric_binding(self, zid: str) -> bool:
+        try:
+            row = self._db.query_one("SELECT 1 FROM biometric_templates WHERE identity_zid = ? LIMIT 1", (zid,))
+            return row is not None
+        except Exception:
+            return False
+
 
 class FrozenIdentityError(PermissionError):
     """AX-FREEZE: el ZID esta congelado por su dueno."""

@@ -96,6 +96,26 @@ _MIGRATIONS = (
             " PRIMARY KEY (zid, field))",
         ),
     ),
+    Migration(
+        2,
+        "network_profile_consent",
+        (
+            "CREATE TABLE IF NOT EXISTS profile_consents ("
+            " consent_id TEXT PRIMARY KEY, zid TEXT NOT NULL,"
+            " app_id TEXT NOT NULL, fields TEXT NOT NULL,"
+            " granted_at REAL NOT NULL, expires_at REAL NOT NULL,"
+            " face_score REAL, revoked_at REAL)",
+        ),
+    ),
+    Migration(
+        3,
+        "network_profile_freeze",
+        (
+            "CREATE TABLE IF NOT EXISTS zid_freezes ("
+            " zid TEXT PRIMARY KEY, frozen_at REAL NOT NULL,"
+            " reason TEXT, unfreeze_code TEXT)",
+        ),
+    ),
 )
 
 
@@ -457,6 +477,9 @@ class ProfileRegistry:
             app_id, "app_id")
         require_non_empty_str(
             zid, "zid")
+        if self.is_frozen(zid=zid):
+            raise FrozenIdentityError(
+                "ZID congelado por su dueno (AX-FREEZE)")
         scopes = self.app_scopes(
             app_id)
         if scopes is None:
@@ -518,6 +541,9 @@ class ProfileRegistry:
         import time as _time
         require_non_empty_str(app_id, "app_id")
         require_non_empty_str(zid, "zid")
+        if self.is_frozen(zid=zid):
+            raise FrozenIdentityError(
+                "ZID congelado por su dueno (AX-FREEZE)")
         base = self.universal_view(app_id=app_id, zid=zid)
         match = bool(face_verdict.get("match"))
         score = float(face_verdict.get("score", 0.0))
@@ -542,3 +568,72 @@ class ProfileRegistry:
             payload={"match": match, "score": score},
         )
         return verd
+
+    def grant_consent(self, *, zid: str, app_id: str, fields: tuple[str, ...], face_score: float, ttl_hours: float = 24.0) -> dict[str, object]:
+        """AX-CONSENT: el dueno autoriza a una app ver campos especificos por tiempo limitado. Evidencia: puntaje biometrico."""
+        import secrets
+        require_non_empty_str(zid, "zid")
+        require_non_empty_str(app_id, "app_id")
+        if not fields:
+            raise ValueError("fields required")
+        if not (0.0 <= face_score <= 1.0):
+            raise ValueError("face_score invalid")
+        now = self._clock.now()
+        consent_id = "CON-" + secrets.token_hex(6)
+        expires = now + ttl_hours * 3600.0
+        with self._db.transaction() as cursor:
+            cursor.execute("INSERT INTO profile_consents (consent_id, zid, app_id, fields, granted_at, expires_at, face_score) VALUES (?, ?, ?, ?, ?, ?, ?)", (consent_id, zid, app_id, ",".join(fields), now, expires, face_score))
+        self._audit.append(event_type="network.consent.granted", actor=zid, subject=consent_id, payload={"app": app_id, "fields": list(fields)})
+        return {"consent_id": consent_id, "expires_at": expires, "fields": list(fields)}
+
+    def check_consent(self, *, zid: str, app_id: str):
+        """Campos autorizados vigentes; None si no hay o expiro."""
+        now = self._clock.now()
+        rows = self._db.query_all("SELECT fields FROM profile_consents WHERE zid = ? AND app_id = ? AND expires_at > ? AND revoked_at IS NULL", (zid, app_id, now))
+        if not rows:
+            return None
+        campos = set()
+        for r in rows:
+            campos.update(str(r["fields"]).split(","))
+        return tuple(sorted(campos))
+
+    def revoke_consent(self, *, zid: str, consent_id: str) -> None:
+        require_non_empty_str(consent_id, "consent_id")
+        with self._db.transaction() as cursor:
+            cursor.execute("UPDATE profile_consents SET revoked_at = ? WHERE consent_id = ? AND zid = ?", (self._clock.now(), consent_id, zid))
+        self._audit.append(event_type="network.consent.revoked", actor=zid, subject=consent_id, payload={})
+
+    def consents_of(self, *, zid: str) -> tuple[dict[str, object], ...]:
+        """El dueno ve sus permisos: quien, que campos, hasta cuando."""
+        rows = self._db.query_all("SELECT * FROM profile_consents WHERE zid = ? ORDER BY granted_at DESC", (zid,))
+        return tuple({"consent_id": str(r["consent_id"]), "app_id": str(r["app_id"]), "fields": str(r["fields"]).split(","), "expires_at": float(r["expires_at"]), "revoked": r["revoked_at"] is not None} for r in rows)
+
+    def freeze_zid(self, *, zid: str, reason: str = "") -> dict[str, str]:
+        """AX-FREEZE: boton de panico. Congela el ZID: NINGUNA verificacion pasa. Devuelve el codigo de desbloqueo de un solo uso."""
+        import secrets
+        require_non_empty_str(zid, "zid")
+        code = secrets.token_hex(4)
+        with self._db.transaction() as cursor:
+            cursor.execute("INSERT INTO zid_freezes (zid, frozen_at, reason, unfreeze_code) VALUES (?, ?, ?, ?) ON CONFLICT(zid) DO UPDATE SET frozen_at = excluded.frozen_at, reason = excluded.reason, unfreeze_code = excluded.unfreeze_code", (zid, self._clock.now(), reason, code))
+        self._audit.append(event_type="network.identity.frozen", actor=zid, subject=zid, payload={"reason": reason})
+        return {"zid": zid, "unfreeze_code": code}
+
+    def is_frozen(self, *, zid: str) -> bool:
+        row = self._db.query_one("SELECT 1 FROM zid_freezes WHERE zid = ?", (zid,))
+        return row is not None
+
+    def unfreeze_zid(self, *, zid: str, code: str) -> bool:
+        """Descongela SOLO con el codigo entregado al congelar."""
+        require_non_empty_str(code, "code")
+        row = self._db.query_one("SELECT unfreeze_code FROM zid_freezes WHERE zid = ?", (zid,))
+        if row is None:
+            return False
+        if str(row["unfreeze_code"]) != code:
+            return False
+        with self._db.transaction() as cursor:
+            cursor.execute("DELETE FROM zid_freezes WHERE zid = ?", (zid,))
+        self._audit.append(event_type="network.identity.unfrozen", actor=zid, subject=zid, payload={})
+        return True
+
+class FrozenIdentityError(PermissionError):
+    """AX-FREEZE: el ZID esta congelado por su dueno."""

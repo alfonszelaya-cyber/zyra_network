@@ -154,6 +154,14 @@ class CapabilitiesApiHandler(
         caps = type(self).caps
         if (
             len(s) == 3
+            and s[0] == "consent"
+            and s[1] == "list"
+        ):
+            reg = caps.profiles
+            self._ok(list(reg.consents_of(zid=s[2])))
+            return
+        if (
+            len(s) == 3
             and s[0] == "bridge"
             and s[1] == "subscriptions"
         ):
@@ -460,6 +468,39 @@ class CapabilitiesApiHandler(
                     "ok": True,
                     "data": (resultado)},
             )
+            return
+        if s == ["consent", "grant"]:
+            import base64 as _b64c
+            bio = getattr(type(self).kernel, "_biometrics", None)
+            if bio is None:
+                self._error(503, "not_wired", "biometrics not configured")
+                return
+            zid_c = self._req(doc, "zid")
+            selfie_c = _b64c.b64decode(self._req(doc, "selfie_b64"))
+            reporte = bio.verify_face(zid_c, selfie_image=selfie_c, actor=zid_c)
+            match_c = bool(getattr(reporte, "match", False))
+            score_c = float(getattr(reporte, "score", 0.0))
+            if not match_c:
+                self._error(403, "face_rejected", "biometria no coincide: consentimiento denegado")
+                return
+            campos_c = tuple(str(doc.get("fields", "")).split(","))
+            res = caps.profiles.grant_consent(zid=zid_c, app_id=self._req(doc, "app_id"), fields=campos_c, face_score=score_c, ttl_hours=float(doc.get("ttl_hours", 24)))
+            self._send(201, {"ok": True, "data": res})
+            return
+        if s == ["consent", "revoke"]:
+            caps.profiles.revoke_consent(zid=self._req(doc, "zid"), consent_id=self._req(doc, "consent_id"))
+            self._send(200, {"ok": True})
+            return
+        if s == ["freeze"]:
+            res = caps.profiles.freeze_zid(zid=self._req(doc, "zid"), reason=str(doc.get("reason", "")))
+            self._send(200, {"ok": True, "data": res})
+            return
+        if s == ["unfreeze"]:
+            ok_u = caps.profiles.unfreeze_zid(zid=self._req(doc, "zid"), code=self._req(doc, "unfreeze_code"))
+            if not ok_u:
+                self._error(403, "bad_code", "codigo de desbloqueo invalido")
+                return
+            self._send(200, {"ok": True})
             return
         if s == ["documents", "register"]:
             import base64 as _b64

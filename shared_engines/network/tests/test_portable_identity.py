@@ -394,3 +394,43 @@ def test_universal_id_maria_and_juan(
     print("OK AX-ID: Maria GT pasaporte"
           " y Juan SV DUI - edad derivada"
           " y niveles correctos")
+
+
+def test_consent_and_freeze_flow(tmp_path) -> None:
+    """AX-CONSENT/FREEZE: otorgar con biometria -> expiracion -> revocacion; freeze bloquea verdict; unfreeze solo con codigo."""
+    from shared_engines.network.portable_profile import ProfileRegistry, FrozenIdentityError
+    from shared_engines.audit.chain import AuditTrail
+    from shared_engines.events.outbox import Outbox
+    from shared_engines.events.contracts import EventCatalog
+    from shared_engines.storage.database import SQLiteAdapter
+    from shared_engines.common.clocks import SystemClock
+    db = SQLiteAdapter(tmp_path / "cf.db")
+    clock = SystemClock()
+    reg = ProfileRegistry(db, clock, audit=AuditTrail(db, clock), outbox=Outbox(db, clock))
+    zid = "ZID-fraud-test-00000001"
+    reg.set_field(zid=zid, field="display_name", value="Pedro", verified=True)
+    reg.register_app(app_id="banco", display_name="Banco", scopes=("display_name", "national_id"))
+    c = reg.grant_consent(zid=zid, app_id="banco", fields=("display_name", "national_id"), face_score=0.92, ttl_hours=24.0)
+    assert c["consent_id"].startswith("CON-")
+    campos = reg.check_consent(zid=zid, app_id="banco")
+    assert campos is not None and "display_name" in campos
+    db.execute("UPDATE profile_consents SET expires_at = 1")
+    assert reg.check_consent(zid=zid, app_id="banco") is None
+    c2 = reg.grant_consent(zid=zid, app_id="banco", fields=("display_name",), face_score=0.92)
+    reg.revoke_consent(zid=zid, consent_id=c2["consent_id"])
+    assert reg.check_consent(zid=zid, app_id="banco") is None
+    res = reg.freeze_zid(zid=zid, reason="robo de telefono")
+    assert res["unfreeze_code"]
+    congelado = False
+    try:
+        reg.verification_verdict(app_id="banco", zid=zid, face_verdict={"match": True, "score": 0.95}, signer=None, clock=clock)
+    except FrozenIdentityError:
+        congelado = True
+    assert congelado, "freeze no bloqueo"
+    assert reg.is_frozen(zid=zid)
+    assert reg.unfreeze_zid(zid=zid, code="000000") is False
+    assert reg.unfreeze_zid(zid=zid, code=res["unfreeze_code"]) is True
+    assert not reg.is_frozen(zid=zid)
+    lista = reg.consents_of(zid=zid)
+    assert len(lista) >= 2
+    print("OK AX-CONSENT/FREEZE: otorgar, expirar, revocar, congelar, desbloquear con codigo, historial visible")

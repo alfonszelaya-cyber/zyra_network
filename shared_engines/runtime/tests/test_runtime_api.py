@@ -481,3 +481,104 @@ def test_person_register_is_bypass_blocked(
         payload["error"]["type"]
         == "person_bypass_forbidden"
     )
+
+
+def test_verify_existence_public(
+    tmp_path,
+) -> None:
+    """AX-NIVEL1: consulta publica de
+    existencia - mata documentos
+    falsos. Solo existe/status; cero
+    datos personales en la respuesta."""
+    import json as _json
+    import threading
+    import time as _time
+    import urllib.request
+    from shared_engines.storage.database import (
+        SQLiteAdapter)
+    from shared_engines.common.clocks import (
+        FrozenClock)
+    from shared_engines.runtime.config import (
+        RuntimeConfig)
+    from shared_engines.runtime.kernel import (
+        ZyraKernel)
+    from shared_engines.runtime.capabilities import (
+        ZyraCapabilities)
+    from shared_engines.runtime.combined_api import (
+        serve_combined)
+    from shared_engines.verification.signatures import (
+        Ed25519Signer)
+    from shared_engines.identity.contracts import (
+        IdentityKind)
+    net_db = SQLiteAdapter(":memory:")
+    signer, _ = Ed25519Signer.generate()
+    kernel = ZyraKernel(
+        db=net_db,
+        clock=FrozenClock(),
+        signer=signer,
+        config=RuntimeConfig(
+            host="127.0.0.1",
+            port=0,
+            api_token=None))
+    kernel.bootstrap_root()
+    caps = ZyraCapabilities(
+        net_db, FrozenClock(),
+        identity=kernel.identity,
+        signer=signer)
+    srv = serve_combined(
+        kernel, caps,
+        host="127.0.0.1", port=0)
+    threading.Thread(
+        target=(srv.serve_forever),
+        daemon=True).start()
+    _time.sleep(0.3)
+    base = ("http://127.0.0.1:"
+            + str(
+                srv.server_address[
+                    1]))
+    try:
+        real = (kernel.identity
+            .register_identity(
+                kind=(
+                    IdentityKind
+                    .PERSON),
+                display_name=(
+                    "Pedro Real"),
+                actor="test"))
+        def get(zid):
+            with urllib.request.urlopen(
+                base
+                + "/verify-existence/"
+                + zid,
+                timeout=15,
+            ) as r:
+                return (r.status,
+                    _json.loads(
+                        r.read().decode()))
+
+        st, r1 = get(real.zid)
+        assert st == 200, str(r1)
+        d1 = r1["data"]
+        assert d1["exists"] is True
+        assert d1["status"] in (
+            "REGISTERED", "ACTIVE")
+        assert "display_name" not in (
+            str(d1))
+        assert "birth" not in (
+            str(d1).lower())
+        assert "national" not in (
+            str(d1).lower())
+
+        st, r2 = get(
+            "ZID-falso-estafador-000")
+        assert st == 200
+        d2 = r2["data"]
+        assert d2["exists"] is False
+        print("OK AX-NIVEL1: existencia"
+              " publica funciona (real:"
+              " existe; falso: no existe)"
+              " y NO filtra datos"
+              " personales")
+    finally:
+        srv.shutdown()
+        srv.server_close()

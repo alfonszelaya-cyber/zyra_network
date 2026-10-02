@@ -103,6 +103,34 @@ class ZyraApiHandler(BaseHTTPRequestHandler):
         if segments == ["health"] and method == "GET":
             self._handle_health()
             return
+        if (
+            len(segments) == 2
+            and segments[0] == "verify-existence"
+            and method == "GET"
+        ):
+            zid_q = segments[1]
+            existe = (
+                type(self).kernel.identity
+                .get_identity(zid_q))
+            if existe is None:
+                self._send_json(200, {
+                    "ok": True,
+                    "data": {
+                        "exists": False,
+                        "status": None,
+                    },
+                })
+                return
+            estado = str(existe.status.value)
+            self._send_json(200, {
+                "ok": True,
+                "data": {
+                    "exists": True,
+                    "status": estado,
+                    "active": estado == "ACTIVE",
+                },
+            })
+            return
         if segments == ["verify"] and method == "POST":
             self._handle_public_verify()
             return

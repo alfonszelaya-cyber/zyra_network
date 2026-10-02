@@ -487,6 +487,41 @@ class AxisApiHandler(
         if s == ["exam"]:
             self._exam_form(doc)
             return
+        if s == ["death-register"]:
+            from apps.axis.life_history.permissions import (
+                authorize as _dz_auth,
+            )
+            _dz_role = (
+                self.headers.get(
+                    "X-ZYRA-Actor-Role"
+                ) or ""
+            )
+            if not _dz_role:
+                _dz_reg = str((doc or {}).get(
+                    "registrar_account") or "")
+                if _dz_reg:
+                    try:
+                        _dz_role = str(type(self).store.get_account(_dz_reg).get("role"))
+                    except LookupError:
+                        _dz_role = ""
+            if not _dz_auth("birth.register", _dz_role):
+                self._html(403, _page("AXIS - Rechazado", "<h1>Sin autorizacion</h1><p>Solo registradores/gobierno pueden registrar defunciones.</p>"))
+                return
+            _dz_life = self._lh()
+            _dz_zid = self._req(doc, "zid")
+            _dz_date = self._req(doc, "death_date")
+            _dz_detail = str(doc.get("detail") or "")
+            _dz_ev = _dz_life._store.register_death(
+                _dz_zid,
+                actor=_dz_role or "registrador",
+                death_date=_dz_date,
+                detail=_dz_detail,
+            )
+            self._html(200, _page("AXIS - Defuncion registrada", (
+                "<h1>Defuncion registrada</h1>"
+                "<p>Evento: <b>" + str(_dz_ev.get("event_id", "")) + "</b></p>"
+                "<a href='/axis'><button>Volver</button></a>")))
+            return
         if s == ["birth-register"]:
             from apps.axis.life_history.access_control import authorize as _zax_auth
             _zax_role = (self.headers.get("X-ZYRA-Actor-Role") or "").strip()

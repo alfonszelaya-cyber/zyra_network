@@ -12,6 +12,7 @@ _EVENT_TO_LIFE = {
     "justice_status": "life.justice.event",
     "security_incident": "life.security.event",
     "security_status": "life.security.event",
+    "death_registered": "life.death.event",
 }
 
 # AX-4: catalogo tipado completo (9 eventos AXIS + emergency/evidence).

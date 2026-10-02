@@ -674,6 +674,21 @@ class LifeHistoryStore:
 
     # ---------------------------------------- amendments
 
+    def register_death(
+        self,
+        person_id: str,
+        *,
+        actor: str,
+        death_date: str,
+        detail: str,
+    ) -> dict[str, object]:
+        """AX-DEATH: partida de defuncion anexada a la cadena del ZID."""
+        return self.add_life_event(
+            person_id,
+            actor=actor,
+            event_type="death_registered",
+            detail="death_date=" + death_date + "; " + detail,
+        )
     def amend_birth(
         self,
         birth_id: str,

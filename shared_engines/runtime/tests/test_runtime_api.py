@@ -582,3 +582,68 @@ def test_verify_existence_public(
     finally:
         srv.shutdown()
         srv.server_close()
+
+
+def test_death_lifecycle_deceased(tmp_path) -> None:
+    """AX-DEATH: ACTIVE -> DECEASED -> verify-existence lo muestra -> terminal."""
+    import json as _json
+    import threading
+    import time as _time
+    import urllib.request
+    from shared_engines.storage.database import SQLiteAdapter
+    from shared_engines.common.clocks import FrozenClock
+    from shared_engines.runtime.config import RuntimeConfig
+    from shared_engines.runtime.kernel import ZyraKernel
+    from shared_engines.runtime.capabilities import ZyraCapabilities
+    from shared_engines.runtime.combined_api import serve_combined
+    from shared_engines.verification.signatures import Ed25519Signer
+    from shared_engines.security.biometrics import BiometricsEngine, BiometricsPolicy, DeterministicTestProvider, TemplateCipher
+    from shared_engines.identity.contracts import IdentityStatus
+    net_db = SQLiteAdapter(":memory:")
+    signer, _ = Ed25519Signer.generate()
+    kernel = ZyraKernel(db=net_db, clock=FrozenClock(), signer=signer, config=RuntimeConfig(host="127.0.0.1", port=0, api_token=None))
+    kernel.bootstrap_root()
+    kernel._biometrics = BiometricsEngine(db=net_db, clock=FrozenClock(), audit=kernel.audit, provider=DeterministicTestProvider(), cipher=TemplateCipher(master_key_hex="ab" * 32), policy=BiometricsPolicy(require_liveness=False, doc_reject=0.01, doc_review=0.02, doc_auto=0.03, dup_reject=0.98))
+    caps = ZyraCapabilities(net_db, FrozenClock(), identity=kernel.identity, signer=signer)
+    srv = serve_combined(kernel, caps, host="127.0.0.1", port=0)
+    threading.Thread(target=srv.serve_forever, daemon=True).start()
+    _time.sleep(0.3)
+    base = "http://127.0.0.1:" + str(srv.server_address[1])
+
+    def post(ruta, doc):
+        data = _json.dumps(doc).encode()
+        req = urllib.request.Request(base + ruta, data=data, method="POST", headers={"Content-Type": "application/json"})
+        try:
+            with urllib.request.urlopen(req, timeout=15) as r:
+                return r.status, _json.loads(r.read().decode())
+        except urllib.error.HTTPError as e:
+            return e.code, _json.loads(e.read().decode())
+
+    try:
+        st, r1 = post("/identity/enroll", {"kind": "person", "display_name": "Pedro Ciclo", "actor": "test", "doc_image_b64": "cGVkcm8tZG9j", "selfie_image_b64": "cGVkcm8tc2VsZmll"})
+        assert st in (200, 201), str(st) + " " + str(r1)
+        zid = ((r1.get("data") or {}).get("identity") or {}).get("zid")
+        assert zid, str(r1)[:300]
+        kernel.identity.transition_identity(zid, IdentityStatus.ACTIVE, actor="test", reason="onboarding")
+        st, r2 = post("/identity/transition", {"zid": zid, "to_status": "DECEASED", "actor": "registrador", "reason": "acta de defuncion 2025-001"})
+        assert st in (200, 201), str(st) + " " + str(r2)[:300]
+        ident = kernel.identity.get_identity(zid)
+        assert ident.status == IdentityStatus.DECEASED, str(ident)
+        with urllib.request.urlopen(base + "/verify-existence/" + zid, timeout=15) as r:
+            d = _json.loads(r.read().decode())
+        assert d["data"]["exists"] is True
+        assert d["data"]["status"] == "DECEASED"
+        assert d["data"]["active"] is False
+        bloq = False
+        try:
+            kernel.identity.transition_identity(zid, IdentityStatus.ACTIVE, actor="fraud", reason="intento")
+        except Exception:
+            bloq = True
+        assert bloq, "DECEASED debe ser terminal"
+        evs = net_db.query_all("SELECT event_type FROM events_outbox WHERE aggregate_id = ? ORDER BY created_at", (zid,))
+        tipos = [str(r["event_type"]) for r in evs]
+        assert "identity.status_changed" in tipos, str(tipos)
+        print("OK AX-DEATH: ACTIVE -> DECEASED, terminal, verify-existence lo refleja, evento al outbox para el cartero")
+    finally:
+        srv.shutdown()
+        srv.server_close()

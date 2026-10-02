@@ -33,6 +33,7 @@ class IdentityStatus(Enum):
     ACTIVE = "ACTIVE"
     SUSPENDED = "SUSPENDED"
     REVOKED = "REVOKED"
+    DECEASED = "DECEASED"
 
 
 VALID_TRANSITIONS: dict[IdentityStatus, frozenset[IdentityStatus]] = {
@@ -47,15 +48,19 @@ VALID_TRANSITIONS: dict[IdentityStatus, frozenset[IdentityStatus]] = {
         {IdentityStatus.VERIFIED, IdentityStatus.REVOKED}
     ),
     IdentityStatus.VERIFIED: frozenset(
-        {IdentityStatus.ACTIVE, IdentityStatus.REVOKED}
+        {IdentityStatus.ACTIVE, IdentityStatus.REVOKED,
+         IdentityStatus.DECEASED}
     ),
     IdentityStatus.ACTIVE: frozenset(
-        {IdentityStatus.SUSPENDED, IdentityStatus.REVOKED}
+        {IdentityStatus.SUSPENDED, IdentityStatus.REVOKED,
+         IdentityStatus.DECEASED}
     ),
     IdentityStatus.SUSPENDED: frozenset(
-        {IdentityStatus.ACTIVE, IdentityStatus.REVOKED}
+        {IdentityStatus.ACTIVE, IdentityStatus.REVOKED,
+         IdentityStatus.DECEASED}
     ),
     IdentityStatus.REVOKED: frozenset(),
+    IdentityStatus.DECEASED: frozenset(),
 }
 
 

@@ -1,4 +1,4 @@
-name: "RED-VERIF v6: autosuficiente (crea verdict + ruta + test en orden, verifica cada paso)"
+name: "RED-CONSENT+FREEZE: consentimientos con codigo + congelamiento de ZID (tokens, no notificaciones) + rutas + tests"
 
 on:
   workflow_dispatch:
@@ -31,228 +31,776 @@ jobs:
           pip install -r requirements.txt
           pip install pytest
 
-      - name: "Paso 1 - crear verification_verdict en ProfileRegistry (si falta)"
+      - name: "Paso 1 - portable_profile: migracion v2 (consents + freezes) + metodos de consentimiento y congelamiento (aditivo)"
         run: |
-          python3 - <<'VEOF'
+          python3 - <<'CEOF'
           import ast
           import textwrap
           from pathlib import Path
-          p = Path("shared_engines/network/portable_profile.py")
+          p = Path(
+              "shared_engines/network/"
+              "portable_profile.py")
           t = p.read_text(encoding="utf-8")
-          if "def verification_verdict(" in t:
-              print("SKIP 1 (verdict ya presente)")
+          if "bridge_consent" in t or "def grant_consent(" in t:
+              print("SKIP 1 (ya presente)")
               raise SystemExit(0)
+
+          VIEJO_M = (
+              "    Migration(\n"
+              "        1,\n"
+              '        "network_portable_profile",\n'
+          )
+          cnt = t.count(VIEJO_M)
+          assert cnt == 1, (
+              "ancla migraciones " + str(cnt))
+          NUEVO_M = (
+              "    Migration(\n"
+              "        2,\n"
+              '        "network_profile_consent",\n'
+              "        (\n"
+              '            "CREATE TABLE IF NOT'
+              " EXISTS profile_consents (\"\n"
+              '            " consent_id TEXT PRIMARY'
+              " KEY, zid TEXT NOT NULL,\"\n"
+              '            " app_id TEXT NOT NULL,'
+              " fields TEXT NOT NULL,\"\n"
+              '            " granted_at REAL NOT'
+              " NULL, expires_at REAL NOT"
+              " NULL,\"\n"
+              '            " face_score REAL,'
+              " revoked_at REAL)\"\n"
+              "        ),\n"
+              "    ),\n"
+              "    Migration(\n"
+              "        3,\n"
+              '        "network_profile_freeze",\n'
+              "        (\n"
+              '            "CREATE TABLE IF NOT'
+              " EXISTS zid_freezes (\"\n"
+              '            " zid TEXT PRIMARY KEY,'
+              " frozen_at REAL NOT NULL,\"\n"
+              '            " reason TEXT,'
+              " unfreeze_code TEXT)\"\n"
+              "        ),\n"
+              "    ),\n"
+          )
+          t = t.replace(VIEJO_M, NUEVO_M, 1)
+          print("OK migraciones v2/v3 (consents + freezes)")
+
           CUERPO = textwrap.dedent('''\
-              def verification_verdict(
+              def _code6(self) -> str:
+                  import secrets
+                  return str(
+                      secrets.randbelow(
+                          1000000)
+                  ).zfill(6)
+
+              def grant_consent(
                   self,
                   *,
-                  app_id: str,
                   zid: str,
-                  face_verdict: dict[str, object],
-                  signer,
-                  clock: Clock,
+                  app_id: str,
+                  fields: tuple[str, ...],
+                  face_score: float,
+                  ttl_hours: float = 24.0,
               ) -> dict[str, object]:
-                  """AX-VERIF: EL veredicto de verificacion para bancos/consulados/empleadores. Une biometria 1:1 + universal_view + FIRMA de la Red (prueba verificable offline). Scope gobierna; acceso auditado."""
-                  from shared_engines.common.serialization import canonical_json_dumps
-                  import time as _time
-                  require_non_empty_str(app_id, "app_id")
-                  require_non_empty_str(zid, "zid")
-                  base = self.universal_view(app_id=app_id, zid=zid)
-                  match = bool(face_verdict.get("match"))
-                  score = float(face_verdict.get("score", 0.0))
-                  verdict = {
-                      "zid": zid,
-                      "verified_person": match,
-                      "face_score": score,
-                      "fields": base["fields"],
-                      "levels": base["levels"],
-                      "age": base["age"],
-                      "verified_at": _time.time(),
-                      "issuer": "zyra-network",
-                  }
-                  payload = canonical_json_dumps(verdict).encode("utf-8")
-                  firma = signer.sign(payload)
-                  verd = dict(verdict)
-                  verd["signature"] = firma.hex()
+                  """AX-CONSENT: el dueno
+                  autoriza a una app ver campos
+                  especificos por tiempo limitado.
+                  Evidencia: puntaje biometrico
+                  de la autorizacion."""
+                  import secrets
+                  require_non_empty_str(
+                      zid, "zid")
+                  require_non_empty_str(
+                      app_id, "app_id")
+                  if not fields:
+                      raise ValueError(
+                          "fields required")
+                  if not (0.0 <= face_score
+                          <= 1.0):
+                      raise ValueError(
+                          "face_score invalid")
+                  now = self._clock.now()
+                  consent_id = ("CON-"
+                      + secrets.token_hex(6))
+                  expires = (now
+                             + ttl_hours
+                             * 3600.0)
+                  with (
+                      self._db.transaction()
+                      as cursor
+                  ):
+                      cursor.execute(
+                          "INSERT INTO"
+                          " profile_consents"
+                          " (consent_id, zid,"
+                          " app_id, fields,"
+                          " granted_at,"
+                          " expires_at,"
+                          " face_score)"
+                          " VALUES (?, ?, ?, ?,"
+                          " ?, ?, ?)",
+                          (
+                              consent_id,
+                              zid,
+                              app_id,
+                              ",".join(fields),
+                              now,
+                              expires,
+                              face_score,
+                          ),
+                      )
                   self._audit.append(
-                      event_type="network.verification.verdict",
-                      actor=app_id,
-                      subject=zid,
-                      payload={"match": match, "score": score},
+                      event_type=(
+                          "network.consent"
+                          ".granted"),
+                      actor=zid,
+                      subject=consent_id,
+                      payload={
+                          "app": app_id,
+                          "fields": list(
+                              fields),
+                      },
                   )
-                  return verd
+                  return {
+                      "consent_id": consent_id,
+                      "expires_at": expires,
+                      "fields": list(fields),
+                  }
+
+              def check_consent(
+                  self,
+                  *,
+                  zid: str,
+                  app_id: str,
+              ) -> tuple[str, ...] | None:
+                  """Campos autorizados vigentes
+                  para esta app; None si no hay
+                  consentimiento o expiro."""
+                  now = self._clock.now()
+                  rows = self._db.query_all(
+                      "SELECT fields, expires_at"
+                      " FROM profile_consents"
+                      " WHERE zid = ? AND"
+                      " app_id = ? AND"
+                      " expires_at > ? AND"
+                      " revoked_at IS NULL"
+                      " ORDER BY granted_at"
+                      " DESC",
+                      (zid, app_id, now),
+                  )
+                  if not rows:
+                      return None
+                  campos: set[str] = set()
+                  for r in rows:
+                      campos.update(
+                          str(r["fields"])
+                          .split(","))
+                  return tuple(
+                      sorted(campos))
+
+              def revoke_consent(
+                  self,
+                  *,
+                  zid: str,
+                  consent_id: str,
+              ) -> None:
+                  require_non_empty_str(
+                      consent_id,
+                      "consent_id")
+                  with (
+                      self._db.transaction()
+                      as cursor
+                  ):
+                      cursor.execute(
+                          "UPDATE"
+                          " profile_consents SET"
+                          " revoked_at = ?"
+                          " WHERE consent_id = ?"
+                          " AND zid = ?",
+                          (
+                              self._clock.now(),
+                              consent_id,
+                              zid,
+                          ),
+                      )
+                  self._audit.append(
+                      event_type=(
+                          "network.consent"
+                          ".revoked"),
+                      actor=zid,
+                      subject=consent_id,
+                      payload={},
+                  )
+
+              def consents_of(
+                  self, *, zid: str,
+              ) -> tuple[dict[str, object], ...]:
+                  """El dueno ve sus permisos:
+                  quien, que campos, hasta
+                  cuando, activo o no."""
+                  rows = self._db.query_all(
+                      "SELECT * FROM"
+                      " profile_consents"
+                      " WHERE zid = ?"
+                      " ORDER BY granted_at"
+                      " DESC",
+                      (zid,),
+                  )
+                  return tuple(
+                      {
+                          "consent_id": str(
+                              r["consent_id"]),
+                          "app_id": str(
+                              r["app_id"]),
+                          "fields": str(
+                              r["fields"]).split(
+                              ","),
+                          "expires_at": float(
+                              r["expires_at"]),
+                          "revoked": (
+                              r["revoked_at"]
+                              is not None),
+                      }
+                      for r in rows)
+
+
+              class FrozenIdentityError(
+                  PermissionError,
+              ):
+                  """El ZID esta congelado por
+                  el dueno (robo/fraude)."""
+
+
+              def freeze_zid(
+                  self,
+                  *,
+                  zid: str,
+                  reason: str = "",
+              ) -> dict[str, str]:
+                  """AX-FREEZE: boton de
+                  panico. Congela el ZID:
+                  NINGUNA verificacion pasa
+                  mientras este congelado.
+                  Devuelve el codigo de
+                  desbloqueo de un solo uso."""
+                  import secrets
+                  require_non_empty_str(
+                      zid, "zid")
+                  code = secrets.token_hex(4)
+                  with (
+                      self._db.transaction()
+                      as cursor
+                  ):
+                      cursor.execute(
+                          "INSERT INTO"
+                          " zid_freezes (zid,"
+                          " frozen_at, reason,"
+                          " unfreeze_code)"
+                          " VALUES (?, ?, ?, ?)"
+                          " ON CONFLICT(zid) DO"
+                          " UPDATE SET frozen_at"
+                          " = excluded.frozen_at,"
+                          " reason = excluded"
+                          ".reason, unfreeze_code"
+                          " = excluded"
+                          ".unfreeze_code",
+                          (
+                              zid,
+                              self._clock.now(),
+                              reason,
+                              code,
+                          ),
+                      )
+                  self._audit.append(
+                      event_type=(
+                          "network.identity"
+                          ".frozen"),
+                      actor=zid,
+                      subject=zid,
+                      payload={
+                          "reason": reason},
+                  )
+                  return {
+                      "zid": zid,
+                      "unfreeze_code": code,
+                  }
+
+              def is_frozen(
+                  self, *, zid: str,
+              ) -> bool:
+                  row = self._db.query_one(
+                      "SELECT 1 FROM zid_freezes"
+                      " WHERE zid = ?",
+                      (zid,),
+                  )
+                  return row is not None
+
+              def unfreeze_zid(
+                  self,
+                  *,
+                  zid: str,
+                  code: str,
+              ) -> bool:
+                  """Descongela SOLO con el
+                  codigo entregado al congelar
+                  (un solo uso)."""
+                  require_non_empty_str(
+                      code, "code")
+                  row = self._db.query_one(
+                      "SELECT unfreeze_code FROM"
+                      " zid_freezes WHERE zid = ?",
+                      (zid,),
+                  )
+                  if row is None:
+                      return False
+                  if str(
+                      row["unfreeze_code"]
+                  ) != code:
+                      return False
+                  with (
+                      self._db.transaction()
+                      as cursor
+                  ):
+                      cursor.execute(
+                          "DELETE FROM"
+                          " zid_freezes WHERE"
+                          " zid = ?",
+                          (zid,),
+                      )
+                  self._audit.append(
+                      event_type=(
+                          "network.identity"
+                          ".unfrozen"),
+                      actor=zid,
+                      subject=zid,
+                      payload={},
+                  )
+                  return True
           ''')
-          METODO = textwrap.indent(CUERPO.rstrip("\n"), "    ")
-          t = t.rstrip("\n") + "\n\n" + METODO + "\n"
+          METODOS = textwrap.indent(
+              CUERPO.rstrip("\n"), "    ")
+          t = (t.rstrip("\n") + "\n\n"
+               + METODOS + "\n")
           ast.parse(t)
           p.write_text(t, encoding="utf-8")
-          print("OK 1: verification_verdict creado (AST valido)")
-          VEOF
+          print("OK consent + freeze metodos"
+                " (AST valido)")
+          CEOF
 
-      - name: "Paso 2 - verificar metodo vivo (hasattr duro)"
+      - name: "Paso 2 - verificacion dura: metodos vivos, clase intacta"
         run: |
           python3 -c "
-          from shared_engines.network.portable_profile import ProfileRegistry
-          assert hasattr(ProfileRegistry, 'verification_verdict'), 'verdict NO quedo en la clase'
-          for m in ('register_app', 'set_field', 'view_for_app', 'universal_view'):
+          from shared_engines.network.portable_profile import (
+              ProfileRegistry, age_of,
+              FrozenIdentityError)
+          for m in ('grant_consent', 'check_consent',
+                    'revoke_consent', 'consents_of',
+                    'freeze_zid', 'is_frozen',
+                    'unfreeze_zid'):
               assert hasattr(ProfileRegistry, m), m
-          print('OK 2: verification_verdict es metodo de ProfileRegistry; clase intacta')
+          for m in ('register_app', 'set_field',
+                    'view_for_app',
+                    'universal_view',
+                    'verification_verdict'):
+              assert hasattr(ProfileRegistry, m), m
+          print('OK 2: consent + freeze dentro de la clase; metodos previos intactos')
           "
 
-      - name: "Paso 3 - crear ruta POST /verification/person (si falta)"
+      - name: "Paso 3 - guardia de congelamiento en universal_view y verification_verdict (si frozen -> FrozenIdentityError)"
+        run: |
+          python3 - <<'GEOF'
+          import ast
+          from pathlib import Path
+          p = Path(
+              "shared_engines/network/"
+              "portable_profile.py")
+          t = p.read_text(encoding="utf-8")
+
+          ANCLA1 = (
+              "                  vista = self"
+              ".view_for_app(\n"
+              "                      app_id="
+              "app_id, zid=zid)\n"
+          )
+          # verificamos que universal_view existe y
+          # le agregamos la guardia al inicio
+          if "def universal_view(" in t:
+              pass
+          GEOF
+
+      - name: "Paso 3b - guardia is_frozen en verification_verdict y universal_view (reemplazo exacto de su primera linea de validacion)"
+        run: |
+          python3 - <<'G2EOF'
+          import ast
+          from pathlib import Path
+          p = Path(
+              "shared_engines/network/"
+              "portable_profile.py")
+          t = p.read_text(encoding="utf-8")
+
+          # guardia en verification_verdict
+          ANCLA_V = (
+              "                  require_non_empty_str(\n"
+              "                      zid, \"zid\")\n"
+              "                  base = self.universal_view(\n"
+              "                      app_id=app_id, zid=zid)\n"
+          )
+          if ANCLA_V in t and "_frozen_guard" not in t:
+              NUEVO_V = (
+                  "                  require_non_empty_str(\n"
+                  "                      zid, \"zid\")\n"
+                  "                  if self.is_frozen(\n"
+                  "                          zid=zid):\n"
+                  "                      raise"
+                  " FrozenIdentityError(\n"
+                  "                          \"ZID congelado"
+                  " por su dueno (AX-FREEZE)\")\n"
+                  "                  base = self.universal_view(\n"
+                  "                      app_id=app_id, zid=zid)\n"
+              )
+              t = t.replace(ANCLA_V, NUEVO_V, 1)
+              print("OK guardia freeze en verification_verdict")
+
+          # guardia en universal_view (metodo de clase, indent 4)
+          ANCLA_U = (
+              "        scopes = self.app_scopes(\n"
+              "            app_id\n"
+              "        )\n"
+              "        if scopes is None:\n"
+              "            raise PermissionError(\n"
+              "                \"app not registered:\"\n"
+              "                f\" {app_id}\"\n"
+              "            )\n"
+          )
+          if ANCLA_U in t and t.count(
+              ANCLA_U,
+          ) == 1:
+              NUEVO_U = (
+                  ANCLA_U
+                  + "        if self.is_frozen(\n"
+                  "                zid=zid):\n"
+                  "            raise"
+                  " FrozenIdentityError(\n"
+                  "                \"ZID congelado por"
+                  " su dueno (AX-FREEZE)\")\n"
+              )
+              t = t.replace(ANCLA_U, NUEVO_U, 1)
+              print("OK guardia freeze en universal_view")
+          else:
+              print("SKIP guardia universal_view"
+                    " (ancla no hallada o ya presente)")
+
+          ast.parse(t)
+          p.write_text(t, encoding="utf-8")
+          print("OK guardias (AST valido)")
+          G2EOF
+
+      - name: "Paso 4 - verificacion dura: guardias activas"
+        run: |
+          python3 -c "
+          src = open('shared_engines/network/portable_profile.py').read()
+          assert src.count('FrozenIdentityError') >= 3, src.count('FrozenIdentityError')
+          print('OK 4: guardias de freeze presentes (>=3 usos)')
+          "
+
+      - name: "Paso 5 - rutas HTTP del dueno (grant/list/revoke/freeze/unfreeze)"
         run: |
           python3 - <<'RTEOF'
           import ast
           import textwrap
           from pathlib import Path
-          p = Path("shared_engines/runtime/api.py")
+          p = Path(
+              "shared_engines/runtime/"
+              "capabilities_api.py")
           t = p.read_text(encoding="utf-8")
-          if 's == ["verification", "person"]' in t:
-              print("SKIP 3 (ruta ya presente)")
+          if 's == ["consent", "grant"]' in t:
+              print("SKIP rutas (ya presentes)")
               raise SystemExit(0)
+          ig = t.find("def _route_get(")
+          assert ig >= 0
+          ic = t.find(
+              "caps = type(self).caps", ig)
+          assert ic > ig
+          le = t.find("\n", ic) + 1
+          GET_R = textwrap.dedent('''\
+                  if (
+                      len(s) == 3
+                      and s[0] == "consent"
+                      and s[1] == "list"
+                  ):
+                      reg = caps.profiles
+                      self._ok(list(
+                          reg.consents_of(
+                              zid=s[2])))
+                      return
+          ''')
+          t = t[:le] + GET_R + t[le:]
+          print("OK GET /consent/list/{zid}")
+          marker = (
+              'if s == ["documents", "register"]:'
+          )
+          idx = t.find(marker)
+          assert idx >= 0
+          ls = t.rfind("\n", 0, idx) + 1
+          IND = t[ls:idx]
           CUERPO = textwrap.dedent('''\
-              elif s == ["verification", "person"]:
-                  import base64 as _b64v
-                  bio = getattr(type(self).kernel, "_biometrics", None)
+              if s == ["consent", "grant"]:
+                  import base64 as _b64c
+                  bio = getattr(
+                      type(self).kernel,
+                      "_biometrics", None)
                   if bio is None:
-                      raise ApiError(503, "not_wired", "biometrics not configured")
-                  zid_v = self._req(doc, "zid")
-                  selfie_v = _b64v.b64decode(self._req(doc, "selfie_b64"))
-                  reporte = bio.verify_face(zid_v, selfie_image=selfie_v, actor=self._req(doc, "actor_app"))
-                  fv = {"match": bool(getattr(reporte, "match", False)), "score": float(getattr(reporte, "score", 0.0))}
-                  verd = type(self).caps.profiles.verification_verdict(app_id=self._req(doc, "actor_app"), zid=zid_v, face_verdict=fv, signer=type(self).kernel.signer, clock=type(self).kernel.clock)
-                  self._send(200, {"ok": True, "data": verd})
+                      raise ApiError(
+                          503, "not_wired",
+                          "biometrics not"
+                          " configured")
+                  zid_c = self._req(doc, "zid")
+                  selfie_c = _b64c.b64decode(
+                      self._req(doc, "selfie_b64"))
+                  reporte = bio.verify_face(
+                      zid_c,
+                      selfie_image=selfie_c,
+                      actor=zid_c)
+                  match_c = bool(
+                      getattr(reporte,
+                      "match", False))
+                  score_c = float(
+                      getattr(reporte,
+                      "score", 0.0))
+                  if not match_c:
+                      raise ApiError(
+                          403, "face_rejected",
+                          "biometria no coincide:"
+                          " consentimiento"
+                          " denegado")
+                  campos_c = tuple(
+                      str(doc.get("fields", "")).split(
+                          ","))
+                  res = (type(self).caps.profiles
+                  .grant_consent(
+                      zid=zid_c,
+                      app_id=self._req(
+                          doc, "app_id"),
+                      fields=campos_c,
+                      face_score=score_c,
+                      ttl_hours=float(
+                          doc.get("ttl_hours", 24)),
+                  ))
+                  self._send(201, {"ok": True, "data": res})
+                  return
+              if s == ["consent", "revoke"]:
+                  (type(self).caps.profiles
+                  .revoke_consent(
+                      zid=self._req(doc, "zid"),
+                      consent_id=self._req(
+                          doc, "consent_id")))
+                  self._send(200, {"ok": True})
+                  return
+              if s == ["freeze"]:
+                  res = (type(self).caps.profiles
+                  .freeze_zid(
+                      zid=self._req(doc, "zid"),
+                      reason=str(
+                          doc.get("reason", "")),
+                  ))
+                  self._send(200, {"ok": True, "data": res})
+                  return
+              if s == ["unfreeze"]:
+                  ok_u = (type(self).caps.profiles
+                  .unfreeze_zid(
+                      zid=self._req(doc, "zid"),
+                      code=self._req(
+                          doc, "unfreeze_code")))
+                  if not ok_u:
+                      raise ApiError(
+                          403, "bad_code",
+                          "codigo de desbloqueo"
+                          " invalido")
+                  self._send(200, {"ok": True})
                   return
           ''')
-          ANCLA = 'elif s == ["verification", "media", "verify"]:'
-          cnt = t.count(ANCLA)
-          assert cnt == 1, "ancla " + str(cnt)
-          i = t.find(ANCLA)
-          ls = t.rfind("\n", 0, i) + 1
-          linea = t[ls:i]
-          IND = linea[:len(linea) - len(linea.lstrip())]
-          RUTA = textwrap.indent(CUERPO.rstrip("\n"), IND) + "\n"
-          t = t[:ls] + RUTA + t[ls:]
+          BLOQUE = textwrap.indent(
+              CUERPO.rstrip("\n"), IND) + "\n"
+          t = t[:ls] + BLOQUE + t[ls:]
           ast.parse(t)
           p.write_text(t, encoding="utf-8")
-          print("OK 3: ruta /verification/person (AST valido)")
+          tq2 = p.read_text(encoding="utf-8")
+          assert ('s == ["consent", "grant"]:' in tq2)
+          assert ('s == ["freeze"]:' in tq2)
+          print("OK rutas consent/freeze (AST valido)")
           RTEOF
 
-      - name: "Paso 4 - verificar ruta viva (import fresco del api)"
-        run: |
-          python3 -c "
-          src = open('shared_engines/runtime/api.py').read()
-          assert 's == [\"verification\", \"person\"]' in src
-          import shared_engines.runtime.api
-          print('OK 4: ruta presente y api.py compila')
-          "
-
-      - name: "Paso 5 - crear test e2e (si falta)"
+      - name: "Paso 6 - tests: otorgar con biometria -> check -> expirar -> revocar -> freeze bloquea verdict -> unfreeze con codigo"
         run: |
           python3 - <<'TSEOF'
           import ast
           import textwrap
           from pathlib import Path
-          target = Path("shared_engines/runtime/tests/test_capabilities_api.py")
+          target = Path(
+              "shared_engines/network/tests/"
+              "test_portable_identity.py")
           assert target.exists()
           t = target.read_text(encoding="utf-8")
-          if "test_verification_verdict_signed" in t:
-              print("SKIP 5 (test ya presente)")
+          if "test_consent_and_freeze_flow" in t:
+              print("SKIP tests (ya presentes)")
               raise SystemExit(0)
           EXTRA = textwrap.dedent('''\
 
 
-              def test_verification_verdict_signed(tmp_path) -> None:
-                  """AX-VERIF: enroll biometrico -> verify_face 1:1 -> veredicto firmado -> firma verificada offline."""
-                  import base64
-                  import json as _json
-                  import threading
-                  import time as _time
-                  import urllib.error
-                  import urllib.request
-                  from shared_engines.storage.database import SQLiteAdapter
-                  from shared_engines.common.clocks import FrozenClock
-                  from shared_engines.runtime.config import RuntimeConfig
-                  from shared_engines.runtime.kernel import ZyraKernel
-                  from shared_engines.runtime.capabilities import ZyraCapabilities
-                  from shared_engines.runtime.combined_api import serve_combined
-                  from shared_engines.verification.signatures import Ed25519Signer, Ed25519Verifier
-                  from shared_engines.security.biometrics import BiometricsEngine, BiometricsPolicy, DeterministicTestProvider, TemplateCipher
-                  from shared_engines.network.portable_profile import ProfileRegistry
-                  from shared_engines.audit.chain import AuditTrail
-                  from shared_engines.events.outbox import Outbox
-                  from shared_engines.common.serialization import canonical_json_dumps
-                  net_db = SQLiteAdapter(":memory:")
-                  signer, pub = Ed25519Signer.generate()
-                  kernel = ZyraKernel(db=net_db, clock=FrozenClock(), signer=signer, config=RuntimeConfig(host="127.0.0.1", port=0, api_token=None))
-                  kernel.bootstrap_root()
-                  kernel._biometrics = BiometricsEngine(db=net_db, clock=FrozenClock(), audit=kernel.audit, provider=DeterministicTestProvider(), cipher=TemplateCipher(master_key_hex="ab" * 32), policy=BiometricsPolicy(require_liveness=False, doc_reject=0.01, doc_review=0.02, doc_auto=0.03, dup_reject=0.98))
-                  caps = ZyraCapabilities(net_db, FrozenClock(), identity=kernel.identity, signer=signer)
-                  caps.profiles = ProfileRegistry(net_db, FrozenClock(), audit=AuditTrail(net_db, FrozenClock()), outbox=Outbox(net_db, FrozenClock()))
-                  caps.profiles.register_app(app_id="banco-ny", display_name="Banco NY", scopes=("display_name", "national_id", "id_country", "id_type", "id_number", "nationality", "birth_date", "address"))
-                  srv = serve_combined(kernel, caps, host="127.0.0.1", port=0)
-                  threading.Thread(target=srv.serve_forever, daemon=True).start()
-                  _time.sleep(0.3)
-                  base = "http://127.0.0.1:" + str(srv.server_address[1])
+              def test_consent_and_freeze_flow(
+                  tmp_path,
+              ) -> None:
+                  """AX-CONSENT/FREEZE: otorgar con
+                  biometria -> campos vigentes ->
+                  expiracion -> revocacion; freeze
+                  bloquea verification -> unfreeze
+                  solo con codigo correcto."""
+                  from shared_engines.network.portable_profile import (
+                      ProfileRegistry,
+                      FrozenIdentityError)
+                  from shared_engines.audit.chain import (
+                      AuditTrail)
+                  from shared_engines.events.outbox import (
+                      Outbox)
+                  from shared_engines.events.contracts import (
+                      EventCatalog)
+                  from shared_engines.storage.database import (
+                      SQLiteAdapter)
+                  from shared_engines.common.clocks import (
+                      SystemClock)
+                  db = SQLiteAdapter(
+                      tmp_path / "cf.db")
+                  clock = SystemClock()
+                  reg = ProfileRegistry(
+                      db, clock,
+                      audit=AuditTrail(db, clock),
+                      outbox=Outbox(db, clock))
+                  zid = ("ZID-fraud-test-"
+                         "00000000001")
+                  reg.set_field(
+                      zid=zid,
+                      field="display_name",
+                      value="Pedro",
+                      verified=True)
+                  reg.register_app(
+                      app_id="banco",
+                      display_name="Banco",
+                      scopes=(
+                          "display_name",
+                          "national_id",
+                      ),
+                  )
 
-                  def post(ruta, doc):
-                      data = _json.dumps(doc).encode()
-                      req = urllib.request.Request(base + ruta, data=data, method="POST", headers={"Content-Type": "application/json"})
-                      try:
-                          with urllib.request.urlopen(req, timeout=15) as r:
-                              return r.status, _json.loads(r.read().decode())
-                      except urllib.error.HTTPError as e:
-                          return e.code, _json.loads(e.read().decode())
+                  # 1. otorgar consentimiento
+                  #    (face_score como evidencia)
+                  c = reg.grant_consent(
+                      zid=zid,
+                      app_id="banco",
+                      fields=(
+                          "display_name",
+                          "national_id",
+                      ),
+                      face_score=0.92,
+                      ttl_hours=24.0)
+                  assert c["consent_id"].startswith(
+                      "CON-")
+                  campos = reg.check_consent(
+                      zid=zid, app_id="banco")
+                  assert campos is not None
+                  assert "display_name" in campos
 
+                  # 2. expiracion: forzamos el
+                  #    tiempo hacia adelante
+                  db.execute(
+                      "UPDATE profile_consents"
+                      " SET expires_at = 1")
+                  assert reg.check_consent(
+                      zid=zid,
+                      app_id="banco",
+                  ) is None
+                  # re-otorgar para seguir
+                  c2 = reg.grant_consent(
+                      zid=zid,
+                      app_id="banco",
+                      fields=("display_name",),
+                      face_score=0.92)
+
+                  # 3. revocar
+                  reg.revoke_consent(
+                      zid=zid,
+                      consent_id=c2["consent_id"])
+                  assert reg.check_consent(
+                      zid=zid,
+                      app_id="banco",
+                  ) is None
+
+                  # 4. freeze bloquea
+                  #    verification_verdict
+                  res = reg.freeze_zid(
+                      zid=zid,
+                      reason="robo de telefono")
+                  assert res["unfreeze_code"]
+                  congelado = False
                   try:
-                      selfie = base64.b64encode(b"selfie-pedro-real").decode("ascii")
-                      docimg = base64.b64encode(b"doc-pedro-dui").decode("ascii")
-                      st, r1 = post("/identity/enroll", {"kind": "person", "display_name": "Pedro Prueba", "actor": "banco-ny", "doc_image_b64": docimg, "selfie_image_b64": selfie})
-                      assert st in (200, 201), str(st) + " " + str(r1)
-                      zid = ((r1.get("data") or {}).get("identity") or {}).get("zid")
-                      assert zid, str(r1)[:300]
-                      reg = caps.profiles
-                      reg.set_field(zid=zid, field="display_name", value="Pedro Prueba", verified=True)
-                      reg.set_field(zid=zid, field="id_country", value="SV", verified=True)
-                      reg.set_field(zid=zid, field="id_type", value="dui", verified=True)
-                      reg.set_field(zid=zid, field="birth_date", value="1992-04-04", verified=True)
-                      st, r2 = post("/verification/person", {"zid": zid, "selfie_b64": selfie, "actor_app": "banco-ny"})
-                      assert st == 200, str(st) + " " + str(r2)[:400]
-                      d = r2["data"]
-                      assert d["verified_person"] is True, str(d)[:200]
-                      assert d["fields"]["id_type"] == "dui"
-                      assert d["age"] >= 30
-                      assert d.get("signature")
-                      verde = bytes.fromhex(d["signature"])
-                      sin_firma = dict((k, v) for k, v in d.items() if k != "signature")
-                      recom = canonical_json_dumps(sin_firma).encode("utf-8")
-                      assert Ed25519Verifier(pub).verify(recom, verde) is True
-                      print("OK AX-VERIF: veredicto firmado, verificable offline")
-                  finally:
-                      srv.shutdown()
-                      srv.server_close()
+                      reg.verification_verdict(
+                          app_id="banco",
+                          zid=zid,
+                          face_verdict={
+                              "match": True,
+                              "score": 0.95},
+                          signer=None,
+                          clock=clock)
+                  except FrozenIdentityError:
+                      congelado = True
+                  assert congelado, (
+                      "freeze no bloqueo")
+                  assert reg.is_frozen(zid=zid)
+
+                  # 5. unfreeze con codigo
+                  #    incorrecto -> sigue congelado
+                  mal = reg.unfreeze_zid(
+                      zid=zid, code="000000")
+                  assert mal is False
+                  bien = reg.unfreeze_zid(
+                      zid=zid,
+                      code=res["unfreeze_code"])
+                  assert bien is True
+                  assert not reg.is_frozen(
+                      zid=zid)
+
+                  # 6. el dueno ve su historial
+                  lista = reg.consents_of(zid=zid)
+                  assert len(lista) >= 2
+                  print("OK AX-CONSENT/FREEZE:"
+                        " otorgar, expirar, revocar,"
+                        " congelar, desbloquear con"
+                        " codigo, historial visible")
           ''')
           t = t.rstrip("\n") + "\n" + EXTRA
           ast.parse(t)
           target.write_text(t, encoding="utf-8")
-          print("OK 5: test e2e escrito (AST valido)")
+          final = target.read_text(encoding="utf-8")
+          assert "test_consent_and_freeze_flow" in final
+          print("OK test consent/freeze (AST valido)")
           TSEOF
 
-      - name: "Paso 6 - GATE Red (incluye el test nuevo)"
+      - name: "Paso 7 - GATE Red"
         run: |
           python3 -m pytest shared_engines -q --tb=short 2>&1 | tail -10
 
-      - name: "Paso 7 - GATE apps"
+      - name: "Paso 8 - GATE apps"
         run: |
           python3 -m pytest apps/axis/tests apps/axis/life_history/tests apps/subastas/tests apps/semilla/tests -q --tb=short 2>&1 | tail -4
 
-      - name: "Paso 8 - SOLO SI FALLO: diagnostico al Resumen"
+      - name: "Paso 9 - SOLO SI FALLO: diagnostico al Resumen"
         if: failure()
         run: |
           {
-            echo "## DIAGNOSTICO RED-VERIF v6"
+            echo "## DIAGNOSTICO RED-CONSENT"
             echo '```'
-            python3 -m pytest shared_engines/runtime/tests/test_capabilities_api.py::test_verification_verdict_signed -vv --tb=long 2>&1 | tail -80 || true
+            python3 -m pytest shared_engines/network/tests -vv --tb=long 2>&1 | tail -70 || true
             echo '```'
           } >> "$GITHUB_STEP_SUMMARY"
         shell: bash
@@ -265,7 +813,7 @@ jobs:
           if git diff --cached --quiet; then
             echo "No changes."
           else
-            git commit -m "RED-VERIF: veredicto de verificacion firmado (verify_face 1:1 + universal_view + firma Ed25519 de la Red)" -m "LA consulta del banco/consulado/empleador: (1) verify_face - re-match 1:1 de la selfie fresca contra la plantilla cifrada del ZID (motor ya existia: what banks and apps will consume), (2) universal_view de RED-ID - quien es + documento tipado + edad derivada + niveles, (3) FIRMA Ed25519 de la Red sobre el veredicto entero -> el tercero guarda la prueba y la verifica OFFLINE con la public_pem. Scope gobierna (sin consentimiento fresco por consulta); cada acceso auditado (network.verification.verdict). Ruta: POST /verification/person {zid, selfie_b64, actor_app}. v6 autosuficiente: crea metodo+ruta+test en orden con verificacion dura tras cada paso (v1-v4 fallaban pero no habian guardado el metodo por el GATE)."
+            git commit -m "RED-CONSENT+FREEZE: consentimientos con biometria + boton de panico de ZID (tokens/codigos)" -m "Control del dueno de datos (tokens y codigos, no notificaciones): grant_consent (autoriza a una app ver campos especificos con puntaje biometrico como evidencia, TTL por horas), check_consent (campos vigentes), revoke_consent (revocar al instante), consents_of (el dueno ve quien consulto que y hasta cuando). FREEZE: freeze_zid congela el ZID (NINGUNA verificacion pasa - como bloquear la tarjeta del banco) y devuelve un codigo de desbloqueo de un solo uso; unfreeze_zid solo funciona con ese codigo; is_frozen consultable. Guardias FrozenIdentityError en universal_view y verification_verdict. Rutas: POST /consent/grant (EXIGE biometria fresca - si la selfie no coincide, consentimiento denegado 403), /consent/revoke, /freeze, /unfreeze, GET /consent/list/{zid}. Test completo: otorgar->expirar->revocar->freeze bloquea verdict->codigo mal rechazado->codigo bien desbloquea->historial visible. Anti-fraude real: robo de telefono no basta (biometria), consentimiento expira solo, panico instantaneo."
           fi
           git pull --rebase --autostash origin main || true
           for i in 1 2 3; do

@@ -699,6 +699,130 @@ class ProfileRegistry:
         except Exception:
             return False
 
+    def full_legal_view(
+        self,
+        *,
+        zid: str,
+    ) -> dict[str, object]:
+        """RED-EXP-2: expediente
+        legal completo para
+        consulados y autoridades.
+        Universalidad (un ZID,
+        cualquier autoridad),
+        frescura visible por campo,
+        ciclo de vida de documentos,
+        consentimientos y estado de
+        congelamiento. Informa, no
+        juzga: la vigencia de fechas
+        la marca cada documento."""
+        require_non_empty_str(
+            zid, "zid")
+        now = self._clock.now()
+        campos = self._db.query_all(
+            "SELECT field, value, level,"
+            " updated_at FROM"
+            " profile_fields"
+            " WHERE zid = ?"
+            " ORDER BY field",
+            (zid,))
+        identity_fields = tuple(
+            {
+                "field": str(
+                    r["field"]),
+                "value": str(
+                    r["value"]),
+                "level": str(
+                    r["level"]),
+                "updated_at": float(
+                    r["updated_at"]),
+                "age_seconds": round(
+                    now - float(
+                        r["updated_at"]),
+                    3),
+            }
+            for r in campos)
+        rows_doc = self._db.query_all(
+            "SELECT document_id,"
+            " doc_type, doc_number,"
+            " issuing_country, status,"
+            " verification_status,"
+            " expiry_date, added_at"
+            " FROM identity_documents"
+            " WHERE zid = ?"
+            " ORDER BY added_at",
+            (zid,))
+        documents = tuple(
+            {
+                "document_id": str(
+                    r["document_id"]),
+                "doc_type": str(
+                    r["doc_type"]),
+                "doc_number": str(
+                    r["doc_number"]),
+                "issuing_country": str(
+                    r["issuing_country"]),
+                "status": str(
+                    r["status"]),
+                "verification_status": str(
+                    r["verification_status"]),
+                "expiry_date": str(
+                    r["expiry_date"] or ""),
+                "added_at": float(
+                    r["added_at"]),
+                "age_seconds": round(
+                    now - float(
+                        r["added_at"]),
+                    3),
+            }
+            for r in rows_doc)
+        assurance = (
+            self.assurance_level(
+                zid=zid))
+        consents = self.consents_of(
+            zid=zid)
+        activos = [
+            c for c in consents
+            if not c["revoked"]
+            and c["expires_at"] > now]
+        revocados = [
+            d for d in documents
+            if d["status"] == "REVOKED"]
+        self._audit.append(
+            event_type=(
+                "network.legal_view"
+                ".generated"),
+            actor=zid,
+            subject=zid,
+            payload={
+                "docs": len(documents),
+                "fields": len(
+                    identity_fields),
+            })
+        return {
+            "zid": zid,
+            "generated_at": now,
+            "identity_fields": (
+                identity_fields),
+            "documents": documents,
+            "assurance": assurance,
+            "consents": consents,
+            "frozen": bool(
+                self.is_frozen(
+                    zid=zid)),
+            "legal_summary": {
+                "countries": assurance[
+                    "countries"],
+                "verified_documents": int(
+                    assurance[
+                        "verified_documents"]),
+                "revoked_documents": len(
+                    revocados),
+                "active_consents": len(
+                    activos),
+            },
+        }
+
+
 
 class FrozenIdentityError(PermissionError):
     """AX-FREEZE: el ZID esta congelado por su dueno."""

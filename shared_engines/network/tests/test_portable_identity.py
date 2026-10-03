@@ -482,3 +482,129 @@ def test_expediente_legal_pedro(tmp_path) -> None:
     a6 = reg.assurance_level(zid=zid)
     assert a6["assurance_level"] == 4, str(a6)
     print("OK AX-EXP: Pedro SV-DUI + US-pasaporte en un ZID, assurance 0->2->4->5, revocacion en historial")
+
+
+def test_full_legal_view_consular(
+    tmp_path,
+) -> None:
+    """RED-EXP-2: vista legal
+    completa para consulados:
+    frescura por campo, ciclo de
+    vida de documentos, assurance,
+    consentimientos, congelamiento."""
+    from shared_engines.network.portable_profile import (
+        ProfileRegistry)
+    from shared_engines.audit.chain import (
+        AuditTrail)
+    from shared_engines.events.outbox import (
+        Outbox)
+    from shared_engines.storage.database import (
+        SQLiteAdapter)
+    from shared_engines.common.clocks import (
+        FrozenClock)
+    from shared_engines.runtime.config import (
+        RuntimeConfig)
+    from shared_engines.runtime.kernel import (
+        ZyraKernel)
+    from shared_engines.verification.signatures import (
+        Ed25519Signer)
+    from shared_engines.security.biometrics import (
+        BiometricsEngine, BiometricsPolicy,
+        DeterministicTestProvider, TemplateCipher)
+    db = SQLiteAdapter(
+        tmp_path / "exp2.db")
+    clock = FrozenClock()
+    signer, _ = Ed25519Signer.generate()
+    kernel = ZyraKernel(
+        db=db, clock=clock,
+        signer=signer,
+        config=RuntimeConfig(
+            host="127.0.0.1", port=0,
+            api_token=None))
+    kernel.bootstrap_root()
+    kernel._biometrics = BiometricsEngine(
+        db=db, clock=clock,
+        audit=kernel.audit,
+        provider=DeterministicTestProvider(),
+        cipher=TemplateCipher(
+            master_key_hex="ab" * 32),
+        policy=BiometricsPolicy(
+            require_liveness=False,
+            doc_reject=0.01,
+            doc_review=0.02,
+            doc_auto=0.03,
+            dup_reject=0.98))
+    reg = ProfileRegistry(
+        db, clock,
+        audit=AuditTrail(db, clock),
+        outbox=Outbox(db, clock))
+    reg.register_app(
+        app_id="consulado-sv",
+        display_name="Consulado SV",
+        scopes=("display_name",
+                "id_country"))
+    zid = "ZID-exp2-00000001"
+    reg.set_field(
+        zid=zid, field="display_name",
+        value="Pedro Exp2",
+        verified=True)
+    reg.set_field(
+        zid=zid, field="id_country",
+        value="SV", verified=True)
+    reg.set_field(
+        zid=zid, field="id_type",
+        value="dui", verified=True)
+    reg.set_field(
+        zid=zid, field="birth_date",
+        value="1992-04-04",
+        verified=True)
+    reg.add_document(
+        zid=zid, doc_type="dui",
+        doc_number="00000000-0",
+        issuing_country="SV",
+        verified=True,
+        verified_by="RNPN")
+    d2 = reg.add_document(
+        zid=zid, doc_type="passport",
+        doc_number="US-PASS-9",
+        issuing_country="US",
+        verified=True,
+        verified_by="StateDept")
+    reg.revoke_document(
+        zid=zid,
+        document_id=d2["document_id"],
+        reason="perdida")
+    reg.grant_consent(
+        zid=zid,
+        app_id="consulado-sv",
+        fields=("display_name",
+                "id_country"),
+        face_score=0.99)
+    vista = reg.full_legal_view(
+        zid=zid)
+    assert vista["zid"] == zid, (
+        str(vista)[:200])
+    assert len(
+        vista["identity_fields"]) == 4
+    for f in vista["identity_fields"]:
+        assert "age_seconds" in f
+        assert "level" in f
+    docs = vista["documents"]
+    assert len(docs) == 2
+    estados = sorted(
+        d["status"] for d in docs)
+    assert estados == [
+        "REVOKED", "VALID"], str(estados)
+    ls = vista["legal_summary"]
+    assert ls["revoked_documents"] == 1
+    assert ls["verified_documents"] == 1
+    assert (vista["assurance"]
+            ["assurance_level"] == 2), (
+        str(vista["assurance"]))
+    assert len(vista["consents"]) >= 1
+    assert vista["frozen"] is False
+    assert vista["generated_at"] > 0
+    print("OK RED-EXP-2: full_legal_view"
+          " con frescura por campo,"
+          " ciclo de vida, assurance,"
+          " consentimientos y congelamiento")

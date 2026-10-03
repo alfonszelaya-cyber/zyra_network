@@ -537,3 +537,47 @@ def market_gov_cartera_api(self) -> None:
             "ok": False, "error": "server error",
             "trace": traceback.format_exc(),
         })
+
+
+def _zyra_get_live_rate(
+    self,
+    *,
+    from_cur: str,
+    to_cur: str,
+) -> dict:
+    """RED-7: tasa en vivo desde proveedores
+    publicos. Cripto (BTC/ETH/TRX/SOL/USDT/LINK)
+    via CryptoRateProvider (CoinGecko); fiat via
+    ErApiRateProvider (er-api). Falla honesto.
+    La tasa MANUAL del gov sigue mandando en
+    convert() (regla 2): este metodo es la fuente
+    automatica cuando no existe manual."""
+    from shared_engines.currency.contracts import (
+        CurrencyPair as _CP)
+    from shared_engines.currency.rates import (
+        ProviderChain as _PC,
+        CryptoRateProvider as _CRP,
+        ErApiRateProvider as _ERP,
+    )
+
+    class _LiveClock:
+        def now(self):
+            import time as _t
+            return _t.time()
+
+    f = from_cur.upper().strip()
+    t = to_cur.upper().strip()
+    cripto = {"BTC", "ETH", "TRX",
+              "SOL", "USDT", "LINK"}
+    if f in cripto or t in cripto:
+        providers = [_CRP()]
+    else:
+        providers = [_ERP()]
+    q = _PC(providers).fetch(
+        _CP(f, t), _LiveClock())
+    return {"from": f, "to": t,
+            "rate": float(q.rate),
+            "source": q.source}
+
+
+CarteraStore.get_live_rate = _zyra_get_live_rate

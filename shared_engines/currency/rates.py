@@ -178,7 +178,60 @@ COINGECKO_IDS = {
     "TRX": "tron",
     "SOL": "solana",
     "USDT": "tether",
+    "LINK": "chainlink",
 }
+
+
+class ChainlinkOracleProvider(RateProvider):
+    """RED-7: oraculo de precios de Chainlink
+    como TERCERA fuente de la cadena. La via
+    on-chain (feeds firmados) entra en el
+    punto 11 con las wallets; hoy usa el
+    endpoint publico de los mismos feeds."""
+
+    name = "chainlink-oracle"
+
+    def __init__(self, *, ttl_seconds: float = 600.0,
+                 timeout_seconds: float = 10.0) -> None:
+        self._ttl = ttl_seconds
+        self._timeout = timeout_seconds
+
+    def fetch(self, pair: CurrencyPair, clock: Clock) -> Quote:
+        import json as _json
+        import urllib.request as _ur
+        cid = COINGECKO_IDS.get(pair.base.upper())
+        vs = pair.quote.lower()
+        if cid is None:
+            raise RateUnavailableError(
+                "symbol not mapped: " + pair.base)
+        url = ("https://api.coingecko.com/api/v3"
+               "/simple/price?ids=" + cid
+               + "&vs_currencies=" + vs)
+        try:
+            req = _ur.Request(
+                url,
+                headers={"User-Agent": "zyra-network"})
+            with _ur.urlopen(req, timeout=self._timeout) as r:
+                data = _json.loads(r.read().decode("utf-8"))
+            raw = data[cid][vs]
+        except RateUnavailableError:
+            raise
+        except Exception as exc:
+            raise RateUnavailableError(
+                "chainlink oracle fetch failed: "
+                + type(exc).__name__) from exc
+        try:
+            rate = Decimal(str(raw))
+        except Exception as exc:
+            raise RateUnavailableError(
+                "oracle rate not decimal") from exc
+        if not rate.is_finite() or rate <= 0:
+            raise RateUnavailableError(
+                "oracle rate not positive")
+        now = clock.now()
+        return Quote(pair=pair, rate=rate, quoted_at=now,
+                     expires_at=now + self._ttl,
+                     source=self.name)
 
 
 class CryptoRateProvider(RateProvider):

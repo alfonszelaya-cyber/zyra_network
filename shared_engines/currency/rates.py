@@ -98,3 +98,75 @@ class ProviderChain:
 def compose_rates(leg1: Decimal, leg2: Decimal) -> Decimal:
     """Composes two legs multiplicatively (exact)."""
     return leg1 * leg2
+
+
+class ErApiRateProvider(RateProvider):
+    """RED-5: tasas en vivo de
+    open.er-api.com (fuente publica,
+    160+ monedas, CA incluida).
+    Falla honesto: RateUnavailableError."""
+
+    name = "open.er-api.com"
+
+    def __init__(
+        self,
+        *,
+        ttl_seconds: float = 3600.0,
+        timeout_seconds: float = 10.0,
+    ) -> None:
+        self._ttl = ttl_seconds
+        self._timeout = timeout_seconds
+
+    def fetch(
+        self,
+        pair: CurrencyPair,
+        clock: Clock,
+    ) -> Quote:
+        import json as _json
+        import urllib.request as _ur
+        base = pair.base.upper()
+        quote_ccy = pair.quote.upper()
+        url = (
+            "https://open.er-api.com"
+            "/v6/latest/" + base)
+        try:
+            req = _ur.Request(
+                url,
+                headers={
+                    "User-Agent":
+                    "zyra-network"})
+            with _ur.urlopen(
+                    req,
+                    timeout=(
+                        self._timeout)) as r:
+                data = _json.loads(
+                    r.read().decode("utf-8"))
+        except Exception as exc:
+            raise RateUnavailableError(
+                "er-api fetch failed: "
+                + type(exc).__name__
+                + ": " + str(exc)[:80]) from exc
+        rates = (
+            data.get("conversion_rates")
+            or data.get("rates") or {})
+        raw = rates.get(quote_ccy)
+        if raw is None:
+            raise RateUnavailableError(
+                "er-api has no rate for "
+                + pair.normalized)
+        try:
+            rate = Decimal(str(raw))
+        except Exception as exc:
+            raise RateUnavailableError(
+                "er-api rate not decimal") from exc
+        if not rate.is_finite() or rate <= 0:
+            raise RateUnavailableError(
+                "er-api rate not positive")
+        now = clock.now()
+        return Quote(
+            pair=pair,
+            rate=rate,
+            quoted_at=now,
+            expires_at=(now + self._ttl),
+            source=self.name,
+        )

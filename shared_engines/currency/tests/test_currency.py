@@ -354,3 +354,100 @@ def test_quote_rejects_same_currency(tmp_path: Path) -> None:
             base="USD", quote_ccy="USD", requester_zid=user
         )
     harness.close()
+
+
+class _FakeResponse:
+    def __init__(self, payload: bytes) -> None:
+        self._p = payload
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *a):
+        return False
+
+    def read(self) -> bytes:
+        return self._p
+
+
+def test_erapi_provider_parses_live_shape(
+    tmp_path, monkeypatch,
+) -> None:
+    """RED-5: proveedor publico
+    (mockeado): JSON real de er-api
+    -> Quote exacta en Decimal."""
+    import json as _json
+    import urllib.request as _ur
+    from shared_engines.currency.rates import (
+        ErApiRateProvider)
+    payload = _json.dumps({
+        "result": "success",
+        "conversion_rates": {
+            "EUR": 0.888752,
+            "GTQ": 7.637735,
+            "HNL": 26.845764,
+        },
+    }).encode()
+
+    def fake_urlopen(req, timeout=None):
+        return _FakeResponse(payload)
+
+    monkeypatch.setattr(
+        _ur, "urlopen", fake_urlopen)
+    clock = FrozenClock()
+    q = ErApiRateProvider().fetch(
+        CurrencyPair("USD", "GTQ"), clock)
+    assert (q.rate
+            == Decimal("7.637735")), str(q)
+    assert q.source == "open.er-api.com"
+    assert q.expires_at > q.quoted_at
+    print("OK RED-5: er-api parsea y"
+          " fabrica Quote Decimal exacta")
+
+
+def test_erapi_provider_raises_when_down(
+    tmp_path, monkeypatch,
+) -> None:
+    import urllib.request as _ur
+    from shared_engines.currency.rates import (
+        ErApiRateProvider)
+
+    def boom(req, timeout=None):
+        raise OSError("down")
+
+    monkeypatch.setattr(
+        _ur, "urlopen", boom)
+    with pytest.raises(RateUnavailableError):
+        ErApiRateProvider().fetch(
+            CurrencyPair("USD", "EUR"),
+            FrozenClock())
+
+
+def test_provider_chain_falls_back_to_erapi(
+    tmp_path, monkeypatch,
+) -> None:
+    """RED-5: cadena con proveedor
+    muerto + er-api: el fallback
+    entrega la Quote."""
+    import json as _json
+    import urllib.request as _ur
+    from shared_engines.currency.rates import (
+        ErApiRateProvider, ProviderChain)
+    payload = _json.dumps({
+        "conversion_rates": {"EUR": 0.9},
+    }).encode()
+
+    def fake_urlopen(req, timeout=None):
+        return _FakeResponse(payload)
+
+    monkeypatch.setattr(
+        _ur, "urlopen", fake_urlopen)
+    chain = ProviderChain(
+        [_Dead(), ErApiRateProvider()])
+    q = chain.fetch(
+        CurrencyPair("USD", "EUR"),
+        FrozenClock())
+    assert q.rate == Decimal("0.9")
+    assert q.source == "open.er-api.com"
+    print("OK RED-5: cadena con fallback"
+          " a proveedor vivo funciona")

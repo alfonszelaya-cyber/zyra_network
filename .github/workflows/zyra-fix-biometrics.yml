@@ -1,16 +1,16 @@
-name: "ZYRA AUDIT RELAY 4 (flag corregido)"
+name: "ZYRA RED-RELAY: cartero autonomo"
 
 on:
   push:
   workflow_dispatch:
 
 permissions:
-  contents: read
+  contents: write
 
 jobs:
-  audit:
+  run:
     runs-on: ubuntu-latest
-    timeout-minutes: 20
+    timeout-minutes: 25
 
     steps:
       - name: Checkout
@@ -24,51 +24,251 @@ jobs:
       - name: Dependencias
         run: |
           python3 -m pip install --upgrade pip
-          python3 -m pip install pytest pytest-timeout || true
+          python3 -m pip install pytest pytest-timeout httpx
           if [ -f requirements.txt ]; then
             python3 -m pip install -r requirements.txt || true
           fi
           echo "DEPS OK"
 
-      - name: Test 1 bridge (timeout con dump de threads)
+      - name: RED-RELAY relay_forever + test autonomo
         run: |
           export PYTHONPATH="$(pwd):$(pwd)/shared_engines"
-          {
-          echo "## test_bridge_deliver_once_and_dedup"
-          echo '```'
-          timeout 150 python3 -m pytest "shared_engines/events/tests/test_events.py::test_bridge_deliver_once_and_dedup" -vv --tb=long --timeout=45 --timeout-method=thread 2>&1 | tail -80 || true
-          echo '```'
-          } | tee -a "$GITHUB_STEP_SUMMARY"
-          exit 0
+          python3 << 'EOF'
+          import ast, pathlib, py_compile, traceback
+          SUM = __import__("os").environ.get("GITHUB_STEP_SUMMARY", "")
+          def out(t):
+              print(t, flush=True)
+              if SUM:
+                  with open(SUM, "a", encoding="utf-8") as f:
+                      f.write(t + "\n")
 
-      - name: Test 2 bridge (timeout con dump de threads)
+          # 1) Metodo en InterAppBridge (append al final del archivo = final de la clase)
+          p = pathlib.Path("shared_engines/events/outbox.py")
+          src = p.read_text(encoding="utf-8")
+          if "def relay_forever" in src:
+              out("- **RELAY metodo: YA**")
+          else:
+              metodo = (
+                  '\n'
+                  '    def relay_forever(\n'
+                  '        self,\n'
+                  '        *,\n'
+                  '        stop,\n'
+                  '        interval_seconds: float = 0.5,\n'
+                  '        max_cycles: int = 0,\n'
+                  '    ) -> dict[str, int]:\n'
+                  '        """RED-RELAY: cartero\n'
+                  '        autonomo. Drena el outbox en\n'
+                  '        ciclos hasta que stop sea\n'
+                  '        activado (o max_cycles se\n'
+                  '        alcance). Nunca lanza: un\n'
+                  '        ciclo con error queda\n'
+                  '        contado y el bucle sigue.\n'
+                  '        Sin hilos internos: el\n'
+                  '        dueno decide el hilo."""\n'
+                  '        total = {\n'
+                  '            "drained": 0,\n'
+                  '            "delivered": 0,\n'
+                  '            "duplicates": 0,\n'
+                  '            "cycles": 0,\n'
+                  '            "errors": 0,\n'
+                  '        }\n'
+                  '        ciclos = 0\n'
+                  '        while True:\n'
+                  '            if (max_cycles\n'
+                  '                    and ciclos\n'
+                  '                    >= max_cycles):\n'
+                  '                break\n'
+                  '            if stop.wait(\n'
+                  '                    interval_seconds):\n'
+                  '                break\n'
+                  '            ciclos += 1\n'
+                  '            try:\n'
+                  '                r = self.relay()\n'
+                  '                for k in (\n'
+                  '                        "drained",\n'
+                  '                        "delivered",\n'
+                  '                        "duplicates"):\n'
+                  '                    total[k] += int(\n'
+                  '                        r.get(k, 0))\n'
+                  '            except Exception:\n'
+                  '                total["errors"] += 1\n'
+                  '        total["cycles"] = ciclos\n'
+                  '        return total\n'
+              )
+              if not src.endswith("\n"):
+                  src += "\n"
+              src = src + metodo
+              ast.parse(src)
+              p.write_text(src, encoding="utf-8")
+              py_compile.compile(str(p), doraise=True)
+              out("- **RELAY metodo: OK**")
+
+          # 2) Test autonomo (append al final de test_events.py)
+          t = pathlib.Path("shared_engines/events/tests/test_events.py")
+          tsrc = t.read_text(encoding="utf-8")
+          if "test_relay_forever_autonomous" in tsrc:
+              out("- **RELAY test: YA**")
+          else:
+              test = (
+                  '\n'
+                  '\n'
+                  'def test_relay_forever_autonomous(\n'
+                  '    tmp_path,\n'
+                  ') -> None:\n'
+                  '    """RED-RELAY: el cartero\n'
+                  '    distribuye solo: evento\n'
+                  '    encolado DESPUES de arrancar\n'
+                  '    el bucle es entregado sin\n'
+                  '    llamada manual; stop termina\n'
+                  '    limpio. Todas las esperas con\n'
+                  '    timeout: el test no puede\n'
+                  '    colgar."""\n'
+                  '    import threading\n'
+                  '    from shared_engines.events.outbox import (\n'
+                  '        Outbox, InterAppBridge)\n'
+                  '    from shared_engines.events.inbox import (\n'
+                  '        Inbox)\n'
+                  '    from shared_engines.events.contracts import (\n'
+                  '        EventCatalog)\n'
+                  '    from shared_engines.storage.database import (\n'
+                  '        SQLiteAdapter)\n'
+                  '    from shared_engines.common.clocks import (\n'
+                  '        FrozenClock)\n'
+                  '    cat = EventCatalog()\n'
+                  '    cat.register(\n'
+                  '        "agro.sale.created")\n'
+                  '    db_red = SQLiteAdapter(\n'
+                  '        tmp_path / "rr.db")\n'
+                  '    db_nexo = SQLiteAdapter(\n'
+                  '        tmp_path / "rrn.db")\n'
+                  '    clock = FrozenClock()\n'
+                  '    out_red = Outbox(db_red, clock)\n'
+                  '    out_red.ensure_schema()\n'
+                  '    inbox_nexo = Inbox(\n'
+                  '        db_nexo, clock)\n'
+                  '    llego = threading.Event()\n'
+                  '    recibidos = []\n'
+                  '\n'
+                  '    def handler(ev):\n'
+                  '        recibidos.append(\n'
+                  '            ev.event_id)\n'
+                  '        llego.set()\n'
+                  '\n'
+                  '    bridge = InterAppBridge(\n'
+                  '        db=db_red, clock=clock,\n'
+                  '        source=out_red)\n'
+                  '    bridge.subscribe(\n'
+                  '        app_id="nexo",\n'
+                  '        event_types=(\n'
+                  '            "agro.sale"\n'
+                  '            ".created",),\n'
+                  '        inbox=inbox_nexo,\n'
+                  '        handler=handler)\n'
+                  '    stop = threading.Event()\n'
+                  '    res = {}\n'
+                  '    hilo = threading.Thread(\n'
+                  '        target=lambda: res.update(\n'
+                  '            bridge.relay_forever(\n'
+                  '                stop=stop,\n'
+                  '                interval_seconds=(\n'
+                  '                    0.05))),\n'
+                  '        daemon=True)\n'
+                  '    hilo.start()\n'
+                  '    ev = cat.build(\n'
+                  '        "agro.sale.created",\n'
+                  '        aggregate_id="S9",\n'
+                  '        payload={"t": 1},\n'
+                  '        clock=clock)\n'
+                  '    out_red.enqueue(ev)\n'
+                  '    assert llego.wait(\n'
+                  '        timeout=10), (\n'
+                  '        "autonomo no entrego")\n'
+                  '    stop.set()\n'
+                  '    hilo.join(timeout=5)\n'
+                  '    assert not hilo.is_alive(), (\n'
+                  '        "bucle no termino")\n'
+                  '    assert (res.get(\n'
+                  '        "delivered", 0) >= 1), (\n'
+                  '        str(res))\n'
+                  '    assert (res.get(\n'
+                  '        "errors", 0) == 0), (\n'
+                  '        str(res))\n'
+                  '    print("OK RED-RELAY:"\n'
+                  '          " cartero autonomo"\n'
+                  '          " entrego, stop limpio,"'
+                  '          " cero errores")\n'
+              )
+              tsrc = tsrc + test
+              ast.parse(tsrc)
+              t.write_text(tsrc, encoding="utf-8")
+              py_compile.compile(str(t), doraise=True)
+              out("- **RELAY test: OK**")
+          EOF
+
+      - name: "R1: test autonomo (timeout 45s)"
+        if: always()
         run: |
           export PYTHONPATH="$(pwd):$(pwd)/shared_engines"
-          {
-          echo "## test_bridge_routes_by_type"
-          echo '```'
-          timeout 150 python3 -m pytest "shared_engines/events/tests/test_events.py::test_bridge_routes_by_type" -vv --tb=long --timeout=45 --timeout-method=thread 2>&1 | tail -80 || true
-          echo '```'
-          } | tee -a "$GITHUB_STEP_SUMMARY"
+          set +e
+          timeout 120 python3 -m pytest "shared_engines/events/tests/test_events.py::test_relay_forever_autonomous" -vv --tb=long --timeout=45 --timeout-method=thread > /tmp/r1.out 2>&1
+          echo $? > /tmp/r1
+          if [ "$(cat /tmp/r1)" = "0" ]; then echo "- R1 autonomo: ✅" >> "$GITHUB_STEP_SUMMARY"; else echo "- R1: ❌" >> "$GITHUB_STEP_SUMMARY"; { echo "### R1 detalle"; echo '```'; tail -60 /tmp/r1.out; echo '```'; } >> "$GITHUB_STEP_SUMMARY"; fi
           exit 0
 
-      - name: Suite events completa
+      - name: "R2: suite events completa"
+        if: always()
         run: |
           export PYTHONPATH="$(pwd):$(pwd)/shared_engines"
-          {
-          echo "## Suite events completa"
-          echo '```'
-          timeout 300 python3 -m pytest shared_engines/events/tests -q --timeout=45 --timeout-method=thread --tb=line 2>&1 | tail -25 || true
-          echo '```'
-          } | tee -a "$GITHUB_STEP_SUMMARY"
+          set +e
+          timeout 300 python3 -m pytest shared_engines/events/tests -q --timeout=45 --timeout-method=thread --tb=short > /tmp/r2.out 2>&1
+          echo $? > /tmp/r2
+          if [ "$(cat /tmp/r2)" = "0" ]; then echo "- R2 events: ✅" >> "$GITHUB_STEP_SUMMARY"; else echo "- R2: ❌" >> "$GITHUB_STEP_SUMMARY"; { echo "### R2 detalle"; echo '```'; tail -50 /tmp/r2.out; echo '```'; } >> "$GITHUB_STEP_SUMMARY"; fi
           exit 0
 
-      - name: Fuente dispatch_pending y pending (zona clave)
+      - name: "R3: regresion shared_engines completa"
+        if: always()
         run: |
-          {
-          echo "## outbox.py lineas 107-260 (dispatch_pending, claim_batch, la zona oculta)"
-          echo '```python'
-          awk 'NR>=107 && NR<=260 {printf "%5d| %s\n", NR, $0}' shared_engines/events/outbox.py || true
-          echo '```'
-          } | tee -a "$GITHUB_STEP_SUMMARY"
+          export PYTHONPATH="$(pwd):$(pwd)/shared_engines"
+          set +e
+          timeout 900 python3 -m pytest shared_engines -q --timeout=60 --timeout-method=thread --tb=line > /tmp/r3.out 2>&1
+          echo $? > /tmp/r3
+          if [ "$(cat /tmp/r3)" = "0" ]; then echo "- R3 shared_engines completo: ✅" >> "$GITHUB_STEP_SUMMARY"; else echo "- R3: ❌" >> "$GITHUB_STEP_SUMMARY"; { echo "### R3 detalle (cola)"; echo '```'; tail -60 /tmp/r3.out; echo '```'; } >> "$GITHUB_STEP_SUMMARY"; fi
           exit 0
+
+      - name: Veredicto + commit solo si TODO verde
+        if: always()
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          SUM="$GITHUB_STEP_SUMMARY"
+          log() { echo "$1" >> "$SUM"; echo "$1"; }
+          fails=""
+          for g in r1 r2 r3; do
+            c=$(cat /tmp/$g 2>/dev/null || echo 1)
+            [ "$c" != "0" ] && fails="$fails $g"
+          done
+          if [ -n "$fails" ]; then
+            log "**RESULTADO: fallan:$fails — SIN commit**"
+            exit 1
+          fi
+          log "**RESULTADO: R1+R2+R3 VERDES**"
+          find shared_engines -name "__pycache__" -type d -prune -exec rm -rf {} + || true
+          rm -rf .pytest_cache || true
+          git config user.name "zyra-bot"
+          git config user.email "zyra-bot@users.noreply.github.com"
+          git add shared_engines
+          set +e
+          if git diff --cached --quiet; then
+            log "**SIN CAMBIOS**"; exit 0
+          fi
+          git commit -m "feat(RED-RELAY): relay_forever cartero autonomo + test sin cuelgues (R1-R3 verdes)"
+          [ $? -ne 0 ] && { log "**COMMIT FALLO**"; exit 1; }
+          log "**COMMIT OK**"
+          git push "https://x-access-token:${GH_TOKEN}@github.com/${GITHUB_REPOSITORY}.git" "HEAD:main" > /tmp/p1.out 2> /tmp/p1.err
+          if [ $? -eq 0 ]; then log "**PUSH OK — PUNTO 1 (RED-RELAY) CERRADO.**"; exit 0; fi
+          log "**PUSH fallo:**"; { echo '```'; cat /tmp/p1.err; echo '```'; } >> "$SUM"
+          git push origin "HEAD:main" > /tmp/p2.out 2> /tmp/p2.err
+          if [ $? -eq 0 ]; then log "**PUSH OK (intento 2) — PUNTO 1 CERRADO.**"; exit 0; fi
+          log "**PUSH intento 2 fallo:**"; { echo '```'; cat /tmp/p2.err; echo '```'; } >> "$SUM"
+          exit 1

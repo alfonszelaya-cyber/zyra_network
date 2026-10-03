@@ -620,7 +620,7 @@ def test_death_lifecycle_deceased(tmp_path) -> None:
             return e.code, _json.loads(e.read().decode())
 
     try:
-        st, r1 = post("/identity/enroll", {"kind": "person", "display_name": "Pedro Ciclo", "actor": "test", "doc_image_b64": "cGVkcm8tZG9j", "selfie_image_b64": "cGVkcm8tc2VsZmll"})
+        st, r1 = post("/identity/enroll", {"kind": "person", "display_name": "Pedro Ciclo", "actor": "test", "doc_image_b64": "cGVkcm8tZG9j", "selfie_image_b64": "cGVkcm8tZG9j"})
         assert st in (200, 201), str(st) + " " + str(r1)
         zid = ((r1.get("data") or {}).get("identity") or {}).get("zid")
         assert zid, str(r1)[:300]

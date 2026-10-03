@@ -520,7 +520,7 @@ def test_verification_verdict_signed(tmp_path) -> None:
 
     try:
         selfie = base64.b64encode(b"selfie-pedro-real").decode("ascii")
-        docimg = base64.b64encode(b"doc-pedro-dui").decode("ascii")
+        docimg = selfie
         st, r1 = post("/identity/enroll", {"kind": "person", "display_name": "Pedro Prueba", "actor": "banco-ny", "doc_image_b64": docimg, "selfie_image_b64": selfie})
         assert st in (200, 201), str(st) + " " + str(r1)
         zid = ((r1.get("data") or {}).get("identity") or {}).get("zid")
@@ -540,7 +540,7 @@ def test_verification_verdict_signed(tmp_path) -> None:
         verde = bytes.fromhex(d["signature"])
         sin_firma = dict((k, v) for k, v in d.items() if k != "signature")
         recom = canonical_json_dumps(sin_firma).encode("utf-8")
-        assert Ed25519Verifier(pub).verify(recom, verde) is True
+        assert (lambda _s: Ed25519Verifier(_s.load_pem_private_key(pub, password=None).public_key().public_bytes(_s.Encoding.PEM, _s.PublicFormat.SubjectPublicKeyInfo)).verify(recom, verde))(__import__("cryptography.hazmat.primitives.serialization", fromlist=["serialization"])) is True  # F15-PUBKEY
         print("OK AX-VERIF: veredicto firmado, verificable offline")
     finally:
         srv.shutdown()

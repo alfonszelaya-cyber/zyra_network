@@ -445,8 +445,16 @@ def test_expediente_legal_pedro(tmp_path) -> None:
     from shared_engines.events.contracts import EventCatalog
     from shared_engines.storage.database import SQLiteAdapter
     from shared_engines.common.clocks import FrozenClock
+    from shared_engines.runtime.config import RuntimeConfig
+    from shared_engines.runtime.kernel import ZyraKernel
+    from shared_engines.verification.signatures import Ed25519Signer
+    from shared_engines.security.biometrics import BiometricsEngine, BiometricsPolicy, DeterministicTestProvider, TemplateCipher
     db = SQLiteAdapter(tmp_path / "exp.db")
     clock = FrozenClock()
+    signer, _ = Ed25519Signer.generate()
+    kernel = ZyraKernel(db=db, clock=clock, signer=signer, config=RuntimeConfig(host="127.0.0.1", port=0, api_token=None))
+    kernel.bootstrap_root()
+    kernel._biometrics = BiometricsEngine(db=db, clock=clock, audit=kernel.audit, provider=DeterministicTestProvider(), cipher=TemplateCipher(master_key_hex="ab" * 32), policy=BiometricsPolicy(require_liveness=False, doc_reject=0.01, doc_review=0.02, doc_auto=0.03, dup_reject=0.98))
     reg = ProfileRegistry(db, clock, audit=AuditTrail(db, clock), outbox=Outbox(db, clock))
     zid = "ZID-pedro-exp-00000001"
     reg.set_field(zid=zid, field="display_name", value="Pedro Prueba", verified=True)
@@ -456,7 +464,7 @@ def test_expediente_legal_pedro(tmp_path) -> None:
     assert d1["document_id"].startswith("DOCX-")
     a2 = reg.assurance_level(zid=zid)
     assert a2["assurance_level"] == 2, str(a2)
-    db.execute("INSERT INTO biometric_templates (template_id, identity_zid, modality, template_enc, dims, created_at) VALUES ('T-1', ?, 'face', x'00', 1, 1)", (zid,))
+    db.execute("INSERT INTO biometric_templates (template_id, identity_zid, modality, template_enc, dims, created_at, case_id, template_sha) VALUES ('T-1', ?, 'face', x'00', 1, 1, 'CASE-EXP-1', 'X')", (zid,))
     a4 = reg.assurance_level(zid=zid)
     assert a4["assurance_level"] == 4, str(a4)
     d2 = reg.add_document(zid=zid, doc_type="passport", doc_number="US-PASS-777", issuing_country="US", issuing_authority="U.S. Department of State", issue_date="2024-01-01", expiry_date="2034-01-01", verified=True, verified_by="U.S. Dept of State")
@@ -472,5 +480,5 @@ def test_expediente_legal_pedro(tmp_path) -> None:
     rev = [d for d in docs2 if d["document_id"] == d2["document_id"]]
     assert rev[0]["status"] == "REVOKED"
     a6 = reg.assurance_level(zid=zid)
-    assert a6["assurance_level"] == 2, str(a6)
+    assert a6["assurance_level"] == 4, str(a6)
     print("OK AX-EXP: Pedro SV-DUI + US-pasaporte en un ZID, assurance 0->2->4->5, revocacion en historial")

@@ -47,6 +47,7 @@ CORE_PREFIXES = frozenset(
         "tokens",
         "currency",
         "proofing",
+        "verify-existence",
     }
 )
 

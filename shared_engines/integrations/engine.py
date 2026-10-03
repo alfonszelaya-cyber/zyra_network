@@ -622,6 +622,8 @@ class SourceIndex:
         summary: dict[
             str, object],
     ) -> None:
+        from shared_engines.common.serialization import (
+            canonical_json_dumps)
         with (
             self._db.transaction()
             as cursor
@@ -793,8 +795,7 @@ def sweep_marn(
                     "summary"
                 ] = resumen
                 ok += 1
-                if index is (not (
-                        None)):
+                if index is not None:
                     index.record(
                         source_id=(
                             "marn-"

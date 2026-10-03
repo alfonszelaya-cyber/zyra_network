@@ -204,6 +204,7 @@ class ProfileRegistry:
         self._clock = clock
         self._audit = audit
         self._outbox = outbox
+        self._outbox.ensure_schema()
         MigrationRunner(
             db,
             "network.portable_profile",

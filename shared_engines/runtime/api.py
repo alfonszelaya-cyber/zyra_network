@@ -215,9 +215,107 @@ class ZyraApiHandler(BaseHTTPRequestHandler):
         else:
             raise ApiError(404, "not_found", "unknown route")
 
+    def _handle_verification_person(self) -> None:
+        """AX-VERIF: verify_face 1:1 -> veredicto firmado."""
+        import traceback as _tbf
+        try:
+            doc = self._read_json()
+            zid_v = self._require_str(doc, "zid")
+            actor = self._require_str(doc, "actor_app")
+            selfie_v = self._decode_b64(
+                self._require_str(doc, "selfie_b64"))
+            kernel = type(self).kernel
+            bio = getattr(kernel, "_biometrics", None)
+            if bio is None:
+                raise ApiError(503, "not_wired",
+                    "kernel._biometrics ausente")
+            reporte = bio.verify_face(
+                zid_v,
+                selfie_image=selfie_v,
+                actor=actor)
+            fv = {
+                "match": bool(getattr(
+                    reporte, "matched", False)),
+                "score": float(getattr(
+                    reporte, "score", 0.0)),
+            }
+            caps_obj = (
+                getattr(type(self), "caps", None)
+                or getattr(self, "caps", None))
+            if caps_obj is None:
+                raise ApiError(503, "not_wired",
+                    "caps no accesible")
+            clock = (
+                getattr(kernel, "clock", None)
+                or getattr(kernel, "_clock", None)
+                or getattr(caps_obj, "_clock", None))
+            signer = None
+            for _host in (caps_obj, kernel):
+                try:
+                    _subs = list(
+                        vars(_host).values())
+                except Exception:
+                    _subs = []
+                for _sub in _subs:
+                    if not _sub:
+                        continue
+                    for _a in (
+                            "_signer",
+                            "signer"):
+                        try:
+                            _c = getattr(
+                                _sub, _a, None)
+                        except Exception:
+                            _c = None
+                        if _c is not None and callable(
+                                getattr(
+                                    _c, "sign", None)):
+                            signer = _c
+                            break
+                    if signer is not None:
+                        break
+                if signer is not None:
+                    break
+            if signer is None:
+                raise ApiError(
+                    500, "internal_error",
+                    "signer no localizado; "
+                    "caps=" + str(list(
+                        vars(caps_obj).keys()))[:120])
+            try:
+                verd = (
+                    caps_obj.profiles
+                    .verification_verdict(
+                        app_id=actor,
+                        zid=zid_v,
+                        face_verdict=fv,
+                        signer=signer,
+                        clock=clock))
+            except ApiError:
+                raise
+            except Exception as exc:
+                _tbf.print_exc()
+                raise ApiError(500, "internal_error",
+                    "diag verdict: "
+                    + type(exc).__name__ + ": "
+                    + str(exc)[:150])
+            self._send_json(
+                200,
+                {"ok": True, "data": verd},
+            )
+        except ApiError:
+            raise
+        except Exception as exc:
+            _tbf.print_exc()
+            raise ApiError(500, "internal_error",
+                "diag person: "
+                + type(exc).__name__ + ": "
+                + str(exc)[:150])
+
     def _route_post(self, s: list[str]) -> None:
         if s == ["identity", "register"]:
             self._handle_register_identity()
+            return
         if s == ["identity", "birth-zid"]:
             self._handle_birth_zid()
             return
@@ -228,16 +326,7 @@ class ZyraApiHandler(BaseHTTPRequestHandler):
         elif s == ["verification", "media"]:
             self._handle_register_media()
         elif s == ["verification", "person"]:
-            import base64 as _b64v
-            bio = getattr(type(self).kernel, "_biometrics", None)
-            if bio is None:
-                raise ApiError(503, "not_wired", "biometrics not configured")
-            zid_v = self._req(doc, "zid")
-            selfie_v = _b64v.b64decode(self._req(doc, "selfie_b64"))
-            reporte = bio.verify_face(zid_v, selfie_image=selfie_v, actor=self._req(doc, "actor_app"))
-            fv = {"match": bool(getattr(reporte, "match", False)), "score": float(getattr(reporte, "score", 0.0))}
-            verd = type(self).caps.profiles.verification_verdict(app_id=self._req(doc, "actor_app"), zid=zid_v, face_verdict=fv, signer=type(self).kernel.signer, clock=type(self).kernel.clock)
-            self._send(200, {"ok": True, "data": verd})
+            self._handle_verification_person()
             return
         elif s == ["verification", "media", "verify"]:
             self._handle_verify_media()

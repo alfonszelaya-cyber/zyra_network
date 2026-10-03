@@ -1,4 +1,4 @@
-name: "ZYRA FIX: 9 PATCHES"
+name: "ZYRA FIX FINAL: 9 PATCHES + AUTOPATCH + DIAGNOSTICO"
 
 on:
   push:
@@ -30,7 +30,7 @@ jobs:
           fi
           echo "DEPS OK"
 
-      - name: Aplicar 9 fixes (anclas del audit 5)
+      - name: Aplicar 9 fixes (idempotente)
         run: |
           python3 << 'EOF'
           import pathlib, sys
@@ -42,7 +42,7 @@ jobs:
                   print("[YA APLICADO] " + etiqueta); return
               n = src.count(viejo)
               if n != 1:
-                  print("[ERROR] " + etiqueta + " ancla=" + str(n) + " veces (esperaba 1)"); sys.exit(1)
+                  print("[ERROR] " + etiqueta + " ancla=" + str(n)); sys.exit(1)
               p.write_text(src.replace(viejo, nuevo, 1), encoding="utf-8")
               print("[OK] " + etiqueta)
 
@@ -92,30 +92,138 @@ jobs:
           print("9 FIXES OK")
           EOF
 
-      - name: Sonda sweep (verificacion inline)
+      - name: Autopatch condicional (atributos reales del kernel)
         run: |
           export PYTHONPATH="$(pwd):$(pwd)/shared_engines"
           python3 << 'EOF'
-          import json, pathlib, tempfile
+          import pathlib
           from shared_engines.storage.database import SQLiteAdapter
           from shared_engines.common.clocks import FrozenClock
-          from shared_engines.integrations.engine import (PublicSourceClient, SourceIndex, sweep_onec, sweep_marn, ONEC_ENDPOINTS)
-          d = pathlib.Path(tempfile.mkdtemp())
-          geo = json.dumps({"type":"FeatureCollection","features":[{"type":"Feature"},{"type":"Feature"}]}).encode()
-          meta = json.dumps({"layers":[{"id":0,"name":"a"},{"id":1,"name":"b"}]}).encode()
-          one = json.dumps([{"codigo":"0111101"}]).encode()
-          def opener(url):
-              if url.endswith("?f=json"): return meta
-              if "/query" in url: return geo
-              if url.endswith(tuple(ONEC_ENDPOINTS)): return one
-              raise OSError("no simulada")
-          cli = PublicSourceClient(clock=FrozenClock(), ttl_seconds=60.0, opener=opener)
-          idx = SourceIndex(SQLiteAdapter(d / "s.db"), FrozenClock())
-          r1 = sweep_onec(cli, idx)
-          r2 = sweep_marn(cli, idx, max_layers_per_service=2, pause_seconds=0)
-          rows = idx._db.query_all("SELECT * FROM source_snapshots")
-          print("ROWS esperadas 25 / obtenidas:", len(rows))
-          print("MARN muestra:", json.dumps(r2["results"][:2], default=str)[:600])
+          from shared_engines.verification.signatures import Ed25519Signer
+          from shared_engines.runtime.config import RuntimeConfig
+          from shared_engines.runtime.kernel import ZyraKernel
+
+          s, _ = Ed25519Signer.generate()
+          k = ZyraKernel(db=SQLiteAdapter(":memory:"), clock=FrozenClock(), signer=s, config=RuntimeConfig(host="127.0.0.1", port=0, api_token=None))
+          clock_attr = "clock" if hasattr(k, "clock") else ("_clock" if hasattr(k, "_clock") else None)
+          signer_attr = "signer" if hasattr(k, "signer") else ("_signer" if hasattr(k, "_signer") else None)
+          print("ATRIBUTO CLOCK REAL:", clock_attr)
+          print("ATRIBUTO SIGNER REAL:", signer_attr)
+
+          p = pathlib.Path("shared_engines/runtime/api.py")
+          src = p.read_text(encoding="utf-8")
+          if clock_attr and clock_attr != "clock":
+              viejo = "type(self).kernel.clock"
+              nuevo = "type(self).kernel." + clock_attr
+              if nuevo in src:
+                  print("[YA] clock parcheado")
+              elif viejo in src:
+                  src = src.replace(viejo, nuevo)
+                  print("[OK] autopatch clock -> " + nuevo)
+          if signer_attr and signer_attr != "signer":
+              viejo = "type(self).kernel.signer"
+              nuevo = "type(self).kernel." + signer_attr
+              if nuevo in src:
+                  print("[YA] signer parcheado")
+              elif viejo in src:
+                  src = src.replace(viejo, nuevo)
+                  print("[OK] autopatch signer -> " + nuevo)
+          p.write_text(src, encoding="utf-8")
+          print("AUTOPATCH LISTO")
+          EOF
+
+      - name: Sonda veredicto (traceback real del 500)
+        run: |
+          export PYTHONPATH="$(pwd):$(pwd)/shared_engines"
+          python3 << 'EOF'
+          import base64, inspect, json, sys, threading, time, traceback, urllib.request, urllib.error
+          from shared_engines.storage.database import SQLiteAdapter
+          from shared_engines.common.clocks import FrozenClock
+          from shared_engines.runtime.config import RuntimeConfig
+          from shared_engines.runtime.kernel import ZyraKernel
+          from shared_engines.runtime.capabilities import ZyraCapabilities
+          from shared_engines.runtime import api as A
+          from shared_engines.runtime import combined_api as C
+          from shared_engines.runtime.combined_api import serve_combined
+          from shared_engines.verification.signatures import Ed25519Signer
+          from shared_engines.security.biometrics import BiometricsEngine, BiometricsPolicy, DeterministicTestProvider, TemplateCipher
+          from shared_engines.network.portable_profile import ProfileRegistry
+          from shared_engines.audit.chain import AuditTrail
+          from shared_engines.events.outbox import Outbox
+
+          def tb():
+              traceback.print_exc(file=sys.stdout)
+
+          print("### A. ATRIBUTOS Y RESOLUCION")
+          print("  ProfileRegistry.verification_verdict existe:", hasattr(ProfileRegistry, "verification_verdict"), flush=True)
+          if hasattr(ProfileRegistry, "verification_verdict"):
+              try:
+                  print("  firma:", inspect.signature(ProfileRegistry.verification_verdict), flush=True)
+              except Exception:
+                  tb()
+          print("  metodos verif/verdict:", [n for n in dir(ProfileRegistry) if "verif" in n.lower() or "verdict" in n.lower()], flush=True)
+          print("  CombinedHandler._req:", "OK" if hasattr(C.CombinedHandler, "_req") else "AUSENTE", flush=True)
+          print("  CombinedHandler._send:", "OK" if hasattr(C.CombinedHandler, "_send") else "AUSENTE", flush=True)
+
+          net_db = SQLiteAdapter(":memory:")
+          signer, pub = Ed25519Signer.generate()
+          kernel = ZyraKernel(db=net_db, clock=FrozenClock(), signer=signer, config=RuntimeConfig(host="127.0.0.1", port=0, api_token=None))
+          kernel.bootstrap_root()
+          kernel._biometrics = BiometricsEngine(db=net_db, clock=FrozenClock(), audit=kernel.audit, provider=DeterministicTestProvider(), cipher=TemplateCipher(master_key_hex="ab" * 32), policy=BiometricsPolicy(require_liveness=False, doc_reject=0.01, doc_review=0.02, doc_auto=0.03, dup_reject=0.98))
+          caps = ZyraCapabilities(net_db, FrozenClock(), identity=kernel.identity, signer=signer)
+          caps.profiles = ProfileRegistry(net_db, FrozenClock(), audit=AuditTrail(net_db, FrozenClock()), outbox=Outbox(net_db, FrozenClock()))
+          caps.profiles.register_app(app_id="banco-ny", display_name="Banco NY", scopes=("display_name", "national_id", "id_country", "id_type", "id_number", "nationality", "birth_date", "address"))
+
+          srv = serve_combined(kernel, caps, host="127.0.0.1", port=0)
+          threading.Thread(target=srv.serve_forever, daemon=True).start()
+          time.sleep(0.3)
+          base = "http://127.0.0.1:" + str(srv.server_address[1])
+
+          def post(ruta, doc):
+              req = urllib.request.Request(base + ruta, data=json.dumps(doc).encode(), method="POST", headers={"Content-Type": "application/json"})
+              try:
+                  with urllib.request.urlopen(req, timeout=15) as r:
+                      return r.status, json.loads(r.read().decode())
+              except urllib.error.HTTPError as e:
+                  return e.code, json.loads(e.read().decode())
+
+          selfie = base64.b64encode(b"selfie-pedro-real").decode("ascii")
+          st, r1 = post("/identity/enroll", {"kind": "person", "display_name": "Pedro Prueba", "actor": "banco-ny", "doc_image_b64": selfie, "selfie_image_b64": selfie})
+          zid = ((r1.get("data") or {}).get("identity") or {}).get("zid")
+          print("### ENROLL:", st, "zid:", zid, flush=True)
+
+          print("### B. VERIFY_FACE DIRECTO")
+          try:
+              rep = kernel._biometrics.verify_face(zid, selfie_image=base64.b64decode(selfie), actor="banco-ny")
+              print("  attrs:", {a: getattr(rep, a) for a in dir(rep) if not a.startswith("_") and not callable(getattr(rep, a))}, flush=True)
+          except Exception:
+              tb()
+
+          print("### C. VERIFICATION_VERDICT DIRECTO")
+          try:
+              kc = getattr(kernel, "clock", None)
+              if kc is None:
+                  kc = getattr(kernel, "_clock")
+              verd = caps.profiles.verification_verdict(app_id="banco-ny", zid=zid, face_verdict={"match": True, "score": 0.99}, signer=signer, clock=kc)
+              print("  OK claves:", sorted(verd.keys()) if isinstance(verd, dict) else type(verd).__name__, flush=True)
+          except Exception:
+              tb()
+
+          print("### D. HTTP REAL CON TRACEBACK SERVIDOR")
+          _orig = A.ZyraApiHandler._route_post
+          def _tp(self, s):
+              try:
+                  return _orig(self, s)
+              except Exception:
+                  print("@@@ TRACEBACK REAL DEL 500:", flush=True)
+                  tb()
+                  raise
+          A.ZyraApiHandler._route_post = _tp
+          st2, r2 = post("/verification/person", {"zid": zid, "selfie_b64": selfie, "actor_app": "banco-ny"})
+          print("  HTTP:", st2, json.dumps(r2)[:300], flush=True)
+          srv.shutdown()
+          srv.server_close()
+          print("FIN SONDA")
           EOF
 
       - name: "GATE 1: verify-existence"
@@ -158,6 +266,6 @@ jobs:
           if git diff --cached --quiet; then
             echo "SIN CAMBIOS"
           else
-            git commit -m "fix(RED): 9 patches - CORE_PREFIXES, semillas, schema expediente, guard+import sweep, doc/matched en /verification/person, return register"
+            git commit -m "fix(RED): 9 patches + autopatch kernel attrs - red transportable verde"
             git push origin "HEAD:${{ github.ref_name }}"
           fi

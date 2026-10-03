@@ -130,6 +130,17 @@ def main() -> None:
         identity=kernel.identity,
         signer=signer,
     )
+    import threading as _threading
+    _relay_stop = _threading.Event()
+    _relay_thread = _threading.Thread(
+        target=caps.bridge.relay_forever,
+        kwargs={"stop": _relay_stop,
+                "interval_seconds": 1.0},
+        daemon=True,
+        name="zyra-relay-forever",
+    )
+    _relay_thread.start()
+    # VIVA-1-RELAY-FOREVER: cartero autonomo
     server = serve_combined(
         kernel,
         caps,
@@ -155,6 +166,8 @@ def main() -> None:
     except KeyboardInterrupt:
         pass
     finally:
+        _relay_stop.set()
+        _relay_thread.join(timeout=5)
         server.server_close()
         db.close()
 

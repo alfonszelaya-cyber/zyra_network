@@ -52,7 +52,8 @@ CORE_PREFIXES = frozenset(
 )
 
 CAPS_GET_PREFIXES = frozenset(
-    {
+    {  # VIVA-1-BRIDGE-ROUTES
+        "bridge",
         "trust",
         "profile",
         "history",
@@ -62,7 +63,8 @@ CAPS_GET_PREFIXES = frozenset(
 )
 
 CAPS_POST_PREFIXES = frozenset(
-    {
+    {  # VIVA-1-BRIDGE-ROUTES
+        "bridge",
         "apps",
         "profile",
         "trust",

@@ -184,3 +184,11 @@ class ZyraCapabilities:
             clock,
             namespace="capabilities",
         )
+        from shared_engines.events.outbox import (
+            InterAppBridge,
+        )  # VIVA-1-BRIDGE
+        self.bridge = InterAppBridge(
+            db=db,
+            clock=clock,
+            source=self.outbox,
+        )  # VIVA-1-BRIDGE

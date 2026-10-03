@@ -23,7 +23,12 @@ import os
 from shared_engines.audit.chain import AuditTrail
 from shared_engines.common.clocks import Clock
 from shared_engines.currency.engine import CurrencyEngine
-from shared_engines.currency.rates import StaticTableRateProvider
+from shared_engines.currency.rates import (
+    StaticTableRateProvider,
+    ErApiRateProvider,
+    CryptoRateProvider,
+    ChainlinkOracleProvider,
+)  # VIVA-1-FX-LIVE
 from shared_engines.events.contracts import EventCatalog
 from shared_engines.events.outbox import Outbox
 from shared_engines.identity.contracts import (
@@ -230,10 +235,22 @@ class ZyraKernel:
             identity=self._identity,
             metrics=self._metrics,
         )
+        _fx_live = (
+            os.environ.get("ZYRA_FX_LIVE", "")
+            == "1")  # VIVA-1-FX-LIVE
         self._currency = CurrencyEngine(
             db=db,
             clock=clock,
-            providers=[
+            providers=(
+                [
+                    ErApiRateProvider(),
+                    CryptoRateProvider(),
+                    ChainlinkOracleProvider(),
+                ]
+                if _fx_live
+                else []
+            )
+            + [
                 StaticTableRateProvider(
                     fx_rates
                     if fx_rates is not None

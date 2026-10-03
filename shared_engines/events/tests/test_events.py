@@ -318,3 +318,89 @@ def test_bridge_routes_by_type(
             .event_type
             == "agro.sale"
             ".created")
+
+
+def test_relay_forever_autonomous(
+    tmp_path,
+) -> None:
+    """RED-RELAY: el cartero
+    distribuye solo: evento
+    encolado DESPUES de arrancar
+    el bucle es entregado sin
+    llamada manual; stop termina
+    limpio. Todas las esperas con
+    timeout: el test no puede
+    colgar."""
+    import threading
+    from shared_engines.events.outbox import (
+        Outbox, InterAppBridge)
+    from shared_engines.events.inbox import (
+        Inbox)
+    from shared_engines.events.contracts import (
+        EventCatalog)
+    from shared_engines.storage.database import (
+        SQLiteAdapter)
+    from shared_engines.common.clocks import (
+        FrozenClock)
+    cat = EventCatalog()
+    cat.register(
+        "agro.sale.created")
+    db_red = SQLiteAdapter(
+        tmp_path / "rr.db")
+    db_nexo = SQLiteAdapter(
+        tmp_path / "rrn.db")
+    clock = FrozenClock()
+    out_red = Outbox(db_red, clock)
+    out_red.ensure_schema()
+    inbox_nexo = Inbox(
+        db_nexo, clock)
+    llego = threading.Event()
+    recibidos = []
+
+    def handler(ev):
+        recibidos.append(
+            ev.event_id)
+        llego.set()
+
+    bridge = InterAppBridge(
+        db=db_red, clock=clock,
+        source=out_red)
+    bridge.subscribe(
+        app_id="nexo",
+        event_types=(
+            "agro.sale"
+            ".created",),
+        inbox=inbox_nexo,
+        handler=handler)
+    stop = threading.Event()
+    res = {}
+    hilo = threading.Thread(
+        target=lambda: res.update(
+            bridge.relay_forever(
+                stop=stop,
+                interval_seconds=(
+                    0.05))),
+        daemon=True)
+    hilo.start()
+    ev = cat.build(
+        "agro.sale.created",
+        aggregate_id="S9",
+        payload={"t": 1},
+        clock=clock)
+    out_red.enqueue(ev)
+    assert llego.wait(
+        timeout=10), (
+        "autonomo no entrego")
+    stop.set()
+    hilo.join(timeout=5)
+    assert not hilo.is_alive(), (
+        "bucle no termino")
+    assert (res.get(
+        "delivered", 0) >= 1), (
+        str(res))
+    assert (res.get(
+        "errors", 0) == 0), (
+        str(res))
+    print("OK RED-RELAY:"
+          " cartero autonomo"
+          " entrego, stop limpio,"          " cero errores")

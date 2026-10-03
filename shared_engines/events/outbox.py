@@ -630,3 +630,49 @@ class InterAppBridge:
         return tuple(
             str(r["event_type"])
             for r in rows)
+
+    def relay_forever(
+        self,
+        *,
+        stop,
+        interval_seconds: float = 0.5,
+        max_cycles: int = 0,
+    ) -> dict[str, int]:
+        """RED-RELAY: cartero
+        autonomo. Drena el outbox en
+        ciclos hasta que stop sea
+        activado (o max_cycles se
+        alcance). Nunca lanza: un
+        ciclo con error queda
+        contado y el bucle sigue.
+        Sin hilos internos: el
+        dueno decide el hilo."""
+        total = {
+            "drained": 0,
+            "delivered": 0,
+            "duplicates": 0,
+            "cycles": 0,
+            "errors": 0,
+        }
+        ciclos = 0
+        while True:
+            if (max_cycles
+                    and ciclos
+                    >= max_cycles):
+                break
+            if stop.wait(
+                    interval_seconds):
+                break
+            ciclos += 1
+            try:
+                r = self.relay()
+                for k in (
+                        "drained",
+                        "delivered",
+                        "duplicates"):
+                    total[k] += int(
+                        r.get(k, 0))
+            except Exception:
+                total["errors"] += 1
+        total["cycles"] = ciclos
+        return total

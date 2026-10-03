@@ -451,3 +451,34 @@ def test_provider_chain_falls_back_to_erapi(
     assert q.source == "open.er-api.com"
     print("OK RED-5: cadena con fallback"
           " a proveedor vivo funciona")
+
+
+def test_cryptoprovider_coingecko_parses(tmp_path, monkeypatch) -> None:
+    """RED-6/RED-7: precio cripto (mock) -> Quote Decimal."""
+    import json as _json
+    import urllib.request as _ur
+    from shared_engines.currency.rates import CryptoRateProvider
+
+    class _R:
+        def __init__(self, p):
+            self._p = p
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *a):
+            return False
+
+        def read(self):
+            return self._p
+
+    payload = _json.dumps({"bitcoin": {"usd": 84780.0}}).encode()
+
+    def fake_urlopen(req, timeout=None):
+        return _R(payload)
+
+    monkeypatch.setattr(_ur, "urlopen", fake_urlopen)
+    q = CryptoRateProvider().fetch(CurrencyPair("BTC", "USD"), FrozenClock())
+    assert q.rate == Decimal("84780.0"), str(q)
+    assert q.source == "coingecko"
+    print("OK cripto: BTC/USD via coingecko -> Quote exacta")

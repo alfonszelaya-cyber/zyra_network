@@ -170,3 +170,48 @@ class ErApiRateProvider(RateProvider):
             expires_at=(now + self._ttl),
             source=self.name,
         )
+
+
+COINGECKO_IDS = {
+    "BTC": "bitcoin",
+    "ETH": "ethereum",
+    "TRX": "tron",
+    "SOL": "solana",
+    "USDT": "tether",
+}
+
+
+class CryptoRateProvider(RateProvider):
+    """RED-6/RED-7: precios cripto en vivo via CoinGecko. Falla honesto."""
+
+    name = "coingecko"
+
+    def __init__(self, *, ttl_seconds: float = 600.0, timeout_seconds: float = 10.0) -> None:
+        self._ttl = ttl_seconds
+        self._timeout = timeout_seconds
+
+    def fetch(self, pair: CurrencyPair, clock: Clock) -> Quote:
+        import json as _json
+        import urllib.request as _ur
+        cid = COINGECKO_IDS.get(pair.base.upper())
+        vs = pair.quote.lower()
+        if cid is None:
+            raise RateUnavailableError("crypto symbol not mapped: " + pair.base)
+        url = "https://api.coingecko.com/api/v3/simple/price?ids=" + cid + "&vs_currencies=" + vs
+        try:
+            req = _ur.Request(url, headers={"User-Agent": "zyra-network"})
+            with _ur.urlopen(req, timeout=self._timeout) as r:
+                data = _json.loads(r.read().decode("utf-8"))
+            raw = data[cid][vs]
+        except RateUnavailableError:
+            raise
+        except Exception as exc:
+            raise RateUnavailableError("coingecko fetch failed: " + type(exc).__name__) from exc
+        try:
+            rate = Decimal(str(raw))
+        except Exception as exc:
+            raise RateUnavailableError("coingecko rate not decimal") from exc
+        if not rate.is_finite() or rate <= 0:
+            raise RateUnavailableError("coingecko rate not positive")
+        now = clock.now()
+        return Quote(pair=pair, rate=rate, quoted_at=now, expires_at=now + self._ttl, source=self.name)

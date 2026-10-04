@@ -187,6 +187,31 @@ class ZyraCapabilities:
         from shared_engines.events.outbox import (
             InterAppBridge,
         )  # VIVA-1-BRIDGE
+        from shared_engines.integrations.engine import (  # VIVA-2-INTEGRATIONS
+            IntegrationsEngine,
+            PublicSourceClient,
+            SourceIndex,
+        )
+        self.integrations = IntegrationsEngine(
+            db, clock)
+        self.integrations.register_adapter(
+            adapter_id="onec-classifiers",
+            kind="http",
+            endpoint=(
+                "https://onec.bcr.gob.sv"
+                "/clasificadoresv2.api"),
+            max_retries=2)
+        self.integrations.register_adapter(
+            adapter_id="marn-geo",
+            kind="http-geo",
+            endpoint=(
+                "https://geoportal.marn.gob.sv"
+                "/server/rest/services"),
+            max_retries=2)
+        self._source_client = PublicSourceClient(
+            clock=clock, ttl_seconds=900.0)
+        self._source_index = SourceIndex(
+            db, clock)  # VIVA-2-INTEGRATIONS
         self.bridge = InterAppBridge(
             db=db,
             clock=clock,

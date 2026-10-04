@@ -28,6 +28,8 @@ from shared_engines.currency.rates import (
     ErApiRateProvider,
     CryptoRateProvider,
     ChainlinkOracleProvider,
+    FrankfurterRateProvider,
+    KrakenRateProvider,
 )  # VIVA-1-FX-LIVE
 from shared_engines.events.contracts import EventCatalog
 from shared_engines.events.outbox import Outbox
@@ -246,6 +248,8 @@ class ZyraKernel:
                     ErApiRateProvider(),
                     CryptoRateProvider(),
                     ChainlinkOracleProvider(),
+                    FrankfurterRateProvider(),
+                    KrakenRateProvider(),  # VIVA-2-FX-5
                 ]
                 if _fx_live
                 else []

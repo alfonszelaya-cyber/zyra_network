@@ -268,3 +268,71 @@ class CryptoRateProvider(RateProvider):
             raise RateUnavailableError("coingecko rate not positive")
         now = clock.now()
         return Quote(pair=pair, rate=rate, quoted_at=now, expires_at=now + self._ttl, source=self.name)
+
+
+class FrankfurterRateProvider(RateProvider):
+    """VIVA-2: fiat oficial del BCE, sin key."""
+
+    name = "frankfurter"
+
+    def __init__(self, *, ttl_seconds: float = 1800.0, timeout_seconds: float = 10.0) -> None:
+        self._ttl = ttl_seconds
+        self._timeout = timeout_seconds
+
+    def fetch(self, pair: CurrencyPair, clock: Clock) -> Quote:
+        import json as _json
+        import urllib.request as _ur
+        base = pair.base.upper()
+        q = pair.quote.upper()
+        url = ("https://api.frankfurter.dev/v1/latest?base=" + base + "&symbols=" + q)
+        try:
+            req = _ur.Request(url, headers={"User-Agent": "zyra-network"})
+            with _ur.urlopen(req, timeout=self._timeout) as r:
+                data = _json.loads(r.read().decode("utf-8"))
+            raw = data["rates"][q]
+        except RateUnavailableError:
+            raise
+        except Exception as exc:
+            raise RateUnavailableError("frankfurter fetch failed: " + type(exc).__name__) from exc
+        rate = Decimal(str(raw))
+        if not rate.is_finite() or rate <= 0:
+            raise RateUnavailableError("frankfurter rate invalid")
+        now = clock.now()
+        return Quote(pair=pair, rate=rate, quoted_at=now, expires_at=now + self._ttl, source=self.name)
+
+
+class KrakenRateProvider(RateProvider):
+    """VIVA-2: cripto publico sin key (fallback BTC/ETH)."""
+
+    name = "kraken"
+
+    _KRAKEN_PAIRS = {
+        ("BTC", "USD"): "XXBTZUSD",
+        ("ETH", "USD"): "XETHZUSD",
+    }
+
+    def __init__(self, *, ttl_seconds: float = 600.0, timeout_seconds: float = 10.0) -> None:
+        self._ttl = ttl_seconds
+        self._timeout = timeout_seconds
+
+    def fetch(self, pair: CurrencyPair, clock: Clock) -> Quote:
+        import json as _json
+        import urllib.request as _ur
+        pk = self._KRAKEN_PAIRS.get((pair.base.upper(), pair.quote.upper()))
+        if pk is None:
+            raise RateUnavailableError("kraken pair not mapped: " + pair.normalized)
+        url = ("https://api.kraken.com/0/public/Ticker?pair=" + pk)
+        try:
+            req = _ur.Request(url, headers={"User-Agent": "zyra-network"})
+            with _ur.urlopen(req, timeout=self._timeout) as r:
+                data = _json.loads(r.read().decode("utf-8"))
+            raw = data["result"][pk]["c"][0]
+        except RateUnavailableError:
+            raise
+        except Exception as exc:
+            raise RateUnavailableError("kraken fetch failed: " + type(exc).__name__) from exc
+        rate = Decimal(str(raw))
+        if not rate.is_finite() or rate <= 0:
+            raise RateUnavailableError("kraken rate invalid")
+        now = clock.now()
+        return Quote(pair=pair, rate=rate, quoted_at=now, expires_at=now + self._ttl, source=self.name)

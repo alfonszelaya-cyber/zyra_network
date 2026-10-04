@@ -892,3 +892,29 @@ def serve_capabilities(
     CapabilitiesApiHandler.caps = caps
     CapabilitiesApiHandler.token = token
     return CapabilitiesServer((host, port))
+
+
+_VIVA2_ORIG_ROUTE_POST = CapabilitiesApiHandler._route_post
+
+
+def _viva2_route_post(self, s):
+    if len(s) == 2 and s[0] == "sources" and s[1] == "sweep":
+        doc = self._read_json()
+        source = str(doc.get("source", "onec"))
+        max_layers = int(doc.get("max_layers", 5))
+        caps = type(self).caps
+        try:
+            if source == "marn":
+                from shared_engines.integrations.engine import sweep_marn
+                r = sweep_marn(caps._source_client, caps._source_index, max_layers_per_service=max_layers, pause_seconds=0.0)
+            else:
+                from shared_engines.integrations.engine import sweep_onec
+                r = sweep_onec(caps._source_client, caps._source_index)
+            self._send(200, {"ok": True, "data": r})
+        except Exception as exc:
+            self._send(502, {"ok": False, "error": {"type": "source_unavailable", "message": type(exc).__name__ + ": " + str(exc)[:100]}})
+        return
+    return _VIVA2_ORIG_ROUTE_POST(self, s)
+
+
+CapabilitiesApiHandler._route_post = _viva2_route_post  # VIVA-2-SOURCES

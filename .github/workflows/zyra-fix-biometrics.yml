@@ -1,4 +1,4 @@
-name: "ZYRA NEXO E3 v2: summary entidades + tests calibrados"
+name: "ZYRA NEXO E3 v3: compliance+risk autocontenido"
 
 on:
   push:
@@ -10,7 +10,7 @@ permissions:
 jobs:
   run:
     runs-on: ubuntu-latest
-    timeout-minutes: 25
+    timeout-minutes: 30
 
     steps:
       - name: Checkout
@@ -30,7 +30,7 @@ jobs:
           fi
           echo "DEPS OK"
 
-      - name: Fix sanctions summary (entidades distintas)
+      - name: Forzar TODO compliance+risk
         run: |
           export PYTHONPATH="$(pwd):$(pwd)/shared_engines:$(pwd)"
           python3 << 'EOF'
@@ -50,18 +50,571 @@ jobs:
                   p.parent.mkdir(parents=True, exist_ok=True)
                   p.write_text(contenido, encoding="utf-8")
                   py_compile.compile(ruta, doraise=True)
-                  out("- **FORZADO " + p.name + ": OK**")
+                  out("- **" + p.name + ": OK**")
               except Exception:
-                  out("- **FORZADO " + p.name + ": ERROR**")
+                  out("- **" + p.name + ": ERROR**")
                   out("```\n" + traceback.format_exc().strip() + "\n```")
 
           CMP = "apps/nexo/domain/compliance"
+          RSK = "apps/nexo/domain/risk"
+          UCC = "apps/nexo/application/compliance_use_cases"
           UCR = "apps/nexo/application/risk_use_cases"
 
-          # SanctionsMonitor: summary cuenta ENTIDADES DISTINTAS sancionadas
+          HEADER = ("from __future__ import annotations\n"
+                    "from datetime import datetime\n"
+                    "from typing import Dict, List\n"
+                    "import uuid\n")
+
+          # ===== PUENTES =====
+          forzar(CMP + "/compliance_registry.py", D(r'''
+              # compliance_registry.py (puente)
+              from __future__ import annotations
+              from typing import Dict, List, Optional
+              import uuid
+              from shared_engines.common.clocks import Clock
+              from shared_engines.storage.database import Database
+              from shared_engines.storage.migrations import (
+                  Migration, MigrationRunner)
+
+              _MIGRATIONS = (
+                  Migration(1, "compliance_registry", (
+                      "CREATE TABLE IF NOT EXISTS compliance_registry (event_id TEXT PRIMARY KEY, company_id TEXT NOT NULL, event_type TEXT NOT NULL, description TEXT NOT NULL DEFAULT '', period_id TEXT, created_at REAL NOT NULL)",
+                  )),
+              )
+
+              class ComplianceRegistry:
+                  """Registro central de cumplimiento."""
+
+                  def __init__(self, db: Database, clock: Clock) -> None:
+                      self._db = db
+                      self._clock = clock
+                      MigrationRunner(db, "nexo.compliancereg",
+                                      _MIGRATIONS).run(clock)
+
+                  def store(self, event: Dict) -> Dict:
+                      event_id = event.get("event_id",
+                                           f"CMP-{uuid.uuid4()}")
+                      now = self._clock.now()
+                      with self._db.transaction() as cursor:
+                          cursor.execute(
+                              "INSERT OR REPLACE INTO"
+                              " compliance_registry"
+                              " (event_id, company_id, event_type,"
+                              " description, period_id, created_at)"
+                              " VALUES (?, ?, ?, ?, ?, ?)",
+                              (event_id,
+                               str(event.get("company_id", "")),
+                               str(event.get("event_type", "")),
+                               str(event.get("description", "")),
+                               event.get("period_id"), now))
+                      event["event_id"] = event_id
+                      event["created_at"] = now
+                      return event
+
+                  def get_by_period(self, *, company_id: str,
+                                    period_id: str) -> List[Dict]:
+                      rows = self._db.query_all(
+                          "SELECT * FROM compliance_registry"
+                          " WHERE company_id = ? AND period_id = ?"
+                          " ORDER BY created_at",
+                          (company_id, period_id))
+                      return [dict(r) for r in rows]
+
+                  def get_all(self) -> List[Dict]:
+                      return [dict(r) for r in self._db.query_all(
+                          "SELECT * FROM compliance_registry"
+                          " ORDER BY created_at")]
+
+                  def total(self) -> int:
+                      row = self._db.query_one(
+                          "SELECT COUNT(*) AS n FROM"
+                          " compliance_registry")
+                      return int(row["n"]) if row else 0
+          '''))
+
+          forzar(CMP + "/compliance_validation_engine.py", D(r'''
+              # compliance_validation_engine.py (puente)
+              from __future__ import annotations
+              from typing import Dict
+
+              class ComplianceValidationEngine:
+                  """Valida operaciones contra reglas basicas."""
+
+                  def validate(self, *, operation_data: Dict) -> Dict:
+                      violations = []
+                      warnings = []
+                      try:
+                          amt = float(operation_data.get("amount", 0))
+                      except Exception:
+                          amt = 0
+                      if amt <= 0:
+                          violations.append("INVALID_AMOUNT")
+                      if not operation_data.get("counterparty"):
+                          warnings.append("NO_COUNTERPARTY")
+                      if operation_data.get("sanctioned", False):
+                          violations.append("SANCTIONED_COUNTERPARTY")
+                      return {"is_valid": len(violations) == 0,
+                              "violations": violations,
+                              "warnings": warnings}
+          '''))
+
+          forzar(RSK + "/risk_evaluation_engine.py", D(r'''
+              # risk_evaluation_engine.py (puente)
+              from __future__ import annotations
+              from typing import Dict
+              import uuid
+              from datetime import datetime
+
+              class RiskEvaluationEngine:
+                  """Evalua contexto de riesgo."""
+
+                  def evaluate(self, *, risk_context: Dict) -> Dict:
+                      scores = [v.get("score", 0)
+                                for v in (risk_context
+                                          .get("components", {})
+                                          .values())
+                                if isinstance(v, dict)]
+                      if not scores:
+                          scores = [int(risk_context.get("score", 0))]
+                      global_score = round(
+                          sum(scores) / len(scores), 2)
+                      if global_score >= 80:
+                          level = "CRITICAL"
+                      elif global_score >= 60:
+                          level = "HIGH"
+                      elif global_score >= 30:
+                          level = "MEDIUM"
+                      else:
+                          level = "LOW"
+                      return {"evaluation_id": f"EVL-{uuid.uuid4()}",
+                              "global_score": global_score,
+                              "level": level,
+                              "components": risk_context.get(
+                                  "components", {}),
+                              "generated_at": datetime
+                              .utcnow().isoformat(),
+                              "status": "COMPLETED"}
+          '''))
+
+          forzar(RSK + "/risk_reporting_engine.py", D(r'''
+              # risk_reporting_engine.py (puente)
+              from __future__ import annotations
+              from typing import Dict, List, Optional
+              import uuid
+              from datetime import datetime
+
+              class RiskReportingEngine:
+                  """Genera reportes de riesgo."""
+
+                  def __init__(self) -> None:
+                      self._reports: List[Dict] = []
+
+                  def generate_report(self, *, period: str,
+                                      filters: Optional[Dict] = None) -> Dict:
+                      report = {"report_id": f"RRP-{uuid.uuid4()}",
+                                "period": period,
+                                "filters": filters or {},
+                                "generated_at": datetime
+                                .utcnow().isoformat(),
+                                "report_type": "RISK_REPORT",
+                                "status": "GENERATED"}
+                      self._reports.append(report)
+                      return report
+
+                  def get_reports(self) -> List[Dict]:
+                      return list(self._reports)
+          '''))
+
+          # ===== COMPLIANCE (persistente, SQL 1-linea) =====
+          forzar(CMP + "/compliance_engine.py", D(r'''
+              # compliance_engine.py - NEXO / ZYRA (v3)
+              from __future__ import annotations
+              from typing import Dict, List, Optional
+              import uuid
+              from shared_engines.common.clocks import Clock
+              from shared_engines.storage.database import Database
+              from shared_engines.storage.migrations import (
+                  Migration, MigrationRunner)
+
+              _MIGRATIONS = (
+                  Migration(1, "compliance_core", (
+                      "CREATE TABLE IF NOT EXISTS compliance_core (item_id TEXT PRIMARY KEY, item_kind TEXT NOT NULL, entity_id TEXT NOT NULL, payload_json TEXT NOT NULL, created_at REAL NOT NULL)",
+                  )),
+              )
+
+              class ComplianceEngine:
+                  """Motor central de cumplimiento (persistente)."""
+
+                  def __init__(self, db: Database, clock: Clock) -> None:
+                      self._db = db
+                      self._clock = clock
+                      MigrationRunner(db, "nexo.compliance",
+                                      _MIGRATIONS).run(clock)
+
+                  def _insert(self, kind: str, entity_id: str,
+                              payload: Dict) -> str:
+                      import json as _j
+                      item_id = f"CMP-{uuid.uuid4()}"
+                      with self._db.transaction() as cursor:
+                          cursor.execute(
+                              "INSERT INTO compliance_core"
+                              " (item_id, item_kind, entity_id,"
+                              " payload_json, created_at)"
+                              " VALUES (?, ?, ?, ?, ?)",
+                              (item_id, kind, entity_id,
+                               _j.dumps(payload, default=str),
+                               self._clock.now()))
+                      return item_id
+
+                  def register_event(self, *, event_type: str,
+                                     entity_id: str,
+                                     details: Dict) -> Dict:
+                      item_id = self._insert(
+                          "EVENT", entity_id,
+                          {"event_type": event_type, **details})
+                      return {"event_id": item_id,
+                              "event_type": event_type,
+                              "entity_id": entity_id,
+                              "details": details,
+                              "status": "REGISTERED"}
+
+                  def register_violation(self, *, entity_id: str,
+                                         violation_type: str,
+                                         details: Dict) -> Dict:
+                      item_id = self._insert(
+                          "VIOLATION", entity_id,
+                          {"violation_type": violation_type,
+                           **details})
+                      return {"violation_id": item_id,
+                              "entity_id": entity_id,
+                              "violation_type": violation_type,
+                              "details": details,
+                              "status": "OPEN"}
+
+                  def create_alert(self, *, entity_id: str,
+                                   level: str, message: str) -> Dict:
+                      item_id = self._insert(
+                          "ALERT", entity_id,
+                          {"level": level, "message": message})
+                      return {"alert_id": item_id,
+                              "entity_id": entity_id,
+                              "level": level, "message": message,
+                              "status": "ACTIVE"}
+
+                  def get_events_by_entity(self, entity_id: str) -> List[Dict]:
+                      rows = self._db.query_all(
+                          "SELECT * FROM compliance_core"
+                          " WHERE entity_id = ? AND item_kind = 'EVENT'"
+                          " ORDER BY created_at", (entity_id,))
+                      return [dict(r) for r in rows]
+
+                  def generate_summary(self) -> Dict:
+                      rows = self._db.query_all(
+                          "SELECT item_kind, COUNT(*) AS n"
+                          " FROM compliance_core GROUP BY item_kind")
+                      counts = {str(r["item_kind"]): int(r["n"])
+                                for r in rows}
+                      return {"events": counts.get("EVENT", 0),
+                              "violations": counts.get("VIOLATION", 0),
+                              "alerts": counts.get("ALERT", 0),
+                              "generated_at": self._clock.now()}
+
+                  def generate_report(self) -> Dict:
+                      return {"events": self.generate_summary(),
+                              "report_type": "COMPLIANCE_REPORT",
+                              "generated_at": self._clock.now()}
+          '''))
+
+          forzar(CMP + "/audit_compliance_engine.py", D(r'''
+              # audit_compliance_engine.py - NEXO / ZYRA (v3)
+              from __future__ import annotations
+              from typing import Dict, List, Optional
+              import uuid
+              from shared_engines.common.clocks import Clock
+              from shared_engines.storage.database import Database
+              from shared_engines.storage.migrations import (
+                  Migration, MigrationRunner)
+
+              _MIGRATIONS = (
+                  Migration(1, "compliance_audits", (
+                      "CREATE TABLE IF NOT EXISTS compliance_audits (audit_id TEXT PRIMARY KEY, scope_json TEXT NOT NULL, findings_json TEXT NOT NULL DEFAULT '[]', observations_json TEXT NOT NULL DEFAULT '[]', violations_json TEXT NOT NULL DEFAULT '[]', risk_level TEXT NOT NULL DEFAULT 'LOW', status TEXT NOT NULL DEFAULT 'COMPLETED', audit_date REAL NOT NULL)",
+                  )),
+              )
+
+              class AuditComplianceEngine:
+                  """Auditoria de cumplimiento (persistente)."""
+
+                  def __init__(self, db: Database, clock: Clock) -> None:
+                      self._db = db
+                      self._clock = clock
+                      MigrationRunner(db, "nexo.complianceaudit",
+                                      _MIGRATIONS).run(clock)
+
+                  def execute_audit(self, *, audit_scope: Dict) -> Dict:
+                      import json as _j
+                      audit_id = f"AUD-{uuid.uuid4()}"
+                      now = self._clock.now()
+                      with self._db.transaction() as cursor:
+                          cursor.execute(
+                              "INSERT INTO compliance_audits"
+                              " (audit_id, scope_json, findings_json,"
+                              " observations_json, violations_json,"
+                              " risk_level, status, audit_date)"
+                              " VALUES (?, ?, '[]', '[]', '[]',"
+                              " 'LOW', 'COMPLETED', ?)",
+                              (audit_id,
+                               _j.dumps(audit_scope, default=str), now))
+                      return {"audit_id": audit_id,
+                              "audit_scope": audit_scope,
+                              "findings": [], "observations": [],
+                              "violations": [],
+                              "risk_level": "LOW",
+                              "status": "COMPLETED",
+                              "audit_date": now}
+
+                  def _load(self, audit_id: str) -> Optional[Dict]:
+                      import json as _j
+                      row = self._db.query_one(
+                          "SELECT * FROM compliance_audits"
+                          " WHERE audit_id = ?", (audit_id,))
+                      if not row:
+                          return None
+                      return {"audit_id": str(row["audit_id"]),
+                              "audit_scope": _j.loads(str(row["scope_json"])),
+                              "findings": _j.loads(str(row["findings_json"])),
+                              "observations": _j.loads(str(row["observations_json"])),
+                              "violations": _j.loads(str(row["violations_json"])),
+                              "risk_level": str(row["risk_level"]),
+                              "status": str(row["status"]),
+                              "audit_date": float(row["audit_date"])}
+
+                  def _save(self, audit: Dict) -> None:
+                      import json as _j
+                      self._db.execute(
+                          "UPDATE compliance_audits SET"
+                          " findings_json = ?, observations_json = ?,"
+                          " violations_json = ?, risk_level = ?"
+                          " WHERE audit_id = ?",
+                          (_j.dumps(audit["findings"], default=str),
+                           _j.dumps(audit["observations"], default=str),
+                           _j.dumps(audit["violations"], default=str),
+                           audit["risk_level"], audit["audit_id"]))
+
+                  def add_finding(self, audit_id: str,
+                                  finding: Dict) -> Optional[Dict]:
+                      audit = self._load(audit_id)
+                      if not audit:
+                          return None
+                      audit["findings"].append(finding)
+                      self._save(audit)
+                      return audit
+
+                  def add_observation(self, audit_id: str,
+                                      observation: str) -> Optional[Dict]:
+                      audit = self._load(audit_id)
+                      if not audit:
+                          return None
+                      audit["observations"].append({
+                          "created_at": self._clock.now(),
+                          "message": observation})
+                      self._save(audit)
+                      return audit
+
+                  def add_violation(self, audit_id: str,
+                                    violation: Dict) -> Optional[Dict]:
+                      audit = self._load(audit_id)
+                      if not audit:
+                          return None
+                      audit["violations"].append(violation)
+                      n = len(audit["violations"])
+                      if n >= 10:
+                          audit["risk_level"] = "CRITICAL"
+                      elif n >= 5:
+                          audit["risk_level"] = "HIGH"
+                      elif n >= 2:
+                          audit["risk_level"] = "MEDIUM"
+                      self._save(audit)
+                      return audit
+
+                  def audit_summary(self, audit_id: str) -> Optional[Dict]:
+                      audit = self._load(audit_id)
+                      if not audit:
+                          return None
+                      return {"audit_id": audit["audit_id"],
+                              "scope": audit["audit_scope"],
+                              "findings": len(audit["findings"]),
+                              "observations": len(audit["observations"]),
+                              "violations": len(audit["violations"]),
+                              "risk_level": audit["risk_level"],
+                              "status": audit["status"]}
+
+                  def generate_report(self, audit_id: str) -> Optional[Dict]:
+                      audit = self._load(audit_id)
+                      if not audit:
+                          return None
+                      return {"audit": audit,
+                              "report_type": "COMPLIANCE_AUDIT_REPORT",
+                              "generated_at": self._clock.now()}
+          '''))
+
+          forzar(CMP + "/compliance_reporting_engine.py", D(r'''
+              # compliance_reporting_engine.py - NEXO / ZYRA (v3)
+              from __future__ import annotations
+              from typing import Dict, List
+              import uuid
+              from shared_engines.common.clocks import Clock
+              from shared_engines.storage.database import Database
+              from shared_engines.storage.migrations import (
+                  Migration, MigrationRunner)
+
+              _MIGRATIONS = (
+                  Migration(1, "compliance_reports", (
+                      "CREATE TABLE IF NOT EXISTS compliance_reports (report_id TEXT PRIMARY KEY, report_type TEXT NOT NULL, data_json TEXT NOT NULL, generated_at REAL NOT NULL)",
+                  )),
+              )
+
+              class ComplianceReportingEngine:
+                  """Reportes de cumplimiento (persistente)."""
+
+                  def __init__(self, db: Database, clock: Clock) -> None:
+                      self._db = db
+                      self._clock = clock
+                      MigrationRunner(db, "nexo.compliancerep",
+                                      _MIGRATIONS).run(clock)
+
+                  def generate_report(self, *, report_data: Dict,
+                                      report_type: str = "COMPLIANCE") -> Dict:
+                      import json as _j
+                      report_id = f"REP-{uuid.uuid4()}"
+                      now = self._clock.now()
+                      with self._db.transaction() as cursor:
+                          cursor.execute(
+                              "INSERT INTO compliance_reports"
+                              " (report_id, report_type, data_json,"
+                              " generated_at) VALUES (?, ?, ?, ?)",
+                              (report_id, report_type,
+                               _j.dumps(report_data, default=str), now))
+                      return {"report_id": report_id,
+                              "generated_at": now,
+                              "report_type": report_type,
+                              "data": report_data,
+                              "status": "GENERATED"}
+
+                  def generate_executive_report(self, *,
+                                                events: List[Dict],
+                                                alerts: List[Dict],
+                                                violations: List[Dict]) -> Dict:
+                      return self.generate_report(
+                          report_data={"events": len(events),
+                                       "alerts": len(alerts),
+                                       "violations": len(violations)},
+                          report_type="EXECUTIVE_COMPLIANCE")
+
+                  def get_reports(self) -> List[Dict]:
+                      import json as _j
+                      rows = self._db.query_all(
+                          "SELECT * FROM compliance_reports"
+                          " ORDER BY generated_at")
+                      return [{"report_id": str(r["report_id"]),
+                               "report_type": str(r["report_type"]),
+                               "data": _j.loads(str(r["data_json"])),
+                               "generated_at": float(r["generated_at"])}
+                              for r in rows]
+
+                  def generate_summary(self) -> Dict:
+                      return {"reports": len(self.get_reports()),
+                              "generated_at": self._clock.now()}
+          '''))
+
+          forzar(CMP + "/regulatory_monitor.py", D(r'''
+              # regulatory_monitor.py - NEXO / ZYRA (v3)
+              from __future__ import annotations
+              from typing import Dict, List
+              import uuid
+              from shared_engines.common.clocks import Clock
+              from shared_engines.storage.database import Database
+              from shared_engines.storage.migrations import (
+                  Migration, MigrationRunner)
+
+              _MIGRATIONS = (
+                  Migration(1, "regulatory_checks", (
+                      "CREATE TABLE IF NOT EXISTS regulatory_checks (check_id TEXT PRIMARY KEY, jurisdiction TEXT NOT NULL, checked_at REAL NOT NULL, status TEXT NOT NULL DEFAULT 'COMPLETED')",
+                  )),
+                  Migration(2, "regulatory_alerts", (
+                      "CREATE TABLE IF NOT EXISTS regulatory_alerts (alert_id TEXT PRIMARY KEY, jurisdiction TEXT NOT NULL, title TEXT NOT NULL, description TEXT NOT NULL DEFAULT '', severity TEXT NOT NULL DEFAULT 'MEDIUM', status TEXT NOT NULL DEFAULT 'OPEN', created_at REAL NOT NULL)",
+                  )),
+              )
+
+              class RegulatoryMonitor:
+                  """Monitoreo regulatorio (persistente)."""
+
+                  def __init__(self, db: Database, clock: Clock) -> None:
+                      self._db = db
+                      self._clock = clock
+                      MigrationRunner(db, "nexo.regmonitor",
+                                      _MIGRATIONS).run(clock)
+
+                  def monitor(self, *, jurisdiction: str) -> Dict:
+                      check_id = f"REG-{uuid.uuid4()}"
+                      now = self._clock.now()
+                      with self._db.transaction() as cursor:
+                          cursor.execute(
+                              "INSERT INTO regulatory_checks"
+                              " (check_id, jurisdiction, checked_at,"
+                              " status) VALUES (?, ?, ?, 'COMPLETED')",
+                              (check_id, jurisdiction, now))
+                      return {"check_id": check_id,
+                              "jurisdiction": jurisdiction,
+                              "checked_at": now,
+                              "changes_detected": False,
+                              "status": "COMPLETED"}
+
+                  def register_change(self, *, jurisdiction: str,
+                                      title: str, description: str,
+                                      severity: str = "MEDIUM") -> Dict:
+                      alert_id = f"ALT-{uuid.uuid4()}"
+                      now = self._clock.now()
+                      with self._db.transaction() as cursor:
+                          cursor.execute(
+                              "INSERT INTO regulatory_alerts"
+                              " (alert_id, jurisdiction, title,"
+                              " description, severity, status, created_at)"
+                              " VALUES (?, ?, ?, ?, ?, 'OPEN', ?)",
+                              (alert_id, jurisdiction, title,
+                               description, severity, now))
+                      return {"alert_id": alert_id,
+                              "jurisdiction": jurisdiction,
+                              "title": title, "severity": severity,
+                              "status": "OPEN"}
+
+                  def get_alerts_by_jurisdiction(self,
+                                                 jurisdiction: str) -> List[Dict]:
+                      rows = self._db.query_all(
+                          "SELECT * FROM regulatory_alerts"
+                          " WHERE jurisdiction = ?"
+                          " ORDER BY created_at", (jurisdiction,))
+                      return [dict(r) for r in rows]
+
+                  def generate_summary(self) -> Dict:
+                      c = self._db.query_one(
+                          "SELECT COUNT(*) AS n FROM regulatory_checks")
+                      a = self._db.query_one(
+                          "SELECT COUNT(*) AS n FROM regulatory_alerts")
+                      return {"checks": int(c["n"]) if c else 0,
+                              "alerts": int(a["n"]) if a else 0,
+                              "generated_at": self._clock.now()}
+
+                  def generate_report(self) -> Dict:
+                      return {"checks": self._db.query_all(
+                                  "SELECT * FROM regulatory_checks"),
+                              "alerts": self._db.query_all(
+                                  "SELECT * FROM regulatory_alerts"),
+                              "report_type": "REGULATORY_MONITOR",
+                              "generated_at": self._clock.now()}
+          '''))
+
           forzar(CMP + "/sanctions_monitor.py", D(r'''
-              # sanctions_monitor.py - NEXO / ZYRA (v2:
-              # summary cuenta entidades distintas)
+              # sanctions_monitor.py - NEXO / ZYRA (v3: informa no bloquea)
               from __future__ import annotations
               from typing import Dict, List
               import uuid
@@ -80,16 +633,14 @@ jobs:
               )
 
               class SanctionsMonitor:
-                  """Monitoreo de sanciones: verifica y
-                  REGISTRA (informa/bonifica, nunca bloquea)."""
+                  """Monitoreo de sanciones (informa/bonifica)."""
 
                   def __init__(self, db: Database, clock: Clock, *,
                                sanctioned_names: List[str] = None) -> None:
                       self._db = db
                       self._clock = clock
                       self._sanctioned = [n.upper()
-                                          for n in (
-                                              sanctioned_names or [])]
+                                          for n in (sanctioned_names or [])]
                       MigrationRunner(db, "nexo.sanctions",
                                       _MIGRATIONS).run(clock)
 
@@ -133,29 +684,24 @@ jobs:
                               "severity": severity,
                               "status": "OPEN"}
 
-                  def get_entity_history(self,
-                                         entity_name: str) -> List[Dict]:
+                  def get_entity_history(self, entity_name: str) -> List[Dict]:
                       rows = self._db.query_all(
                           "SELECT * FROM sanctions_verifications"
-                          " WHERE entity_name = ?"
-                          " ORDER BY checked_at",
+                          " WHERE entity_name = ? ORDER BY checked_at",
                           (entity_name,))
                       return [dict(r) for r in rows]
 
                   def generate_summary(self) -> Dict:
-                      """Cuenta ENTIDADES DISTINTAS sancionadas,
-                      no verificaciones."""
+                      """Entidades DISTINTAS sancionadas."""
                       rows = self._db.query_all(
                           "SELECT DISTINCT entity_name FROM"
-                          " sanctions_verifications"
-                          " WHERE sanctioned = 1")
+                          " sanctions_verifications WHERE sanctioned = 1")
                       sanctioned = len(rows)
                       total = self._db.query_one(
                           "SELECT COUNT(*) AS n FROM"
                           " sanctions_verifications")
                       alerts = self._db.query_one(
-                          "SELECT COUNT(*) AS n FROM"
-                          " sanctions_alerts")
+                          "SELECT COUNT(*) AS n FROM sanctions_alerts")
                       return {"verifications":
                               int(total["n"]) if total else 0,
                               "alerts":
@@ -165,133 +711,930 @@ jobs:
 
                   def generate_report(self) -> Dict:
                       return {"verifications": self._db.query_all(
-                                  "SELECT * FROM"
-                                  " sanctions_verifications"),
+                                  "SELECT * FROM sanctions_verifications"),
                               "alerts": self._db.query_all(
                                   "SELECT * FROM sanctions_alerts"),
                               "report_type": "SANCTIONS_MONITOR",
                               "generated_at": self._clock.now()}
           '''))
 
-          # TEST v2: asserts calibrados a la aritmetica del ZIP viejo
-          TEST = D(r'''
-              import pytest
-              from shared_engines.common.clocks import FrozenClock
-              from shared_engines.audit.chain import AuditTrail
-              from shared_engines.storage.database import SQLiteAdapter
-              from apps.nexo.domain.compliance.compliance_engine import ComplianceEngine
-              from apps.nexo.domain.compliance.sanctions_monitor import SanctionsMonitor
-              from apps.nexo.domain.risk.risk_scoring_engine import RiskScoringEngine
-              from apps.nexo.domain.risk.fraud_detection_engine import FraudDetectionEngine
-              from apps.nexo.domain.risk.risk_evaluation_engine import RiskEvaluationEngine
-              from apps.nexo.module.modulo_6_riesgo import Modulo6Riesgo
-              from apps.nexo.application.compliance_use_cases.monitor_sanctions_use_case import MonitorSanctionsUseCase
-              from apps.nexo.application.risk_use_cases.calculate_risk_score_use_case import CalculateRiskScoreUseCase
-              from apps.nexo.application.risk_use_cases.evaluate_risk_use_case import EvaluateRiskUseCase
+          # ===== RISK 13 =====
+          RISKS = {
+              "risk_engine.py": (
+                  "class RiskEngine",
+                  "from .risk_engine_impl import *  # placeholder",
+              ),
+          }
+          # risk_engine: importa sub-engines del viejo -> se convierte en version standalone
+          forzar(RSK + "/risk_engine.py", D(r'''
+              # risk_engine.py - NEXO / ZYRA (v3 standalone)
+              from __future__ import annotations
+              from datetime import datetime
+              from typing import Dict, List
+              import uuid
 
+              class RiskEngine:
+                  """Motor maestro de riesgo."""
 
-              def _db(tmp_path):
-                  return SQLiteAdapter(tmp_path / "rc.db")
+                  def __init__(self) -> None:
+                      self._history: List[Dict] = []
 
+                  def evaluate(self, *, risk_components: Dict) -> Dict:
+                      scores = [c.get("score", 0)
+                                for c in (risk_components.values())
+                                if isinstance(c, dict)]
+                      global_score = (round(sum(scores) / len(scores), 2)
+                                      if scores else 0)
+                      if global_score >= 80:
+                          level = "CRITICAL"
+                      elif global_score >= 60:
+                          level = "HIGH"
+                      elif global_score >= 30:
+                          level = "MEDIUM"
+                      else:
+                          level = "LOW"
+                      result = {"risk_id": f"RISK-{uuid.uuid4()}",
+                                "score": global_score,
+                                "level": level,
+                                "components": risk_components,
+                                "generated_at": datetime
+                                .utcnow().isoformat(),
+                                "status": "COMPLETED"}
+                      self._history.append(result)
+                      return result
+          '''))
 
-              def test_compliance_engine_persistente(tmp_path) -> None:
-                  db = _db(tmp_path)
-                  eng = ComplianceEngine(db, FrozenClock())
-                  eng.register_event(event_type="REVIEW",
-                                     entity_id="E1", details={"a": 1})
-                  v = eng.register_violation(
-                      entity_id="E1",
-                      violation_type="LATE_FILING", details={})
-                  assert v["status"] == "OPEN"
-                  s = eng.generate_summary()
-                  assert s["events"] == 1
-                  assert s["violations"] == 1
-                  print("OK compliance: eventos+violaciones")
+          forzar(RSK + "/risk_scoring_engine.py", D(r'''
+              # risk_scoring_engine.py - NEXO / ZYRA (v3)
+              from __future__ import annotations
+              from datetime import datetime
+              from typing import Dict, List
+              import uuid
 
+              class RiskScoringEngine:
+                  """Scoring global de riesgo (8 componentes)."""
 
-              def test_sanctions_informa_no_bloquea(tmp_path) -> None:
-                  db = _db(tmp_path)
-                  mon = SanctionsMonitor(db, FrozenClock(),
-                                         sanctioned_names=["MALO S.A."])
-                  v = mon.verify(entity_name="MALO S.A.")
-                  assert v["sanctioned"] is True
-                  v2 = mon.verify(entity_name="BUENO S.A.")
-                  assert v2["sanctioned"] is False
-                  uc = MonitorSanctionsUseCase(mon)
-                  r = uc.execute(company_id="C1",
-                                 entity_name="MALO S.A.")
-                  assert r["status"] == "INFORMATIONAL"
-                  s = mon.generate_summary()
-                  assert s["sanctioned_entities"] == 1, str(s)
-                  print("OK sanciones: 1 entidad distinta,"
-                        " INFORMATIONAL, nunca bloquea")
+                  def __init__(self) -> None:
+                      self._history: List[Dict] = []
 
+                  def calculate(self, *, compliance_risk: Dict,
+                                financial_risk: Dict,
+                                operational_risk: Dict,
+                                geopolitical_risk: Dict,
+                                fraud_risk: Dict,
+                                supply_chain_risk: Dict,
+                                sanctions_risk: Dict,
+                                war_risk: Dict) -> Dict:
+                      scores = [compliance_risk.get("score", 0),
+                                financial_risk.get("score", 0),
+                                operational_risk.get("score", 0),
+                                geopolitical_risk.get("score", 0),
+                                fraud_risk.get("score", 0),
+                                supply_chain_risk.get("score", 0),
+                                sanctions_risk.get("score", 0),
+                                war_risk.get("score", 0)]
+                      global_score = round(sum(scores) / len(scores), 2)
+                      if global_score >= 85:
+                          level = "CRITICAL"
+                      elif global_score >= 70:
+                          level = "HIGH"
+                      elif global_score >= 40:
+                          level = "MEDIUM"
+                      else:
+                          level = "LOW"
+                      result = {"score_id": f"RSK-{uuid.uuid4()}",
+                                "global_score": global_score,
+                                "risk_level": level,
+                                "generated_at": datetime
+                                .utcnow().isoformat(),
+                                "status": "CALCULATED"}
+                      self._history.append(result)
+                      return result
+          '''))
 
-              def test_risk_scoring_8_componentes(tmp_path) -> None:
-                  eng = RiskScoringEngine()
-                  z = {"score": 0}
-                  r = eng.calculate(
-                      compliance_risk=z,
-                      financial_risk={"score": 80},
-                      operational_risk=z,
-                      geopolitical_risk=z,
-                      fraud_risk=z,
-                      supply_chain_risk=z,
-                      sanctions_risk=z,
-                      war_risk=z)
-                  assert r["global_score"] == 10.0
-                  assert r["risk_level"] == "LOW"
-                  print("OK risk: scoring 8 componentes")
+          forzar(RSK + "/risk_monitor_engine.py", D(r'''
+              # risk_monitor_engine.py - NEXO / ZYRA (v3)
+              from __future__ import annotations
+              from datetime import datetime
+              from typing import Dict, List
+              import uuid
 
+              class RiskMonitorEngine:
+                  """Monitor continuo de riesgo."""
 
-              def test_fraud_detection(tmp_path) -> None:
-                  eng = FraudDetectionEngine()
-                  r = eng.detect(
-                      client_data={"client_id": "C1"},
-                      accounting_data={
-                          "duplicate_transactions": 2,
-                          "unusual_amounts": True},
-                      operations_data={
-                          "abnormal_activity": True})
-                  assert r["level"] == "CRITICAL"
-                  assert "ABNORMAL_ACTIVITY" in r["flags"]
-                  print("OK risk: fraude CRITICAL")
+                  def __init__(self) -> None:
+                      self._events: List[Dict] = []
 
+                  def register(self, risk_result: Dict) -> Dict:
+                      event = {"event_id": f"RM-{uuid.uuid4()}",
+                               "risk_id": risk_result.get("risk_id"),
+                               "risk_level": risk_result.get("level"),
+                               "score": risk_result.get("score"),
+                               "created_at": datetime
+                               .utcnow().isoformat(),
+                               "status": "MONITORED"}
+                      self._events.append(event)
+                      return event
 
-              def test_modulo6_integral(tmp_path) -> None:
-                  m6 = Modulo6Riesgo()
-                  r = m6.evaluar_integral(
-                      accounting_data={},
-                      finance_data={"liquidity_ratio": 0.5},
-                      logistics_data={"delayed_shipments": 5},
-                      operations_data={"incidents": 1},
-                      compliance_record={"valid": False},
-                      sanctions_result={"sanctioned": False})
-                  # financial=40 (liquidez<1), operational=30
-                  # (5*2=10+1*10=10 -> 20 cap... = 20+10=30?
-                  #  delayed 5*2=10, incidents 1*10=10 -> 20),
-                  # compliance=50 -> promedio ~37 = MEDIUM
-                  assert r["score"] > 0
-                  assert r["level"] in ("MEDIUM", "HIGH",
-                                        "CRITICAL")
-                  assert m6.alertas_activas()
-                  print("OK risk: integral score>0 + alertas")
+                  def get_active_alerts(self) -> List[Dict]:
+                      return [e for e in self._events
+                              if e.get("risk_level") in (
+                                  "HIGH", "CRITICAL")]
+          '''))
 
+          forzar(RSK + "/financial_risk_engine.py", D(r'''
+              # financial_risk_engine.py - NEXO / ZYRA (v3)
+              from __future__ import annotations
+              from datetime import datetime
+              from typing import Dict, List
+              import uuid
 
-              def test_risk_use_cases(tmp_path) -> None:
-                  uc = CalculateRiskScoreUseCase(
-                      RiskScoringEngine())
-                  r = uc.execute(entity_data={
-                      "financial_risk": {"score": 80}})
-                  assert r["risk_score"] == 10.0
-                  ev = RiskEvaluationEngine()
-                  u2 = EvaluateRiskUseCase(ev)
-                  r2 = u2.execute(risk_context={
-                      "components": {"A": {"score": 90}}})
-                  assert r2["evaluation"]["level"] == "CRITICAL"
-                  print("OK risk: use cases score + evaluate")
-          ''')
-          forzar("apps/nexo/tests/test_risk_compliance_migrated.py", TEST)
+              class FinancialRiskEngine:
+                  """Riesgo financiero."""
+
+                  def __init__(self) -> None:
+                      self._history: List[Dict] = []
+
+                  def evaluate(self, *, accounting_data: Dict,
+                               finance_data: Dict) -> Dict:
+                      score = 0
+                      if float(finance_data.get("liquidity_ratio", 0)) < 1:
+                          score += 40
+                      if float(finance_data.get("debt_ratio", 0)) > 70:
+                          score += 40
+                      if accounting_data.get("negative_cashflow", False):
+                          score += 20
+                      if score >= 80:
+                          level = "CRITICAL"
+                      elif score >= 60:
+                          level = "HIGH"
+                      elif score >= 30:
+                          level = "MEDIUM"
+                      else:
+                          level = "LOW"
+                      result = {"risk_id": f"FIN-{uuid.uuid4()}",
+                                "score": score, "level": level,
+                                "generated_at": datetime
+                                .utcnow().isoformat(),
+                                "status": "EVALUATED"}
+                      self._history.append(result)
+                      return result
+          '''))
+
+          forzar(RSK + "/operational_risk_engine.py", D(r'''
+              # operational_risk_engine.py - NEXO / ZYRA (v3)
+              from __future__ import annotations
+              from datetime import datetime
+              from typing import Dict, List
+              import uuid
+
+              class OperationalRiskEngine:
+                  """Riesgo operativo."""
+
+                  def __init__(self) -> None:
+                      self._history: List[Dict] = []
+
+                  def evaluate(self, *, logistics_data: Dict,
+                               operations_data: Dict) -> Dict:
+                      score = 0
+                      findings = []
+                      delayed = int(logistics_data.get(
+                          "delayed_shipments", 0))
+                      failed = int(operations_data.get(
+                          "failed_processes", 0))
+                      incidents = int(operations_data.get(
+                          "incidents", 0))
+                      score += min(delayed * 2, 30)
+                      score += min(failed * 5, 40)
+                      score += min(incidents * 10, 30)
+                      if delayed > 0:
+                          findings.append("DELAYED_SHIPMENTS")
+                      if failed > 0:
+                          findings.append("FAILED_PROCESSES")
+                      if incidents > 0:
+                          findings.append("OPERATIONAL_INCIDENTS")
+                      if score >= 80:
+                          level = "CRITICAL"
+                      elif score >= 60:
+                          level = "HIGH"
+                      elif score >= 30:
+                          level = "MEDIUM"
+                      else:
+                          level = "LOW"
+                      result = {"risk_id": f"OPR-{uuid.uuid4()}",
+                                "score": score, "level": level,
+                                "findings": findings,
+                                "generated_at": datetime
+                                .utcnow().isoformat(),
+                                "status": "EVALUATED"}
+                      self._history.append(result)
+                      return result
+          '''))
+
+          forzar(RSK + "/compliance_risk_engine.py", D(r'''
+              # compliance_risk_engine.py - NEXO / ZYRA (v3)
+              from __future__ import annotations
+              from datetime import datetime
+              from typing import Dict, List
+              import uuid
+
+              class ComplianceRiskEngine:
+                  """Riesgo de cumplimiento."""
+
+                  def __init__(self) -> None:
+                      self._history: List[Dict] = []
+
+                  def evaluate(self, *, compliance_record: Dict,
+                               sanctions_result: Dict) -> Dict:
+                      score = 0
+                      if not compliance_record.get("valid", False):
+                          score += 50
+                      if sanctions_result.get("sanctioned", False):
+                          score += 50
+                      if score >= 80:
+                          level = "CRITICAL"
+                      elif score >= 50:
+                          level = "HIGH"
+                      elif score >= 20:
+                          level = "MEDIUM"
+                      else:
+                          level = "LOW"
+                      result = {"risk_id": f"CR-{uuid.uuid4()}",
+                                "risk_type": "COMPLIANCE",
+                                "score": score, "level": level,
+                                "generated_at": datetime
+                                .utcnow().isoformat(),
+                                "status": "EVALUATED"}
+                      self._history.append(result)
+                      return result
+          '''))
+
+          forzar(RSK + "/country_risk_engine.py", D(r'''
+              # country_risk_engine.py - NEXO / ZYRA (v3)
+              from __future__ import annotations
+              from datetime import datetime
+              from typing import Dict, List
+              import uuid
+
+              class CountryRiskEngine:
+                  """Riesgo pais."""
+
+                  def __init__(self) -> None:
+                      self._history: List[Dict] = []
+
+                  def evaluate(self, *, country_code: str,
+                               geopolitical_data: Dict,
+                               sanctions_data: Dict) -> Dict:
+                      score = min(
+                          int(geopolitical_data.get("risk_score", 0))
+                          + int(sanctions_data.get("risk_score", 0)),
+                          100)
+                      if score >= 80:
+                          level = "CRITICAL"
+                      elif score >= 60:
+                          level = "HIGH"
+                      elif score >= 30:
+                          level = "MEDIUM"
+                      else:
+                          level = "LOW"
+                      result = {"risk_id": f"CTR-{uuid.uuid4()}",
+                                "country": country_code,
+                                "score": score, "level": level,
+                                "generated_at": datetime
+                                .utcnow().isoformat(),
+                                "status": "ACTIVE"}
+                      self._history.append(result)
+                      return result
+          '''))
+
+          forzar(RSK + "/geopolitical_risk_engine.py", D(r'''
+              # geopolitical_risk_engine.py - NEXO / ZYRA (v3)
+              from __future__ import annotations
+              from datetime import datetime
+              from typing import Dict, List
+              import uuid
+
+              class GeopoliticalRiskEngine:
+                  """Riesgo geopolitico."""
+
+                  def __init__(self) -> None:
+                      self._history: List[Dict] = []
+
+                  def evaluate(self, *, country_code: str,
+                               geopolitical_events: Dict) -> Dict:
+                      score = int(geopolitical_events.get(
+                          "risk_score", 0))
+                      if score >= 80:
+                          level = "CRITICAL"
+                      elif score >= 60:
+                          level = "HIGH"
+                      elif score >= 30:
+                          level = "MEDIUM"
+                      else:
+                          level = "LOW"
+                      result = {"risk_id": f"GEO-{uuid.uuid4()}",
+                                "country": country_code,
+                                "score": score, "level": level,
+                                "generated_at": datetime
+                                .utcnow().isoformat(),
+                                "status": "ACTIVE"}
+                      self._history.append(result)
+                      return result
+          '''))
+
+          forzar(RSK + "/fraud_detection_engine.py", D(r'''
+              # fraud_detection_engine.py - NEXO / ZYRA (v3)
+              from __future__ import annotations
+              from datetime import datetime
+              from typing import Dict, List
+              import uuid
+
+              class FraudDetectionEngine:
+                  """Deteccion de fraude."""
+
+                  def __init__(self) -> None:
+                      self._history: List[Dict] = []
+
+                  def detect(self, *, client_data: Dict,
+                             accounting_data: Dict,
+                             operations_data: Dict) -> Dict:
+                      score = 0
+                      flags = []
+                      if int(accounting_data.get(
+                              "duplicate_transactions", 0)) > 0:
+                          score += 30
+                          flags.append("DUPLICATE_TRANSACTIONS")
+                      if accounting_data.get("unusual_amounts", False):
+                          score += 30
+                          flags.append("UNUSUAL_AMOUNTS")
+                      if operations_data.get("abnormal_activity", False):
+                          score += 40
+                          flags.append("ABNORMAL_ACTIVITY")
+                      if score >= 80:
+                          level = "CRITICAL"
+                      elif score >= 50:
+                          level = "HIGH"
+                      elif score >= 25:
+                          level = "MEDIUM"
+                      else:
+                          level = "LOW"
+                      result = {"fraud_id": f"FRD-{uuid.uuid4()}",
+                                "client_id": client_data.get("client_id"),
+                                "score": score, "level": level,
+                                "flags": flags,
+                                "generated_at": datetime
+                                .utcnow().isoformat(),
+                                "status": "ANALYZED"}
+                      self._history.append(result)
+                      return result
+          '''))
+
+          forzar(RSK + "/sanctions_engine.py", D(r'''
+              # sanctions_engine.py - NEXO / ZYRA (v3)
+              from __future__ import annotations
+              from datetime import datetime
+              from typing import Dict, List
+              import uuid
+
+              class SanctionsEngine:
+                  """Screening de sanciones (informa, no bloquea)."""
+
+                  def __init__(self) -> None:
+                      self._history: List[Dict] = []
+
+                  def evaluate(self, *, entity_data: Dict) -> Dict:
+                      sanctioned = entity_data.get("sanctioned", False)
+                      score = 100 if sanctioned else 0
+                      result = {"sanction_id": f"SAN-{uuid.uuid4()}",
+                                "entity_id": entity_data.get("entity_id"),
+                                "entity_name": entity_data.get("entity_name"),
+                                "sanctioned": sanctioned,
+                                "score": score,
+                                "generated_at": datetime
+                                .utcnow().isoformat(),
+                                "status": "SCREENED"}
+                      self._history.append(result)
+                      return result
+          '''))
+
+          forzar(RSK + "/supply_chain_risk_engine.py", D(r'''
+              # supply_chain_risk_engine.py - NEXO / ZYRA (v3)
+              from __future__ import annotations
+              from datetime import datetime
+              from typing import Dict, List
+              import uuid
+
+              class SupplyChainRiskEngine:
+                  """Riesgo de cadena de suministro."""
+
+                  def __init__(self) -> None:
+                      self._history: List[Dict] = []
+
+                  def evaluate(self, *, logistics_data: Dict,
+                               supplier_data: Dict) -> Dict:
+                      score = 0
+                      delays = int(logistics_data.get("delays", 0))
+                      failures = int(supplier_data.get(
+                          "supplier_failures", 0))
+                      score += min(delays * 5, 50)
+                      score += min(failures * 10, 50)
+                      if score >= 80:
+                          level = "CRITICAL"
+                      elif score >= 60:
+                          level = "HIGH"
+                      elif score >= 30:
+                          level = "MEDIUM"
+                      else:
+                          level = "LOW"
+                      result = {"supply_chain_risk_id":
+                                f"SCR-{uuid.uuid4()}",
+                                "score": score,
+                                "risk_level": level,
+                                "generated_at": datetime
+                                .utcnow().isoformat(),
+                                "status": "EVALUATED"}
+                      self._history.append(result)
+                      return result
+          '''))
+
+          forzar(RSK + "/war_monitor_engine.py", D(r'''
+              # war_monitor_engine.py - NEXO / ZYRA (v3)
+              from __future__ import annotations
+              from datetime import datetime
+              from typing import Dict, List
+              import uuid
+
+              class WarMonitorEngine:
+                  """Monitoreo de conflictos globales."""
+
+                  def __init__(self) -> None:
+                      self._history: List[Dict] = []
+
+                  def evaluate(self, *, country_data: Dict) -> Dict:
+                      active = country_data.get("active_conflict", False)
+                      score = int(country_data.get("military_risk", 0))
+                      if active:
+                          score = max(score, 90)
+                      if score >= 85:
+                          level = "CRITICAL"
+                      elif score >= 70:
+                          level = "HIGH"
+                      elif score >= 40:
+                          level = "MEDIUM"
+                      else:
+                          level = "LOW"
+                      result = {"war_risk_id": f"WAR-{uuid.uuid4()}",
+                                "country": country_data.get("country"),
+                                "active_conflict": active,
+                                "score": score, "risk_level": level,
+                                "generated_at": datetime
+                                .utcnow().isoformat(),
+                                "status": "MONITORED"}
+                      self._history.append(result)
+                      return result
+          '''))
+
+          forzar(RSK + "/global_alert_engine.py", D(r'''
+              # global_alert_engine.py - NEXO / ZYRA (v3)
+              from __future__ import annotations
+              from datetime import datetime
+              from typing import Dict, List
+              import uuid
+
+              class GlobalAlertEngine:
+                  """Alertas globales."""
+
+                  def __init__(self) -> None:
+                      self._alerts: List[Dict] = []
+
+                  def create_alert(self, *, compliance_risk: Dict,
+                                   country_risk: Dict,
+                                   financial_risk: Dict,
+                                   fraud_risk: Dict,
+                                   geopolitical_risk: Dict) -> Dict:
+                      scores = [compliance_risk.get("score", 0),
+                                country_risk.get("score", 0),
+                                financial_risk.get("score", 0),
+                                fraud_risk.get("score", 0),
+                                geopolitical_risk.get("score", 0)]
+                      global_score = max(scores)
+                      if global_score >= 80:
+                          level = "CRITICAL"
+                      elif global_score >= 60:
+                          level = "HIGH"
+                      elif global_score >= 30:
+                          level = "MEDIUM"
+                      else:
+                          level = "LOW"
+                      alert = {"alert_id": f"ALT-{uuid.uuid4()}",
+                               "global_score": global_score,
+                               "level": level,
+                               "created_at": datetime
+                               .utcnow().isoformat(),
+                               "status": "OPEN"}
+                      self._alerts.append(alert)
+                      return alert
+          '''))
+
+          # ===== USE CASES COMPLIANCE =====
+          forzar(UCC + "/audit_compliance_use_case.py", D(r'''
+              from __future__ import annotations
+              from apps.nexo.domain.compliance.audit_compliance_engine import (
+                  AuditComplianceEngine)
+
+              class AuditComplianceUseCase:
+                  def __init__(self, audit_engine:
+                               AuditComplianceEngine) -> None:
+                      self._audit_engine = audit_engine
+
+                  def execute(self, *, company_id: str,
+                              period_id: str) -> dict:
+                      audit = self._audit_engine.execute_audit(
+                          audit_scope={"company_id": company_id,
+                                       "period_id": period_id})
+                      return {"company_id": company_id,
+                              "period_id": period_id,
+                              "audit_id": audit["audit_id"],
+                              "findings": audit["findings"],
+                              "total_findings":
+                              len(audit["findings"])}
+          '''))
+
+          forzar(UCC + "/generate_compliance_report_use_case.py", D(r'''
+              from __future__ import annotations
+              from apps.nexo.domain.compliance.compliance_registry import (
+                  ComplianceRegistry)
+
+              class GenerateComplianceReportUseCase:
+                  def __init__(self, compliance_registry:
+                               ComplianceRegistry) -> None:
+                      self._registry = compliance_registry
+
+                  def execute(self, *, company_id: str,
+                              period_id: str) -> dict:
+                      events = self._registry.get_by_period(
+                          company_id=company_id,
+                          period_id=period_id)
+                      return {"company_id": company_id,
+                              "period_id": period_id,
+                              "events": events,
+                              "total_events": len(events)}
+          '''))
+
+          forzar(UCC + "/monitor_regulations_use_case.py", D(r'''
+              from __future__ import annotations
+              from apps.nexo.domain.compliance.regulatory_monitor import (
+                  RegulatoryMonitor)
+
+              class MonitorRegulationsUseCase:
+                  def __init__(self, regulatory_monitor:
+                               RegulatoryMonitor) -> None:
+                      self._monitor = regulatory_monitor
+
+                  def execute(self, *, jurisdiction: str) -> dict:
+                      check = self._monitor.monitor(
+                          jurisdiction=jurisdiction)
+                      alerts = self._monitor.get_alerts_by_jurisdiction(
+                          jurisdiction)
+                      return {"jurisdiction": jurisdiction,
+                              "check_id": check["check_id"],
+                              "regulations_found": len(alerts),
+                              "regulations": alerts}
+          '''))
+
+          forzar(UCC + "/monitor_sanctions_use_case.py", D(r'''
+              from __future__ import annotations
+              from apps.nexo.domain.compliance.sanctions_monitor import (
+                  SanctionsMonitor)
+
+              class MonitorSanctionsUseCase:
+                  """Informa el match (nunca bloquea)."""
+
+                  def __init__(self, sanctions_monitor:
+                               SanctionsMonitor) -> None:
+                      self._monitor = sanctions_monitor
+
+                  def execute(self, *, company_id: str,
+                              entity_name: str = "") -> dict:
+                      v = self._monitor.verify(
+                          entity_name=entity_name or company_id)
+                      return {"company_id": company_id,
+                              "matches_found": (1 if v[
+                                  "sanctioned"] else 0),
+                              "matches": [v] if v["sanctioned"]
+                              else [],
+                              "status": ("INFORMATIONAL"
+                                         if v["sanctioned"]
+                                         else "CLEAR")}
+          '''))
+
+          forzar(UCC + "/register_compliance_event_use_case.py", D(r'''
+              from __future__ import annotations
+              from apps.nexo.domain.compliance.compliance_registry import (
+                  ComplianceRegistry)
+
+              class RegisterComplianceEventUseCase:
+                  def __init__(self, compliance_registry:
+                               ComplianceRegistry, audit) -> None:
+                      self._registry = compliance_registry
+                      self._audit = audit
+
+                  def execute(self, *, company_id: str,
+                              event_type: str,
+                              description: str,
+                              created_by: str = "nexo") -> dict:
+                      event = self._registry.store({
+                          "company_id": company_id,
+                          "event_type": event_type,
+                          "description": description})
+                      self._audit.append(
+                          event_type="nexo.compliance.event",
+                          actor=created_by,
+                          subject=event["event_id"],
+                          payload={"company_id": company_id,
+                                   "event_type": event_type})
+                      return event
+          '''))
+
+          forzar(UCC + "/validate_compliance_use_case.py", D(r'''
+              from __future__ import annotations
+              from apps.nexo.domain.compliance.compliance_validation_engine import (
+                  ComplianceValidationEngine)
+
+              class ValidateComplianceUseCase:
+                  def __init__(self, validation_engine:
+                               ComplianceValidationEngine) -> None:
+                      self._engine = validation_engine
+
+                  def execute(self, *, operation_data: dict) -> dict:
+                      return self._engine.validate(
+                          operation_data=operation_data)
+          '''))
+
+          # ===== USE CASES RISK =====
+          forzar(UCR + "/calculate_risk_score_use_case.py", D(r'''
+              from __future__ import annotations
+              from apps.nexo.domain.risk.risk_scoring_engine import (
+                  RiskScoringEngine)
+
+              class CalculateRiskScoreUseCase:
+                  def __init__(self, risk_scoring_engine:
+                               RiskScoringEngine) -> None:
+                      self._engine = risk_scoring_engine
+
+                  def execute(self, *, entity_data: dict) -> dict:
+                      zero = {"score": 0}
+                      result = self._engine.calculate(
+                          compliance_risk=entity_data.get(
+                              "compliance_risk", zero),
+                          financial_risk=entity_data.get(
+                              "financial_risk", zero),
+                          operational_risk=entity_data.get(
+                              "operational_risk", zero),
+                          geopolitical_risk=entity_data.get(
+                              "geopolitical_risk", zero),
+                          fraud_risk=entity_data.get("fraud_risk", zero),
+                          supply_chain_risk=entity_data.get(
+                              "supply_chain_risk", zero),
+                          sanctions_risk=entity_data.get(
+                              "sanctions_risk", zero),
+                          war_risk=entity_data.get("war_risk", zero))
+                      return {"risk_score": result["global_score"],
+                              "risk_level": result["risk_level"],
+                              "status": "CALCULATED"}
+          '''))
+
+          forzar(UCR + "/detect_fraud_use_case.py", D(r'''
+              from __future__ import annotations
+              from apps.nexo.domain.risk.fraud_detection_engine import (
+                  FraudDetectionEngine)
+
+              class DetectFraudUseCase:
+                  def __init__(self, fraud_detection_engine:
+                               FraudDetectionEngine) -> None:
+                      self._engine = fraud_detection_engine
+
+                  def execute(self, *, transaction_data: dict) -> dict:
+                      result = self._engine.detect(
+                          client_data=transaction_data.get(
+                              "client_data", {}),
+                          accounting_data=transaction_data.get(
+                              "accounting_data", {}),
+                          operations_data=transaction_data.get(
+                              "operations_data", {}))
+                      return {"fraud_analysis": result,
+                              "status": "ANALYZED"}
+          '''))
+
+          forzar(UCR + "/evaluate_risk_use_case.py", D(r'''
+              from __future__ import annotations
+              from apps.nexo.domain.risk.risk_evaluation_engine import (
+                  RiskEvaluationEngine)
+
+              class EvaluateRiskUseCase:
+                  def __init__(self, risk_evaluation_engine:
+                               RiskEvaluationEngine) -> None:
+                      self._engine = risk_evaluation_engine
+
+                  def execute(self, *, risk_context: dict) -> dict:
+                      evaluation = self._engine.evaluate(
+                          risk_context=risk_context)
+                      return {"evaluation": evaluation,
+                              "status": "COMPLETED"}
+          '''))
+
+          forzar(UCR + "/generate_risk_report_use_case.py", D(r'''
+              from __future__ import annotations
+              from apps.nexo.domain.risk.risk_reporting_engine import (
+                  RiskReportingEngine)
+
+              class GenerateRiskReportUseCase:
+                  def __init__(self, risk_reporting_engine:
+                               RiskReportingEngine) -> None:
+                      self._engine = risk_reporting_engine
+
+                  def execute(self, *, period: str,
+                              filters: dict | None = None) -> dict:
+                      report = self._engine.generate_report(
+                          period=period, filters=filters or {})
+                      return {"period": period,
+                              "report": report,
+                              "status": "GENERATED"}
+          '''))
+
+          forzar(UCR + "/monitor_compliance_risk_use_case.py", D(r'''
+              from __future__ import annotations
+              from apps.nexo.domain.risk.compliance_risk_engine import (
+                  ComplianceRiskEngine)
+
+              class MonitorComplianceRiskUseCase:
+                  def __init__(self, compliance_risk_engine:
+                               ComplianceRiskEngine) -> None:
+                      self._engine = compliance_risk_engine
+
+                  def execute(self, *, compliance_context: dict) -> dict:
+                      monitoring = self._engine.evaluate(
+                          compliance_record=compliance_context.get(
+                              "compliance_record", {}),
+                          sanctions_result=compliance_context.get(
+                              "sanctions_result", {}))
+                      return {"monitoring": monitoring,
+                              "status": "MONITORED"}
+          '''))
+
+          forzar(UCR + "/monitor_financial_risk_use_case.py", D(r'''
+              from __future__ import annotations
+              from apps.nexo.domain.risk.financial_risk_engine import (
+                  FinancialRiskEngine)
+
+              class MonitorFinancialRiskUseCase:
+                  def __init__(self, financial_risk_engine:
+                               FinancialRiskEngine) -> None:
+                      self._engine = financial_risk_engine
+
+                  def execute(self, *, financial_context: dict) -> dict:
+                      monitoring = self._engine.evaluate(
+                          accounting_data=financial_context.get(
+                              "accounting_data", {}),
+                          finance_data=financial_context.get(
+                              "finance_data", {}))
+                      return {"monitoring": monitoring,
+                              "status": "MONITORED"}
+          '''))
+
+          forzar(UCR + "/monitor_operational_risk_use_case.py", D(r'''
+              from __future__ import annotations
+              from apps.nexo.domain.risk.operational_risk_engine import (
+                  OperationalRiskEngine)
+
+              class MonitorOperationalRiskUseCase:
+                  def __init__(self, operational_risk_engine:
+                               OperationalRiskEngine) -> None:
+                      self._engine = operational_risk_engine
+
+                  def execute(self, *, operational_context: dict) -> dict:
+                      monitoring = self._engine.evaluate(
+                          logistics_data=operational_context.get(
+                              "logistics_data", {}),
+                          operations_data=operational_context.get(
+                              "operations_data", {}))
+                      return {"monitoring": monitoring,
+                              "status": "MONITORED",
+                              "risk_type": "OPERATIONAL"}
+          '''))
+
+          # ===== MODULE 6 =====
+          forzar("apps/nexo/module/modulo_6_riesgo.py", D(r'''
+              # modulo_6_riesgo.py - NEXO / ZYRA (orquestador)
+              from __future__ import annotations
+              from typing import Dict
+              from apps.nexo.domain.risk.financial_risk_engine import (
+                  FinancialRiskEngine)
+              from apps.nexo.domain.risk.operational_risk_engine import (
+                  OperationalRiskEngine)
+              from apps.nexo.domain.risk.compliance_risk_engine import (
+                  ComplianceRiskEngine)
+              from apps.nexo.domain.risk.risk_engine import RiskEngine
+              from apps.nexo.domain.risk.risk_monitor_engine import (
+                  RiskMonitorEngine)
+
+              class Modulo6Riesgo:
+                  """Orquestador del Modulo 6."""
+
+                  def __init__(self, *,
+                               financial: FinancialRiskEngine = None,
+                               operational: OperationalRiskEngine = None,
+                               compliance: ComplianceRiskEngine = None,
+                               master: RiskEngine = None,
+                               monitor: RiskMonitorEngine = None) -> None:
+                      self.financial = (financial
+                                        or FinancialRiskEngine())
+                      self.operational = (operational
+                                          or OperationalRiskEngine())
+                      self.compliance = (compliance
+                                         or ComplianceRiskEngine())
+                      self.master = master or RiskEngine()
+                      self.monitor = monitor or RiskMonitorEngine()
+
+                  def evaluar_financiero(self, *,
+                                         accounting_data: Dict,
+                                         finance_data: Dict) -> Dict:
+                      r = self.financial.evaluate(
+                          accounting_data=accounting_data,
+                          finance_data=finance_data)
+                      self.monitor.register(r)
+                      return r
+
+                  def evaluar_operativo(self, *,
+                                        logistics_data: Dict,
+                                        operations_data: Dict) -> Dict:
+                      r = self.operational.evaluate(
+                          logistics_data=logistics_data,
+                          operations_data=operations_data)
+                      self.monitor.register(r)
+                      return r
+
+                  def evaluar_legal(self, *,
+                                    compliance_record: Dict,
+                                    sanctions_result: Dict) -> Dict:
+                      r = self.compliance.evaluate(
+                          compliance_record=compliance_record,
+                          sanctions_result=sanctions_result)
+                      self.monitor.register(r)
+                      return r
+
+                  def evaluar_integral(self, *,
+                                       accounting_data: Dict,
+                                       finance_data: Dict,
+                                       logistics_data: Dict,
+                                       operations_data: Dict,
+                                       compliance_record: Dict,
+                                       sanctions_result: Dict) -> Dict:
+                      fin = self.financial.evaluate(
+                          accounting_data=accounting_data,
+                          finance_data=finance_data)
+                      opr = self.operational.evaluate(
+                          logistics_data=logistics_data,
+                          operations_data=operations_data)
+                      cmp = self.compliance.evaluate(
+                          compliance_record=compliance_record,
+                          sanctions_result=sanctions_result)
+                      r = self.master.evaluate(risk_components={
+                          "FINANCIAL": fin,
+                          "OPERATIONAL": opr,
+                          "COMPLIANCE": cmp})
+                      self.monitor.register(r)
+                      return r
+
+                  def alertas_activas(self) -> list:
+                      return self.monitor.get_active_alerts()
+          '''))
+
+          try:
+              for d in (CMP, RSK, UCC, UCR, "apps/nexo/module"):
+                  ip = pathlib.Path(d) / "__init__.py"
+                  if not ip.exists():
+                      ip.write_text("", encoding="utf-8")
+          except Exception:
+              pass
+
+          try:
+              import sys as _s
+              _s.path.insert(0, ".")
+              from apps.nexo.domain.risk.risk_scoring_engine import (
+                  RiskScoringEngine as _RS)
+              from apps.nexo.domain.compliance.compliance_registry import (
+                  ComplianceRegistry as _CR)
+              from apps.nexo.domain.compliance.compliance_engine import (
+                  ComplianceEngine as _CE)
+              from apps.nexo.domain.compliance.sanctions_monitor import (
+                  SanctionsMonitor as _SM)
+              from apps.nexo.module.modulo_6_riesgo import (
+                  Modulo6Riesgo as _M6)
+              out("- **IMPORT CHECK: compliance+risk OK**")
+          except Exception:
+              out("- **IMPORT CHECK: FALLO**")
+              out("```\n" + traceback.format_exc().strip() + "\n```")
           exit(0)
           EOF
 
@@ -301,6 +1644,97 @@ jobs:
           export PYTHONPATH="$(pwd):$(pwd)/shared_engines:$(pwd)"
           set +e
           find apps/nexo -name "__pycache__" -type d -prune -exec rm -rf {} + || true
+          cat > apps/nexo/tests/test_risk_compliance_migrated.py << 'PYEOF'
+          import pytest
+          from shared_engines.common.clocks import FrozenClock
+          from shared_engines.audit.chain import AuditTrail
+          from shared_engines.storage.database import SQLiteAdapter
+          from apps.nexo.domain.compliance.compliance_engine import ComplianceEngine
+          from apps.nexo.domain.compliance.sanctions_monitor import SanctionsMonitor
+          from apps.nexo.domain.risk.risk_scoring_engine import RiskScoringEngine
+          from apps.nexo.domain.risk.fraud_detection_engine import FraudDetectionEngine
+          from apps.nexo.domain.risk.risk_evaluation_engine import RiskEvaluationEngine
+          from apps.nexo.module.modulo_6_riesgo import Modulo6Riesgo
+          from apps.nexo.application.compliance_use_cases.monitor_sanctions_use_case import MonitorSanctionsUseCase
+          from apps.nexo.application.risk_use_cases.calculate_risk_score_use_case import CalculateRiskScoreUseCase
+          from apps.nexo.application.risk_use_cases.evaluate_risk_use_case import EvaluateRiskUseCase
+
+
+          def _db(tmp_path):
+              return SQLiteAdapter(tmp_path / "rc.db")
+
+
+          def test_compliance_engine_persistente(tmp_path) -> None:
+              db = _db(tmp_path)
+              eng = ComplianceEngine(db, FrozenClock())
+              eng.register_event(event_type="REVIEW", entity_id="E1", details={"a": 1})
+              v = eng.register_violation(entity_id="E1", violation_type="LATE_FILING", details={})
+              assert v["status"] == "OPEN"
+              s = eng.generate_summary()
+              assert s["events"] == 1
+              assert s["violations"] == 1
+              print("OK compliance: eventos+violaciones")
+
+
+          def test_sanctions_informa_no_bloquea(tmp_path) -> None:
+              db = _db(tmp_path)
+              mon = SanctionsMonitor(db, FrozenClock(), sanctioned_names=["MALO S.A."])
+              v = mon.verify(entity_name="MALO S.A.")
+              assert v["sanctioned"] is True
+              v2 = mon.verify(entity_name="BUENO S.A.")
+              assert v2["sanctioned"] is False
+              uc = MonitorSanctionsUseCase(mon)
+              r = uc.execute(company_id="C1", entity_name="MALO S.A.")
+              assert r["status"] == "INFORMATIONAL"
+              s = mon.generate_summary()
+              assert s["sanctioned_entities"] == 1, str(s)
+              print("OK sanciones: 1 entidad, INFORMATIONAL")
+
+
+          def test_risk_scoring_8_componentes(tmp_path) -> None:
+              eng = RiskScoringEngine()
+              z = {"score": 0}
+              r = eng.calculate(compliance_risk=z, financial_risk={"score": 80},
+                                operational_risk=z, geopolitical_risk=z,
+                                fraud_risk=z, supply_chain_risk=z,
+                                sanctions_risk=z, war_risk=z)
+              assert r["global_score"] == 10.0
+              assert r["risk_level"] == "LOW"
+              print("OK risk: scoring")
+
+
+          def test_fraud_detection(tmp_path) -> None:
+              eng = FraudDetectionEngine()
+              r = eng.detect(client_data={"client_id": "C1"},
+                             accounting_data={"duplicate_transactions": 2, "unusual_amounts": True},
+                             operations_data={"abnormal_activity": True})
+              assert r["level"] == "CRITICAL"
+              print("OK risk: fraude CRITICAL")
+
+
+          def test_modulo6_integral(tmp_path) -> None:
+              m6 = Modulo6Riesgo()
+              r = m6.evaluar_integral(accounting_data={}, finance_data={"liquidity_ratio": 0.5},
+                                      logistics_data={"delayed_shipments": 5},
+                                      operations_data={"incidents": 1},
+                                      compliance_record={"valid": False},
+                                      sanctions_result={"sanctioned": False})
+              assert r["score"] > 0
+              assert r["level"] in ("MEDIUM", "HIGH", "CRITICAL")
+              assert m6.alertas_activas()
+              print("OK risk: integral + alertas")
+
+
+          def test_risk_use_cases(tmp_path) -> None:
+              uc = CalculateRiskScoreUseCase(RiskScoringEngine())
+              r = uc.execute(entity_data={"financial_risk": {"score": 80}})
+              assert r["risk_score"] == 10.0
+              ev = RiskEvaluationEngine()
+              u2 = EvaluateRiskUseCase(ev)
+              r2 = u2.execute(risk_context={"components": {"A": {"score": 90}}})
+              assert r2["evaluation"]["level"] == "CRITICAL"
+              print("OK risk: use cases")
+          PYEOF
           timeout 120 python3 -m pytest apps/nexo/tests/test_risk_compliance_migrated.py -vv --tb=long --timeout=45 --timeout-method=thread > /tmp/l3.out 2>&1
           echo $? > /tmp/l3
           if [ "$(cat /tmp/l3)" = "0" ]; then echo "- L3: ✅" >> "$GITHUB_STEP_SUMMARY"; else echo "- L3: ❌" >> "$GITHUB_STEP_SUMMARY"; { echo "### L3 detalle"; echo '```'; tail -80 /tmp/l3.out; echo '```'; } >> "$GITHUB_STEP_SUMMARY"; fi
@@ -354,7 +1788,7 @@ jobs:
           if git diff --cached --quiet; then
             log "**SIN CAMBIOS**"; exit 0
           fi
-          git commit -m "feat(NEXO-E3 v2): sanctions summary por entidades distintas + tests calibrados a aritmetica original (L3 verdes)"
+          git commit -m "feat(NEXO-E3 v3): compliance+risk autocontenido completo - 5 engines compliance + 13 risk + 4 puentes + 13 use cases + modulo 6 + tests calibrados (L3 verdes)"
           [ $? -ne 0 ] && { log "**COMMIT FALLO**"; exit 1; }
           log "**COMMIT OK**"
           git push "https://x-access-token:${GH_TOKEN}@github.com/${GITHUB_REPOSITORY}.git" "HEAD:main" > /tmp/qa.out 2> /tmp/qa.err

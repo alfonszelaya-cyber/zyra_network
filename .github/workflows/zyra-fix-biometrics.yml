@@ -1,16 +1,16 @@
-name: "ZYRA AUDIT VIVA-3 (seguridad: token obligatorio + rate limit)"
+name: "ZYRA CONECTORES 1: clima/geo/riesgo (Open-Meteo, NASA POWER, USGS, OpenAQ, ReliefWeb)"
 
 on:
   push:
   workflow_dispatch:
 
 permissions:
-  contents: read
+  contents: write
 
 jobs:
-  audit:
+  run:
     runs-on: ubuntu-latest
-    timeout-minutes: 15
+    timeout-minutes: 25
 
     steps:
       - name: Checkout
@@ -30,91 +30,399 @@ jobs:
           fi
           echo "DEPS OK"
 
-      - name: P1 - config.py completo
-        run: |
-          {
-          echo "## config.py COMPLETO"
-          echo '```python'
-          awk '{printf "%5d| %s\n", NR, $0}' shared_engines/runtime/config.py 2>/dev/null || true
-          echo '```'
-          } | tee -a "$GITHUB_STEP_SUMMARY"
-          exit 0
-
-      - name: P2 - api.py _authorized + do_GET/do_POST
-        run: |
-          {
-          echo "## api.py - _authorized (fuente)"
-          echo '```python'
-          L=$(grep -n "def _authorized" shared_engines/runtime/api.py | head -1 | cut -d: -f1)
-          s=$((L-3)); [ "$s" -lt 1 ] && s=1
-          awk -v a="$s" -v b="$((L+35))" 'NR>=a && NR<=b {printf "%5d| %s\n", NR, $0}' shared_engines/runtime/api.py
-          echo '```'
-          echo "## api.py - do_GET/do_POST/_dispatch"
-          echo '```python'
-          for FN in "def do_GET" "def do_POST" "def _dispatch"; do
-            L=$(grep -n "$FN" shared_engines/runtime/api.py | head -1 | cut -d: -f1 || true)
-            if [ -n "$L" ]; then
-              s=$((L-3)); [ "$s" -lt 1 ] && s=1
-              awk -v a="$s" -v b="$((L+30))" 'NR>=a && NR<=b {printf "%5d| %s\n", NR, $0}' shared_engines/runtime/api.py
-              echo "---"
-            fi
-          done
-          echo '```'
-          } | tee -a "$GITHUB_STEP_SUMMARY"
-          exit 0
-
-      - name: P3 - menciones rate/limit/token en runtime
-        run: |
-          {
-          echo "## rate/limit existente"
-          echo '```'
-          grep -rniE "rate.?limit|throttle" shared_engines/runtime --include='*.py' | head -10 || true
-          echo "(vacio = no existe, se construye)"
-          echo ""
-          echo "## token en config/api"
-          echo '```'
-          grep -n "api_token\|Bearer\|Authorization" shared_engines/runtime/config.py shared_engines/runtime/api.py | head -15 || true
-          echo '```'
-          } | tee -a "$GITHUB_STEP_SUMMARY"
-          exit 0
-
-      - name: P4 - sonda real de acceso sin token (estado actual)
+      - name: Construir 5 providers clima/riesgo
         run: |
           export PYTHONPATH="$(pwd):$(pwd)/shared_engines"
-          python3 << 'EOF' | tee -a "$GITHUB_STEP_SUMMARY"
-          import json
-          import threading
-          import time
-          import urllib.request
-          import urllib.error
-          from shared_engines.storage.database import SQLiteAdapter
-          from shared_engines.common.clocks import SystemClock
-          from shared_engines.runtime.config import RuntimeConfig
-          from shared_engines.runtime.kernel import ZyraKernel
-          from shared_engines.runtime.capabilities import ZyraCapabilities
-          from shared_engines.runtime.combined_api import serve_combined
-          from shared_engines.verification.signatures import Ed25519Signer
-          print("## Sonda seguridad - rutas sin token (estado actual)")
-          print("```")
-          db = SQLiteAdapter(":memory:")
-          s, _ = Ed25519Signer.generate()
-          k = ZyraKernel(db=db, clock=SystemClock(), signer=s, config=RuntimeConfig(host="127.0.0.1", port=0, api_token=None))
-          k.bootstrap_root()
-          caps = ZyraCapabilities(db, SystemClock(), identity=k.identity, signer=s)
-          srv = serve_combined(k, caps, host="127.0.0.1", port=0)
-          threading.Thread(target=srv.serve_forever, daemon=True).start()
-          time.sleep(0.4)
-          base = "http://127.0.0.1:" + str(srv.server_address[1])
-          for ruta in ("/health", "/bridge/subscriptions/x", "/tokens/items"):
-              try:
-                  with urllib.request.urlopen(base + ruta, timeout=10) as r:
-                      print(ruta, "->", r.status, "(PUBLICA sin token)")
-              except urllib.error.HTTPError as e:
-                  print(ruta, "->", e.code, "(protegida)")
-              except Exception as e:
-                  print(ruta, "->", type(e).__name__, str(e)[:80])
-          srv.shutdown()
-          srv.server_close()
-          print("```")
+          python3 << 'EOF'
+          import ast, pathlib, py_compile, traceback
+          SUM = __import__("os").environ.get("GITHUB_STEP_SUMMARY", "")
+          def out(t):
+              print(t, flush=True)
+              if SUM:
+                  with open(SUM, "a", encoding="utf-8") as f:
+                      f.write(t + "\n")
+
+          MODULO = (
+              '"""Conectores clima/geo/riesgo de la Red\n'
+              '(fuentes publicas sin key, falla honesta).\n'
+              'Cada provider devuelve un dict resumen\n'
+              'normalizado + sha256 (Red ligera: la Red\n'
+              'transporta confianza, no carga)."""\n'
+              'from __future__ import annotations\n'
+              '\n'
+              'import hashlib\n'
+              'import json\n'
+              'import urllib.request\n'
+              '\n'
+              '\n'
+              'class _HttpBase:\n'
+              '    """Base: GET con UA de la Red,\n'
+              '    timeout, y parse JSON tolerante."""\n'
+              '\n'
+              '    name = "base"\n'
+              '\n'
+              '    def __init__(self, *, timeout_seconds: float = 10.0) -> None:\n'
+              '        self._timeout = timeout_seconds\n'
+              '\n'
+              '    def _get_json(self, url: str):\n'
+              '        req = urllib.request.Request(\n'
+              '            url,\n'
+              '            headers={"User-Agent": "zyra-network/1.0"})\n'
+              '        with urllib.request.urlopen(\n'
+              '                req, timeout=self._timeout) as r:\n'
+              '            return json.loads(\n'
+              '                r.read().decode("utf-8"))\n'
+              '\n'
+              '    def _sha(self, data) -> str:\n'
+              '        return hashlib.sha256(\n'
+              '            json.dumps(\n'
+              '                data, sort_keys=True,\n'
+              '                default=str).encode(\n'
+              '            "utf-8")).hexdigest()\n'
+              '\n'
+              '\n'
+              'class OpenMeteoConnector(_HttpBase):\n'
+              '    """Clima/pronostico por lat/lon\n'
+              '    (open-meteo.com, sin key)."""\n'
+              '\n'
+              '    name = "open-meteo"\n'
+              '\n'
+              '    def fetch(self, *, lat: float, lon: float) -> dict:\n'
+              '        url = ("https://api.open-meteo.com/v1/forecast"\n'
+              '               "?latitude=" + str(lat)\n'
+              '               + "&longitude=" + str(lon)\n'
+              '               + "&current=temperature_2m,'
+              'relative_humidity_2m,wind_speed_10m"\n'
+              '               + "&daily=temperature_2m_max,'
+              'temperature_2m_min,precipitation_sum"\n'
+              '               + "&timezone=auto")\n'
+              '        d = self._get_json(url)\n'
+              '        cur = d.get("current", {})\n'
+              '        resumen = {\n'
+              '            "source": self.name,\n'
+              '            "lat": lat, "lon": lon,\n'
+              '            "temperature": cur.get(\n'
+              '                "temperature_2m"),\n'
+              '            "humidity": cur.get(\n'
+              '                "relative_humidity_2m"),\n'
+              '            "wind_speed": cur.get(\n'
+              '                "wind_speed_10m"),\n'
+              '            "daily": d.get("daily"),\n'
+              '        }\n'
+              '        resumen["sha256"] = self._sha(resumen)\n'
+              '        return resumen\n'
+              '\n'
+              '\n'
+              'class NasapowerConnector(_HttpBase):\n'
+              '    """Agroclimatico historico\n'
+              '    (power.larc.nasa.gov, sin key)."""\n'
+              '\n'
+              '    name = "nasa-power"\n'
+              '\n'
+              '    def fetch(self, *, lat: float, lon: float) -> dict:\n'
+              '        url = ("https://power.larc.nasa.gov/api/temporal/climatology"\n'
+              '               "?point&latitude=" + str(lat)\n'
+              '               + "&longitude=" + str(lon)\n'
+              '               + "&community=AG"\n'
+              '               + "&parameters=T2M,PRECTOTCORR,WS2M"\n'
+              '               + "&format=JSON")\n'
+              '        d = self._get_json(url)\n'
+              '        prop = d.get("properties", {}).get(\n'
+              '            "parameter", {})\n'
+              '        resumen = {\n'
+              '            "source": self.name,\n'
+              '            "lat": lat, "lon": lon,\n'
+              '            "t2m": prop.get("T2M"),\n'
+              '            "precip": prop.get("PRECTOTCORR"),\n'
+              '            "wind": prop.get("WS2M"),\n'
+              '        }\n'
+              '        resumen["sha256"] = self._sha(resumen)\n'
+              '        return resumen\n'
+              '\n'
+              '\n'
+              'class UsgsConnector(_HttpBase):\n'
+              '    """Sismos recientes por region\n'
+              '    (earthquake.usgs.gov, sin key)."""\n'
+              '\n'
+              '    name = "usgs"\n'
+              '\n'
+              '    def fetch(self, *, min_lat: float, max_lat: float,\n'
+              '              min_lon: float, max_lon: float,\n'
+              '              min_magnitude: float = 4.0,\n'
+              '              days: int = 30) -> dict:\n'
+              '        url = ("https://earthquake.usgs.gov/fdsnws/event/1/query"\n'
+              '               "?format=geojson"\n'
+              '               "&minlatitude=" + str(min_lat)\n'
+              '               + "&maxlatitude=" + str(max_lat)\n'
+              '               + "&minlongitude=" + str(min_lon)\n'
+              '               + "&maxlongitude=" + str(max_lon)\n'
+              '               + "&minmagnitude=" + str(min_magnitude)\n'
+              '               + "&starttime=" + self._iso(days))\n'
+              '        d = self._get_json(url)\n'
+              '        feats = d.get("features", [])\n'
+              '        sismos = [{\n'
+              '            "mag": f.get("properties", {}).get("mag"),\n'
+              '            "place": f.get("properties", {}).get("place"),\n'
+              '            "time": f.get("properties", {}).get("time"),\n'
+              '        } for f in feats[:20]]\n'
+              '        resumen = {\n'
+              '            "source": self.name,\n'
+              '            "count": len(feats),\n'
+              '            "events": sismos,\n'
+              '        }\n'
+              '        resumen["sha256"] = self._sha(resumen)\n'
+              '        return resumen\n'
+              '\n'
+              '    def _iso(self, days: int) -> str:\n'
+              '        import datetime as _dt\n'
+              '        d = _dt.datetime.now(\n'
+              '            _dt.timezone.utc) - _dt.timedelta(\n'
+              '            days=days)\n'
+              '        return d.strftime("%Y-%m-%d")\n'
+              '\n'
+              '\n'
+              'class OpenAqConnector(_HttpBase):\n'
+              '    """Calidad del aire por coordenadas\n'
+              '    (api.openaq.org, sin key)."""\n'
+              '\n'
+              '    name = "openaq"\n'
+              '\n'
+              '    def fetch(self, *, lat: float, lon: float,\n'
+              '              radius_m: int = 25000) -> dict:\n'
+              '        url = ("https://api.openaq.org/v2/latest"\n'
+              '               "?coordinates=" + str(lat)\n'
+              '               + "," + str(lon)\n'
+              '               + "&radius=" + str(radius_m)\n'
+              '               + "&limit=20")\n'
+              '        d = self._get_json(url)\n'
+              '        results = d.get("results", [])\n'
+              '        mediciones = [{\n'
+              '            "location": r.get("location"),\n'
+              '            "measurements": r.get(\n'
+              '                "measurements"),\n'
+              '        } for r in results[:10]]\n'
+              '        resumen = {\n'
+              '            "source": self.name,\n'
+              '            "count": len(results),\n'
+              '            "stations": mediciones,\n'
+              '        }\n'
+              '        resumen["sha256"] = self._sha(resumen)\n'
+              '        return resumen\n'
+              '\n'
+              '\n'
+              'class ReliefwebConnector(_HttpBase):\n'
+              '    """Emergencias/desastres publicados\n'
+              '    por la ONU (apidoc.reliefweb.int)."""\n'
+              '\n'
+              '    name = "reliefweb"\n'
+              '\n'
+              '    def fetch(self, *, country_iso3: str = "SLV",\n'
+              '              limit: int = 10) -> dict:\n'
+              '        url = ("https://api.reliefweb.int/v1/disasters"\n'
+              '               "?appname=zyra-network"\n'
+              '               "&profile=list&limit=" + str(limit)\n'
+              '               + "&filter[field]=country.iso3"\n'
+              '               + "&filter[value]=" + country_iso3)\n'
+              '        d = self._get_json(url)\n'
+              '        items = d.get("data", [])\n'
+              '        resumen = {\n'
+              '            "source": self.name,\n'
+              '            "count": len(items),\n'
+              '            "disasters": [\n'
+              '                {"id": it.get("id"),\n'
+              '                 "fields": it.get("fields")}\n'
+              '                for it in items[:limit]],\n'
+              '        }\n'
+              '        resumen["sha256"] = self._sha(resumen)\n'
+              '        return resumen\n'
+          )
+
+          TESTS = (
+              '"""Tests de conectores clima/geo/riesgo (mockeados)."""\n'
+              'from __future__ import annotations\n'
+              '\n'
+              'import json\n'
+              '\n'
+              'from shared_engines.integrations.rates_clima import (\n'
+              '    OpenMeteoConnector,\n'
+              '    NasapowerConnector,\n'
+              '    UsgsConnector,\n'
+              '    OpenAqConnector,\n'
+              '    ReliefwebConnector,\n'
+              ')\n'
+              '\n'
+              '\n'
+              'class _R:\n'
+              '    def __init__(self, p):\n'
+              '        self._p = p\n'
+              '\n'
+              '    def __enter__(self):\n'
+              '        return self\n'
+              '\n'
+              '    def __exit__(self, *a):\n'
+              '        return False\n'
+              '\n'
+              '    def read(self):\n'
+              '        return self._p\n'
+              '\n'
+              '\n'
+              'def _patch(monkeypatch, payload):\n'
+              '    body = json.dumps(payload).encode()\n'
+              '    monkeypatch.setattr(\n'
+              '        "urllib.request.urlopen",\n'
+              '        lambda req, timeout=None: _R(body))\n'
+              '\n'
+              '\n'
+              'def test_open_meteo(tmp_path, monkeypatch) -> None:\n'
+              '    _patch(monkeypatch, {\n'
+              '        "current": {"temperature_2m": 31.2,\n'
+              '                    "relative_humidity_2m": 60,\n'
+              '                    "wind_speed_10m": 8.1},\n'
+              '        "daily": {"temperature_2m_max": [33.0]}})\n'
+              '    r = OpenMeteoConnector().fetch(\n'
+              '        lat=13.69, lon=-89.19)\n'
+              '    assert r["source"] == "open-meteo"\n'
+              '    assert r["temperature"] == 31.2\n'
+              '    assert r["sha256"]\n'
+              '    print("OK clima: open-meteo 31.2C SV")\n'
+              '\n'
+              '\n'
+              'def test_nasa_power(tmp_path, monkeypatch) -> None:\n'
+              '    _patch(monkeypatch, {\n'
+              '        "properties": {"parameter": {\n'
+              '            "T2M": {"JAN": 26.1},\n'
+              '            "PRECTOTCORR": {"JAN": 5.2}}}})\n'
+              '    r = NasapowerConnector().fetch(\n'
+              '        lat=13.69, lon=-89.19)\n'
+              '    assert r["source"] == "nasa-power"\n'
+              '    assert r["t2m"]["JAN"] == 26.1\n'
+              '    print("OK clima: nasa-power agroclimatico")\n'
+              '\n'
+              '\n'
+              'def test_usgs(tmp_path, monkeypatch) -> None:\n'
+              '    _patch(monkeypatch, {\n'
+              '        "features": [\n'
+              '            {"properties": {"mag": 5.1,\n'
+              '                            "place": "El Salvador",\n'
+              '                            "time": 1700000000000}}]})\n'
+              '    r = UsgsConnector().fetch(\n'
+              '        min_lat=12.5, max_lat=14.5,\n'
+              '        min_lon=-91.0, max_lon=-88.0)\n'
+              '    assert r["count"] == 1\n'
+              '    assert r["events"][0]["mag"] == 5.1\n'
+              '    print("OK clima: usgs sismos SV")\n'
+              '\n'
+              '\n'
+              'def test_openaq(tmp_path, monkeypatch) -> None:\n'
+              '    _patch(monkeypatch, {\n'
+              '        "results": [\n'
+              '            {"location": "San Salvador",\n'
+              '             "measurements": [\n'
+              '                 {"parameter": "pm25",\n'
+              '                  "value": 22.5}]}}]})\n'
+              '    r = OpenAqConnector().fetch(\n'
+              '        lat=13.69, lon=-89.19)\n'
+              '    assert r["count"] == 1\n'
+              '    assert r["stations"][0]["location"] == "San Salvador"\n'
+              '    print("OK clima: openaq aire SV")\n'
+              '\n'
+              '\n'
+              'def test_reliefweb(tmp_path, monkeypatch) -> None:\n'
+              '    _patch(monkeypatch, {\n'
+              '        "data": [\n'
+              '            {"id": 12345,\n'
+              '             "fields": {"name": "Flood SV"}}]})\n'
+              '    r = ReliefwebConnector().fetch(\n'
+              '        country_iso3="SLV")\n'
+              '    assert r["count"] == 1\n'
+              '    assert r["disasters"][0]["fields"]["name"] == "Flood SV"\n'
+              '    print("OK clima: reliefweb emergencias SV")\n'
+          )
+
+          p = pathlib.Path("shared_engines/integrations/rates_clima.py")
+          if "class OpenMeteoConnector" not in p.read_text(encoding="utf-8"):
+              p.parent.mkdir(parents=True, exist_ok=True)
+              ast.parse(MODULO)
+              p.write_text(MODULO, encoding="utf-8")
+              py_compile.compile(str(p), doraise=True)
+              out("- **5 providers clima: OK**")
+          else:
+              out("- **5 providers clima: YA**")
+
+          t = pathlib.Path("shared_engines/integrations/tests/test_clima.py")
+          if "test_reliefweb" not in t.read_text(encoding="utf-8"):
+              ast.parse(TESTS)
+              t.write_text(TESTS, encoding="utf-8")
+              py_compile.compile(str(t), doraise=True)
+              out("- **tests clima: OK**")
+          else:
+              out("- **tests clima: YA**")
+          exit(0)
           EOF
+
+      - name: "C1: tests clima"
+        if: always()
+        run: |
+          export PYTHONPATH="$(pwd):$(pwd)/shared_engines"
+          set +e
+          timeout 120 python3 -m pytest shared_engines/integrations/tests/test_clima.py -vv --tb=long --timeout=45 --timeout-method=thread > /tmp/c1.out 2>&1
+          echo $? > /tmp/c1
+          if [ "$(cat /tmp/c1)" = "0" ]; then echo "- C1 clima: ✅" >> "$GITHUB_STEP_SUMMARY"; else echo "- C1: ❌" >> "$GITHUB_STEP_SUMMARY"; { echo "### C1 detalle"; echo '```'; tail -60 /tmp/c1.out; echo '```'; } >> "$GITHUB_STEP_SUMMARY"; fi
           exit 0
+
+      - name: "C2: regresion shared_engines completa"
+        if: always()
+        run: |
+          export PYTHONPATH="$(pwd):$(pwd)/shared_engines"
+          set +e
+          timeout 900 python3 -m pytest shared_engines -q --timeout=60 --timeout-method=thread --tb=line > /tmp/c2.out 2>&1
+          echo $? > /tmp/c2
+          if [ "$(cat /tmp/c2)" = "0" ]; then echo "- C2: ✅" >> "$GITHUB_STEP_SUMMARY"; else echo "- C2: ❌" >> "$GITHUB_STEP_SUMMARY"; { echo "### C2 detalle"; echo '```'; tail -60 /tmp/c2.out; echo '```'; } >> "$GITHUB_STEP_SUMMARY"; fi
+          exit 0
+
+      - name: "C3: apps intactas"
+        if: always()
+        run: |
+          export PYTHONPATH="$(pwd):$(pwd)/shared_engines"
+          set +e
+          timeout 600 python3 -m pytest apps/nexo/tests apps/subastas/tests -q --timeout=45 --timeout-method=thread --tb=line > /tmp/c3.out 2>&1
+          echo $? > /tmp/c3
+          if [ "$(cat /tmp/c3)" = "0" ]; then echo "- C3: ✅" >> "$GITHUB_STEP_SUMMARY"; else echo "- C3: ❌" >> "$GITHUB_STEP_SUMMARY"; { echo "### C3 detalle"; echo '```'; tail -40 /tmp/c3.out; echo '```'; } >> "$GITHUB_STEP_SUMMARY"; fi
+          exit 0
+
+      - name: Veredicto + commit solo si TODO verde
+        if: always()
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          SUM="$GITHUB_STEP_SUMMARY"
+          log() { echo "$1" >> "$SUM"; echo "$1"; }
+          fails=""
+          for g in c1 c2 c3; do
+            c=$(cat /tmp/$g 2>/dev/null || echo 1)
+            [ "$c" != "0" ] && fails="$fails $g"
+          done
+          if [ -n "$fails" ]; then
+            log "**RESULTADO: fallan:$fails — SIN commit**"
+            exit 1
+          fi
+          log "**RESULTADO: C1-C3 VERDES**"
+          find shared_engines -name "__pycache__" -type d -prune -exec rm -rf {} + || true
+          rm -rf .pytest_cache || true
+          git config user.name "zyra-bot"
+          git config user.email "zyra-bot@users.noreply.github.com"
+          git add shared_engines
+          set +e
+          if git diff --cached --quiet; then
+            log "**SIN CAMBIOS**"; exit 0
+          fi
+          git commit -m "feat(conectores): 5 providers clima/geo/riesgo - Open-Meteo, NASA POWER, USGS, OpenAQ, ReliefWeb (resumen normalizado + sha256, tests mockeados) (C1-C3 verdes)"
+          [ $? -ne 0 ] && { log "**COMMIT FALLO**"; exit 1; }
+          log "**COMMIT OK**"
+          git push "https://x-access-token:${GH_TOKEN}@github.com/${GITHUB_REPOSITORY}.git" "HEAD:main" > /tmp/qa.out 2> /tmp/qa.err
+          if [ $? -eq 0 ]; then log "**PUSH OK — LOTE 1/4 CONECTORES. Sigue lote cripto on-chain.**"; exit 0; fi
+          log "**PUSH fallo:**"; { echo '```'; cat /tmp/qa.err; echo '```'; } >> "$SUM"
+          git push origin "HEAD:main" > /tmp/qb.out 2> /tmp/qb.err
+          if [ $? -eq 0 ]; then log "**PUSH OK (intento 2).**"; exit 0; fi
+          log "**PUSH intento 2 fallo:**"; { echo '```'; cat /tmp/qb.err; echo '```'; } >> "$SUM"
+          exit 1

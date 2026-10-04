@@ -190,3 +190,57 @@ def serve_combined(
     return ThreadingHTTPServer(
         (host, port), CombinedHandler
     )
+
+
+import os as _os  # VIVA-3-RATELIMIT
+import time as _rl_time
+
+
+class RateLimiter:
+    """VIVA-3: ventana deslizante por IP."""
+
+    def __init__(self, max_per_minute: int = 120) -> None:
+        self._max = max_per_minute
+        self._hits = {}
+
+    def allow(self, ip: str) -> bool:
+        now = _rl_time.time()
+        cutoff = now - 60.0
+        hits = [t for t in self._hits.get(ip, []) if t > cutoff]
+        if len(hits) >= self._max:
+            self._hits[ip] = hits
+            return False
+        hits.append(now)
+        self._hits[ip] = hits
+        return True
+
+
+_RL_MAX = int(
+    _os.environ.get("ZYRA_RATE_LIMIT", "120"))
+_RATE_LIMITER = RateLimiter(
+    max_per_minute=_RL_MAX)
+_VIVA3_ORIG_DISPATCH = CombinedHandler._dispatch
+_VIVA3_PUBLIC = ("/health", "/verify-existence")
+
+
+def _viva3_dispatch(self, method):
+    path = urlparse(self.path).path
+    if not any(
+            path.startswith(p)
+            for p in _VIVA3_PUBLIC):
+        ip = self.client_address[0]
+        if not _RATE_LIMITER.allow(ip):
+            self._send_json(
+                429,
+                {"ok": False,
+                 "error": {
+                     "type": "rate_limited",
+                     "message": (
+                         "too many requests")}})
+            return
+    return _VIVA3_ORIG_DISPATCH(
+        self, method)
+
+
+CombinedHandler._dispatch = (
+    _viva3_dispatch)  # VIVA-3-RATELIMIT

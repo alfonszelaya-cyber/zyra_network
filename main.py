@@ -63,6 +63,15 @@ def main() -> None:
             "ZYRA_API_TOKEN must be at"
             " least 16 characters"
         )
+    require_token = (
+        os.environ.get(
+            "ZYRA_REQUIRE_TOKEN", "")
+        == "1")  # VIVA-3-REQUIRE-TOKEN
+    if require_token and not token:
+        raise SystemExit(
+            "ZYRA_REQUIRE_TOKEN=1 pero"
+            " ZYRA_API_TOKEN no esta definida:"
+            " la Red se niega a arrancar abierta")
     port = int(
         os.environ.get("ZYRA_PORT")
         or os.environ.get("PORT")

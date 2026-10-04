@@ -1,16 +1,16 @@
-name: "ZYRA AUDIT RED-9 (IA plugable)"
+name: "ZYRA RED-9: IA plugable (Gemini + OpenAI + Ollama)"
 
 on:
   push:
   workflow_dispatch:
 
 permissions:
-  contents: read
+  contents: write
 
 jobs:
-  audit:
+  run:
     runs-on: ubuntu-latest
-    timeout-minutes: 15
+    timeout-minutes: 25
 
     steps:
       - name: Checkout
@@ -30,55 +30,549 @@ jobs:
           fi
           echo "DEPS OK"
 
-      - name: P1 - ai/engine.py completo
+      - name: Construir RED-9
         run: |
-          {
-          echo "## ai/engine.py COMPLETO (numerado)"
-          echo '```python'
-          awk '{printf "%5d| %s\n", NR, $0}' shared_engines/ai/engine.py 2>/dev/null | head -280 || true
-          echo '```'
-          } | tee -a "$GITHUB_STEP_SUMMARY"
+          export PYTHONPATH="$(pwd):$(pwd)/shared_engines"
+          python3 << 'EOF'
+          import ast, pathlib, py_compile, textwrap, traceback
+          SUM = __import__("os").environ.get("GITHUB_STEP_SUMMARY", "")
+          def out(t):
+              print(t, flush=True)
+              if SUM:
+                  with open(SUM, "a", encoding="utf-8") as f:
+                      f.write(t + "\n")
+          def D(s):
+              return textwrap.dedent(s)
+
+          MOD = D(r'''
+              """RED-9: IA plugable de la Red.
+
+              Contrato AIProvider + 3 fuentes con
+              fallback (AIChain, patron ProviderChain):
+              Gemini -> OpenAI -> Ollama. Keys por env
+              del dueno (GEMINI_API_KEY, OPENAI_API_KEY);
+              Ollama local en VPS (sin key). Sin key
+              configurada: falla HONESTO not_configured.
+              Cada analisis ejecutado queda registrado
+              por AIEngine (provenance firmado: modelo,
+              version, sha256 del contenido, veredicto,
+              confianza)."""
+              from __future__ import annotations
+
+              import json
+              import os
+              import urllib.request
+              from dataclasses import dataclass
+
+
+              @dataclass(frozen=True)
+              class AIResult:
+                  provider: str
+                  model: str
+                  verdict: str
+                  confidence: float
+                  raw: str
+
+
+              class AIProvider:
+                  """Contrato base de proveedor de IA."""
+
+                  name = "base"
+
+                  def analyze(self, prompt: str,
+                              content: str) -> AIResult:
+                      raise NotImplementedError
+
+
+              class _HttpJson:
+                  """POST JSON comun a los providers."""
+
+                  def __init__(self, *,
+                               timeout_seconds: float = 60.0):
+                      self._timeout = timeout_seconds
+
+                  def _post(self, url: str,
+                            payload: dict,
+                            headers: dict) -> dict:
+                      body = json.dumps(
+                          payload).encode("utf-8")
+                      h = {"Content-Type":
+                           "application/json"}
+                      h.update(headers)
+                      req = urllib.request.Request(
+                          url,
+                          data=body,
+                          headers=h,
+                          method="POST")
+                      with urllib.request.urlopen(
+                              req,
+                              timeout=self._timeout) as r:
+                          return json.loads(
+                              r.read().decode("utf-8"))
+
+
+              class GeminiProvider(_HttpJson, AIProvider):
+                  """1a fuente: Gemini API (key del dueno)."""
+
+                  name = "gemini"
+
+                  def __init__(self, *,
+                               api_key: str = "",
+                               model: str = "gemini-1.5-flash",
+                               **kwargs) -> None:
+                      super().__init__(**kwargs)
+                      self._key = (api_key
+                                   or os.environ.get(
+                                       "GEMINI_API_KEY", ""))
+                      self._model = model
+
+                  def is_configured(self) -> bool:
+                      return bool(self._key)
+
+                  def analyze(self, prompt: str,
+                              content: str) -> AIResult:
+                      if not self.is_configured():
+                          raise RuntimeError(
+                              "not_configured:"
+                              " define GEMINI_API_KEY")
+                      url = ("https://generativelanguage"
+                             ".googleapis.com/v1beta/models/"
+                             + self._model
+                             + ":generateContent?key="
+                             + self._key)
+                      payload = {
+                          "contents": [{
+                              "parts": [{
+                                  "text": prompt + "\n\n"
+                                          + content}]}],
+                          "generationConfig": {
+                              "temperature": 0.1},
+                      }
+                      try:
+                          d = self._post(
+                              url, payload, {})
+                      except Exception as exc:
+                          raise RuntimeError(
+                              "gemini unavailable: "
+                              + type(exc).__name__) from exc
+                      try:
+                          text = (d["candidates"][0]
+                                  ["content"]["parts"][0]
+                                  ["text"])
+                      except (KeyError, IndexError):
+                          raise RuntimeError(
+                              "gemini respuesta inesperada")
+                      verdict = text.strip()[:200]
+                      return AIResult(
+                          provider=self.name,
+                          model=self._model,
+                          verdict=verdict,
+                          confidence=0.8,
+                          raw=text)
+
+
+              class OpenaiProvider(_HttpJson, AIProvider):
+                  """2a fuente: OpenAI API (key del dueno)."""
+
+                  name = "openai"
+
+                  def __init__(self, *,
+                               api_key: str = "",
+                               model: str = "gpt-4o-mini",
+                               **kwargs) -> None:
+                      super().__init__(**kwargs)
+                      self._key = (api_key
+                                   or os.environ.get(
+                                       "OPENAI_API_KEY", ""))
+                      self._model = model
+
+                  def is_configured(self) -> bool:
+                      return bool(self._key)
+
+                  def analyze(self, prompt: str,
+                              content: str) -> AIResult:
+                      if not self.is_configured():
+                          raise RuntimeError(
+                              "not_configured:"
+                              " define OPENAI_API_KEY")
+                      url = ("https://api.openai.com"
+                             "/v1/chat/completions")
+                      payload = {
+                          "model": self._model,
+                          "messages": [
+                              {"role": "system",
+                               "content": prompt},
+                              {"role": "user",
+                               "content": content}],
+                          "temperature": 0.1,
+                      }
+                      try:
+                          d = self._post(
+                              url, payload, headers={
+                                  "Authorization":
+                                  "Bearer "
+                                  + self._key})
+                      except Exception as exc:
+                          raise RuntimeError(
+                              "openai unavailable: "
+                              + type(exc).__name__) from exc
+                      try:
+                          text = (d["choices"][0]
+                                  ["message"]["content"])
+                      except (KeyError, IndexError):
+                          raise RuntimeError(
+                              "openai respuesta inesperada")
+                      verdict = text.strip()[:200]
+                      return AIResult(
+                          provider=self.name,
+                          model=self._model,
+                          verdict=verdict,
+                          confidence=0.8,
+                          raw=text)
+
+
+              class OllamaProvider(_HttpJson, AIProvider):
+                  """3a fuente: IA local via Ollama en
+                  el VPS (localhost:11434). Sin key,
+                  sin costo, soberania total."""
+
+                  name = "ollama"
+
+                  def __init__(self, *,
+                               host: str = "",
+                               model: str = "llama3.2",
+                               **kwargs) -> None:
+                      super().__init__(**kwargs)
+                      self._host = (host
+                                    or os.environ.get(
+                                        "OLLAMA_HOST",
+                                        "http://localhost:11434"))
+                      self._model = model
+
+                  def is_configured(self) -> bool:
+                      return True
+
+                  def analyze(self, prompt: str,
+                              content: str) -> AIResult:
+                      url = (self._host
+                             + "/api/generate")
+                      payload = {
+                          "model": self._model,
+                          "prompt": prompt + "\n\n"
+                                    + content,
+                          "stream": False,
+                      }
+                      try:
+                          d = self._post(url, payload, {})
+                      except Exception as exc:
+                          raise RuntimeError(
+                              "ollama unavailable: "
+                              + type(exc).__name__) from exc
+                      text = d.get("response", "")
+                      verdict = text.strip()[:200]
+                      return AIResult(
+                          provider=self.name,
+                          model=self._model,
+                          verdict=verdict,
+                          confidence=0.6,
+                          raw=text)
+
+
+              class AIChain:
+                  """Fallback en orden: el primer
+                  provider configurado y disponible
+                  gana; los errores pasan al siguiente.
+                  Si todos fallan: error honesto."""
+
+                  def __init__(self,
+                               providers: list) -> None:
+                      self._providers = list(providers)
+
+                  def analyze(self, prompt: str,
+                              content: str) -> AIResult:
+                      errores = []
+                      for p in self._providers:
+                          try:
+                              return p.analyze(
+                                  prompt, content)
+                          except Exception as exc:
+                              errores.append(
+                                  p.name + ": "
+                                  + type(exc).__name__)
+                      raise RuntimeError(
+                          "todos los providers de IA"
+                          " fallaron ("
+                          + "; ".join(errores) + ")")
+          ''')
+
+          TESTS = D(r'''
+              """Tests RED-9: IA plugable (mockeada + honesta)."""
+              from __future__ import annotations
+
+              import json
+
+              import pytest
+
+              from shared_engines.ai.providers import (
+                  AIChain,
+                  GeminiProvider,
+                  OllamaProvider,
+                  OpenaiProvider,
+              )
+              from shared_engines.audit.chain import AuditTrail
+              from shared_engines.common.clocks import FrozenClock
+              from shared_engines.events.outbox import Outbox
+              from shared_engines.ai.engine import AIEngine
+              from shared_engines.storage.database import SQLiteAdapter
+
+
+              class _R:
+                  def __init__(self, p):
+                      self._p = p
+
+                  def __enter__(self):
+                      return self
+
+                  def __exit__(self, *a):
+                      return False
+
+                  def read(self):
+                      return self._p
+
+
+              def _engine(tmp_path):
+                  db = SQLiteAdapter(tmp_path / "ai9.db")
+                  clock = FrozenClock()
+                  audit = AuditTrail(db, clock)
+                  outbox = Outbox(db, clock)
+                  outbox.ensure_schema()
+                  return AIEngine(
+                      db, clock, audit=audit, outbox=outbox)
+
+
+              def test_gemini_sin_key_honesto(
+                  tmp_path, monkeypatch) -> None:
+                  monkeypatch.delenv(
+                      "GEMINI_API_KEY", raising=False)
+                  monkeypatch.setattr(
+                      "urllib.request.urlopen",
+                      lambda req, timeout=None: (
+                          (_ for _ in ()).throw(
+                              AssertionError(
+                                  "sin key no llama red"))))
+                  with pytest.raises(
+                          RuntimeError,
+                          match="not_configured"):
+                      GeminiProvider().analyze(
+                          "analiza", "contenido")
+                  print("OK RED-9: gemini sin key ="
+                        " not_configured, cero llamada")
+
+
+              def test_gemini_analiza_mock(
+                  tmp_path, monkeypatch) -> None:
+                  body = json.dumps({
+                      "candidates": [{"content": {
+                          "parts": [{"text":
+                              "documento autentico"}]}}]}).encode()
+                  monkeypatch.setenv(
+                      "GEMINI_API_KEY", "AIza-test")
+                  monkeypatch.setattr(
+                      "urllib.request.urlopen",
+                      lambda req, timeout=None: _R(body))
+                  r = GeminiProvider().analyze(
+                      "clasifica", "contenido-x")
+                  assert r.provider == "gemini"
+                  assert "autentico" in r.verdict
+                  print("OK RED-9: gemini analiza (mock)")
+
+
+              def test_openai_analiza_mock(
+                  tmp_path, monkeypatch) -> None:
+                  body = json.dumps({
+                      "choices": [{"message": {
+                          "content":
+                          "posible fraude detectado"}}]}).encode()
+                  monkeypatch.setenv(
+                      "OPENAI_API_KEY", "sk-test")
+                  monkeypatch.setattr(
+                      "urllib.request.urlopen",
+                      lambda req, timeout=None: _R(body))
+                  r = OpenaiProvider().analyze(
+                      "clasifica", "contenido-y")
+                  assert r.provider == "openai"
+                  assert "fraude" in r.verdict
+                  print("OK RED-9: openai analiza (mock)")
+
+
+              def test_chain_fallback_gemini_a_openai(
+                  tmp_path, monkeypatch) -> None:
+                  monkeypatch.setenv(
+                      "GEMINI_API_KEY", "AIza-test")
+                  monkeypatch.setenv(
+                      "OPENAI_API_KEY", "sk-test")
+                  body_openai = json.dumps({
+                      "choices": [{"message": {
+                          "content":
+                          "openai respondio"}}]}).encode()
+
+                  def fake(req, timeout=None):
+                      url = req.full_url
+                      if "generativelanguage" in url:
+                          raise OSError("gemini caido")
+                      if "api.openai.com" in url:
+                          return _R(body_openai)
+                      raise OSError(url[:60])
+
+                  monkeypatch.setattr(
+                      "urllib.request.urlopen", fake)
+                  chain = AIChain([
+                      GeminiProvider(),
+                      OpenaiProvider()])
+                  r = chain.analyze("x", "y")
+                  assert r.provider == "openai"
+                  print("OK RED-9: gemini cae ->"
+                        " openai responde solo")
+
+
+              def test_provenance_registrado(
+                  tmp_path, monkeypatch) -> None:
+                  """RED-9 completo: chain ejecuta y
+                  AIEngine registra el provenance."""
+                  body = json.dumps({
+                      "candidates": [{"content": {
+                          "parts": [{"text":
+                              "autentico"}]}}]}).encode()
+                  monkeypatch.setenv(
+                      "GEMINI_API_KEY", "AIza-test")
+                  monkeypatch.setattr(
+                      "urllib.request.urlopen",
+                      lambda req, timeout=None: _R(body))
+                  engine = _engine(tmp_path)
+                  engine.register_model(
+                      model_id="gemini-1.5-flash",
+                      provider="gemini",
+                      model_version="1.5",
+                      capabilities=("document",))
+                  r = GeminiProvider().analyze(
+                      "clasifica", "doc")
+                  rec = engine.record_analysis(
+                      model_id="gemini-1.5-flash",
+                      content_sha256=(
+                          "b" * 64),
+                      verdict=r.verdict,
+                      confidence=r.confidence)
+                  assert rec.model_version == "1.5"
+                  evs = engine._db.query_all(
+                      "SELECT event_type FROM"
+                      " events_outbox WHERE"
+                      " aggregate_id = ?",
+                      (rec.analysis_id,))
+                  tipos = [str(x["event_type"])
+                           for x in evs]
+                  assert ("ai.analysis.recorded"
+                          in tipos)
+                  print("OK RED-9: analisis ejecutado y"
+                        " registrado con provenance firmado")
+          ''')
+
+          p = pathlib.Path("shared_engines/ai/providers.py")
+          if p.exists() and "class AIChain" in p.read_text(encoding="utf-8"):
+              out("- **modulo providers: YA**")
+          else:
+              try:
+                  ast.parse(MOD)
+                  p.parent.mkdir(parents=True, exist_ok=True)
+                  p.write_text(MOD, encoding="utf-8")
+                  py_compile.compile(str(p), doraise=True)
+                  out("- **modulo providers: OK (" + str(len(MOD)) + " chars)**")
+              except Exception:
+                  out("- **modulo providers: ERROR (no bloquea)**")
+                  out("```\n" + traceback.format_exc().strip() + "\n```")
+
+          t = pathlib.Path("shared_engines/ai/tests/test_providers.py")
+          if t.exists() and "test_provenance_registrado" in t.read_text(encoding="utf-8"):
+              out("- **tests providers: YA**")
+          else:
+              try:
+                  ast.parse(TESTS)
+                  t.parent.mkdir(parents=True, exist_ok=True)
+                  t.write_text(TESTS, encoding="utf-8")
+                  py_compile.compile(str(t), doraise=True)
+                  out("- **tests providers: OK (" + str(len(TESTS)) + " chars)**")
+              except Exception:
+                  out("- **tests providers: ERROR (no bloquea)**")
+                  out("```\n" + traceback.format_exc().strip() + "\n```")
+
+          chk = pathlib.Path("shared_engines/ai/providers.py")
+          chk2 = pathlib.Path("shared_engines/ai/tests/test_providers.py")
+          out("- **verif disco: providers=" + str(chk.exists()) + " tests=" + str(chk2.exists()) + "**")
+          exit(0)
+          EOF
+
+      - name: "R9-1: tests providers"
+        if: always()
+        run: |
+          export PYTHONPATH="$(pwd):$(pwd)/shared_engines"
+          set +e
+          timeout 180 python3 -m pytest shared_engines/ai/tests/test_providers.py -vv --tb=long --timeout=60 --timeout-method=thread > /tmp/r9a.out 2>&1
+          echo $? > /tmp/r9a
+          if [ "$(cat /tmp/r9a)" = "0" ]; then echo "- R9 providers: ✅" >> "$GITHUB_STEP_SUMMARY"; else echo "- R9: ❌" >> "$GITHUB_STEP_SUMMARY"; { echo "### R9 detalle"; echo '```'; tail -80 /tmp/r9a.out; echo '```'; } >> "$GITHUB_STEP_SUMMARY"; fi
           exit 0
 
-      - name: P2 - estructura del modulo ai
+      - name: "R9-2: regresion shared_engines completa"
+        if: always()
         run: |
-          {
-          echo "## archivos ai + clases/defs"
-          echo '```'
-          find shared_engines/ai -name "*.py" | sort || true
-          echo ""
-          grep -rn "^class \|    def \|^def " shared_engines/ai --include='*.py' | grep -v tests | head -40 || true
-          echo '```'
-          } | tee -a "$GITHUB_STEP_SUMMARY"
+          export PYTHONPATH="$(pwd):$(pwd)/shared_engines"
+          set +e
+          timeout 900 python3 -m pytest shared_engines -q --timeout=60 --timeout-method=thread --tb=line > /tmp/r9b.out 2>&1
+          echo $? > /tmp/r9b
+          if [ "$(cat /tmp/r9b)" = "0" ]; then echo "- R9b regresion: ✅" >> "$GITHUB_STEP_SUMMARY"; else echo "- R9b: ❌" >> "$GITHUB_STEP_SUMMARY"; { echo "### R9b detalle"; echo '```'; tail -60 /tmp/r9b.out; echo '```'; } >> "$GITHUB_STEP_SUMMARY"; fi
           exit 0
 
-      - name: P3 - patron de construccion en tests
+      - name: "R9-3: apps intactas"
+        if: always()
         run: |
-          {
-          echo "## test_ai.py: tests y construccion del engine"
-          echo '```python'
-          grep -n "def test_" shared_engines/ai/tests/test_ai.py 2>/dev/null | head -20 || true
-          echo ""
-          L=$(grep -n "AIEngine(" shared_engines/ai/tests/test_ai.py | head -1 | cut -d: -f1 || true)
-          if [ -n "$L" ]; then
-            s=$((L-12)); [ "$s" -lt 1 ] && s=1
-            awk -v a="$s" -v b="$((L+28))" 'NR>=a && NR<=b {printf "%5d| %s\n", NR, $0}' shared_engines/ai/tests/test_ai.py
+          export PYTHONPATH="$(pwd):$(pwd)/shared_engines"
+          set +e
+          timeout 600 python3 -m pytest apps/nexo/tests apps/subastas/tests -q --timeout=45 --timeout-method=thread --tb=line > /tmp/r9c.out 2>&1
+          echo $? > /tmp/r9c
+          if [ "$(cat /tmp/r9c)" = "0" ]; then echo "- R9c apps: ✅" >> "$GITHUB_STEP_SUMMARY"; else echo "- R9c: ❌" >> "$GITHUB_STEP_SUMMARY"; { echo "### R9c detalle"; echo '```'; tail -40 /tmp/r9c.out; echo '```'; } >> "$GITHUB_STEP_SUMMARY"; fi
+          exit 0
+
+      - name: Veredicto + commit solo si TODO verde
+        if: always()
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          SUM="$GITHUB_STEP_SUMMARY"
+          log() { echo "$1" >> "$SUM"; echo "$1"; }
+          fails=""
+          for g in r9a r9b r9c; do
+            c=$(cat /tmp/$g 2>/dev/null || echo 1)
+            [ "$c" != "0" ] && fails="$fails $g"
+          done
+          if [ -n "$fails" ]; then
+            log "**RESULTADO: fallan:$fails — SIN commit**"
+            exit 1
           fi
-          echo '```'
-          } | tee -a "$GITHUB_STEP_SUMMARY"
-          exit 0
-
-      - name: P4 - rutas ai en la API (hay o no hay)
-        run: |
-          {
-          echo "## rutas ai en API"
-          echo '```'
-          grep -n '"ai"\|ai/analyze\|_handle_ai\|AIEngine' shared_engines/runtime/api.py shared_engines/runtime/capabilities_api.py shared_engines/runtime/combined_api.py 2>/dev/null | head -12 || true
-          echo "(vacio = no hay rutas, RED-9 las agrega)"
-          echo '```'
-          echo "## AIEngine en capabilities (ya instanciado?)"
-          echo '```'
-          grep -n "AIEngine" shared_engines/runtime/capabilities.py | head -5 || true
-          echo '```'
-          } | tee -a "$GITHUB_STEP_SUMMARY"
-          exit 0
+          log "**RESULTADO: R9 VERDE — 12/12 MOTORES COMPLETOS**"
+          find shared_engines -name "__pycache__" -type d -prune -exec rm -rf {} + || true
+          rm -rf .pytest_cache || true
+          git config user.name "zyra-bot"
+          git config user.email "zyra-bot@users.noreply.github.com"
+          git add shared_engines
+          set +e
+          if git diff --cached --quiet; then
+            log "**SIN CAMBIOS**"; exit 0
+          fi
+          git commit -m "feat(RED-9): IA plugable - AIProvider + GeminiProvider + OpenaiProvider + OllamaProvider + AIChain fallback (keys por env, not_configured honesto) (R9 verdes)"
+          [ $? -ne 0 ] && { log "**COMMIT FALLO**"; exit 1; }
+          log "**COMMIT OK**"
+          git push "https://x-access-token:${GH_TOKEN}@github.com/${GITHUB_REPOSITORY}.git" "HEAD:main" > /tmp/qa.out 2> /tmp/qa.err
+          if [ $? -eq 0 ]; then log "**PUSH OK — RED-9 CERRADO: 12/12 MOTORES. Sigue NEXO Plan A.**"; exit 0; fi
+          log "**PUSH fallo:**"; { echo '```'; cat /tmp/qa.err; echo '```'; } >> "$SUM"
+          git push origin "HEAD:main" > /tmp/qb.out 2> /tmp/qb.err
+          if [ $? -eq 0 ]; then log "**PUSH OK (intento 2) — RED-9 CERRADO.**"; exit 0; fi
+          log "**PUSH intento 2 fallo:**"; { echo '```'; cat /tmp/qb.err; echo '```'; } >> "$SUM"
+          exit 1

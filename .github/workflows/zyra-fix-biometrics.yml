@@ -1,16 +1,16 @@
-name: "ZYRA AUDIT VIVA-3 v2 (re-captura seguridad)"
+name: "ZYRA VIVA-3: token obligatorio + rate limit"
 
 on:
   push:
   workflow_dispatch:
 
 permissions:
-  contents: read
+  contents: write
 
 jobs:
-  audit:
+  run:
     runs-on: ubuntu-latest
-    timeout-minutes: 15
+    timeout-minutes: 25
 
     steps:
       - name: Checkout
@@ -30,85 +30,324 @@ jobs:
           fi
           echo "DEPS OK"
 
-      - name: P1 - config.py completo
-        run: |
-          {
-          echo "## config.py COMPLETO"
-          echo '```python'
-          awk '{printf "%5d| %s\n", NR, $0}' shared_engines/runtime/config.py 2>/dev/null || true
-          echo '```'
-          } | tee -a "$GITHUB_STEP_SUMMARY"
-          exit 0
-
-      - name: P2 - api.py _authorized
-        run: |
-          {
-          echo "## api.py - _authorized (fuente)"
-          echo '```python'
-          L=$(grep -n "def _authorized" shared_engines/runtime/api.py | head -1 | cut -d: -f1)
-          s=$((L-3)); [ "$s" -lt 1 ] && s=1
-          awk -v a="$s" -v b="$((L+35))" 'NR>=a && NR<=b {printf "%5d| %s\n", NR, $0}' shared_engines/runtime/api.py
-          echo '```'
-          } | tee -a "$GITHUB_STEP_SUMMARY"
-          exit 0
-
-      - name: P3 - do_GET/do_POST/_dispatch en api.py y combined_api.py
-        run: |
-          {
-          echo "## puntos de enganche del rate limiter"
-          echo '```python'
-          for F in shared_engines/runtime/api.py shared_engines/runtime/combined_api.py; do
-            echo "--- $F"
-            for FN in "def do_GET" "def do_POST" "def _dispatch"; do
-              L=$(grep -n "$FN" "$F" | head -1 | cut -d: -f1 || true)
-              if [ -n "$L" ]; then
-                s=$((L-2)); [ "$s" -lt 1 ] && s=1
-                awk -v a="$s" -v b="$((L+22))" 'NR>=a && NR<=b {printf "%5d| %s\n", NR, $0}' "$F"
-                echo "---"
-              fi
-            done
-          done
-          echo '```'
-          } | tee -a "$GITHUB_STEP_SUMMARY"
-          exit 0
-
-      - name: P4 - sonda de rutas sin token (linea base)
+      - name: Wiring VIVA-3
         run: |
           export PYTHONPATH="$(pwd):$(pwd)/shared_engines"
-          python3 << 'EOF' | tee -a "$GITHUB_STEP_SUMMARY"
-          import json
-          import threading
-          import time
-          import urllib.request
-          import urllib.error
-          from shared_engines.storage.database import SQLiteAdapter
-          from shared_engines.common.clocks import SystemClock
-          from shared_engines.runtime.config import RuntimeConfig
-          from shared_engines.runtime.kernel import ZyraKernel
-          from shared_engines.runtime.capabilities import ZyraCapabilities
-          from shared_engines.runtime.combined_api import serve_combined
-          from shared_engines.verification.signatures import Ed25519Signer
-          print("## Linea base - rutas sin token")
-          print("```")
-          db = SQLiteAdapter(":memory:")
-          s, _ = Ed25519Signer.generate()
-          k = ZyraKernel(db=db, clock=SystemClock(), signer=s, config=RuntimeConfig(host="127.0.0.1", port=0, api_token=None))
-          k.bootstrap_root()
-          caps = ZyraCapabilities(db, SystemClock(), identity=k.identity, signer=s)
-          srv = serve_combined(k, caps, host="127.0.0.1", port=0)
-          threading.Thread(target=srv.serve_forever, daemon=True).start()
-          time.sleep(0.4)
-          base = "http://127.0.0.1:" + str(srv.server_address[1])
-          for ruta in ("/health", "/verify-existence/ZID-x", "/bridge/subscriptions/x", "/tokens/items"):
+          python3 << 'EOF'
+          import ast, pathlib, py_compile, textwrap, traceback
+          SUM = __import__("os").environ.get("GITHUB_STEP_SUMMARY", "")
+          def out(t):
+              print(t, flush=True)
+              if SUM:
+                  with open(SUM, "a", encoding="utf-8") as f:
+                      f.write(t + "\n")
+          def fix(nombre, fn):
               try:
-                  with urllib.request.urlopen(base + ruta, timeout=10) as r:
-                      print(ruta, "->", r.status, "(PUBLICA)")
-              except urllib.error.HTTPError as e:
-                  print(ruta, "->", e.code, "(protegida)")
-              except Exception as e:
-                  print(ruta, "->", type(e).__name__, str(e)[:80])
-          srv.shutdown()
-          srv.server_close()
-          print("```")
+                  out("- **" + nombre + ": " + fn() + "**")
+              except Exception:
+                  out("- **" + nombre + ": ERROR (no bloquea)**")
+                  out("```\n" + traceback.format_exc().strip() + "\n```")
+
+          def fa():
+              p = pathlib.Path("main.py")
+              src = p.read_text(encoding="utf-8")
+              if "VIVA-3-REQUIRE-TOKEN" in src:
+                  return "YA"
+              ancla = (
+                  "    if token is not None and len(\n"
+                  "        token\n"
+                  "    ) < 16:\n"
+                  "        raise SystemExit(\n"
+                  "            \"ZYRA_API_TOKEN must be at\"\n"
+                  "            \" least 16 characters\"\n"
+                  "        )"
+              )
+              if ancla not in src:
+                  raise RuntimeError("ancla token no hallada")
+              extra = (
+                  "\n    require_token = (\n"
+                  "        os.environ.get(\n"
+                  "            \"ZYRA_REQUIRE_TOKEN\", \"\")\n"
+                  "        == \"1\")  # VIVA-3-REQUIRE-TOKEN\n"
+                  "    if require_token and not token:\n"
+                  "        raise SystemExit(\n"
+                  "            \"ZYRA_REQUIRE_TOKEN=1 pero\"\n"
+                  "            \" ZYRA_API_TOKEN no esta definida:\"\n"
+                  "            \" la Red se niega a arrancar abierta\")"
+              )
+              src = src.replace(ancla, ancla + extra, 1)
+              ast.parse(src)
+              p.write_text(src, encoding="utf-8")
+              py_compile.compile(str(p), doraise=True)
+              return "OK"
+
+          def fb():
+              p = pathlib.Path("shared_engines/runtime/combined_api.py")
+              src = p.read_text(encoding="utf-8")
+              if "VIVA-3-RATELIMIT" in src:
+                  return "YA"
+              W = ('\n\nimport os as _os  # VIVA-3-RATELIMIT\n'
+                   'import time as _rl_time\n'
+                   '\n'
+                   '\n'
+                   'class RateLimiter:\n'
+                   '    """VIVA-3: ventana deslizante por IP."""\n'
+                   '\n'
+                   '    def __init__(self, max_per_minute: int = 120) -> None:\n'
+                   '        self._max = max_per_minute\n'
+                   '        self._hits = {}\n'
+                   '\n'
+                   '    def allow(self, ip: str) -> bool:\n'
+                   '        now = _rl_time.time()\n'
+                   '        cutoff = now - 60.0\n'
+                   '        hits = [t for t in self._hits.get(ip, []) if t > cutoff]\n'
+                   '        if len(hits) >= self._max:\n'
+                   '            self._hits[ip] = hits\n'
+                   '            return False\n'
+                   '        hits.append(now)\n'
+                   '        self._hits[ip] = hits\n'
+                   '        return True\n'
+                   '\n'
+                   '\n'
+                   '_RL_MAX = int(\n'
+                   '    _os.environ.get("ZYRA_RATE_LIMIT", "120"))\n'
+                   '_RATE_LIMITER = RateLimiter(\n'
+                   '    max_per_minute=_RL_MAX)\n'
+                   '_VIVA3_ORIG_DISPATCH = CombinedHandler._dispatch\n'
+                   '_VIVA3_PUBLIC = ("/health", "/verify-existence")\n'
+                   '\n'
+                   '\n'
+                   'def _viva3_dispatch(self, method):\n'
+                   '    path = urlparse(self.path).path\n'
+                   '    if not any(\n'
+                   '            path.startswith(p)\n'
+                   '            for p in _VIVA3_PUBLIC):\n'
+                   '        ip = self.client_address[0]\n'
+                   '        if not _RATE_LIMITER.allow(ip):\n'
+                   '            self._send_json(\n'
+                   '                429,\n'
+                   '                {"ok": False,\n'
+                   '                 "error": {\n'
+                   '                     "type": "rate_limited",\n'
+                   '                     "message": (\n'
+                   '                         "too many requests")}})\n'
+                   '            return\n'
+                   '    return _VIVA3_ORIG_DISPATCH(\n'
+                   '        self, method)\n'
+                   '\n'
+                   '\n'
+                   'CombinedHandler._dispatch = (\n'
+                   '    _viva3_dispatch)  # VIVA-3-RATELIMIT\n')
+              if not src.endswith("\n"):
+                  src += "\n"
+              src = src + W
+              ast.parse(src)
+              p.write_text(src, encoding="utf-8")
+              py_compile.compile(str(p), doraise=True)
+              return "OK"
+
+          def fc():
+              TEST = (
+                  '"""VIVA-3: token obligatorio + rate limit."""\n'
+                  'from __future__ import annotations\n'
+                  '\n'
+                  'import json\n'
+                  'import threading\n'
+                  'import time\n'
+                  'import urllib.request\n'
+                  'import urllib.error\n'
+                  '\n'
+                  'from shared_engines.common.clocks import SystemClock\n'
+                  'from shared_engines.runtime.config import RuntimeConfig\n'
+                  'from shared_engines.runtime.kernel import ZyraKernel\n'
+                  'from shared_engines.runtime.capabilities import (\n'
+                  '    ZyraCapabilities)\n'
+                  'from shared_engines.runtime.combined_api import (\n'
+                  '    serve_combined, RateLimiter)\n'
+                  'import shared_engines.runtime.combined_api as _capi\n'
+                  'from shared_engines.storage.database import SQLiteAdapter\n'
+                  'from shared_engines.verification.signatures import (\n'
+                  '    Ed25519Signer)\n'
+                  '\n'
+                  '\n'
+                  'def _stack(tmp_path, api_token=None):\n'
+                  '    db = SQLiteAdapter(tmp_path / "v3.db")\n'
+                  '    s, _ = Ed25519Signer.generate()\n'
+                  '    k = ZyraKernel(\n'
+                  '        db=db, clock=SystemClock(), signer=s,\n'
+                  '        config=RuntimeConfig(\n'
+                  '            host="127.0.0.1", port=0,\n'
+                  '            api_token=api_token))\n'
+                  '    k.bootstrap_root()\n'
+                  '    caps = ZyraCapabilities(\n'
+                  '        db, SystemClock(),\n'
+                  '        identity=k.identity, signer=s)\n'
+                  '    srv = serve_combined(\n'
+                  '        k, caps, host="127.0.0.1", port=0)\n'
+                  '    threading.Thread(\n'
+                  '        target=srv.serve_forever,\n'
+                  '        daemon=True).start()\n'
+                  '    time.sleep(0.4)\n'
+                  '    base = ("http://127.0.0.1:"\n'
+                  '            + str(srv.server_address[1]))\n'
+                  '    return base, srv\n'
+                  '\n'
+                  '\n'
+                  'def _get(base, ruta, header=None):\n'
+                  '    h = {}\n'
+                  '    if header:\n'
+                  '        h["Authorization"] = header\n'
+                  '    req = urllib.request.Request(\n'
+                  '        base + ruta, headers=h)\n'
+                  '    try:\n'
+                  '        with urllib.request.urlopen(\n'
+                  '                req, timeout=10) as r:\n'
+                  '            return r.status\n'
+                  '    except urllib.error.HTTPError as e:\n'
+                  '        return e.code\n'
+                  '\n'
+                  '\n'
+                  'def test_rate_limiter_unit() -> None:\n'
+                  '    rl = RateLimiter(max_per_minute=3)\n'
+                  '    assert rl.allow("1.2.3.4") is True\n'
+                  '    assert rl.allow("1.2.3.4") is True\n'
+                  '    assert rl.allow("1.2.3.4") is True\n'
+                  '    assert rl.allow("1.2.3.4") is False\n'
+                  '    assert rl.allow("5.6.7.8") is True\n'
+                  '    print("OK VIVA-3: rate limiter 3/min por IP")\n'
+                  '\n'
+                  '\n'
+                  'def test_auth_enforced_con_token(\n'
+                  '        tmp_path) -> None:\n'
+                  '    base, srv = _stack(\n'
+                  '        tmp_path,\n'
+                  '        api_token="test-token-12345678")\n'
+                  '    try:\n'
+                  '        code = _get(base, "/tokens/items")\n'
+                  '        assert code == 401, str(code)\n'
+                  '        code2 = _get(\n'
+                  '            base, "/tokens/items",\n'
+                  '            header=("Bearer "\n'
+                  '                    "test-token-12345678"))\n'
+                  '        assert code2 != 401, str(code2)\n'
+                  '        code3 = _get(base, "/health")\n'
+                  '        assert code3 == 200, str(code3)\n'
+                  '        print("OK VIVA-3: token exigido en"\n'
+                  '              " rutas protegidas; publicas libres")\n'
+                  '    finally:\n'
+                  '        srv.shutdown()\n'
+                  '        srv.server_close()\n'
+                  '\n'
+                  '\n'
+                  'def test_rate_limit_429(tmp_path) -> None:\n'
+                  '    base, srv = _stack(tmp_path)\n'
+                  '    viejo = _capi._RATE_LIMITER._max\n'
+                  '    _capi._RATE_LIMITER._max = 3\n'
+                  '    _capi._RATE_LIMITER._hits.clear()\n'
+                  '    try:\n'
+                  '        codigos = [\n'
+                  '            _get(base, "/tokens/items")\n'
+                  '            for _ in range(5)]\n'
+                  '        assert 429 in codigos, str(codigos)\n'
+                  '        assert codigos[0] != 429\n'
+                  '        h = _get(base, "/health")\n'
+                  '        assert h == 200, str(h)\n'
+                  '        print("OK VIVA-3: 429 al exceder;\n'
+                  '              health exenta")\n'
+                  '    finally:\n'
+                  '        _capi._RATE_LIMITER._max = viejo\n'
+                  '        _capi._RATE_LIMITER._hits.clear()\n'
+                  '        srv.shutdown()\n'
+                  '        srv.server_close()\n'
+                  '\n'
+                  '\n'
+                  'def test_sin_env_comportamiento_actual(\n'
+                  '        tmp_path) -> None:\n'
+                  '    base, srv = _stack(tmp_path)\n'
+                  '    try:\n'
+                  '        code = _get(base, "/tokens/items")\n'
+                  '        assert code == 200, str(code)\n'
+                  '        print("OK VIVA-3: sin env todo como"\n'
+                  '              " siempre (compatibilidad)")\n'
+                  '    finally:\n'
+                  '        srv.shutdown()\n'
+                  '        srv.server_close()\n'
+              )
+              p = pathlib.Path("shared_engines/runtime/tests/test_viva3.py")
+              ast.parse(TEST)
+              p.write_text(TEST, encoding="utf-8")
+              py_compile.compile(str(p), doraise=True)
+              return "OK"
+
+          fix("FIX-A require_token main", fa)
+          fix("FIX-B rate limiter", fb)
+          fix("FIX-C tests viva3", fc)
+          exit(0)
           EOF
+
+      - name: "S1: tests viva3"
+        if: always()
+        run: |
+          export PYTHONPATH="$(pwd):$(pwd)/shared_engines"
+          set +e
+          timeout 180 python3 -m pytest shared_engines/runtime/tests/test_viva3.py -vv --tb=long --timeout=60 --timeout-method=thread > /tmp/s1.out 2>&1
+          echo $? > /tmp/s1
+          if [ "$(cat /tmp/s1)" = "0" ]; then echo "- S1: ✅" >> "$GITHUB_STEP_SUMMARY"; else echo "- S1: ❌" >> "$GITHUB_STEP_SUMMARY"; { echo "### S1 detalle"; echo '```'; tail -80 /tmp/s1.out; echo '```'; } >> "$GITHUB_STEP_SUMMARY"; fi
           exit 0
+
+      - name: "S2: regresion shared_engines completa"
+        if: always()
+        run: |
+          export PYTHONPATH="$(pwd):$(pwd)/shared_engines"
+          set +e
+          timeout 900 python3 -m pytest shared_engines -q --timeout=60 --timeout-method=thread --tb=line > /tmp/s2.out 2>&1
+          echo $? > /tmp/s2
+          if [ "$(cat /tmp/s2)" = "0" ]; then echo "- S2: ✅" >> "$GITHUB_STEP_SUMMARY"; else echo "- S2: ❌" >> "$GITHUB_STEP_SUMMARY"; { echo "### S2 detalle"; echo '```'; tail -60 /tmp/s2.out; echo '```'; } >> "$GITHUB_STEP_SUMMARY"; fi
+          exit 0
+
+      - name: "S3: apps intactas"
+        if: always()
+        run: |
+          export PYTHONPATH="$(pwd):$(pwd)/shared_engines"
+          set +e
+          timeout 600 python3 -m pytest apps/nexo/tests apps/subastas/tests -q --timeout=45 --timeout-method=thread --tb=line > /tmp/s3.out 2>&1
+          echo $? > /tmp/s3
+          if [ "$(cat /tmp/s3)" = "0" ]; then echo "- S3: ✅" >> "$GITHUB_STEP_SUMMARY"; else echo "- S3: ❌" >> "$GITHUB_STEP_SUMMARY"; { echo "### S3 detalle"; echo '```'; tail -40 /tmp/s3.out; echo '```'; } >> "$GITHUB_STEP_SUMMARY"; fi
+          exit 0
+
+      - name: Veredicto + commit solo si TODO verde
+        if: always()
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          SUM="$GITHUB_STEP_SUMMARY"
+          log() { echo "$1" >> "$SUM"; echo "$1"; }
+          fails=""
+          for g in s1 s2 s3; do
+            c=$(cat /tmp/$g 2>/dev/null || echo 1)
+            [ "$c" != "0" ] && fails="$fails $g"
+          done
+          if [ -n "$fails" ]; then
+            log "**RESULTADO: fallan:$fails — SIN commit**"
+            exit 1
+          fi
+          log "**RESULTADO: S1-S3 VERDES — RED SEGURA**"
+          find shared_engines -name "__pycache__" -type d -prune -exec rm -rf {} + || true
+          rm -rf .pytest_cache || true
+          git config user.name "zyra-bot"
+          git config user.email "zyra-bot@users.noreply.github.com"
+          git add shared_engines main.py
+          set +e
+          if git diff --cached --quiet; then
+            log "**SIN CAMBIOS**"; exit 0
+          fi
+          git commit -m "feat(VIVA-3): seguridad - ZYRA_REQUIRE_TOKEN=1 niega arranque abierto, rate limiter por IP (429, health/verify-existence exentas) (S1-S3 verdes)"
+          [ $? -ne 0 ] && { log "**COMMIT FALLO**"; exit 1; }
+          log "**COMMIT OK**"
+          git push "https://x-access-token:${GH_TOKEN}@github.com/${GITHUB_REPOSITORY}.git" "HEAD:main" > /tmp/qa.out 2> /tmp/qa.err
+          if [ $? -eq 0 ]; then log "**PUSH OK — VIVA-3 CERRADO. Sigue RED-9 (ultimo motor).**"; exit 0; fi
+          log "**PUSH fallo:**"; { echo '```'; cat /tmp/qa.err; echo '```'; } >> "$SUM"
+          git push origin "HEAD:main" > /tmp/qb.out 2> /tmp/qb.err
+          if [ $? -eq 0 ]; then log "**PUSH OK (intento 2) — VIVA-3 CERRADO.**"; exit 0; fi
+          log "**PUSH intento 2 fallo:**"; { echo '```'; cat /tmp/qb.err; echo '```'; } >> "$SUM"
+          exit 1

@@ -79,6 +79,22 @@ class SemillaApiHandler(
         return None
 
     def do_GET(self) -> None:
+        from apps.semilla.routers.modules_router import (list_menus as _sm8_list, get_menu as _sm8_get)
+        _sm8_path = ((getattr(self, "path", "") or "").split("?")[0])
+        if (_sm8_path == "/semilla/menus" or _sm8_path.startswith("/semilla/menus/")):
+            import json as _json
+            _sm8_mid = ""
+            if len(_sm8_path) > len("/semilla/menus/"):
+                _sm8_mid = _sm8_path[len("/semilla/menus/"):].lstrip("/")
+            _sm8_payload = _sm8_list() if not _sm8_mid else _sm8_get(_sm8_mid)
+            _sm8_code = 200 if _sm8_payload else 404
+            _sm8_body = _json.dumps(_sm8_payload, default=str).encode("utf-8")
+            self.send_response(_sm8_code)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(_sm8_body)))
+            self.end_headers()
+            self.wfile.write(_sm8_body)
+            return
         self._safe("GET")
 
     def do_POST(self) -> None:

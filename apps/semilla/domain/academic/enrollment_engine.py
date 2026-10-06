@@ -1,6 +1,6 @@
 
 """Enrollment Engine - matricula con control de
-cupo (SM1)."""
+cupo (SM1) + roster por institucion/ano (SM5)."""
 from __future__ import annotations
 from typing import List, Optional
 import uuid
@@ -93,6 +93,21 @@ class EnrollmentEngine:
                 "grade": str(row["grade"]),
                 "turn": str(row["turn"]),
                 "status": str(row["status"])}
+
+    def roster(self, institution_id,
+               school_year) -> List[dict]:
+        """Matriculas ACTIVAS por institucion y
+        ano (dashboard ministerial)."""
+        rows = self._db.query_all(
+            "SELECT enrollment_id FROM"
+            " sm_enrollments WHERE"
+            " institution_id = ? AND"
+            " school_year = ? AND"
+            " status = 'ACTIVA'"
+            " ORDER BY created_at",
+            (institution_id, school_year))
+        return [self.get(str(r["enrollment_id"]))
+                for r in rows]
 
     def withdraw(self, enrollment_id,
                  status="RETIRADA") -> dict:

@@ -141,6 +141,19 @@ def _start_nexo():
     server = serve_nexo(store, client, host="127.0.0.1", port=0)
     return server, "NEXO"
 
+def _start_nexo(*args, **kwargs):
+    _result = _ng_start_nexo_base(
+        *args, **kwargs)
+    try:
+        from apps.nexo.services.startup import (
+            attach_live_runtime as
+            _ng_attach)
+        _ng_attach(_result)
+    except Exception:
+        pass
+    return _result
+
+
 def _start_subastas():
     from apps.subastas.infrastructure.persistence.subastas_store import SubastasStore
     from apps.subastas.server import serve_subastas

@@ -1,4 +1,4 @@
-name: "ZYRA SEMILLA SM5 institucion+gobierno+analitica + SM6 eventos+red"
+name: "ZYRA SEMILLA SM5+SM6 completo (enrollment roster + gobierno + analitica + eventos + bridge)"
 
 on:
   push:
@@ -30,7 +30,203 @@ jobs:
           fi
           echo "DEPS OK"
 
-      - name: "[ESCRITURA] SM5 institucion + gobierno + analitica + reportes"
+      - name: "[ESCRITURA] enrollment con roster (fix)"
+        if: always()
+        run: |
+          export PYTHONPATH="$(pwd):$(pwd)/shared_engines:$(pwd)"
+          python3 << 'PYEOF'
+          import ast, pathlib, py_compile, textwrap, traceback
+          SUM = __import__("os").environ.get("GITHUB_STEP_SUMMARY", "")
+          def out(t):
+              print(t, flush=True)
+              if SUM:
+                  with open(SUM, "a", encoding="utf-8") as f:
+                      f.write(t + "\n")
+          def D(s):
+              return textwrap.dedent(s)
+          def forzar(ruta, contenido):
+              p = None
+              try:
+                  ast.parse(contenido)
+                  p = pathlib.Path(ruta)
+                  p.parent.mkdir(parents=True, exist_ok=True)
+                  p.write_text(contenido, encoding="utf-8")
+                  py_compile.compile(ruta, doraise=True)
+                  out("- **" + p.name + ": OK**")
+              except Exception:
+                  if p is not None and p.exists():
+                      try:
+                          p.unlink()
+                      except Exception:
+                          pass
+                  out("- **" + ruta + ": ERROR (no escrito)**")
+                  out("```\n" + traceback.format_exc().strip()
+                      + "\n```")
+
+          try:
+              forzar("apps/semilla/domain/academic/enrollment_engine.py",
+                     D(r'''
+                  """Enrollment Engine - matricula con control de
+                  cupo (SM1) + roster por institucion/ano (SM5)."""
+                  from __future__ import annotations
+                  from typing import List, Optional
+                  import uuid
+                  from shared_engines.common.clocks import Clock
+                  from shared_engines.storage.database import (
+                      Database)
+                  from shared_engines.storage.migrations import (
+                      Migration, MigrationRunner)
+
+                  ENR_STATUSES = ("ACTIVA", "RETIRADA",
+                                  "TRASLADADA", "COMPLETADA")
+
+                  _MIGRATIONS = (
+                      Migration(1, "sm_enrollments", (
+                          "CREATE TABLE IF NOT EXISTS sm_enrollments (enrollment_id TEXT PRIMARY KEY, student_id TEXT NOT NULL, classroom_id TEXT NOT NULL, institution_id TEXT NOT NULL, school_year TEXT NOT NULL, level TEXT NOT NULL, grade TEXT NOT NULL, turn TEXT NOT NULL DEFAULT 'MATUTINA', status TEXT NOT NULL DEFAULT 'ACTIVA', created_at REAL NOT NULL, updated_at REAL NOT NULL, UNIQUE(student_id, school_year))",
+                      )),
+                  )
+
+                  class EnrollmentEngine:
+                      """Matriculas con control de cupo."""
+
+                      def __init__(self, db, clock,
+                                   classroom_engine=None):
+                          self._db = db
+                          self._clock = clock
+                          self._cls = classroom_engine
+                          MigrationRunner(db, "sm.enroll",
+                                          _MIGRATIONS).run(clock)
+
+                      def enroll(self, *, student_id, classroom_id,
+                                 school_year) -> dict:
+                          room = (self._cls.get(classroom_id)
+                                  if self._cls is not None
+                                  else None)
+                          if room is None:
+                              raise KeyError(classroom_id)
+                          eid = "SMENR-" + str(uuid.uuid4())
+                          now = self._clock.now()
+                          with self._db.transaction() as cursor:
+                              dup = cursor.execute(
+                                  "SELECT enrollment_id FROM"
+                                  " sm_enrollments WHERE"
+                                  " student_id = ? AND"
+                                  " school_year = ?",
+                                  (student_id,
+                                   school_year)).fetchone()
+                              if dup is not None:
+                                  raise ValueError(
+                                      "ya matriculado en "
+                                      + school_year)
+                          if self._cls is not None:
+                              self._cls.claim_seat(classroom_id,
+                                                   student_id)
+                          with self._db.transaction() as cursor:
+                              cursor.execute(
+                                  "INSERT INTO sm_enrollments"
+                                  " (enrollment_id, student_id,"
+                                  " classroom_id, institution_id,"
+                                  " school_year, level, grade,"
+                                  " turn, status, created_at,"
+                                  " updated_at)"
+                                  " VALUES (?, ?, ?, ?, ?, ?, ?, ?,"
+                                  " 'ACTIVA', ?, ?)",
+                                  (eid, student_id, classroom_id,
+                                   room["institution_id"],
+                                   school_year, room["level"],
+                                   room["grade"], room["turn"],
+                                   now, now))
+                          return self.get(eid)
+
+                      def get(self, enrollment_id
+                              ) -> Optional[dict]:
+                          row = self._db.query_one(
+                              "SELECT * FROM sm_enrollments WHERE"
+                              " enrollment_id = ?",
+                              (enrollment_id,))
+                          if not row:
+                              return None
+                          return {"enrollment_id":
+                                      str(row["enrollment_id"]),
+                                  "student_id":
+                                      str(row["student_id"]),
+                                  "classroom_id":
+                                      str(row["classroom_id"]),
+                                  "institution_id":
+                                      str(row["institution_id"]),
+                                  "school_year":
+                                      str(row["school_year"]),
+                                  "level": str(row["level"]),
+                                  "grade": str(row["grade"]),
+                                  "turn": str(row["turn"]),
+                                  "status": str(row["status"])}
+
+                      def roster(self, institution_id,
+                                 school_year) -> List[dict]:
+                          """Matriculas ACTIVAS de una institucion
+                          en un ano escolar (para dashboard
+                          ministerial)."""
+                          rows = self._db.query_all(
+                              "SELECT enrollment_id FROM"
+                              " sm_enrollments WHERE"
+                              " institution_id = ? AND"
+                              " school_year = ? AND"
+                              " status = 'ACTIVA'"
+                              " ORDER BY created_at",
+                              (institution_id, school_year))
+                          return [self.get(str(r["enrollment_id"]))
+                                  for r in rows]
+
+                      def withdraw(self, enrollment_id,
+                                   status="RETIRADA") -> dict:
+                          if status not in ENR_STATUSES:
+                              raise ValueError("estado invalido")
+                          e = self.get(enrollment_id)
+                          if not e:
+                              raise KeyError(enrollment_id)
+                          if e["status"] != "ACTIVA":
+                              raise ValueError(
+                                  "solo ACTIVA se cambia")
+                          if self._cls is not None:
+                              self._cls.release_seat(
+                                  e["classroom_id"])
+                          self._db.execute(
+                              "UPDATE sm_enrollments SET"
+                              " status = ?, updated_at = ? WHERE"
+                              " enrollment_id = ?",
+                              (status, self._clock.now(),
+                               enrollment_id))
+                          return self.get(enrollment_id)
+
+                      def alternatives(self, *, institution_id,
+                                       school_year, level,
+                                       grade) -> List[dict]:
+                          if self._cls is None:
+                              return []
+                          return self._cls.available_sections(
+                              institution_id=institution_id,
+                              school_year=school_year,
+                              level=level, grade=grade)
+
+                      def enrollments_of(self, student_id
+                                         ) -> List[dict]:
+                          rows = self._db.query_all(
+                              "SELECT enrollment_id FROM"
+                              " sm_enrollments WHERE"
+                              " student_id = ? ORDER BY"
+                              " created_at", (student_id,))
+                          return [self.get(str(r["enrollment_id"]))
+                                  for r in rows]
+              '''))
+              out("## FIN enrollment fix")
+          except Exception:
+              out("## BUILDER ERROR")
+              out("```\n" + traceback.format_exc().strip() + "\n```")
+          finally:
+              exit(0)
+          PYEOF
+
+      - name: "[ESCRITURA] SM5 completo (4 archivos)"
         if: always()
         run: |
           export PYTHONPATH="$(pwd):$(pwd)/shared_engines:$(pwd)"
@@ -70,11 +266,9 @@ jobs:
 
           try:
               forzar(IN + "/institution_verification_engine.py", D(r'''
-                  """Institution Verification Engine - verificacion de
-                  instituciones educativas (SM5). Alineado MINED:
-                  registro con documento de respaldo y verificacion
-                  (SE-5: PENDING -> INSTITUTION_VERIFIED ->
-                  MINED_VERIFIED, elevable sin degradar)."""
+                  """Institution Verification Engine (SM5).
+                  PENDING -> INSTITUTION_VERIFIED -> MINED_VERIFIED,
+                  elevable sin degradar (SE-5)."""
                   from __future__ import annotations
                   from typing import List, Optional
                   import uuid
@@ -175,8 +369,7 @@ jobs:
                           rows = self._db.query_all(
                               "SELECT verify_id FROM"
                               " sm_institution_verify WHERE"
-                              " institution_id = ?"
-                              " ORDER BY rowid",
+                              " institution_id = ? ORDER BY rowid",
                               (institution_id,))
                           return [self.get(str(r["verify_id"]))
                                   for r in rows]
@@ -184,10 +377,9 @@ jobs:
 
               forzar(GO + "/governance_engine.py", D(r'''
                   """Governance Engine - gobierno educativo (SM5).
-                  Panel ministerial y supervision de escuelas.
-                  SEMILLA opera la escuela; MINED conserva autoridad:
-                  los reportes son para el mecanismo de
-                  interoperabilidad que MINED autorice (SE-5/R13)."""
+                  Supervision + politicas + dashboard ministerial
+                  con datos reales del enrollment (SEMILLA opera la
+                  escuela, MINED conserva autoridad — R13)."""
                   from __future__ import annotations
                   from typing import Dict, List
                   import uuid
@@ -321,8 +513,7 @@ jobs:
 
               forzar(AN + "/analytics_engine.py", D(r'''
                   """Analytics Engine - analitica educativa (SM5).
-                  Rendimiento por estudiante, escuela y nacion a
-                  partir de evaluaciones reales. Decimal 2d (61)."""
+                  Decimal 2d (61)."""
                   from __future__ import annotations
                   from decimal import (Decimal as _D,
                                        ROUND_HALF_UP as _UP)
@@ -427,9 +618,8 @@ jobs:
               '''))
 
               forzar(RE + "/report_engine.py", D(r'''
-                  """Report Engine - reportes formales SEMILLA (SM5).
-                  Genera, persiste y recupera reportes JSON con tipo
-                  y periodo. Patron NEXO reports."""
+                  """Report Engine - reportes formales SEMILLA
+                  (SM5). Patron NEXO reports."""
                   from __future__ import annotations
                   from typing import List, Optional
                   import json as _j
@@ -517,7 +707,7 @@ jobs:
                                   for r in rows]
               '''))
 
-              out("## FIN SM5 builder")
+              out("## FIN SM5 completo: 4 archivos")
           except Exception:
               out("## SM5 BUILDER ERROR")
               out("```\n" + traceback.format_exc().strip() + "\n```")
@@ -525,7 +715,7 @@ jobs:
               exit(0)
           PYEOF
 
-      - name: "[ESCRITURA] SM6 eventos + bus + bridge a la Red"
+      - name: "[ESCRITURA] SM6 completo (3 archivos)"
         if: always()
         run: |
           export PYTHONPATH="$(pwd):$(pwd)/shared_engines:$(pwd)"
@@ -564,9 +754,7 @@ jobs:
           try:
               forzar(EV + "/contracts.py", D(r'''
                   """Contratos de eventos SEMILLA_* (catalogo oficial
-                  SM6). Fuente unica de nombres. make_event valida
-                  que el evento este catalogado (produccion real,
-                  sin improvisar)."""
+                  SM6). make_event valida el catalogo."""
                   from __future__ import annotations
                   import uuid
 
@@ -611,10 +799,7 @@ jobs:
               '''))
 
               forzar("apps/semilla/infrastructure/messaging/message_bus.py", D(r'''
-                  """Message bus SEMILLA (adaptador fino, regla 69).
-                  Patron NEXO message_bus: si hay outbox inyectado
-                  lo usa (duck-typing por alias); si no, buffer local
-                  marcado como degradado. Idempotente."""
+                  """Message bus SEMILLA (adaptador fino, regla 69)."""
                   from __future__ import annotations
                   from typing import List
                   import json as _j
@@ -672,12 +857,9 @@ jobs:
 
               forzar(SE + "/semilla_bridge.py", D(r'''
                   """SemillaBridge - composicion con el nucleo vivo
-                  (SM6, SE-1 intacto). Une: bus de eventos SEMILLA_*,
-                  tutor/store/link existentes. feed_talent() registra
-                  el talento detectado en el historial de la Red via
-                  semilla_link.record_milestone() (delegacion, cero
-                  duplicar — regla 69). Degradacion honesta: sin
-                  link los eventos quedan en buffer."""
+                  (SM6, SE-1 intacto). feed_talent y
+                  feed_certificacion via semilla_link real (regla
+                  69). Degradacion honesta sin link."""
                   from __future__ import annotations
                   from apps.semilla.events.contracts import make_event
                   from apps.semilla.infrastructure.messaging.message_bus import (
@@ -707,10 +889,6 @@ jobs:
 
                       def feed_talent(self, *, student_id,
                                       category, detail="") -> dict:
-                          """Talento detectado -> evento catalogado
-                          + milestone en el historial de la Red via
-                          link real (best-effort, degradacion
-                          honesta)."""
                           r = self.emit("SEMILLA_TALENT_DETECTED",
                               student_id=student_id,
                               payload={"category": category,
@@ -752,7 +930,7 @@ jobs:
                                       self.link is not None}
               '''))
 
-              out("## FIN SM6 builder")
+              out("## FIN SM6 completo: 3 archivos")
           except Exception:
               out("## SM6 BUILDER ERROR")
               out("```\n" + traceback.format_exc().strip() + "\n```")
@@ -823,8 +1001,8 @@ jobs:
           def test_dashboard_ministerial(tmp_path) -> None:
               db = SQLiteAdapter(tmp_path / "md.db")
               clock = FrozenClock()
-              reg = InstitutionRegistryEngine(db, clock)
-              inst = reg.register(name="Escuela Central",
+              ireg = InstitutionRegistryEngine(db, clock)
+              inst = ireg.register(name="Escuela Central",
                   levels=["BASICA"])
               st = StudentRegistryEngine(db, clock)
               TUT = [{"name": "Padre", "relation": "PADRE"}]
@@ -848,22 +1026,23 @@ jobs:
                   classroom_id=room["classroom_id"],
                   school_year="2026")
               go = GovernanceEngine(db, clock)
-              dash = go.ministry_dashboard(registry=reg,
+              dash = go.ministry_dashboard(registry=ireg,
                   enrollment_engine=en)
               assert dash["institutions"] == 1
               assert dash["enrolled_2026"] == 1
-              print("OK dashboard ministerial: instituciones + matriculados reales")
+              print("OK dashboard ministerial: instituciones + matriculados via roster real")
 
           def test_analitica_estudiante_escuela_nacion(tmp_path) -> None:
               db = SQLiteAdapter(tmp_path / "an.db")
               clock = FrozenClock()
               ev = EvaluationEngine(db, clock)
+              ireg = InstitutionRegistryEngine(db, clock)
               reg = StudentRegistryEngine(db, clock)
+              inst1 = ireg.register(name="Escuela A")
               TUT = [{"name": "Padre", "relation": "PADRE"}]
               PICK = [{"name": "Tia", "relation": "TIA"},
                       {"name": "Abuelo", "relation": "ABUELO"}]
               EMG = [{"name": "Mama", "relation": "MADRE"}]
-              inst1 = reg.register(name="Escuela A")
               ids1 = []
               for i in range(2):
                   s = reg.register(full_name="A" + str(i),
@@ -1031,7 +1210,7 @@ jobs:
             log "**RESULTADO: fallan:$fails — SIN commit**"
             exit 1
           fi
-          log "**RESULTADO: SM5+SM6 VERDES — GOBIERNO+ANALITICA+REPORTES + EVENTOS+BRIDGE A LA RED**"
+          log "**RESULTADO: SM5+SM6 VERDES**"
           find apps shared_engines -name "__pycache__" -type d -prune -exec rm -rf {} + || true
           rm -rf .pytest_cache || true
           git config user.name "zyra-bot"
@@ -1041,7 +1220,7 @@ jobs:
           if git diff --cached --quiet; then
             log "**SIN CAMBIOS**"; exit 0
           fi
-          git commit -m "feat(SEMILLA-SM5+SM6): Institucion verificable (documentos con hash, PENDING->INSTITUTION->MINED elevable sin degradar) + Governance (supervision de escuelas, politicas DRAFT->ACTIVE, dashboard ministerial con datos reales de matricula) + Analitica (reporte estudiante/escuela/nacion Decimal 2d con mejor y debil materia) + Reportes formales persistidos + Eventos SEMILLA_* (catalogo de 9 eventos validados) + Message bus adaptador (regla 69) + SemillaBridge (feed_talent y feed_certificacion al historial de la Red via semilla_link, degradacion honesta sin link) (SM5+SM6 verdes)"
+          git commit -m "feat(SEMILLA-SM5+SM6): enrollment con roster por institucion/ano + Institucion verificable (documentos con hash, PENDING->INSTITUTION->MINED elevable) + Governance (supervision, politicas, dashboard ministerial con datos reales via roster) + Analitica (estudiante/escuela/nacion Decimal 2d) + Reportes persistidos + Eventos SEMILLA_* catalogados (9) + Message bus adaptador + SemillaBridge (feed_talent/feed_certificacion via semilla_link, degradacion honesta) (SM5+SM6 verdes)"
           [ $? -ne 0 ] && { log "**COMMIT FALLO**"; exit 1; }
           log "**COMMIT OK**"
           git push "https://x-access-token:${GH_TOKEN}@github.com/${GITHUB_REPOSITORY}.git" "HEAD:main" > /tmp/qa.out 2> /tmp/qa.err

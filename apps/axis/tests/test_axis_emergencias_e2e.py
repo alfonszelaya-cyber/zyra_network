@@ -39,6 +39,21 @@ class _Eco:
             config=RuntimeConfig(host="127.0.0.1", port=0, api_token=None),
         )
         self.kernel.bootstrap_root()
+        from shared_engines.security.biometrics import (  # AX-2
+            BiometricsEngine, BiometricsPolicy,
+            DeterministicTestProvider, TemplateCipher,
+        )
+        self.kernel._biometrics = BiometricsEngine(  # AX-2 master key
+            db=self.net_db,
+            clock=FrozenClock(),
+            audit=self.kernel.audit,
+            provider=DeterministicTestProvider(),
+            cipher=TemplateCipher(master_key_hex="ab" * 32),
+            policy=BiometricsPolicy(
+                require_liveness=False,
+                doc_reject=0.01, doc_review=0.02,
+                doc_auto=0.03, dup_reject=0.98),
+        )
         self.caps = ZyraCapabilities(
             self.net_db,
             FrozenClock(),

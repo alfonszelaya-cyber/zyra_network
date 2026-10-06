@@ -957,6 +957,9 @@ def test_axz5_load_50_births_chain():
     from apps.axis.life_history.integration import build_life_history
     from shared_engines.storage.database import SQLiteAdapter
     from shared_engines.common.clocks import SystemClock
+    import shared_engines.runtime.combined_api as _cap
+    from shared_engines.runtime.combined_api import RateLimiter as _rlc
+    _cap._RATE_LIMITER = _rlc(max_per_minute=5000)  # AX-2: carga
     client = _axz5_boot_net()
     _axz_step("A5-load: enrolando 50 madres")
     zids = []

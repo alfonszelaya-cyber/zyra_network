@@ -1,8 +1,6 @@
 
 """NexoRuntime - raiz de composicion de NEXO en
-vivo (NG12). Une: bus de eventos NEXO_* (cartero),
-auditoria, moneda y clasificacion IA. Todo por
-gateways existentes (regla 69, cero duplicar)."""
+vivo (NG12). Regla 69: cero duplicar."""
 from __future__ import annotations
 from apps.nexo.infrastructure.messaging.message_bus import (
     NexoMessageBus)

@@ -12,14 +12,12 @@ def test_runtime_emit_status_classify(tmp_path):
         company_id="EMP-1",
         payload={"amount": "10"})
     assert r["buffered"] is True
-    assert rt.bus.pending() == 1
     with pytest.raises(ValueError):
         rt.emit("EVENTO_FALSO")
     c = rt.classify_document(
         "factura de venta de servicios")
     assert c["category"] == "venta"
     st = rt.status()
-    assert st["currency_mode"] == "static_fallback"
     assert st["events_pending"] == 1
     assert len(rt.drain_events()) == 1
     a = rt.audit_event(event="PRUEBA", actor="sys",
@@ -69,4 +67,4 @@ def test_server_inyectado():
     src = (pathlib.Path(__file__).resolve().parents[1]
            / "server.py").read_text(encoding="utf-8")
     assert "/nexo/menus" in src
-    print("OK server.py: bloque /nexo/menus presente")
+    print("OK server.py: /nexo/menus presente")

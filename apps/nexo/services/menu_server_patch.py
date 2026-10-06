@@ -1,7 +1,5 @@
 
-"""Menu server patch - patch aditivo (regla 51).
-Envuelve do_GET para servir /nexo/menus.
-Idempotente por marca de clase."""
+"""Menu server patch - aditivo (regla 51)."""
 from __future__ import annotations
 import json as _json
 from apps.nexo.routers.modules_router import (

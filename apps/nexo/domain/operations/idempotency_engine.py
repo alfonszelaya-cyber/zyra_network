@@ -1,11 +1,6 @@
 
 """Idempotency Engine - idempotencia persistente
-(NG11). claim(key, scope): primera vez ->
-first=True; si ya existe dentro del TTL ->
-first=False con el resultado guardado (replay).
-complete(key, scope, result): guarda el resultado.
-Produccion real: evita doble ejecucion de
-operaciones criticas (pagos, asientos, cierres)."""
+(NG11). claim/complete/replay/forget con TTL."""
 from __future__ import annotations
 import json as _j
 from shared_engines.common.clocks import Clock
@@ -49,8 +44,7 @@ class IdempotencyEngine:
                 "DELETE FROM nexo_idempotency"
                 " WHERE idem_key = ? AND"
                 " scope = ?", (key, scope))
-        return {"first": True,
-                "result": None}
+        return {"first": True, "result": None}
 
     def complete(self, *, key,
                  scope="default",

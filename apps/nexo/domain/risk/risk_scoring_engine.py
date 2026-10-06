@@ -1,7 +1,7 @@
 
 """Risk Scoring - NEXO / ZYRA."""
 from __future__ import annotations
-from datetime import datetime
+from datetime import datetime, timezone
 from typing import Dict
 import uuid
 
@@ -19,6 +19,6 @@ class RiskScoringEngine:
         gs = round(sum(scores) / len(scores), 2)
         level = "CRITICAL" if gs >= 85 else ("HIGH" if gs >= 70 else ("MEDIUM" if gs >= 40 else "LOW"))
         r = {"score_id": f"RSK-{uuid.uuid4()}", "global_score": gs, "risk_level": level,
-             "generated_at": datetime.utcnow().isoformat(), "status": "CALCULATED"}
+             "generated_at": datetime.now(timezone.utc).isoformat(), "status": "CALCULATED"}
         self._history.append(r)
         return r

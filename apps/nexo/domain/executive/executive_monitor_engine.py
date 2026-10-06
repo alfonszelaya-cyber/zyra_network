@@ -1,7 +1,7 @@
 
 """Executive Monitor - NEXO / ZYRA."""
 from __future__ import annotations
-from datetime import datetime
+from datetime import datetime, timezone
 from typing import Dict, List, Optional
 
 class ExecutiveMonitorEngine:
@@ -9,7 +9,7 @@ class ExecutiveMonitorEngine:
         self._monitoring_history = []
 
     def _now(self):
-        return datetime.utcnow().isoformat()
+        return datetime.now(timezone.utc).isoformat()
 
     def monitor_business(self, *, indicators):
         m = {"checked_at": self._now(), "indicators": indicators,

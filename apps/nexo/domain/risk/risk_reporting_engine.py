@@ -3,7 +3,7 @@
 from __future__ import annotations
 from typing import Dict, List, Optional
 import uuid
-from datetime import datetime
+from datetime import datetime, timezone
 
 class RiskReportingEngine:
     """Genera reportes de riesgo."""
@@ -15,7 +15,7 @@ class RiskReportingEngine:
         report = {"report_id": f"RRP-{uuid.uuid4()}",
                   "period": period,
                   "filters": filters or {},
-                  "generated_at": datetime.utcnow().isoformat(),
+                  "generated_at": datetime.now(timezone.utc).isoformat(),
                   "report_type": "RISK_REPORT",
                   "status": "GENERATED"}
         self._reports.append(report)

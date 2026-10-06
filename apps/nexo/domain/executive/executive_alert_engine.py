@@ -1,7 +1,7 @@
 
 """Executive Alert - NEXO / ZYRA."""
 from __future__ import annotations
-from datetime import datetime
+from datetime import datetime, timezone
 from uuid import uuid4
 from typing import Dict, List, Optional
 
@@ -13,7 +13,7 @@ class ExecutiveAlertEngine:
         self._alerts = []
 
     def _now(self):
-        return datetime.utcnow().isoformat()
+        return datetime.now(timezone.utc).isoformat()
 
     def validate_alert(self, level, title, description):
         if level not in self.VALID_LEVELS:

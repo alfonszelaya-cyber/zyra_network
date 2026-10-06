@@ -1,7 +1,7 @@
 
 """Executive Metrics - NEXO / ZYRA."""
 from __future__ import annotations
-from datetime import datetime
+from datetime import datetime, timezone
 from typing import Dict, List, Optional
 
 class ExecutiveMetricsEngine:
@@ -9,7 +9,7 @@ class ExecutiveMetricsEngine:
         self._metrics_history = []
 
     def _now(self):
-        return datetime.utcnow().isoformat()
+        return datetime.now(timezone.utc).isoformat()
 
     def calculate_metrics(self, *, source_data):
         m = {"generated_at": self._now(), "metrics": source_data,

@@ -1,7 +1,7 @@
 
 """Fraud Detection - NEXO / ZYRA."""
 from __future__ import annotations
-from datetime import datetime
+from datetime import datetime, timezone
 from typing import Dict, List
 import uuid
 
@@ -21,6 +21,6 @@ class FraudDetectionEngine:
         level = "CRITICAL" if score >= 80 else ("HIGH" if score >= 50 else ("MEDIUM" if score >= 25 else "LOW"))
         r = {"fraud_id": f"FRD-{uuid.uuid4()}", "client_id": client_data.get("client_id"),
              "score": score, "level": level, "flags": flags,
-             "generated_at": datetime.utcnow().isoformat(), "status": "ANALYZED"}
+             "generated_at": datetime.now(timezone.utc).isoformat(), "status": "ANALYZED"}
         self._history.append(r)
         return r

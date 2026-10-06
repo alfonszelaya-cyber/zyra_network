@@ -2,13 +2,13 @@
 """Wealth Management - NEXO / ZYRA (migrado mejorado)."""
 from __future__ import annotations
 from typing import Dict
-from datetime import datetime
+from datetime import datetime, timezone
 
 class WealthManagementEngine:
     """Gestion global de patrimonio."""
 
     def _now(self):
-        return datetime.utcnow().isoformat()
+        return datetime.now(timezone.utc).isoformat()
 
     def generate_wealth_snapshot(self, *,
                                  total_assets, total_liabilities):

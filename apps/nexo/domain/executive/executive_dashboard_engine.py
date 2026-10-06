@@ -1,7 +1,7 @@
 
 """Executive Dashboard - NEXO / ZYRA."""
 from __future__ import annotations
-from datetime import datetime
+from datetime import datetime, timezone
 from typing import Dict, List
 
 class ExecutiveDashboardEngine:
@@ -9,7 +9,7 @@ class ExecutiveDashboardEngine:
         self._snapshots = []
 
     def _now(self):
-        return datetime.utcnow().isoformat()
+        return datetime.now(timezone.utc).isoformat()
 
     def build_dashboard(self, *, kpis, metrics, alerts, decisions):
         critical = len([a for a in alerts if a.get("level") == "CRITICAL"])

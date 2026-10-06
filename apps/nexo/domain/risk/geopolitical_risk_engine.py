@@ -1,7 +1,7 @@
 
 """Geopolitical Risk - NEXO / ZYRA."""
 from __future__ import annotations
-from datetime import datetime
+from datetime import datetime, timezone
 from typing import Dict, List
 import uuid
 
@@ -14,6 +14,6 @@ class GeopoliticalRiskEngine:
         level = "CRITICAL" if score >= 80 else ("HIGH" if score >= 60 else ("MEDIUM" if score >= 30 else "LOW"))
         r = {"risk_id": f"GEO-{uuid.uuid4()}", "country": country_code,
              "score": score, "level": level,
-             "generated_at": datetime.utcnow().isoformat(), "status": "ACTIVE"}
+             "generated_at": datetime.now(timezone.utc).isoformat(), "status": "ACTIVE"}
         self._history.append(r)
         return r

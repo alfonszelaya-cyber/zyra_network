@@ -3,7 +3,7 @@
 from __future__ import annotations
 from typing import Dict
 import uuid
-from datetime import datetime
+from datetime import datetime, timezone
 
 class RiskEvaluationEngine:
     """Evalua contexto de riesgo."""
@@ -27,5 +27,5 @@ class RiskEvaluationEngine:
         return {"evaluation_id": f"EVL-{uuid.uuid4()}",
                 "global_score": gs, "level": level,
                 "components": risk_context.get("components", {}),
-                "generated_at": datetime.utcnow().isoformat(),
+                "generated_at": datetime.now(timezone.utc).isoformat(),
                 "status": "COMPLETED"}

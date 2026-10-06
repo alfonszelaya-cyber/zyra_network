@@ -77,6 +77,27 @@ class NexoApiHandler(
         return None
 
     def do_GET(self) -> None:
+        from apps.nexo.routers.modules_router import (list_menus as _ng12_list, get_menu as _ng12_get)
+        _ng12_path = ((getattr(self, "path", "") or "").split("?")[0])
+        if (_ng12_path == "/nexo/menus" or _ng12_path.startswith("/nexo/menus/")):
+            import json as _json
+            _ng12_mid = ""
+            if len(_ng12_path) > len("/nexo/menus/"):
+                _ng12_mid = _ng12_path[len("/nexo/menus/"):].lstrip("/")
+            if _ng12_mid:
+                _ng12_m = _ng12_get(_ng12_mid)
+                _ng12_code = 200 if _ng12_m else 404
+                _ng12_payload = _ng12_m if _ng12_m else {"error": "menu no encontrado"}
+            else:
+                _ng12_code = 200
+                _ng12_payload = _ng12_list()
+            _ng12_body = _json.dumps(_ng12_payload, default=str).encode("utf-8")
+            self.send_response(_ng12_code)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(_ng12_body)))
+            self.end_headers()
+            self.wfile.write(_ng12_body)
+            return
         self._safe("GET")
 
     def do_POST(self) -> None:

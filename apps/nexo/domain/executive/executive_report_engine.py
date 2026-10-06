@@ -1,7 +1,7 @@
 
 """Executive Report - NEXO / ZYRA."""
 from __future__ import annotations
-from datetime import datetime
+from datetime import datetime, timezone
 from uuid import uuid4
 from typing import Dict, List, Optional
 
@@ -10,7 +10,7 @@ class ExecutiveReportEngine:
         self._reports = []
 
     def _now(self):
-        return datetime.utcnow().isoformat()
+        return datetime.now(timezone.utc).isoformat()
 
     def generate_report(self, *, dashboard_data, report_scope="GLOBAL"):
         report = {"report_id": f"EXR-{uuid4()}",

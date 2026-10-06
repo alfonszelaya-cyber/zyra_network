@@ -1,7 +1,7 @@
 
 """Executive KPI - NEXO / ZYRA."""
 from __future__ import annotations
-from datetime import datetime
+from datetime import datetime, timezone
 from typing import Dict, List
 
 class ExecutiveKPIEngine:
@@ -9,7 +9,7 @@ class ExecutiveKPIEngine:
         self._history = []
 
     def _now(self):
-        return datetime.utcnow().isoformat()
+        return datetime.now(timezone.utc).isoformat()
 
     def generate_kpis(self, *, metrics):
         kpis = {"revenue_growth": metrics.get("revenue_growth", 0),

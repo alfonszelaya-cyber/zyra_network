@@ -2,13 +2,13 @@
 # client_profile.py - NEXO / ZYRA (migrado)
 from __future__ import annotations
 from typing import Dict, List
-from datetime import datetime
+from datetime import datetime, timezone
 
 class ClientProfile:
     """Perfil ejecutivo consolidado del cliente."""
 
     def _now(self):
-        return datetime.utcnow().isoformat()
+        return datetime.now(timezone.utc).isoformat()
 
     def calculate_risk_level(self, history: List[dict]) -> str:
         risk_events = len([

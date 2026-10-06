@@ -1,7 +1,7 @@
 
 """Operational Risk - NEXO / ZYRA."""
 from __future__ import annotations
-from datetime import datetime
+from datetime import datetime, timezone
 from typing import Dict, List
 import uuid
 
@@ -16,6 +16,6 @@ class OperationalRiskEngine:
         score += min(int(operations_data.get("incidents", 0)) * 10, 30)
         level = "CRITICAL" if score >= 80 else ("HIGH" if score >= 60 else ("MEDIUM" if score >= 30 else "LOW"))
         r = {"risk_id": f"OPR-{uuid.uuid4()}", "score": score, "level": level,
-             "generated_at": datetime.utcnow().isoformat(), "status": "EVALUATED"}
+             "generated_at": datetime.now(timezone.utc).isoformat(), "status": "EVALUATED"}
         self._history.append(r)
         return r

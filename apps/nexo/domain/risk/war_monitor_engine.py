@@ -1,7 +1,7 @@
 
 """War Monitor - NEXO / ZYRA."""
 from __future__ import annotations
-from datetime import datetime
+from datetime import datetime, timezone
 from typing import Dict, List
 import uuid
 
@@ -16,6 +16,6 @@ class WarMonitorEngine:
         r = {"war_risk_id": f"WAR-{uuid.uuid4()}", "country": country_data.get("country"),
              "active_conflict": country_data.get("active_conflict", False),
              "score": score, "risk_level": level,
-             "generated_at": datetime.utcnow().isoformat(), "status": "MONITORED"}
+             "generated_at": datetime.now(timezone.utc).isoformat(), "status": "MONITORED"}
         self._history.append(r)
         return r

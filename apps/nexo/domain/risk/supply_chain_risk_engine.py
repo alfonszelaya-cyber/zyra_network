@@ -1,7 +1,7 @@
 
 """Supply Chain Risk - NEXO / ZYRA."""
 from __future__ import annotations
-from datetime import datetime
+from datetime import datetime, timezone
 from typing import Dict, List
 import uuid
 
@@ -15,6 +15,6 @@ class SupplyChainRiskEngine:
         score += min(int(supplier_data.get("supplier_failures", 0)) * 10, 50)
         level = "CRITICAL" if score >= 80 else ("HIGH" if score >= 60 else ("MEDIUM" if score >= 30 else "LOW"))
         r = {"supply_chain_risk_id": f"SCR-{uuid.uuid4()}", "score": score, "risk_level": level,
-             "generated_at": datetime.utcnow().isoformat(), "status": "EVALUATED"}
+             "generated_at": datetime.now(timezone.utc).isoformat(), "status": "EVALUATED"}
         self._history.append(r)
         return r

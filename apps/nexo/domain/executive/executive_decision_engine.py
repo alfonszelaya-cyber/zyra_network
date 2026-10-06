@@ -1,7 +1,7 @@
 
 """Executive Decision - NEXO / ZYRA."""
 from __future__ import annotations
-from datetime import datetime
+from datetime import datetime, timezone
 from uuid import uuid4
 from typing import Dict, List, Optional
 
@@ -12,7 +12,7 @@ class ExecutiveDecisionEngine:
         self._decisions = []
 
     def _now(self):
-        return datetime.utcnow().isoformat()
+        return datetime.now(timezone.utc).isoformat()
 
     def support_decision(self, *, decision_context,
                          recommendation="REVIEW_REQUIRED", priority="NORMAL"):

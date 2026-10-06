@@ -1,5 +1,10 @@
 
-# journal_engine.py - NEXO / ZYRA (migrado mejorado)
+"""Libro Diario contable persistente.
+
+N-1: si el asiento trae 'lines', se valida el
+cuadre (sum DEBIT == sum CREDIT) antes de
+registrarse. La pierna individual se acepta como
+registro, pero el asiento OFICIAL va cuadrado."""
 from __future__ import annotations
 
 from typing import Dict, List, Optional
@@ -35,6 +40,22 @@ class JournalEngine:
 
     def register_entry(self, accounting_entry: dict) -> dict:
         import json as _json
+        from decimal import Decimal as _D
+        lines = accounting_entry.get("lines")
+        if lines:
+            td = sum((_D(str(l.get("amount", "0")))
+                      for l in lines
+                      if str(l.get("entry_type", ""))
+                      .upper() == "DEBIT"), _D("0"))
+            tc = sum((_D(str(l.get("amount", "0")))
+                      for l in lines
+                      if str(l.get("entry_type", ""))
+                      .upper() == "CREDIT"), _D("0"))
+            if td != tc:
+                raise ValueError(
+                    "asiento descuadrado en journal:"
+                    " DEBIT=" + str(td) + " CREDIT="
+                    + str(tc))
         journal_id = f"JRN-{uuid.uuid4()}"
         now = self._clock.now()
         with self._db.transaction() as cursor:

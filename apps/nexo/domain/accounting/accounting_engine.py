@@ -1,5 +1,18 @@
 
-# accounting_engine.py - NEXO / ZYRA (migrado mejorado)
+"""Motor central contable NEXO (Decimal exacto,
+persistente, auditado por la Red).
+
+REGLA CONTABLE UNICA (N-1): TODO asiento oficial
+DEBE estar cuadrado (sum DEBIT == sum CREDIT).
+- create_balanced_entry(): metodo CANONICO para
+  asientos oficiales (valida el cuadre antes de
+  escribir, un group_id liga las piernas).
+- post_balanced() del GeneralLedgerEngine: misma
+  regla en el libro mayor.
+- create_entry(): PRIMITIVA de pierna individual
+  (un movimiento en una cuenta) — NO constituye
+  por si sola un asiento oficial; las piernas se
+  agrupan via create_balanced_entry."""
 from __future__ import annotations
 
 from decimal import Decimal
@@ -39,7 +52,8 @@ class AccountingEngine:
         self._db = db
         self._clock = clock
         self._audit = audit
-        MigrationRunner(db, "nexo.accounting", _MIGRATIONS).run(clock)
+        MigrationRunner(db, "nexo.accounting",
+                        _MIGRATIONS).run(clock)
 
     def validate_entry(self, account_code: str,
                        amount, entry_type: str) -> bool:
@@ -87,6 +101,63 @@ class AccountingEngine:
                 "metadata": metadata or {},
                 "status": "POSTED",
                 "created_at": now}
+
+    def create_balanced_entry(self, *, lines,
+                              description: str,
+                              reference_id: Optional[str] = None,
+                              metadata: Optional[dict] = None) -> dict:
+        """METODO CANONICO (N-1): asiento oficial
+        cuadrado. Rechaza descuadre. Un group_id
+        liga todas las piernas del asiento."""
+        from decimal import Decimal as _D
+        if not lines or not isinstance(lines, list):
+            raise ValueError("lines requerido")
+        norm = []
+        for ln in lines:
+            code = str(ln.get("account_code",
+                              "")).strip()
+            try:
+                amt = _D(str(ln.get("amount", "0")))
+            except Exception:
+                raise ValueError("amount invalido")
+            et = str(ln.get("entry_type",
+                            "")).upper()
+            if not code or amt <= 0:
+                raise ValueError("linea invalida")
+            if et not in ("DEBIT", "CREDIT"):
+                raise ValueError(
+                    "entry_type invalido")
+            norm.append({"account_code": code,
+                         "amount": amt,
+                         "entry_type": et})
+        total_d = sum((l["amount"] for l in norm
+                       if l["entry_type"] == "DEBIT"),
+                      _D("0"))
+        total_c = sum((l["amount"] for l in norm
+                       if l["entry_type"] == "CREDIT"),
+                      _D("0"))
+        if total_d != total_c:
+            raise ValueError(
+                "asiento descuadrado: DEBIT="
+                + str(total_d) + " CREDIT="
+                + str(total_c))
+        group_id = "GRP-" + str(uuid.uuid4())
+        meta = dict(metadata or {})
+        meta["group_id"] = group_id
+        out = []
+        for l in norm:
+            out.append(self.create_entry(
+                account_code=l["account_code"],
+                amount=l["amount"],
+                entry_type=l["entry_type"],
+                description=description,
+                reference_id=reference_id,
+                metadata=meta))
+        return {"group_id": group_id,
+                "total": str(total_d.quantize(
+                    _D("0.01"))),
+                "lines": len(out),
+                "entries": out}
 
     def get_entry(self, entry_id: str) -> Optional[dict]:
         row = self._db.query_one(

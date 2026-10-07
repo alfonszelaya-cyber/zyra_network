@@ -1,4 +1,14 @@
-"""SEMILLA durable store (v2: + tutor tables)."""
+
+"""SEMILLA durable store (v2: + tutor tables).
+
+S-1 CANONICO (regla 51 aditivo): cada SemillaStore
+se autowirea al StudentRegistryEngine canonico via
+CanonicalBridge — altas de alumnos espejadas al
+canonico (o en cola sm_legacy_pending si faltan
+datos SE-3: nada falso, regla 66) y lecturas
+viejas-primero con fallback canonico por mapa.
+Best-effort: si el lado canonico no esta
+disponible, el store funciona identico a antes."""
 from __future__ import annotations
 
 import uuid
@@ -86,7 +96,6 @@ _MIGRATIONS = (
     ),
 )
 
-
 class SemillaStore:
     """Durable state for SEMILLA."""
 
@@ -94,6 +103,25 @@ class SemillaStore:
         self._db = db
         self._clock = clock
         MigrationRunner(db, "semilla", _MIGRATIONS).run(clock)
+        self.canonical_bridge = None
+        self._wire_canonical()
+
+    def _wire_canonical(self) -> None:
+        """S-1: autowire al canonico (best-effort,
+        jamas rompe el store viejo)."""
+        try:
+            from apps.semilla.domain.student.student_registry_engine import (
+                StudentRegistryEngine,
+            )
+            from apps.semilla.infrastructure.persistence.canonical_bridge import (
+                CanonicalBridge,
+            )
+            registry = StudentRegistryEngine(self._db, self._clock)
+            bridge = CanonicalBridge(self._db, self._clock, registry)
+            bridge.wire(self)
+            self.canonical_bridge = bridge
+        except Exception:
+            self.canonical_bridge = None
 
     def add_account(
         self,

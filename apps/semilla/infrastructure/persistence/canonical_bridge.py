@@ -1,29 +1,21 @@
 
-"""Canonical Bridge (S-1) - puente ADITIVO entre el
-registro viejo (SemillaStore / semilla_accounts) y
-el canonico (StudentRegistryEngine / sm_students).
+"""Canonical Bridge (S-1) v2 - puente ADITIVO entre
+el registro viejo (SemillaStore / semilla_accounts)
+y el canonico (StudentRegistryEngine / sm_students).
 
-REGLA 51 (aditivo): NO cambia el comportamiento
-viejo. El server sigue llamando a sus metodos de
-siempre; el puente:
-1) DUAL-WRITE: tras un alta vieja exitosa, intenta
-   registrar al alumno en el canonico (best-effort;
-   si los datos no alcanzan el minimo SE-3, queda
-   en sm_legacy_pending - NADA falso, regla 66).
-2) READ-THROUGH: get_account responde viejo-primero
-   (forma compatible garantizada); si el viejo no
-   lo tiene, responde el canonico via mapa.
-3) JAMAS lanza: cualquier fallo del lado canonico
-   degrada a operacion vieja pura.
+v2 (auditoria del repo vivo):
+- get_account del store REAL lanza LookupError:
+  el read-through ahora captura LookupError, busca
+  en el mapa y responde del canonico; si tampoco
+  existe, re-lanza el MISMO LookupError
+  (comportamiento viejo identico).
+- complete_pending(): convierte una alta en cola
+  (SE-3 incompleto) en expediente canonico
+  completo, la saca de la cola y la mapea.
 
-Tablas: sm_legacy_map (account_id -> student_id)
-y sm_legacy_pending (altas que faltan completar
-con datos SE-3).
-
-La CONEXION al server vivo (una sola linea:
-bridge.wire(store) en el punto de instanciacion)
-se hace en RUN 1c con la auditoria LECTURA de
-server.py como mapa."""
+REGLA 51 (aditivo): el viejo responde SIEMPRE
+igual; el lado canonico es best-effort y jamas
+lanza hacia el server."""
 from __future__ import annotations
 import json as _j
 from shared_engines.storage.migrations import (
@@ -56,8 +48,8 @@ class CanonicalBridge:
                         _MIGRATIONS).run(clock)
 
     def wire(self, store) -> object:
-        """Envuelve los metodos de cuentas que
-        existan en el store. Idempotente."""
+        """Envuelve metodos de cuentas que existan.
+        Idempotente."""
         for name in ("add_account",
                      "create_account",
                      "register_account"):
@@ -120,7 +112,9 @@ class CanonicalBridge:
             self._pending(
                 str(acc), "SE-3 incompleto",
                 {"name": str(name),
-                 "zid": str(zid)})
+                 "zid": str(zid),
+                 "school": str(school),
+                 "grade": str(grade)})
             return
         est = self._reg.register(
             full_name=str(name), level="BASICA",
@@ -160,12 +154,66 @@ class CanonicalBridge:
             " ORDER BY rowid")
         return [dict(r) for r in rows]
 
+    def complete_pending(self, account_id, *,
+                         tutores,
+                         authorized_pickup,
+                         emergency_contacts,
+                         level="BASICA",
+                         grade=None) -> dict:
+        """Cola -> expediente canonico SE-3
+        completo + mapa (sale de la cola)."""
+        row = self._db.query_one(
+            "SELECT payload_json FROM"
+            " sm_legacy_pending WHERE"
+            " account_id = ?",
+            (str(account_id),))
+        if not row:
+            raise KeyError(account_id)
+        p = _j.loads(
+            str(row["payload_json"]) or "{}")
+        est = self._reg.register(
+            full_name=str(p.get("name") or ""),
+            level=str(level),
+            grade=str(grade
+                      or p.get("grade")
+                      or "1"),
+            institution_id=str(
+                p.get("school") or ""),
+            tutores=list(tutores),
+            authorized_pickup=list(
+                authorized_pickup),
+            emergency_contacts=list(
+                emergency_contacts),
+            zid=str(p.get("zid") or ""),
+            zid_status=("PROVISIONAL"
+                        if p.get("zid")
+                        else "NONE"))
+        with self._db.transaction() as cursor:
+            cursor.execute(
+                "DELETE FROM sm_legacy_pending"
+                " WHERE account_id = ?",
+                (str(account_id),))
+            cursor.execute(
+                "INSERT OR REPLACE INTO"
+                " sm_legacy_map (account_id,"
+                " student_id, created_at)"
+                " VALUES (?, ?, ?)",
+                (str(account_id),
+                 str(est["student_id"]),
+                 self._clock.now()))
+        return est
+
     # ---------- lectura ----------
 
     def _wrap_get(self, original):
         bridge = self
         def patched(*args, **kwargs):
-            res = original(*args, **kwargs)
+            err = None
+            try:
+                res = original(*args, **kwargs)
+            except LookupError as e:
+                err = e
+                res = None
             if res is not None:
                 return res
             try:
@@ -191,6 +239,8 @@ class CanonicalBridge:
                                     est, acc)
             except Exception:
                 pass
+            if err is not None:
+                raise err
             return res
         patched._zyra_canonical = True
         return patched

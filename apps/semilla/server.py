@@ -1358,4 +1358,8 @@ def serve_semilla(
     SemillaApiHandler.link = SemillaLink(
         client
     )
+    from apps.semilla.routers.student.home_registration_router import (
+        patch_hr_routes,
+    )
+    patch_hr_routes()  # _HR_V2
     return SemillaServer((host, port))

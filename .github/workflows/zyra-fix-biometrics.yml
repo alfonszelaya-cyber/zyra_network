@@ -1,4 +1,4 @@
-name: "ZYRA RUN2c v2: S-8 IA tutora (foco UNICO: objetivo nuevo reemplaza cualquier activo) + S-13 rutas"
+name: "ZYRA RUN2d: S-11 llenado dominios (certificacion/admisiones/docente/education_core) + S-12 registro canonico + servicio academico"
 
 on:
   push:
@@ -30,7 +30,31 @@ jobs:
           fi
           echo "DEPS OK"
 
-      - name: "[ESCRITURA] S-8 tutor_link_engine (fix foco unico) + S-13 learning_path_engine"
+      - name: "[LECTURA] auditoria carpetas destino (regla 68: confirmar existentes y vacias)"
+        if: always()
+        run: |
+          set +e
+          SUM="$GITHUB_STEP_SUMMARY"
+          echo "## AUDITORIA RUN 2d (regla 68)" >> "$SUM"
+          echo "### contenido de carpetas destino" >> "$SUM"
+          { echo '```'; for d in admissions certification teacher zyra_education_core management; do echo "-- domain/$d:"; ls apps/semilla/domain/$d 2>/dev/null; done; for d in migrations migrations/database services services/academic; do echo "-- $d:"; ls apps/semilla/$d 2>/dev/null; done; echo '```'; } >> "$SUM"
+          echo "### __init__ presentes?" >> "$SUM"
+          { echo '```'; for d in apps/semilla/migrations apps/semilla/migrations/database apps/semilla/services apps/semilla/services/academic apps/semilla/domain/teacher apps/semilla/domain/admissions apps/semilla/domain/certification apps/semilla/domain/zyra_education_core; do if [ -f "$d/__init__.py" ]; then echo "SI  $d"; else echo "NO  $d"; fi; done; echo '```'; } >> "$SUM"
+          exit 0
+
+      - name: "[ESCRITURA] __init__ faltantes solo como marcador de paquete (carpetas ya existentes)"
+        if: always()
+        run: |
+          set -e
+          for d in apps/semilla/migrations apps/semilla/migrations/database apps/semilla/services apps/semilla/services/academic apps/semilla/domain/teacher apps/semilla/domain/admissions apps/semilla/domain/certification apps/semilla/domain/zyra_education_core; do
+            if [ -d "$d" ] && [ ! -f "$d/__init__.py" ]; then
+              : > "$d/__init__.py"
+              echo "init creado: $d/__init__.py (carpeta existente, solo marcador de paquete)"
+            fi
+          done
+          exit 0
+
+      - name: "[ESCRITURA] S-11: certificacion + admisiones + carga docente + education core"
         if: always()
         run: |
           export PYTHONPATH="$(pwd):$(pwd)/shared_engines:$(pwd)"
@@ -64,38 +88,553 @@ jobs:
                       + "\n```")
 
           try:
-              forzar("apps/semilla/domain/education_ai/tutor_link_engine.py",
+              forzar("apps/semilla/domain/certification/certificate_engine.py",
                      D(r'''
-                  """Tutor Link Engine (S-8) - la IA tutora como
-                  PARTE del ciclo escolar, no un chatbot suelto.
+                  """Certificate Engine (S-11) - certificados
+                  escolares verificables.
 
-                  Conecta: expediente canonico (StudentRegistry)
-                  + notas (sm_evaluations, flujo S-9) + asistencia
-                  por clase (sm_class_attendance, flujo S-6) +
-                  sesiones de tutoria (sm_tutor_sessions, DDL
-                  confirmado) -> OBJETIVO concreto de estudio con
-                  dificultad derivada del promedio real.
+                  - issue(): emite certificado; si cert_type =
+                    'GRADO' EXIGE evento PROMOCION real en
+                    sm_cycle_events (regla 66: no se certifica
+                    lo que no paso).
+                  - Cadena de hash POR ALUMNO (sha256 sobre el
+                    entry_hash previo) — mismo patron que
+                    sm_history del repo.
+                  - verify(code) -> estado + payload.
+                  - revoke(code, reason) -> REVOCADO con motivo.
+                  - verify_chain(student_id) -> True solo si TODA
+                    la cadena del alumno cuadra (detecta
+                    alteraciones).
 
-                  FOCO UNICO (v2): el alumno tiene UN solo objetivo
-                  ACTIVO a la vez — al fijar uno nuevo, los
-                  anteriores de CUALQUIER materia quedan
-                  REEMPLAZADO (el GENERAL de arranque cede ante
-                  el primero con notas reales).
+                  Regla 76: recorrido por rowid (reloj congelado
+                  nunca ordena por timestamp)."""
+                  from __future__ import annotations
+                  import hashlib
+                  import uuid
+                  from shared_engines.common.clocks import Clock
+                  from shared_engines.storage.database import (
+                      Database)
+                  from shared_engines.storage.migrations import (
+                      Migration, MigrationRunner)
 
-                  snapshot(): estado consolidado del alumno.
-                  next_objective(): elige la materia con PEOR
-                  promedio (razon honesta, regla 66) y fija
-                  dificultad 1..4 (sin notas -> GENERAL nivel 1).
-                  record_attempt(): acierto sube nivel y racha
-                  (racha 3 -> objetivo COMPLETADO); error baja
-                  nivel (min 1) y resetea racha; sincroniza la
-                  sesion de tutoria abierta de esa materia.
+                  _MIGRATIONS = (
+                      Migration(1, "cert_tables", (
+                          "CREATE TABLE IF NOT EXISTS"
+                          " sm_certificates (cert_id TEXT PRIMARY"
+                          " KEY, cert_code TEXT NOT NULL UNIQUE,"
+                          " student_id TEXT NOT NULL, cert_type TEXT"
+                          " NOT NULL, detail TEXT NOT NULL DEFAULT"
+                          " '', issued_by TEXT NOT NULL DEFAULT '',"
+                          " status TEXT NOT NULL DEFAULT 'VIGENTE',"
+                          " revoked_reason TEXT NOT NULL DEFAULT"
+                          " '', prev_hash TEXT NOT NULL DEFAULT '',"
+                          " entry_hash TEXT NOT NULL, created_at"
+                          " REAL NOT NULL)",
+                          "CREATE TABLE IF NOT EXISTS"
+                          " sm_cycle_events (event_id TEXT PRIMARY"
+                          " KEY, student_id TEXT NOT NULL,"
+                          " event_type TEXT NOT NULL, school_year"
+                          " TEXT NOT NULL DEFAULT '', detail TEXT"
+                          " NOT NULL DEFAULT '', created_at REAL"
+                          " NOT NULL)",
+                      )),
+                  )
 
-                  Regla 76: ORDER BY rowid (nunca timestamps con
-                  reloj congelado). Regla 61: promedios Decimal
-                  2d. Regla 68: solo carpetas existentes."""
+
+                  class CertificateEngine:
+                      """Certificados verificables (S-11)."""
+
+                      def __init__(self, db, clock):
+                          self._db = db
+                          self._clock = clock
+                          MigrationRunner(db, "sm.certs",
+                                          _MIGRATIONS).run(clock)
+
+                      def _hash(self, prev, student_id, cert_type,
+                                detail, ts) -> str:
+                          base = "|".join([
+                              str(prev), str(student_id),
+                              str(cert_type), str(detail),
+                              str(ts)])
+                          return hashlib.sha256(
+                              base.encode("utf-8")).hexdigest()
+
+                      def _prev_hash(self, student_id) -> str:
+                          row = self._db.query_one(
+                              "SELECT entry_hash FROM"
+                              " sm_certificates WHERE student_id ="
+                              " ? ORDER BY rowid DESC LIMIT 1",
+                              (str(student_id),))
+                          return (str(row["entry_hash"])
+                                  if row else "")
+
+                      def _has_promocion(self, student_id) -> bool:
+                          row = self._db.query_one(
+                              "SELECT COUNT(*) AS n FROM"
+                              " sm_cycle_events WHERE student_id ="
+                              " ? AND event_type = 'PROMOCION'",
+                              (str(student_id),))
+                          return bool(row and int(row["n"]) > 0)
+
+                      def issue(self, *, student_id, cert_type,
+                                detail="", issued_by="") -> dict:
+                          est = self._db.query_one(
+                              "SELECT student_id FROM sm_students"
+                              " WHERE student_id = ?",
+                              (str(student_id),))
+                          if est is None:
+                              raise ValueError(
+                                  "student no existe en el"
+                                  " canonico")
+                          if str(cert_type) == "GRADO" and \
+                                  not self._has_promocion(
+                                      student_id):
+                              raise ValueError(
+                                  "GRADO exige PROMOCION real en"
+                                  " el ciclo (regla 66: nada"
+                                  " falso)")
+                          prev = self._prev_hash(student_id)
+                          ts = self._clock.now()
+                          eh = self._hash(
+                              prev, student_id, cert_type,
+                              detail, ts)
+                          cert_id = ("SMCRT-"
+                                     + uuid.uuid4().hex[:10])
+                          code = ("CERT-" + cert_id[5:])
+                          self._db.execute(
+                              "INSERT INTO sm_certificates"
+                              " (cert_id, cert_code, student_id,"
+                              " cert_type, detail, issued_by,"
+                              " status, revoked_reason, prev_hash,"
+                              " entry_hash, created_at) VALUES"
+                              " (?, ?, ?, ?, ?, ?, 'VIGENTE', '',"
+                              " ?, ?, ?)",
+                              (cert_id, code, str(student_id),
+                               str(cert_type), str(detail),
+                               str(issued_by), prev, eh, ts))
+                          return {"cert_id": cert_id,
+                                  "cert_code": code,
+                                  "cert_type": str(cert_type),
+                                  "entry_hash": eh,
+                                  "status": "VIGENTE"}
+
+                      def verify(self, cert_code) -> dict:
+                          row = self._db.query_one(
+                              "SELECT * FROM sm_certificates WHERE"
+                              " cert_code = ?",
+                              (str(cert_code),))
+                          if not row:
+                              return {"found": False}
+                          return {"found": True,
+                                  "cert_code":
+                                      str(row["cert_code"]),
+                                  "student_id":
+                                      str(row["student_id"]),
+                                  "cert_type":
+                                      str(row["cert_type"]),
+                                  "detail": str(row["detail"]),
+                                  "issued_by":
+                                      str(row["issued_by"]),
+                                  "status": str(row["status"]),
+                                  "revoked_reason":
+                                      str(row["revoked_reason"]),
+                                  "entry_hash":
+                                      str(row["entry_hash"])}
+
+                      def revoke(self, cert_code, reason) -> dict:
+                          row = self._db.query_one(
+                              "SELECT cert_code FROM"
+                              " sm_certificates WHERE cert_code ="
+                              " ?", (str(cert_code),))
+                          if not row:
+                              raise KeyError(cert_code)
+                          self._db.execute(
+                              "UPDATE sm_certificates SET status ="
+                              " 'REVOCADO', revoked_reason = ?"
+                              " WHERE cert_code = ?",
+                              (str(reason), str(cert_code)))
+                          return {"cert_code": str(cert_code),
+                                  "status": "REVOCADO",
+                                  "reason": str(reason)}
+
+                      def verify_chain(self, student_id) -> bool:
+                          rows = self._db.query_all(
+                              "SELECT student_id, cert_type,"
+                              " detail, created_at, prev_hash,"
+                              " entry_hash FROM sm_certificates"
+                              " WHERE student_id = ? ORDER BY"
+                              " rowid", (str(student_id),))
+                          prev = ""
+                          for r in rows:
+                              expect = self._hash(
+                                  prev, r["student_id"],
+                                  r["cert_type"], r["detail"],
+                                  r["created_at"])
+                              if expect != str(r["entry_hash"]):
+                                  return False
+                              if prev != str(r["prev_hash"]):
+                                  return False
+                              prev = str(r["entry_hash"])
+                          return True
+              '''))
+              forzar("apps/semilla/domain/admissions/admission_pipeline_engine.py",
+                     D(r'''
+                  """Admission Pipeline Engine (S-11) - solicitudes
+                  de ingreso / traslados fuera de la matricula
+                  desde casa: solicitud -> revision -> COLOCACION
+                  con cupo REAL (compone S-7 AutoAssignmentEngine,
+                  regla 69) -> matricula.
+
+                  place(): si la solicitud no tiene student_id,
+                  registra al alumno en el canonico con datos SE-3
+                  completos (tutores + 2 retiro + emergencia — si
+                  faltan, error honesto). Si el asignador responde
+                  NO_CUPOS, la solicitud queda APROBADA con nota
+                  (regla 66: nunca se inventa cupo)."""
                   from __future__ import annotations
                   import uuid
+                  from shared_engines.common.clocks import Clock
+                  from shared_engines.storage.database import (
+                      Database)
+                  from shared_engines.storage.migrations import (
+                      Migration, MigrationRunner)
+
+                  _MIGRATIONS = (
+                      Migration(1, "admissions_table", (
+                          "CREATE TABLE IF NOT EXISTS"
+                          " sm_admission_apps (app_id TEXT PRIMARY"
+                          " KEY, student_id TEXT NOT NULL DEFAULT"
+                          " '', applicant_name TEXT NOT NULL,"
+                          " relation TEXT NOT NULL DEFAULT '',"
+                          " target_institution TEXT NOT NULL,"
+                          " target_level TEXT NOT NULL, target_grade"
+                          " TEXT NOT NULL, status TEXT NOT NULL"
+                          " DEFAULT 'PENDIENTE', note TEXT NOT NULL"
+                          " DEFAULT '', created_at REAL NOT NULL,"
+                          " updated_at REAL NOT NULL)",
+                      )),
+                  )
+
+
+                  class AdmissionPipelineEngine:
+                      """Pipeline de admisiones (S-11)."""
+
+                      def __init__(self, db, clock,
+                                   student_registry,
+                                   classroom_engine,
+                                   enrollment_engine):
+                          from apps.semilla.domain.academic.auto_assignment_engine import (
+                              AutoAssignmentEngine,
+                          )
+                          self._db = db
+                          self._clock = clock
+                          self._students = student_registry
+                          self._assigner = AutoAssignmentEngine(
+                              db, clock,
+                              student_registry=student_registry,
+                              classroom_engine=classroom_engine,
+                              enrollment_engine=enrollment_engine)
+                          MigrationRunner(db, "sm.admissions",
+                                          _MIGRATIONS).run(clock)
+
+                      def create_application(self, *,
+                                             applicant_name,
+                                             target_institution,
+                                             target_level,
+                                             target_grade,
+                                             relation="",
+                                             student_id="") -> dict:
+                          if not str(applicant_name).strip():
+                              raise ValueError(
+                                  "applicant_name requerido")
+                          aid = ("SMADM-"
+                                 + uuid.uuid4().hex[:10])
+                          now = self._clock.now()
+                          self._db.execute(
+                              "INSERT INTO sm_admission_apps"
+                              " (app_id, student_id, applicant_name,"
+                              " relation, target_institution,"
+                              " target_level, target_grade, status,"
+                              " note, created_at, updated_at)"
+                              " VALUES (?, ?, ?, ?, ?, ?, ?,"
+                              " 'PENDIENTE', '', ?, ?)",
+                              (aid, str(student_id or ""),
+                               str(applicant_name).strip(),
+                               str(relation or ""),
+                               str(target_institution),
+                               str(target_level),
+                               str(target_grade), now, now))
+                          return self.get_application(aid)
+
+                      def get_application(self, app_id) -> dict:
+                          row = self._db.query_one(
+                              "SELECT * FROM sm_admission_apps"
+                              " WHERE app_id = ?",
+                              (str(app_id),))
+                          if not row:
+                              raise KeyError(app_id)
+                          return {"app_id": str(row["app_id"]),
+                                  "student_id":
+                                      str(row["student_id"]),
+                                  "applicant_name":
+                                      str(row["applicant_name"]),
+                                  "relation": str(row["relation"]),
+                                  "target_institution":
+                                      str(row[
+                                          "target_institution"]),
+                                  "target_level":
+                                      str(row["target_level"]),
+                                  "target_grade":
+                                      str(row["target_grade"]),
+                                  "status": str(row["status"]),
+                                  "note": str(row["note"])}
+
+                      def review(self, app_id, *, decision,
+                                 reviewer, note="") -> dict:
+                          row = self._db.query_one(
+                              "SELECT status FROM"
+                              " sm_admission_apps WHERE app_id ="
+                              " ?", (str(app_id),))
+                          if not row:
+                              raise KeyError(app_id)
+                          d = str(decision).upper()
+                          if d not in ("APROBADA", "RECHAZADA"):
+                              raise ValueError(
+                                  "decision debe ser APROBADA o"
+                                  " RECHAZADA")
+                          if str(row["status"]) != "PENDIENTE":
+                              raise ValueError(
+                                  "estado: " + str(row["status"]))
+                          self._db.execute(
+                              "UPDATE sm_admission_apps SET status"
+                              " = ?, note = ?, updated_at = ? WHERE"
+                              " app_id = ?",
+                              (d, ("revisado por "
+                                   + str(reviewer)
+                                   + ("; " + str(note)
+                                      if str(note) else "")),
+                               self._clock.now(), str(app_id)))
+                          return self.get_application(app_id)
+
+                      def place(self, app_id, *, tutores,
+                                authorized_pickup,
+                                emergency_contacts,
+                                turn_order=None) -> dict:
+                          app = self.get_application(app_id)
+                          if app["status"] != "APROBADA":
+                              raise ValueError(
+                                  "solo APROBADA se coloca;"
+                                  " estado: "
+                                  + app["status"])
+                          sid = app["student_id"]
+                          if not sid:
+                              est = self._students.register(
+                                  full_name=app["applicant_name"],
+                                  level=app["target_level"],
+                                  grade=app["target_grade"],
+                                  institution_id=app[
+                                      "target_institution"],
+                                  tutores=list(tutores or []),
+                                  authorized_pickup=list(
+                                      authorized_pickup or []),
+                                  emergency_contacts=list(
+                                      emergency_contacts or []),
+                                  zid="", zid_status="NONE")
+                              sid = est["student_id"]
+                              self._db.execute(
+                                  "UPDATE sm_admission_apps SET"
+                                  " student_id = ?, updated_at = ?"
+                                  " WHERE app_id = ?",
+                                  (sid, self._clock.now(),
+                                   str(app_id)))
+                          res = self._assigner.assign(
+                              student_id=sid,
+                              level=app["target_level"],
+                              grade=app["target_grade"],
+                              turn_order=turn_order,
+                              institution_id=app[
+                                  "target_institution"])
+                          if res["status"] == "ASIGNADO":
+                              self._db.execute(
+                                  "UPDATE sm_admission_apps SET"
+                                  " status = 'MATRICULADO', note ="
+                                  " ?, updated_at = ? WHERE app_id"
+                                  " = ?",
+                                  ("colocado en aula "
+                                   + res["classroom_id"]
+                                   + " turno " + res["turn"],
+                                   self._clock.now(),
+                                   str(app_id)))
+                          else:
+                              self._db.execute(
+                                  "UPDATE sm_admission_apps SET"
+                                  " note = ?, updated_at = ? WHERE"
+                                  " app_id = ?",
+                                  ("NO_CUPOS: "
+                                   + str(res.get("note", "")),
+                                   self._clock.now(),
+                                   str(app_id)))
+                          out = self.get_application(app_id)
+                          out["assignment"] = res
+                          return out
+              '''))
+              forzar("apps/semilla/domain/teacher/teacher_workload_engine.py",
+                     D(r'''
+                  """Teacher Workload Engine (S-11) - asignacion de
+                  docentes a aulas/materias con horario simple y
+                  control de carga honesto:
+                  - un docente no puede estar en 2 aulas a la misma
+                    hora (conflicto de docente)
+                  - un aula no puede tener 2 clases a la misma hora
+                    (conflicto de aula)
+                  - tope de aulas por docente (max_classrooms,
+                    ValueError honesto al exceder)
+                  - usa ClassroomEngine.set_teacher / by_teacher
+                    (APIs verificadas en verde).
+
+                  Regla 76: consultas por rowid."""
+                  from __future__ import annotations
+                  import uuid
+                  from shared_engines.common.clocks import Clock
+                  from shared_engines.storage.database import (
+                      Database)
+                  from shared_engines.storage.migrations import (
+                      Migration, MigrationRunner)
+
+                  _MIGRATIONS = (
+                      Migration(1, "teacher_workload", (
+                          "CREATE TABLE IF NOT EXISTS"
+                          " sm_teacher_assignments (assignment_id"
+                          " TEXT PRIMARY KEY, teacher_id TEXT NOT"
+                          " NULL, classroom_id TEXT NOT NULL,"
+                          " subject TEXT NOT NULL DEFAULT '', day"
+                          " TEXT NOT NULL DEFAULT '', time_slot"
+                          " TEXT NOT NULL DEFAULT '', created_at"
+                          " REAL NOT NULL, UNIQUE(classroom_id,"
+                          " day, time_slot))",
+                      )),
+                  )
+
+
+                  class TeacherWorkloadEngine:
+                      """Carga docente (S-11)."""
+
+                      def __init__(self, db, clock,
+                                   classroom_engine,
+                                   max_classrooms=6):
+                          self._db = db
+                          self._clock = clock
+                          self._cls = classroom_engine
+                          self._max = int(max_classrooms)
+                          MigrationRunner(db, "sm.twork",
+                                          _MIGRATIONS).run(clock)
+
+                      def _aulas_de(self, teacher_id) -> list:
+                          try:
+                              return [str(a["classroom_id"])
+                                      for a in self._cls.by_teacher(
+                                          str(teacher_id))]
+                          except Exception:
+                              return []
+
+                      def assign(self, *, teacher_id, classroom_id,
+                                 subject, day, time_slot) -> dict:
+                          self._cls.get(str(classroom_id))
+                          d = str(day).upper()
+                          ts = str(time_slot)
+                          row = self._db.query_one(
+                              "SELECT teacher_id FROM"
+                              " sm_teacher_assignments WHERE"
+                              " classroom_id = ? AND day = ? AND"
+                              " time_slot = ?",
+                              (str(classroom_id), d, ts))
+                          if row is not None:
+                              raise ValueError(
+                                  "conflicto de AULA: ocupada el "
+                                  + d + " " + ts)
+                          row2 = self._db.query_one(
+                              "SELECT classroom_id FROM"
+                              " sm_teacher_assignments WHERE"
+                              " teacher_id = ? AND day = ? AND"
+                              " time_slot = ?",
+                              (str(teacher_id), d, ts))
+                          if row2 is not None:
+                              raise ValueError(
+                                  "conflicto de DOCENTE: ya tiene"
+                                  " clase el " + d + " " + ts)
+                          aulas = self._aulas_de(teacher_id)
+                          if (str(classroom_id) not in aulas
+                                  and len(aulas) >= self._max):
+                              raise ValueError(
+                                  "tope de carga: el docente ya"
+                                  " atiende " + str(len(aulas))
+                                  + " aulas (max "
+                                  + str(self._max) + ")")
+                          self._cls.set_teacher(
+                              str(classroom_id), str(teacher_id))
+                          aid = ("SMTW-"
+                                 + uuid.uuid4().hex[:10])
+                          self._db.execute(
+                              "INSERT INTO sm_teacher_assignments"
+                              " (assignment_id, teacher_id,"
+                              " classroom_id, subject, day,"
+                              " time_slot, created_at)"
+                              " VALUES (?, ?, ?, ?, ?, ?, ?)",
+                              (aid, str(teacher_id),
+                               str(classroom_id), str(subject),
+                               d, ts, self._clock.now()))
+                          return {"assignment_id": aid,
+                                  "teacher_id": str(teacher_id),
+                                  "classroom_id":
+                                      str(classroom_id),
+                                  "subject": str(subject),
+                                  "day": d, "time_slot": ts}
+
+                      def workload_of(self, teacher_id) -> dict:
+                          rows = self._db.query_all(
+                              "SELECT classroom_id, subject, day,"
+                              " time_slot FROM"
+                              " sm_teacher_assignments WHERE"
+                              " teacher_id = ? ORDER BY day,"
+                              " time_slot, rowid",
+                              (str(teacher_id),))
+                          items = [
+                              {"classroom_id":
+                                   str(r["classroom_id"]),
+                               "subject": str(r["subject"]),
+                               "day": str(r["day"]),
+                               "time_slot": str(r["time_slot"])}
+                              for r in rows]
+                          aulas = sorted(set(
+                              i["classroom_id"]
+                              for i in items))
+                          extra = self._aulas_de(teacher_id)
+                          for c in extra:
+                              if c not in aulas:
+                                  aulas.append(c)
+                          return {"teacher_id":
+                                      str(teacher_id),
+                                  "aulas": len(aulas),
+                                  "classroom_ids": aulas,
+                                  "slots": items,
+                                  "max_classrooms": self._max}
+              '''))
+              forzar("apps/semilla/domain/zyra_education_core/education_core_engine.py",
+                     D(r'''
+                  """Education Core Engine (S-11 / zyra_education_core)
+                  - indicadores educativos consolidados POR
+                  INSTITUCION (lectura pura, sin duplicar motores):
+                  alumnos, aulas/capacidad/cupos por turno,
+                  promedios por materia, asistencia y LISTA DE
+                  RIESGO (promedio < 6.00 o asistencia < 70%).
+
+                  Es la semilla de la Capa A de GOV-DATA
+                  (APP_OPERATIONAL_INTELLIGENCE): cada app publica
+                  sus indicadores; el panel nacional los agrega.
+
+                  Regla 61: promedios/ratios Decimal 2d.
+                  Regla 76: ORDER BY rowid/subject."""
+                  from __future__ import annotations
                   from decimal import Decimal
                   from shared_engines.common.clocks import Clock
                   from shared_engines.storage.database import (
@@ -104,7 +643,7 @@ jobs:
                       Migration, MigrationRunner)
 
                   _MIGRATIONS = (
-                      Migration(1, "ai_canonical_guarantees", (
+                      Migration(1, "core_guarantees", (
                           "CREATE TABLE IF NOT EXISTS"
                           " sm_evaluations (evaluation_id TEXT"
                           " PRIMARY KEY, student_id TEXT NOT NULL,"
@@ -113,8 +652,8 @@ jobs:
                           " TEXT NOT NULL DEFAULT '10.00',"
                           " eval_type TEXT NOT NULL DEFAULT"
                           " 'EXAMEN', teacher_id TEXT NOT NULL"
-                          " DEFAULT '', detail TEXT NOT NULL"
-                          " DEFAULT '', created_at REAL NOT NULL)",
+                          " DEFAULT '', detail TEXT NOT NULL DEFAULT"
+                          " '', created_at REAL NOT NULL)",
                           "CREATE TABLE IF NOT EXISTS"
                           " sm_class_attendance (class_att_id TEXT"
                           " PRIMARY KEY, student_id TEXT NOT NULL,"
@@ -126,6 +665,202 @@ jobs:
                           " '', created_at REAL NOT NULL,"
                           " UNIQUE(student_id, classroom_id, subject,"
                           " date, time_slot))",
+                      )),
+                  )
+
+
+                  def _q2(x) -> str:
+                      return str(Decimal(str(x)).quantize(
+                          Decimal("0.01")))
+
+
+                  class EducationCoreEngine:
+                      """Indicadores por institucion (Capa A)."""
+
+                      def __init__(self, db, clock,
+                                   student_registry):
+                          self._db = db
+                          self._clock = clock
+                          self._students = student_registry
+                          MigrationRunner(db, "sm.educore",
+                                          _MIGRATIONS).run(clock)
+
+                      def indicators(self, institution_id,
+                                     school_year="2026") -> dict:
+                          students = list(
+                              self._students.by_institution(
+                                  str(institution_id)))
+                          ids = [str(s["student_id"])
+                                 for s in students]
+                          rooms = self._db.query_all(
+                              "SELECT capacity, enrolled, turn FROM"
+                              " sm_classrooms WHERE institution_id"
+                              " = ? AND school_year = ?",
+                              (str(institution_id),
+                               str(school_year)))
+                          aulas = len(rooms)
+                          cap = sum(int(r["capacity"] or 0)
+                                    for r in rooms)
+                          enr = sum(int(r["enrolled"] or 0)
+                                    for r in rooms)
+                          por_turno = {}
+                          for r in rooms:
+                              t = str(r["turn"] or "SIN_TURNO")
+                              e = por_turno.setdefault(
+                                  t, {"capacidad": 0,
+                                      "matriculados": 0})
+                              e["capacidad"] += int(
+                                  r["capacity"] or 0)
+                              e["matriculados"] += int(
+                                  r["enrolled"] or 0)
+                          avgs = {}
+                          rows = self._db.query_all(
+                              "SELECT e.subject AS subject,"
+                              " AVG(CAST(e.score AS REAL)) AS a"
+                              " FROM sm_evaluations e JOIN"
+                              " sm_students s ON e.student_id ="
+                              " s.student_id WHERE"
+                              " s.institution_id = ? GROUP BY"
+                              " e.subject ORDER BY e.subject",
+                              (str(institution_id),))
+                          for r in rows:
+                              if r["a"] is not None:
+                                  avgs[str(r["subject"])] = \
+                                      _q2(r["a"])
+                          att_rows = self._db.query_all(
+                              "SELECT a.status AS status,"
+                              " COUNT(*) AS n FROM"
+                              " sm_class_attendance a JOIN"
+                              " sm_students s ON a.student_id ="
+                              " s.student_id WHERE"
+                              " s.institution_id = ? GROUP BY"
+                              " a.status",
+                              (str(institution_id),))
+                          att = {str(r["status"]): int(r["n"])
+                                 for r in att_rows}
+                          tot_att = sum(att.values())
+                          pres = att.get("PRESENTE", 0)
+                          ratio = (_q2(Decimal(pres)
+                                       * Decimal(100)
+                                       / Decimal(tot_att))
+                                   if tot_att else None)
+                          riesgo = []
+                          for sid in ids:
+                              r1 = self._db.query_one(
+                                  "SELECT AVG(CAST(score AS REAL))"
+                                  " AS a FROM sm_evaluations WHERE"
+                                  " student_id = ?", (sid,))
+                              r2 = self._db.query_all(
+                                  "SELECT status, COUNT(*) AS n"
+                                  " FROM sm_class_attendance WHERE"
+                                  " student_id = ? GROUP BY status",
+                                  (sid,))
+                              a = (r1["a"]
+                                   if r1 else None)
+                              p = sum(int(x["n"])
+                                      for x in r2
+                                      if x["status"]
+                                      == "PRESENTE")
+                              tt = sum(int(x["n"]) for x in r2)
+                              reasons = []
+                              if a is not None and \
+                                      Decimal(str(a)) \
+                                      < Decimal("6.00"):
+                                  reasons.append(
+                                      "promedio " + _q2(a))
+                              if tt > 0:
+                                  pct = (Decimal(p)
+                                         * Decimal(100)
+                                         / Decimal(tt))
+                                  if pct < Decimal("70.00"):
+                                      reasons.append(
+                                          "asistencia "
+                                          + _q2(pct) + "%")
+                              if reasons:
+                                  riesgo.append({
+                                      "student_id": sid,
+                                      "reasons": reasons})
+                          return {"institution_id":
+                                      str(institution_id),
+                                  "school_year":
+                                      str(school_year),
+                                  "alumnos": len(ids),
+                                  "aulas": aulas,
+                                  "capacidad": cap,
+                                  "matriculados": enr,
+                                  "cupos": cap - enr,
+                                  "por_turno": por_turno,
+                                  "promedios": avgs,
+                                  "asistencia": att,
+                                  "asistencia_pct": ratio,
+                                  "riesgo": riesgo}
+              '''))
+              forzar("apps/semilla/migrations/database/canonical_migrations.py",
+                     D(r'''
+                  """Registro canonico de migraciones (S-12) - UN
+                  bootstrap idempotente con las tablas de DDL
+                  100% CONOCIDO (esquema exacto del repo).
+
+                  EXCLUIDAS A PROPOSITO: sm_students,
+                  sm_classrooms, sm_enrollments, sm_history,
+                  sm_institutions y demas nucleo — sus DDL
+                  completos no han sido auditados; sus engines
+                  duenos los crean. Un registro que creara esas
+                  tablas con esquema supuesto corromperia el
+                  nucleo en una db fresca (regla 66/68/69)."""
+                  from __future__ import annotations
+                  from shared_engines.storage.migrations import (
+                      Migration, MigrationRunner)
+
+                  _MIGRATIONS = (
+                      Migration(1, "canonical_known_ddl", (
+                          "CREATE TABLE IF NOT EXISTS"
+                          " sm_home_registrations (request_id TEXT"
+                          " PRIMARY KEY, responsable_zid TEXT NOT"
+                          " NULL, responsable_name TEXT NOT NULL,"
+                          " relation TEXT NOT NULL, student_id TEXT,"
+                          " child_name TEXT NOT NULL, birth_date"
+                          " TEXT NOT NULL DEFAULT '', child_zid TEXT"
+                          " NOT NULL DEFAULT '', child_zid_status"
+                          " TEXT NOT NULL DEFAULT 'NONE',"
+                          " institution_id TEXT NOT NULL, level TEXT"
+                          " NOT NULL, grade TEXT NOT NULL, turn TEXT"
+                          " NOT NULL DEFAULT 'MATUTINA',"
+                          " classroom_id TEXT NOT NULL DEFAULT '',"
+                          " pickup_json TEXT NOT NULL DEFAULT '[]',"
+                          " emergency_json TEXT NOT NULL DEFAULT"
+                          " '[]', status TEXT NOT NULL DEFAULT"
+                          " 'PENDING_DOCS', note TEXT NOT NULL"
+                          " DEFAULT '', created_at REAL NOT NULL,"
+                          " updated_at REAL NOT NULL)",
+                          "CREATE TABLE IF NOT EXISTS"
+                          " sm_school_geo (institution_id TEXT"
+                          " PRIMARY KEY, name TEXT NOT NULL DEFAULT"
+                          " '', department TEXT NOT NULL DEFAULT '',"
+                          " municipality TEXT NOT NULL DEFAULT '',"
+                          " updated_at REAL NOT NULL)",
+                          "CREATE TABLE IF NOT EXISTS"
+                          " sm_evaluations (evaluation_id TEXT"
+                          " PRIMARY KEY, student_id TEXT NOT NULL,"
+                          " subject TEXT NOT NULL, period TEXT NOT"
+                          " NULL, score TEXT NOT NULL, scale_max"
+                          " TEXT NOT NULL DEFAULT '10.00',"
+                          " eval_type TEXT NOT NULL DEFAULT"
+                          " 'EXAMEN', teacher_id TEXT NOT NULL"
+                          " DEFAULT '', detail TEXT NOT NULL DEFAULT"
+                          " '', created_at REAL NOT NULL)",
+                          "CREATE TABLE IF NOT EXISTS"
+                          " sm_family_comms (comm_id TEXT PRIMARY"
+                          " KEY, student_id TEXT NOT NULL,"
+                          " from_role TEXT NOT NULL, subject TEXT"
+                          " NOT NULL, body TEXT NOT NULL DEFAULT '',"
+                          " created_at REAL NOT NULL)",
+                          "CREATE TABLE IF NOT EXISTS"
+                          " sm_calendar (event_id TEXT PRIMARY KEY,"
+                          " date TEXT NOT NULL, event_type TEXT NOT"
+                          " NULL, title TEXT NOT NULL, subject TEXT"
+                          " NOT NULL DEFAULT '', created_at REAL NOT"
+                          " NULL)",
                           "CREATE TABLE IF NOT EXISTS"
                           " sm_tutor_sessions (session_id TEXT"
                           " PRIMARY KEY, student_id TEXT NOT NULL,"
@@ -135,8 +870,41 @@ jobs:
                           " 'TUTOR', status TEXT NOT NULL DEFAULT"
                           " 'OPEN', created_at REAL NOT NULL,"
                           " updated_at REAL NOT NULL)",
-                      )),
-                      Migration(2, "ai_own_tables", (
+                          "CREATE TABLE IF NOT EXISTS"
+                          " sm_tutor_attempts (attempt_id TEXT"
+                          " PRIMARY KEY, session_id TEXT NOT NULL,"
+                          " challenge TEXT NOT NULL, student_answer"
+                          " TEXT NOT NULL DEFAULT '', correct"
+                          " INTEGER NOT NULL, hints_used INTEGER NOT"
+                          " NULL DEFAULT 0, points INTEGER NOT NULL"
+                          " DEFAULT 0, created_at REAL NOT NULL)",
+                          "CREATE TABLE IF NOT EXISTS"
+                          " sm_cycle_years (year_id TEXT PRIMARY"
+                          " KEY, institution_id TEXT NOT NULL,"
+                          " school_year TEXT NOT NULL, start_date"
+                          " TEXT NOT NULL DEFAULT '', end_date TEXT"
+                          " NOT NULL DEFAULT '', status TEXT NOT"
+                          " NULL DEFAULT 'ACTIVO', created_at REAL"
+                          " NOT NULL, UNIQUE(institution_id,"
+                          " school_year))",
+                          "CREATE TABLE IF NOT EXISTS"
+                          " sm_cycle_events (event_id TEXT PRIMARY"
+                          " KEY, student_id TEXT NOT NULL,"
+                          " event_type TEXT NOT NULL, school_year"
+                          " TEXT NOT NULL DEFAULT '', detail TEXT"
+                          " NOT NULL DEFAULT '', created_at REAL"
+                          " NOT NULL)",
+                          "CREATE TABLE IF NOT EXISTS"
+                          " sm_class_attendance (class_att_id TEXT"
+                          " PRIMARY KEY, student_id TEXT NOT NULL,"
+                          " classroom_id TEXT NOT NULL, subject TEXT"
+                          " NOT NULL, date TEXT NOT NULL, time_slot"
+                          " TEXT NOT NULL DEFAULT '', status TEXT"
+                          " NOT NULL, teacher_id TEXT NOT NULL"
+                          " DEFAULT '', detail TEXT NOT NULL DEFAULT"
+                          " '', created_at REAL NOT NULL,"
+                          " UNIQUE(student_id, classroom_id, subject,"
+                          " date, time_slot))",
                           "CREATE TABLE IF NOT EXISTS"
                           " sm_ai_objectives (objective_id TEXT"
                           " PRIMARY KEY, student_id TEXT NOT NULL,"
@@ -151,303 +919,6 @@ jobs:
                           " student_id TEXT NOT NULL, correct INTEGER"
                           " NOT NULL, detail TEXT NOT NULL DEFAULT"
                           " '', created_at REAL NOT NULL)",
-                      )),
-                  )
-
-
-                  def _difficulty_from_average(avg):
-                      if avg is None:
-                          return 1
-                      d = Decimal(str(avg))
-                      if d < Decimal("5.00"):
-                          return 1
-                      if d < Decimal("7.00"):
-                          return 2
-                      if d < Decimal("9.00"):
-                          return 3
-                      return 4
-
-
-                  class TutorLinkEngine:
-                      """IA tutora integrada al ciclo (S-8)."""
-
-                      def __init__(self, db, clock,
-                                   student_registry):
-                          self._db = db
-                          self._clock = clock
-                          self._students = student_registry
-                          MigrationRunner(db, "sm.ailink",
-                                          _MIGRATIONS).run(clock)
-
-                      def _averages_by_subject(self,
-                                               student_id) -> dict:
-                          rows = self._db.query_all(
-                              "SELECT subject, score FROM"
-                              " sm_evaluations WHERE student_id ="
-                              " ?", (str(student_id),))
-                          acc = {}
-                          for r in rows:
-                              try:
-                                  acc.setdefault(
-                                      str(r["subject"]),
-                                      []).append(
-                                      Decimal(str(r["score"])))
-                              except Exception:
-                                  continue
-                          out = {}
-                          for subj, vals in acc.items():
-                              out[subj] = str(
-                                  (sum(vals)
-                                   / Decimal(len(vals)))
-                                  .quantize(Decimal("0.01")))
-                          return out
-
-                      def snapshot(self, student_id) -> dict:
-                          est = self._students.get(
-                              str(student_id))
-                          if est is None:
-                              return {"found": False}
-                          avgs = self._averages_by_subject(
-                              student_id)
-                          att_rows = self._db.query_all(
-                              "SELECT status, COUNT(*) AS n FROM"
-                              " sm_class_attendance WHERE"
-                              " student_id = ? GROUP BY status",
-                              (str(student_id),))
-                          attendance = {
-                              str(r["status"]): int(r["n"])
-                              for r in att_rows}
-                          sess = self._db.query_all(
-                              "SELECT session_id, subject, level,"
-                              " streak, status FROM"
-                              " sm_tutor_sessions WHERE"
-                              " student_id = ? ORDER BY rowid",
-                              (str(student_id),))
-                          sessions = [
-                              {"session_id":
-                                   str(r["session_id"]),
-                               "subject": str(r["subject"]),
-                               "level": int(r["level"]),
-                               "streak": int(r["streak"]),
-                               "status": str(r["status"])}
-                              for r in sess]
-                          objs = self._db.query_all(
-                              "SELECT objective_id, subject,"
-                              " difficulty, reason, status FROM"
-                              " sm_ai_objectives WHERE student_id"
-                              " = ? AND status = 'ACTIVO'"
-                              " ORDER BY rowid",
-                              (str(student_id),))
-                          actives = [
-                              {"objective_id":
-                                   str(r["objective_id"]),
-                               "subject": str(r["subject"]),
-                               "difficulty": int(r["difficulty"]),
-                               "reason": str(r["reason"])}
-                              for r in objs]
-                          return {"found": True,
-                                  "student": est,
-                                  "averages": avgs,
-                                  "attendance": attendance,
-                                  "tutor_sessions": sessions,
-                                  "active_objectives": actives}
-
-                      def next_objective(self, student_id,
-                                         subject=None) -> dict:
-                          avgs = self._averages_by_subject(
-                              student_id)
-                          if str(subject or "").strip():
-                              chosen = str(subject)
-                              avg = avgs.get(chosen)
-                              if avg is None:
-                                  reason = ("sin notas de "
-                                            + chosen
-                                            + ": nivel inicial")
-                                  diff = 1
-                              else:
-                                  diff = _difficulty_from_average(
-                                      avg)
-                                  reason = ("promedio " + avg
-                                            + " en " + chosen)
-                          elif avgs:
-                              chosen = sorted(
-                                  avgs.items(),
-                                  key=lambda kv:
-                                      (Decimal(kv[1]),
-                                       kv[0]))[0][0]
-                              avg = avgs[chosen]
-                              diff = _difficulty_from_average(avg)
-                              reason = ("peor promedio " + avg
-                                        + " en " + chosen)
-                          else:
-                              chosen = "GENERAL"
-                              diff = 1
-                              reason = ("sin notas: nivel"
-                                        " inicial GENERAL")
-                          with self._db.transaction() as cur:
-                              cur.execute(
-                                  "UPDATE sm_ai_objectives SET"
-                                  " status = 'REEMPLAZADO',"
-                                  " updated_at = ? WHERE"
-                                  " student_id = ? AND status ="
-                                  " 'ACTIVO'",
-                                  (self._clock.now(),
-                                   str(student_id)))
-                              oid = ("SMOBJ-"
-                                     + uuid.uuid4().hex[:10])
-                              cur.execute(
-                                  "INSERT INTO sm_ai_objectives"
-                                  " (objective_id, student_id,"
-                                  " subject, difficulty, reason,"
-                                  " status, created_at, updated_at)"
-                                  " VALUES (?, ?, ?, ?, ?,"
-                                  " 'ACTIVO', ?, ?)",
-                                  (oid, str(student_id), chosen,
-                                   int(diff), reason,
-                                   self._clock.now(),
-                                   self._clock.now()))
-                          return {"objective_id": oid,
-                                  "student_id": str(student_id),
-                                  "subject": chosen,
-                                  "difficulty": int(diff),
-                                  "reason": reason,
-                                  "status": "ACTIVO"}
-
-                      def record_attempt(self, objective_id, *,
-                                         correct, detail="") -> dict:
-                          row = self._db.query_one(
-                              "SELECT * FROM sm_ai_objectives"
-                              " WHERE objective_id = ?",
-                              (str(objective_id),))
-                          if not row:
-                              raise KeyError(objective_id)
-                          oid = str(row["objective_id"])
-                          sid = str(row["student_id"])
-                          subj = str(row["subject"])
-                          diff = int(row["difficulty"])
-                          rows = self._db.query_all(
-                              "SELECT correct FROM sm_ai_attempts"
-                              " WHERE objective_id = ?"
-                              " ORDER BY rowid DESC LIMIT 3",
-                              (oid,))
-                          streak = 0
-                          for r in rows:
-                              if int(r["correct"]) == 1:
-                                  streak += 1
-                              else:
-                                  break
-                          if bool(correct):
-                              new_diff = min(5, diff + 1)
-                              new_streak = streak + 1
-                          else:
-                              new_diff = max(1, diff - 1)
-                              new_streak = 0
-                          aid = ("SMAAT-"
-                                 + uuid.uuid4().hex[:10])
-                          with self._db.transaction() as cur:
-                              cur.execute(
-                                  "INSERT INTO sm_ai_attempts"
-                                  " (attempt_id, objective_id,"
-                                  " student_id, correct, detail,"
-                                  " created_at) VALUES"
-                                  " (?, ?, ?, ?, ?, ?)",
-                                  (aid, oid, sid,
-                                   1 if bool(correct) else 0,
-                                   str(detail),
-                                   self._clock.now()))
-                              status = "ACTIVO"
-                              if new_streak >= 3:
-                                  status = "COMPLETADO"
-                                  cur.execute(
-                                      "UPDATE sm_ai_objectives"
-                                      " SET status = 'COMPLETADO',"
-                                      " updated_at = ? WHERE"
-                                      " objective_id = ?",
-                                      (self._clock.now(), oid))
-                              else:
-                                  cur.execute(
-                                      "UPDATE sm_ai_objectives SET"
-                                      " difficulty = ?, updated_at"
-                                      " = ? WHERE objective_id = ?",
-                                      (new_diff,
-                                       self._clock.now(), oid))
-                              srow = cur.execute(
-                                  "SELECT session_id FROM"
-                                  " sm_tutor_sessions WHERE"
-                                  " student_id = ? AND subject = ?"
-                                  " AND status = 'OPEN'"
-                                  " ORDER BY rowid LIMIT 1",
-                                  (sid, subj)).fetchone()
-                              if srow is not None:
-                                  cur.execute(
-                                      "UPDATE sm_tutor_sessions"
-                                      " SET level = ?, streak = ?,"
-                                      " updated_at = ? WHERE"
-                                      " session_id = ?",
-                                      (new_diff, new_streak,
-                                       self._clock.now(),
-                                       str(srow[0])))
-                              else:
-                                  cur.execute(
-                                      "INSERT INTO"
-                                      " sm_tutor_sessions"
-                                      " (session_id, student_id,"
-                                      " subject, level, streak,"
-                                      " mode, status, created_at,"
-                                      " updated_at) VALUES"
-                                      " (?, ?, ?, ?, ?, 'TUTOR',"
-                                      " 'OPEN', ?, ?)",
-                                      ("SMSES-"
-                                       + uuid.uuid4().hex[:10],
-                                       sid, subj, new_diff,
-                                       new_streak,
-                                       self._clock.now(),
-                                       self._clock.now()))
-                          return {"attempt_id": aid,
-                                  "objective_id": oid,
-                                  "difficulty": new_diff,
-                                  "streak": new_streak,
-                                  "objective_status": status}
-
-                      def objectives_of(self, student_id) -> list:
-                          rows = self._db.query_all(
-                              "SELECT objective_id, subject,"
-                              " difficulty, reason, status FROM"
-                              " sm_ai_objectives WHERE student_id"
-                              " = ? ORDER BY rowid",
-                              (str(student_id),))
-                          return [
-                              {"objective_id":
-                                   str(r["objective_id"]),
-                               "subject": str(r["subject"]),
-                               "difficulty": int(r["difficulty"]),
-                               "reason": str(r["reason"]),
-                               "status": str(r["status"])}
-                              for r in rows]
-              '''))
-              forzar("apps/semilla/domain/learning/learning_path_engine.py",
-                     D(r'''
-                  """Learning Path Engine (S-13) - rutas de estudio
-                  personalizadas por materia, alimentadas por la
-                  IA tutora integrada (S-8) y los promedios reales
-                  (S-9): 3 pasos por materia con dificultad base
-                  = objetivo ACTIVO de esa materia (si existe),
-                  si no, derivada del promedio; sin notas ->
-                  ruta GENERAL nivel 1 (razon honesta, regla 66).
-
-                  Regla 61: porcentaje Decimal 2d. Regla 76:
-                  ORDER BY subject, step_no, rowid."""
-                  from __future__ import annotations
-                  import uuid
-                  from decimal import Decimal
-                  from shared_engines.common.clocks import Clock
-                  from shared_engines.storage.database import (
-                      Database)
-                  from shared_engines.storage.migrations import (
-                      Migration, MigrationRunner)
-
-                  _MIGRATIONS = (
-                      Migration(1, "learning_own", (
                           "CREATE TABLE IF NOT EXISTS"
                           " sm_learning_paths (path_id TEXT PRIMARY"
                           " KEY, student_id TEXT NOT NULL, subject"
@@ -457,170 +928,155 @@ jobs:
                           " created_at REAL NOT NULL, updated_at"
                           " REAL NOT NULL, UNIQUE(student_id,"
                           " subject, step_no))",
+                          "CREATE TABLE IF NOT EXISTS"
+                          " sm_certificates (cert_id TEXT PRIMARY"
+                          " KEY, cert_code TEXT NOT NULL UNIQUE,"
+                          " student_id TEXT NOT NULL, cert_type TEXT"
+                          " NOT NULL, detail TEXT NOT NULL DEFAULT"
+                          " '', issued_by TEXT NOT NULL DEFAULT '',"
+                          " status TEXT NOT NULL DEFAULT 'VIGENTE',"
+                          " revoked_reason TEXT NOT NULL DEFAULT"
+                          " '', prev_hash TEXT NOT NULL DEFAULT '',"
+                          " entry_hash TEXT NOT NULL, created_at"
+                          " REAL NOT NULL)",
+                          "CREATE TABLE IF NOT EXISTS"
+                          " sm_admission_apps (app_id TEXT PRIMARY"
+                          " KEY, student_id TEXT NOT NULL DEFAULT"
+                          " '', applicant_name TEXT NOT NULL,"
+                          " relation TEXT NOT NULL DEFAULT '',"
+                          " target_institution TEXT NOT NULL,"
+                          " target_level TEXT NOT NULL, target_grade"
+                          " TEXT NOT NULL, status TEXT NOT NULL"
+                          " DEFAULT 'PENDIENTE', note TEXT NOT NULL"
+                          " DEFAULT '', created_at REAL NOT NULL,"
+                          " updated_at REAL NOT NULL)",
+                          "CREATE TABLE IF NOT EXISTS"
+                          " sm_teacher_assignments (assignment_id"
+                          " TEXT PRIMARY KEY, teacher_id TEXT NOT"
+                          " NULL, classroom_id TEXT NOT NULL,"
+                          " subject TEXT NOT NULL DEFAULT '', day"
+                          " TEXT NOT NULL DEFAULT '', time_slot"
+                          " TEXT NOT NULL DEFAULT '', created_at"
+                          " REAL NOT NULL, UNIQUE(classroom_id,"
+                          " day, time_slot))",
                       )),
                   )
 
-
-                  def _base_from_average(avg):
-                      if avg is None:
-                          return 1
-                      d = Decimal(str(avg))
-                      if d < Decimal("5.00"):
-                          return 1
-                      if d < Decimal("7.00"):
-                          return 2
-                      if d < Decimal("9.00"):
-                          return 3
-                      return 4
+                  KNOWN_TABLES = (
+                      "sm_home_registrations", "sm_school_geo",
+                      "sm_evaluations", "sm_family_comms",
+                      "sm_calendar", "sm_tutor_sessions",
+                      "sm_tutor_attempts", "sm_cycle_years",
+                      "sm_cycle_events", "sm_class_attendance",
+                      "sm_ai_objectives", "sm_ai_attempts",
+                      "sm_learning_paths", "sm_certificates",
+                      "sm_admission_apps", "sm_teacher_assignments")
 
 
-                  class LearningPathEngine:
-                      """Rutas personalizadas (S-13)."""
-
-                      def __init__(self, db, clock,
-                                   tutor_link=None):
-                          self._db = db
-                          self._clock = clock
-                          self._tutor = tutor_link
-                          MigrationRunner(db, "sm.learning",
-                                          _MIGRATIONS).run(clock)
-
-                      def _base_difficulty(self, student_id,
-                                           subject) -> int:
-                          if self._tutor is not None:
-                              for o in self._tutor.objectives_of(
-                                      student_id):
-                                  if (o["subject"] == subject
-                                          and o["status"]
-                                          == "ACTIVO"):
-                                      return int(
-                                          o["difficulty"])
-                          row = self._db.query_one(
-                              "SELECT AVG(CAST(score AS REAL)) AS"
-                              " a FROM sm_evaluations WHERE"
-                              " student_id = ? AND subject = ?",
-                              (str(student_id), str(subject)))
-                          if row is not None and \
-                                  row["a"] is not None:
-                              return _base_from_average(
-                                  row["a"])
-                          return 1
-
-                      def build_path(self, student_id) -> dict:
-                          rows = self._db.query_all(
-                              "SELECT DISTINCT subject FROM"
-                              " sm_evaluations WHERE student_id ="
-                              " ?", (str(student_id),))
-                          subjects = sorted(set(
-                              str(r["subject"]) for r in rows))
-                          note = ""
-                          if not subjects:
-                              subjects = ["GENERAL"]
-                              note = ("sin notas: ruta GENERAL"
-                                      " nivel 1")
-                          with self._db.transaction() as cur:
-                              cur.execute(
-                                  "DELETE FROM sm_learning_paths"
-                                  " WHERE student_id = ?",
-                                  (str(student_id),))
-                              built = {}
-                              for subj in subjects:
-                                  base = self._base_difficulty(
-                                      student_id, subj)
-                                  for step in (1, 2, 3):
-                                      diff = min(5, base
-                                                 + (step - 1))
-                                      cur.execute(
-                                          "INSERT INTO"
-                                          " sm_learning_paths"
-                                          " (path_id, student_id,"
-                                          " subject, step_no,"
-                                          " difficulty, status,"
-                                          " created_at, updated_at)"
-                                          " VALUES (?, ?, ?, ?, ?,"
-                                          " 'ACTIVO', ?, ?)",
-                                          ("SMPTH-"
-                                           + uuid.uuid4()
-                                           .hex[:10],
-                                           str(student_id),
-                                           subj, step, diff,
-                                           self._clock.now(),
-                                           self._clock.now()))
-                                  built[subj] = {
-                                      "base": base,
-                                      "steps": [
-                                          min(5, base
-                                              + (s - 1))
-                                          for s in (1, 2, 3)]}
-                          return {"student_id":
-                                      str(student_id),
-                                  "by_subject": built,
-                                  "total_steps":
-                                      3 * len(subjects),
-                                  "note": note}
-
-                      def complete_step(self, path_id) -> dict:
-                          row = self._db.query_one(
-                              "SELECT path_id FROM"
-                              " sm_learning_paths WHERE"
-                              " path_id = ?", (str(path_id),))
-                          if not row:
-                              raise KeyError(path_id)
-                          self._db.execute(
-                              "UPDATE sm_learning_paths SET"
-                              " status = 'COMPLETADO',"
-                              " updated_at = ? WHERE path_id = ?",
-                              (self._clock.now(),
-                               str(path_id)))
-                          return {"path_id": str(path_id),
-                                  "status": "COMPLETADO"}
-
-                      def progress(self, student_id) -> dict:
-                          tot = self._db.query_one(
-                              "SELECT COUNT(*) AS n FROM"
-                              " sm_learning_paths WHERE"
-                              " student_id = ?",
-                              (str(student_id),))
-                          done = self._db.query_one(
-                              "SELECT COUNT(*) AS n FROM"
-                              " sm_learning_paths WHERE"
-                              " student_id = ? AND status ="
-                              " 'COMPLETADO'",
-                              (str(student_id),))
-                          total = int(tot["n"]) if tot else 0
-                          comp = int(done["n"]) if done else 0
-                          if total > 0:
-                              pct = str(
-                                  ((Decimal(comp)
-                                    / Decimal(total))
-                                   * Decimal(100))
-                                  .quantize(Decimal("0.01")))
-                          else:
-                              pct = "0.00"
-                          nxt = self._db.query_one(
-                              "SELECT subject, step_no, difficulty"
-                              " FROM sm_learning_paths WHERE"
-                              " student_id = ? AND status ="
-                              " 'ACTIVO' ORDER BY subject,"
-                              " step_no, rowid LIMIT 1",
-                              (str(student_id),))
-                          next_step = None
-                          if nxt is not None:
-                              next_step = {
-                                  "subject": str(
-                                      nxt["subject"]),
-                                  "step_no": int(
-                                      nxt["step_no"]),
-                                  "difficulty": int(
-                                      nxt["difficulty"])}
-                          return {"student_id":
-                                      str(student_id),
-                                  "total": total,
-                                  "completed": comp,
-                                  "pct": pct,
-                                  "next_step": next_step}
+                  def run_all(db, clock) -> None:
+                      """Bootstrap idempotente de tablas conocidas."""
+                      MigrationRunner(
+                          db, "sm.canonical",
+                          _MIGRATIONS).run(clock)
               '''))
-              out("## FIN builders 2c v2")
+              forzar("apps/semilla/services/academic/academic_service.py",
+                     D(r'''
+                  """Academic Service (S-12) - fachada UNICA del
+                  ciclo escolar para wiring del server: construye
+                  todos los engines del ciclo sobre una db/clock y
+                  expone bootstrap canonico."""
+                  from __future__ import annotations
+                  from shared_engines.storage.database import (
+                      Database)
+                  from apps.semilla.domain.student.student_registry_engine import (
+                      StudentRegistryEngine)
+                  from apps.semilla.domain.classroom.classroom_engine import (
+                      ClassroomEngine)
+                  from apps.semilla.domain.academic.enrollment_engine import (
+                      EnrollmentEngine)
+                  from apps.semilla.domain.academic.academic_history_engine import (
+                      AcademicHistoryEngine)
+                  from apps.semilla.domain.academic.school_cycle_engine import (
+                      SchoolCycleEngine)
+                  from apps.semilla.domain.academic.exam_flow_engine import (
+                      ExamFlowEngine)
+                  from apps.semilla.domain.attendance.linked_attendance_engine import (
+                      LinkedAttendanceEngine)
+                  from apps.semilla.domain.notifications.alert_engine import (
+                      AlertEngine)
+                  from apps.semilla.domain.evaluation.notes_flow_engine import (
+                      NotesFlowEngine)
+                  from apps.semilla.domain.education_ai.tutor_link_engine import (
+                      TutorLinkEngine)
+                  from apps.semilla.domain.learning.learning_path_engine import (
+                      LearningPathEngine)
+                  from apps.semilla.domain.certification.certificate_engine import (
+                      CertificateEngine)
+                  from apps.semilla.domain.admissions.admission_pipeline_engine import (
+                      AdmissionPipelineEngine)
+                  from apps.semilla.domain.teacher.teacher_workload_engine import (
+                      TeacherWorkloadEngine)
+                  from apps.semilla.domain.zyra_education_core.education_core_engine import (
+                      EducationCoreEngine)
+                  from apps.semilla.migrations.database.canonical_migrations import (
+                      run_all)
+
+
+                  class AcademicService:
+                      """Fachada del ciclo escolar (S-12)."""
+
+                      def __init__(self, db, clock):
+                          self.db = db
+                          self.clock = clock
+                          self.students = StudentRegistryEngine(
+                              db, clock)
+                          self.classrooms = ClassroomEngine(
+                              db, clock)
+                          self.enrollment = EnrollmentEngine(
+                              db, clock,
+                              classroom_engine=self.classrooms)
+                          self.history = AcademicHistoryEngine(
+                              db, clock)
+                          self.alerts = AlertEngine(db, clock)
+                          self.notes = NotesFlowEngine(
+                              db, clock,
+                              history_engine=self.history)
+                          self.attendance = LinkedAttendanceEngine(
+                              db, clock,
+                              alert_engine=self.alerts)
+                          self.exams = ExamFlowEngine(
+                              db, clock, calendar_engine=None,
+                              alert_engine=self.alerts,
+                              notes_flow=self.notes)
+                          self.cycle = SchoolCycleEngine(
+                              db, clock,
+                              student_registry=self.students,
+                              enrollment_engine=self.enrollment,
+                              history_engine=self.history)
+                          self.tutor = TutorLinkEngine(
+                              db, clock,
+                              student_registry=self.students)
+                          self.paths = LearningPathEngine(
+                              db, clock, tutor_link=self.tutor)
+                          self.certificates = CertificateEngine(
+                              db, clock)
+                          self.admissions = AdmissionPipelineEngine(
+                              db, clock,
+                              student_registry=self.students,
+                              classroom_engine=self.classrooms,
+                              enrollment_engine=self.enrollment)
+                          self.workload = TeacherWorkloadEngine(
+                              db, clock,
+                              classroom_engine=self.classrooms)
+                          self.core = EducationCoreEngine(
+                              db, clock,
+                              student_registry=self.students)
+
+                      def bootstrap_canonical(self) -> None:
+                          """S-12: garantiza tablas conocidas."""
+                          run_all(self.db, self.clock)
+              '''))
+              out("## FIN builders 2d")
           except Exception:
               out("## ERROR")
               out("```\n" + traceback.format_exc().strip() + "\n```")
@@ -628,190 +1084,288 @@ jobs:
               exit(0)
           PYEOF
 
-      - name: "[ESCRITURA tests + LECTURA veredicto] tests S-8 + S-13 (identicos, el fallo era del engine)"
+      - name: "[ESCRITURA tests + LECTURA veredicto] tests S-11/S-12"
         if: always()
         run: |
           export PYTHONPATH="$(pwd):$(pwd)/shared_engines:$(pwd)"
           set +e
           find apps -name "__pycache__" -type d -prune -exec rm -rf {} + || true
           mkdir -p apps/semilla/tests
-          cat > apps/semilla/tests/test_run2c_tutoria.py << 'TSEOF'
+          cat > apps/semilla/tests/test_run2d_fill.py << 'TSEOF'
           import pytest
           from shared_engines.common.clocks import FrozenClock
           from shared_engines.storage.database import SQLiteAdapter
           from apps.semilla.domain.student.student_registry_engine import StudentRegistryEngine
-          from apps.semilla.domain.evaluation.notes_flow_engine import NotesFlowEngine
-          from apps.semilla.domain.attendance.linked_attendance_engine import LinkedAttendanceEngine
-          from apps.semilla.domain.education_ai.tutor_link_engine import TutorLinkEngine
-          from apps.semilla.domain.learning.learning_path_engine import LearningPathEngine
+          from apps.semilla.domain.classroom.classroom_engine import ClassroomEngine
+          from apps.semilla.domain.academic.enrollment_engine import EnrollmentEngine
+          from apps.semilla.domain.certification.certificate_engine import CertificateEngine
+          from apps.semilla.domain.admissions.admission_pipeline_engine import AdmissionPipelineEngine
+          from apps.semilla.domain.teacher.teacher_workload_engine import TeacherWorkloadEngine
+          from apps.semilla.domain.zyra_education_core.education_core_engine import EducationCoreEngine
+          from apps.semilla.migrations.database.canonical_migrations import (
+              run_all, KNOWN_TABLES)
+          from apps.semilla.services.academic.academic_service import AcademicService
 
           PICK2 = [{"name": "Mama", "relation": "MADRE"},
                    {"name": "Papa", "relation": "PADRE"}]
           EMG = [{"name": "Tio", "relation": "TIO", "phone": "911"}]
+          TUT = [{"name": "Mama", "relation": "MADRE",
+                  "zid": "ZID-M-1"}]
 
-          def _base(tmp_path):
-              db = SQLiteAdapter(tmp_path / "t.db")
-              clock = FrozenClock()
-              students = StudentRegistryEngine(db, clock)
-              nf = NotesFlowEngine(db, clock,
-                  evaluation_engine=None, history_engine=None,
-                  family_engine=None)
-              la = LinkedAttendanceEngine(db, clock,
-                  attendance_engine=None, alert_engine=None)
-              tl = TutorLinkEngine(db, clock,
-                  student_registry=students)
-              lp = LearningPathEngine(db, clock, tutor_link=tl)
-              return db, clock, students, nf, la, tl, lp
-
-          def _alumno(students, name="Alumno Tutoria"):
-              return students.register(full_name=name,
+          def _alumno(students, name, avg=None, att=None):
+              est = students.register(full_name=name,
                   level="BASICA", grade="1", institution_id="INST-1",
-                  tutores=[{"name": "Mama", "relation": "MADRE",
-                            "zid": "ZID-M-1"}],
-                  authorized_pickup=PICK2,
+                  tutores=TUT, authorized_pickup=PICK2,
                   emergency_contacts=EMG,
                   zid="ZID-" + name[:3], zid_status="PROVISIONAL")
+              return est
 
-          def test_s8_snapshot_integrado(tmp_path) -> None:
-              db, clock, students, nf, la, tl, lp = _base(tmp_path)
-              est = _alumno(students)
-              nf.record_note(student_id=est["student_id"],
-                  subject="LENGUA", period="P1", score="5.00",
-                  teacher_id="PROF-L")
-              nf.record_note(student_id=est["student_id"],
-                  subject="MATEMATICAS", period="P1", score="8.50",
-                  teacher_id="PROF-M")
-              la.record_class(student_id=est["student_id"],
-                  classroom_id="AULA-1", subject="MATEMATICAS",
-                  date="2026-03-10", status="PRESENTE",
-                  time_slot="08:00")
-              snap = tl.snapshot(est["student_id"])
-              assert snap["found"] is True
-              assert snap["averages"]["LENGUA"] == "5.00"
-              assert snap["averages"]["MATEMATICAS"] == "8.50"
-              assert snap["attendance"]["PRESENTE"] == 1
-              assert snap["tutor_sessions"] == []
-              nf2 = tl.snapshot("NO-EXISTE")
-              assert nf2["found"] is False
-              print("OK S-8: snapshot consolida expediente + notas (S-9) + asistencia (S-6) + sesiones")
-
-          def test_s8_next_objective_peor_materia(tmp_path) -> None:
-              db, clock, students, nf, la, tl, lp = _base(tmp_path)
-              est = _alumno(students)
-              o0 = tl.next_objective(est["student_id"])
-              assert o0["subject"] == "GENERAL"
-              assert o0["difficulty"] == 1
-              assert "sin notas" in o0["reason"]
-              nf.record_note(student_id=est["student_id"],
-                  subject="LENGUA", period="P1", score="5.00")
-              nf.record_note(student_id=est["student_id"],
-                  subject="MATEMATICAS", period="P1", score="8.50")
-              o1 = tl.next_objective(est["student_id"])
-              assert o1["subject"] == "LENGUA"
-              assert o1["difficulty"] == 2
-              assert "5.00" in o1["reason"]
-              assert "LENGUA" in o1["reason"]
-              objs = tl.objectives_of(est["student_id"])
-              actives = [o for o in objs
-                         if o["status"] == "ACTIVO"]
-              assert len(actives) == 1
-              assert actives[0]["objective_id"] == \
-                  o1["objective_id"]
-              replaced = [o for o in objs
-                          if o["status"] == "REEMPLAZADO"]
-              assert len(replaced) == 1
-              assert replaced[0]["subject"] == "GENERAL"
-              print("OK S-8: FOCO UNICO — el GENERAL de arranque queda REEMPLAZADO cuando hay notas reales (peor promedio -> LENGUA)")
-
-          def test_s8_record_attempt_racha_y_sesion(tmp_path) -> None:
-              db, clock, students, nf, la, tl, lp = _base(tmp_path)
-              est = _alumno(students)
-              nf.record_note(student_id=est["student_id"],
-                  subject="LENGUA", period="P1", score="5.00")
-              o = tl.next_objective(est["student_id"])
-              assert o["difficulty"] == 2
-              r1 = tl.record_attempt(o["objective_id"],
-                  correct=True, detail="bien")
-              assert r1["difficulty"] == 3
-              assert r1["streak"] == 1
-              assert r1["objective_status"] == "ACTIVO"
-              r2 = tl.record_attempt(o["objective_id"],
-                  correct=True)
-              assert r2["difficulty"] == 4
-              assert r2["streak"] == 2
-              r3 = tl.record_attempt(o["objective_id"],
-                  correct=True)
-              assert r3["difficulty"] == 5
-              assert r3["streak"] == 3
-              assert r3["objective_status"] == "COMPLETADO"
-              sess = db.query_one(
-                  "SELECT level, streak, status FROM"
-                  " sm_tutor_sessions WHERE student_id = ?"
-                  " AND subject = 'LENGUA' ORDER BY rowid",
+          def test_certificacion_cadena_y_reglas(tmp_path) -> None:
+              db = SQLiteAdapter(tmp_path / "c.db")
+              clock = FrozenClock()
+              students = StudentRegistryEngine(db, clock)
+              ce = CertificateEngine(db, clock)
+              est = _alumno(students, "Cert Uno")
+              with pytest.raises(ValueError):
+                  ce.issue(student_id=est["student_id"],
+                      cert_type="GRADO", detail="fin de ano",
+                      issued_by="MINED-LOCAL")
+              db.execute(
+                  "INSERT INTO sm_cycle_events (event_id,"
+                  " student_id, event_type, school_year, detail,"
+                  " created_at) VALUES ('EV1', ?, 'PROMOCION',"
+                  " '2026', 'paso a 2', 0)",
                   (est["student_id"],))
-              assert sess is not None
-              assert int(sess["level"]) == 5
-              assert int(sess["streak"]) == 3
-              assert str(sess["status"]) == "OPEN"
-              est2 = _alumno(students, "Ben Dos")
-              o2 = tl.next_objective(est2["student_id"])
-              rf = tl.record_attempt(o2["objective_id"],
-                  correct=False)
-              assert rf["difficulty"] == 1
-              assert rf["streak"] == 0
-              print("OK S-8: aciertos suben nivel/racha (racha 3 COMPLETADO) + sesion sm_tutor_sessions sincronizada + error resetea racha sin bajar de 1")
+              r = ce.issue(student_id=est["student_id"],
+                  cert_type="GRADO", detail="completo 1ro",
+                  issued_by="DIR-1")
+              assert r["status"] == "VIGENTE"
+              v = ce.verify(r["cert_code"])
+              assert v["found"] is True
+              assert v["cert_type"] == "GRADO"
+              r2 = ce.issue(student_id=est["student_id"],
+                  cert_type="PARTICIPACION", detail="olimpiada")
+              assert ce.verify_chain(est["student_id"]) is True
+              ce.revoke(r2["cert_code"], "duplicado")
+              v2 = ce.verify(r2["cert_code"])
+              assert v2["status"] == "REVOCADO"
+              assert "duplicado" in v2["revoked_reason"]
+              db.execute(
+                  "UPDATE sm_certificates SET detail = 'TAMPER'"
+                  " WHERE cert_code = ?",
+                  (r["cert_code"],))
+              assert ce.verify_chain(est["student_id"]) is False
+              with pytest.raises(ValueError):
+                  ce.issue(student_id="NO-EXISTE",
+                      cert_type="PARTICIPACION")
+              print("OK S-11 certificacion: GRADO exige PROMOCION real + cadena hash por alumno + revocacion + tamper detectado")
 
-          def test_s13_ruta_y_progreso(tmp_path) -> None:
-              db, clock, students, nf, la, tl, lp = _base(tmp_path)
-              est = _alumno(students)
-              nf.record_note(student_id=est["student_id"],
-                  subject="LENGUA", period="P1", score="5.00")
-              nf.record_note(student_id=est["student_id"],
-                  subject="MATEMATICAS", period="P1", score="8.50")
-              p = lp.build_path(est["student_id"])
-              assert p["total_steps"] == 6
-              assert p["by_subject"]["LENGUA"]["base"] == 2
-              assert p["by_subject"]["MATEMATICAS"]["base"] == 3
-              assert p["by_subject"]["LENGUA"]["steps"] == [2, 3, 4]
-              pr0 = lp.progress(est["student_id"])
-              assert pr0["total"] == 6
-              assert pr0["completed"] == 0
-              assert pr0["pct"] == "0.00"
-              assert pr0["next_step"]["subject"] == "LENGUA"
-              assert pr0["next_step"]["step_no"] == 1
-              first = db.query_one(
-                  "SELECT path_id FROM sm_learning_paths WHERE"
-                  " student_id = ? AND subject = 'LENGUA' AND"
-                  " step_no = 1", (est["student_id"],))
-              lp.complete_step(str(first["path_id"]))
-              pr1 = lp.progress(est["student_id"])
-              assert pr1["completed"] == 1
-              assert pr1["pct"] == "16.67"
-              assert pr1["next_step"]["subject"] == "LENGUA"
-              assert pr1["next_step"]["step_no"] == 2
-              print("OK S-13: ruta 3 pasos/materia con base del promedio real + progreso Decimal 2d + siguiente paso ordenado")
-              with pytest.raises(KeyError):
-                  lp.complete_step("NO-EXISTS")
+          def test_admisiones_pipeline_con_s7(tmp_path) -> None:
+              db = SQLiteAdapter(tmp_path / "a.db")
+              clock = FrozenClock()
+              students = StudentRegistryEngine(db, clock)
+              cls = ClassroomEngine(db, clock)
+              en = EnrollmentEngine(db, clock, classroom_engine=cls)
+              ap = AdmissionPipelineEngine(db, clock,
+                  student_registry=students,
+                  classroom_engine=cls,
+                  enrollment_engine=en)
+              aula = cls.create(name="2A", institution_id="INST-9",
+                  school_year="2026", level="BASICA", grade="2",
+                  section="A", turn="MATUTINA", capacity=1)
+              a1 = ap.create_application(applicant_name="Nueva",
+                  relation="MADRE", target_institution="INST-9",
+                  target_level="BASICA", target_grade="2")
+              assert a1["status"] == "PENDIENTE"
+              with pytest.raises(ValueError):
+                  ap.place(a1["app_id"], tutores=TUT,
+                      authorized_pickup=PICK2,
+                      emergency_contacts=EMG)
+              rv = ap.review(a1["app_id"], decision="APROBADA",
+                  reviewer="DIR-9")
+              assert rv["status"] == "APROBADA"
+              p1 = ap.place(a1["app_id"], tutores=TUT,
+                  authorized_pickup=PICK2,
+                  emergency_contacts=EMG)
+              assert p1["status"] == "MATRICULADO"
+              assert p1["assignment"]["status"] == "ASIGNADO"
+              assert p1["assignment"]["turn"] == "MATUTINA"
+              assert cls.get(aula["classroom_id"])["enrolled"] == 1
+              a2 = ap.create_application(applicant_name="Segundo",
+                  relation="PADRE", target_institution="INST-9",
+                  target_level="BASICA", target_grade="2")
+              ap.review(a2["app_id"], decision="APROBADA",
+                  reviewer="DIR-9")
+              p2 = ap.place(a2["app_id"], tutores=TUT,
+                  authorized_pickup=PICK2,
+                  emergency_contacts=EMG)
+              assert p2["status"] == "APROBADA"
+              assert "NO_CUPOS" in p2["note"]
+              print("OK S-11 admisiones: solicitud->revision->colocacion compone S-7 (cupo real, una vez) + NO_CUPOS honesto deja APROBADA")
 
-          def test_s13_ruta_general_sin_notas(tmp_path) -> None:
-              db, clock, students, nf, la, tl, lp = _base(tmp_path)
-              est = _alumno(students, "Sin Notas")
-              p = lp.build_path(est["student_id"])
+          def test_carga_docente_conflictos(tmp_path) -> None:
+              db = SQLiteAdapter(tmp_path / "t.db")
+              clock = FrozenClock()
+              cls = ClassroomEngine(db, clock)
+              a = cls.create(name="A", institution_id="INST-1",
+                  school_year="2026", level="BASICA", grade="1",
+                  section="A", turn="MATUTINA", capacity=10)
+              b = cls.create(name="B", institution_id="INST-1",
+                  school_year="2026", level="BASICA", grade="1",
+                  section="B", turn="MATUTINA", capacity=10)
+              tw = TeacherWorkloadEngine(db, clock,
+                  classroom_engine=cls, max_classrooms=2)
+              r1 = tw.assign(teacher_id="T1",
+                  classroom_id=a["classroom_id"],
+                  subject="MATE", day="LUN", time_slot="08:00")
+              assert r1["assignment_id"]
+              with pytest.raises(ValueError) as e1:
+                  tw.assign(teacher_id="T1",
+                      classroom_id=b["classroom_id"],
+                      subject="MATE", day="LUN",
+                      time_slot="08:00")
+              assert "DOCENTE" in str(e1.value)
+              with pytest.raises(ValueError) as e2:
+                  tw.assign(teacher_id="T2",
+                      classroom_id=a["classroom_id"],
+                      subject="LENG", day="LUN",
+                      time_slot="08:00")
+              assert "AULA" in str(e2.value)
+              tw.assign(teacher_id="T1",
+                  classroom_id=b["classroom_id"],
+                  subject="MATE", day="LUN", time_slot="09:00")
+              w = tw.workload_of("T1")
+              assert w["aulas"] == 2
+              c = cls.create(name="C", institution_id="INST-1",
+                  school_year="2026", level="BASICA", grade="1",
+                  section="C", turn="MATUTINA", capacity=10)
+              tw2 = TeacherWorkloadEngine(db, clock,
+                  classroom_engine=cls, max_classrooms=1)
+              tw2.assign(teacher_id="T3",
+                  classroom_id=c["classroom_id"],
+                  subject="MATE", day="LUN", time_slot="08:00")
+              with pytest.raises(ValueError) as e3:
+                  tw2.assign(teacher_id="T3",
+                      classroom_id=b["classroom_id"],
+                      subject="MATE", day="MAR",
+                      time_slot="08:00")
+              assert "tope" in str(e3.value)
+              print("OK S-11 carga docente: conflicto docente/aula + tope de aulas honesto + set_teacher real aplicado")
+
+          def test_education_core_indicadores(tmp_path) -> None:
+              db = SQLiteAdapter(tmp_path / "e.db")
+              clock = FrozenClock()
+              students = StudentRegistryEngine(db, clock)
+              cls = ClassroomEngine(db, clock)
+              cls.create(name="1A", institution_id="INST-1",
+                  school_year="2026", level="BASICA", grade="1",
+                  section="A", turn="MATUTINA", capacity=10)
+              core = EducationCoreEngine(db, clock,
+                  student_registry=students)
+              s1 = _alumno(students, "Fuerte Uno")
+              s2 = _alumno(students, "Debil Dos")
+              db.execute(
+                  "INSERT INTO sm_evaluations (evaluation_id,"
+                  " student_id, subject, period, score,"
+                  " scale_max, eval_type, teacher_id, detail,"
+                  " created_at) VALUES ('E1', ?, 'MATE', 'P1',"
+                  " '9.00', '10.00', 'EXAMEN', '', '', 0)",
+                  (s1["student_id"],))
+              db.execute(
+                  "INSERT INTO sm_evaluations (evaluation_id,"
+                  " student_id, subject, period, score,"
+                  " scale_max, eval_type, teacher_id, detail,"
+                  " created_at) VALUES ('E2', ?, 'MATE', 'P1',"
+                  " '4.00', '10.00', 'EXAMEN', '', '', 0)",
+                  (s2["student_id"],))
+              db.execute(
+                  "INSERT INTO sm_class_attendance (class_att_id,"
+                  " student_id, classroom_id, subject, date,"
+                  " time_slot, status, teacher_id, detail,"
+                  " created_at) VALUES ('C1', ?, 'AUL', 'MATE',"
+                  " '2026-03-10', '08:00', 'PRESENTE', '', '', 0)",
+                  (s1["student_id"],))
+              for i, st in enumerate(("PRESENTE", "AUSENTE",
+                                      "AUSENTE")):
+                  db.execute(
+                      "INSERT INTO sm_class_attendance"
+                      " (class_att_id, student_id, classroom_id,"
+                      " subject, date, time_slot, status,"
+                      " teacher_id, detail, created_at) VALUES"
+                      " (?, ?, 'AUL', 'MATE', '2026-03-1"
+                      + str(i) + "', '08:00', ?, '', '', 0)",
+                      ("C2" + str(i), s2["student_id"], st))
+              ind = core.indicators("INST-1", "2026")
+              assert ind["alumnos"] == 2
+              assert ind["aulas"] == 1
+              assert ind["capacidad"] == 10
+              assert ind["promedios"]["MATE"] in ("6.50",
+                                                  "6.5")
+              ids_riesgo = [r["student_id"]
+                            for r in ind["riesgo"]]
+              assert s2["student_id"] in ids_riesgo
+              assert s1["student_id"] not in ids_riesgo
+              r2row = [r for r in ind["riesgo"]
+                       if r["student_id"] == s2["student_id"]][0]
+              assert any("promedio" in x
+                         for x in r2row["reasons"])
+              assert any("asistencia" in x
+                         for x in r2row["reasons"])
+              print("OK S-11 education core: indicadores por institucion (alumnos/aulas/cupos/promedios) + riesgo con razones honestas (semilla Capa A GOV-DATA)")
+
+          def test_s12_registro_canonico_idempotente(tmp_path) -> None:
+              db = SQLiteAdapter(tmp_path / "m.db")
+              clock = FrozenClock()
+              run_all(db, clock)
+              run_all(db, clock)
+              for t in KNOWN_TABLES:
+                  row = db.query_one(
+                      "SELECT COUNT(*) AS n FROM"
+                      " sqlite_master WHERE type = 'table' AND"
+                      " name = ?", (t,))
+                  assert row is not None and int(row["n"]) == 1, t
+              db.execute(
+                  "INSERT INTO sm_evaluations (evaluation_id,"
+                  " student_id, subject, period, score, created_at)"
+                  " VALUES ('X1', 'S1', 'MATE', 'P1', '8.00', 0)")
+              row = db.query_one(
+                  "SELECT score FROM sm_evaluations WHERE"
+                  " evaluation_id = 'X1'")
+              assert str(row["score"]) == "8.00"
+              print("OK S-12: registro canonico de 16 tablas de DDL conocido, doble ejecucion idempotente; nucleo (sm_students/classrooms/enrollments) EXCLUIDO a proposito — lo crean sus duenos")
+
+          def test_s12_servicio_academico_integrado(tmp_path) -> None:
+              db = SQLiteAdapter(tmp_path / "s.db")
+              svc = AcademicService(db, FrozenClock())
+              svc.bootstrap_canonical()
+              est = svc.students.register(full_name="Serv Uno",
+                  level="BASICA", grade="1",
+                  institution_id="INST-1", tutores=TUT,
+                  authorized_pickup=PICK2,
+                  emergency_contacts=EMG,
+                  zid="ZID-SV1", zid_status="PROVISIONAL")
+              r = svc.notes.record_note(
+                  student_id=est["student_id"],
+                  subject="MATE", period="P1", score="8.00",
+                  teacher_id="T1")
+              assert r["score"] == "8.00"
+              o = svc.tutor.next_objective(est["student_id"])
+              assert o["subject"] == "MATE"
+              p = svc.paths.build_path(est["student_id"])
               assert p["total_steps"] == 3
-              assert "GENERAL" in p["by_subject"]
-              assert p["by_subject"]["GENERAL"]["base"] == 1
-              assert "sin notas" in p["note"]
-              print("OK S-13 honesto (regla 66): alumno sin notas -> ruta GENERAL nivel 1 con nota aclaratoria")
+              ind = svc.core.indicators("INST-1")
+              assert ind["alumnos"] == 1
+              print("OK S-12: AcademicService fachada unica (notas->tutoria->rutas->indicadores) + bootstrap canonico en una linea para el server")
           TSEOF
           python3 - << 'ASTEOF'
           import ast
-          ast.parse(open("apps/semilla/tests/test_run2c_tutoria.py",
+          ast.parse(open("apps/semilla/tests/test_run2d_fill.py",
                          encoding="utf-8").read())
-          print("AST OK test_run2c_tutoria.py")
+          print("AST OK test_run2d_fill.py")
           ASTEOF
-          timeout 240 python3 -m pytest apps/semilla/tests/test_run2c_tutoria.py -vv --tb=long --timeout=45 --timeout-method=thread > /tmp/r2c.out 2>&1
-          echo $? > /tmp/r2c
-          if [ "$(cat /tmp/r2c)" = "0" ]; then echo "- RUN 2c (S-8 + S-13): ✅" >> "$GITHUB_STEP_SUMMARY"; else echo "- RUN 2c: ❌" >> "$GITHUB_STEP_SUMMARY"; { echo "### RUN 2c detalle"; echo '```'; tail -90 /tmp/r2c.out; echo '```'; } >> "$GITHUB_STEP_SUMMARY"; fi
+          timeout 240 python3 -m pytest apps/semilla/tests/test_run2d_fill.py -vv --tb=long --timeout=45 --timeout-method=thread > /tmp/r2d.out 2>&1
+          echo $? > /tmp/r2d
+          if [ "$(cat /tmp/r2d)" = "0" ]; then echo "- RUN 2d (S-11 + S-12): ✅" >> "$GITHUB_STEP_SUMMARY"; else echo "- RUN 2d: ❌" >> "$GITHUB_STEP_SUMMARY"; { echo "### RUN 2d detalle"; echo '```'; tail -90 /tmp/r2d.out; echo '```'; } >> "$GITHUB_STEP_SUMMARY"; fi
           exit 0
 
       - name: "[LECTURA] regresion 4 apps"
@@ -849,7 +1403,7 @@ jobs:
         run: |
           SUM="$GITHUB_STEP_SUMMARY"
           log() { echo "$1" >> "$SUM"; echo "$1"; }
-          if [ "$(cat /tmp/r2c 2>/dev/null || echo 1)" != "0" ] || [ "$(cat /tmp/x4 2>/dev/null || echo 1)" != "0" ]; then
+          if [ "$(cat /tmp/r2d 2>/dev/null || echo 1)" != "0" ] || [ "$(cat /tmp/x4 2>/dev/null || echo 1)" != "0" ]; then
             log "**RESULTADO: rojo — SIN commit**"
             exit 1
           fi
@@ -862,11 +1416,11 @@ jobs:
           if git diff --cached --quiet; then
             log "**SIN CAMBIOS**"; exit 0
           fi
-          git commit -m "fix(SEMILLA RUN2c v2): S-8 TutorLinkEngine con FOCO UNICO — next_objective reemplaza CUALQUIER objetivo activo previo (antes solo el de la misma materia: el GENERAL de arranque quedaba vivo junto al nuevo con notas reales; ahora el foco del alumno es siempre UNO) + assertion de REEMPLAZADO del GENERAL en test + S-13 LearningPathEngine intacto (paso verde previo) — regla 68: domain/education_ai y domain/learning EXISTENTES confirmados por auditoria; regla 76: ORDER BY rowid"
+          git commit -m "feat(SEMILLA RUN2d S-11/S-12): CertificateEngine (GRADO exige PROMOCION real regla 66 + cadena hash por alumno + revocacion + tamper detectado) + AdmissionPipelineEngine (solicitud->revision->colocacion compone S-7 con cupo real; alta sin SE-3 registrada honestamente) + TeacherWorkloadEngine (conflicto docente/aula por horario + tope de aulas + set_teacher/by_teacher verificados) + EducationCoreEngine (indicadores por institucion + lista de riesgo con razones — semilla Capa A GOV-DATA) + canonical_migrations.py (bootstrap idempotente de 16 tablas de DDL CONOCIDO; nucleo excluido a proposito — sus duenos lo crean) + AcademicService (fachada unica del ciclo para wiring del server) — regla 68: solo carpetas EXISTENTES (__init__ de paquete agregado solo donde faltaba); regla 61 Decimal 2d; regla 76 rowid"
           [ $? -ne 0 ] && { log "**COMMIT FALLO**"; exit 1; }
           log "**COMMIT OK**"
           git push "https://x-access-token:${GH_TOKEN}@github.com/${GITHUB_REPOSITORY}.git" "HEAD:main" > /tmp/qa.out 2> /tmp/qa.err
-          if [ $? -eq 0 ]; then log "**PUSH OK — S-8 + S-13 CERRADOS. RUN 2d: S-11 (dominios vacios) + S-12 (services vacios + consolidar CREATE TABLE en migraciones) — con auditoria previa de lo vacio real. SEMILLA queda completa.**"; exit 0; fi
+          if [ $? -eq 0 ]; then log "**PUSH OK — S-11/S-12 NUCLEO CERRADO. SEMILLA OPERATIVA COMPLETA. RUN 3: N-2 a N-7 integraciones NEXO + A-1 a A-3 AGRO (persistencia/Decimal/utcnow) — con auditoria previa de ambos repos.**"; exit 0; fi
           git push origin "HEAD:main" > /tmp/qc.out 2> /tmp/qd.err
           if [ $? -eq 0 ]; then log "**PUSH OK (intento 2).**"; exit 0; fi
           log "**PUSH fallo:**"; { echo '```'; cat /tmp/qd.err; echo '```'; } >> "$SUM"

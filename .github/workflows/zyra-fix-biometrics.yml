@@ -1,4 +1,4 @@
-name: "ZYRA RUN1d fix: S-4 HTTP (test con aulas creadas + cache por store — el 409 era honesto)"
+name: "ZYRA RUN2a: smoke HTTP real (S-4 punta a punta) + S-7 asignacion automatica + auditoria ciclo escolar"
 
 on:
   push:
@@ -30,7 +30,24 @@ jobs:
           fi
           echo "DEPS OK"
 
-      - name: "[ESCRITURA] router S-4 (cache por store, sin id() global)"
+      - name: "[LECTURA] auditoria cadena academica (prepara RUN 2b: S-5/S-6/S-9/S-10)"
+        if: always()
+        run: |
+          set +e
+          SUM="$GITHUB_STEP_SUMMARY"
+          echo "## AUDITORIA ciclo escolar (para RUN 2b)" >> "$SUM"
+          echo "### archivos por dominio (academic/attendance/evaluation/notifications/family/teacher)" >> "$SUM"
+          { echo '```'; for d in academic attendance evaluation notifications family teacher; do echo "-- domain/$d:"; ls apps/semilla/domain/$d 2>/dev/null; done; echo '```'; } >> "$SUM"
+          echo "### clases y metodos de engines existentes en esos dominios" >> "$SUM"
+          { echo '```'; for d in academic attendance evaluation notifications family teacher; do for f in apps/semilla/domain/$d/*.py; do [ -f "$f" ] || continue; case "$f" in *__init__*) continue;; esac; echo "== $f"; grep -n "^class \|    def " "$f" | head -25; done; done; echo '```'; } >> "$SUM"
+          echo "### esquemas completos de tablas del ciclo" >> "$SUM"
+          { echo '```'; for t in sm_attendance sm_evaluations sm_calendar sm_family_comms sm_history sm_tutor_sessions; do echo "-- $t:"; grep -rh "CREATE TABLE IF NOT EXISTS $t " apps/semilla --include="*.py" 2>/dev/null | head -2; done; echo '```'; } >> "$SUM"
+          echo "### firma promote() del canonico (S-5 lo usara)" >> "$SUM"
+          { echo '```'; sed -n '233,245p' apps/semilla/domain/student/student_registry_engine.py 2>/dev/null; echo '```'; } >> "$SUM"
+          echo "### fin auditoria" >> "$SUM"
+          exit 0
+
+      - name: "[ESCRITURA] S-7: auto_assignment_engine (cupo real, preferencia turno, expediente)"
         if: always()
         run: |
           export PYTHONPATH="$(pwd):$(pwd)/shared_engines:$(pwd)"
@@ -64,298 +81,190 @@ jobs:
                       + "\n```")
 
           try:
-              forzar("apps/semilla/routers/student/home_registration_router.py",
+              forzar("apps/semilla/domain/academic/auto_assignment_engine.py",
                      D(r'''
-              """Home Registration Router (S-4) - API de
-              matricula desde casa sobre el server vivo.
+                  """Auto Assignment Engine (S-7) - asignacion
+                  automatica de matricula.
 
-              RUTAS (el server real sirve todo bajo /semilla):
-                POST /semilla/api/home-registration -> start
-                GET  /semilla/api/home-registration/{id}
-                POST /semilla/api/home-registration/{id}/confirm
-                GET  /semilla/api/home-registrations
-                     ?institution_id=...
+                  Flujo del dueno: encuentra escuela -> comprueba
+                  grado/jornada/CUPO REAL -> selecciona seccion/
+                  aula -> confirma matricula (enroll: el cupo se
+                  reclama UNA SOLA VEZ).
 
-              Logica PURA (dict in -> (codigo, dict) out);
-              los tests la ejercitan sin red.
-              patch_hr_routes() conecta estas rutas al
-              SemillaApiHandler con monkey-patch ADITIVO e
-              IDEMPOTENTE (regla 51): las rutas existentes
-              quedan intactas y el fallback 'unknown api
-              route' sigue siendo el ultimo recurso.
-              El router se cachea PEGADO AL STORE (un router
-              por server vivo; sin claves id() globales que
-              pueden colisionar entre tests).
+                  - Si el alumno tiene institucion en su expediente
+                    canonico, SOLO busca ahi (la escuela del
+                    expediente manda).
+                  - Si no, DESCUBRE escuelas con secciones de ese
+                    nivel/grado y cupo disponible (via
+                    available_sections, que solo devuelve secciones
+                    CON cupo — verificado en fix2).
+                  - Respeta la preferencia de turno en orden
+                    (ej: MATUTINA primero, VESPERTINA alternativa);
+                    JAMAS asigna un turno distinto sin que este en
+                    el orden pedido.
+                  - NO_CUPOS honesto (regla 66): nota con lo
+                    intentado y turnos con cupo por escuela.
+                  - preview(): muestra el plan SIN enrollar (para
+                    UI de cupos antes de confirmar).
 
-              Regla 78: el menor trae su ZID de NACIMIENTO si
-              existe (SEMILLA lo CONSUME, jamas crea otro);
-              sin documentos NO impide iniciar (zid NONE).
-              SE-3: 2 encargados de retiro + 1 de emergencia.
-              Errores honestos 400/404/405/409/503 (regla 66)
-              — incluido 409 SIN_CUPOS si la escuela no tiene
-              aulas/cupo configurados: jamas se inventa
-              capacidad."""
-              from __future__ import annotations
-              from typing import Tuple
-              from apps.semilla.domain.student.student_registry_engine import (
-                  StudentRegistryEngine)
-              from apps.semilla.domain.student.home_registration_engine import (
-                  HomeRegistrationEngine)
-              from apps.semilla.domain.classroom.classroom_engine import (
-                  ClassroomEngine)
-              from apps.semilla.domain.academic.enrollment_engine import (
-                  EnrollmentEngine)
+                  Solo APIs verificadas en verde: available_sections,
+                  enroll, get (StudentRegistryEngine)."""
+                  from __future__ import annotations
+                  from typing import Dict, List, Optional
+                  from shared_engines.common.clocks import Clock
+                  from shared_engines.storage.database import (
+                      Database)
 
-              _REQ = ("responsable_zid", "responsable_name",
-                      "relation", "child_name",
-                      "institution_id", "level", "grade")
+                  _TURNS = ("MATUTINA", "VESPERTINA",
+                            "NOCTURNA")
 
 
-              class HomeRegistrationRouter:
-                  """API matricula desde casa (S-4)."""
+                  class AutoAssignmentEngine:
+                      """Asignacion automatica (S-7)."""
 
-                  def __init__(self, db, clock):
-                      reg = StudentRegistryEngine(db, clock)
-                      cls = ClassroomEngine(db, clock)
-                      enr = EnrollmentEngine(
-                          db, clock, classroom_engine=cls)
-                      self._hr = HomeRegistrationEngine(
-                          db, clock, student_registry=reg,
-                          classroom_engine=cls,
-                          enrollment_engine=enr)
+                      def __init__(self, db, clock,
+                                   student_registry,
+                                   classroom_engine,
+                                   enrollment_engine):
+                          self._db = db
+                          self._clock = clock
+                          self._students = student_registry
+                          self._cls = classroom_engine
+                          self._enr = enrollment_engine
 
-                  @staticmethod
-                  def _err(code, msg) -> Tuple[int, dict]:
-                      return (int(code),
-                              {"ok": False,
-                               "error": str(msg)})
+                      def _instituciones(self, *, student_id,
+                                         institution_id,
+                                         school_year, level,
+                                         grade) -> List[str]:
+                          if str(institution_id).strip():
+                              return [str(institution_id)]
+                          est = self._students.get(
+                              str(student_id))
+                          home = str((est or {}).get(
+                              "institution_id") or "")
+                          if home:
+                              return [home]
+                          rows = self._db.query_all(
+                              "SELECT DISTINCT institution_id"
+                              " FROM sm_classrooms WHERE"
+                              " school_year = ? AND level = ?"
+                              " AND grade = ?",
+                              (str(school_year),
+                               str(level), str(grade)))
+                          return sorted(set(
+                              str(r["institution_id"])
+                              for r in rows))
 
-                  def start(self, doc) -> Tuple[int, dict]:
-                      if not isinstance(doc, dict):
-                          return self._err(
-                              400, "body JSON requerido")
-                      missing = [
-                          f for f in _REQ
-                          if not str(doc.get(f, "")).strip()]
-                      if missing:
-                          return self._err(
-                              400, "faltan campos: "
-                              + ", ".join(missing))
-                      try:
-                          r = self._hr.start_request(
-                              responsable_zid=str(
-                                  doc.get("responsable_zid", "")),
-                              responsable_name=str(
-                                  doc.get("responsable_name", "")),
-                              relation=str(doc.get("relation", "")),
-                              child_name=str(
-                                  doc.get("child_name", "")),
-                              birth_date=str(
-                                  doc.get("birth_date", "")),
-                              child_zid=str(
-                                  doc.get("child_zid", "")),
-                              child_zid_status=str(
-                                  doc.get("child_zid_status",
-                                          "NONE") or "NONE"),
-                              institution_id=str(
-                                  doc.get("institution_id", "")),
-                              level=str(doc.get("level", "")),
-                              grade=str(doc.get("grade", "")),
-                              turn=str(doc.get("turn", "MATUTINA")
-                                       or "MATUTINA"),
-                              authorized_pickup=list(
-                                  doc.get("authorized_pickup")
-                                  or []),
-                              emergency_contacts=list(
-                                  doc.get("emergency_contacts")
-                                  or []))
-                      except ValueError as e:
-                          return self._err(400, str(e))
-                      if r.get("status") == "SIN_CUPOS":
-                          return (409, {
-                              "ok": False,
-                              "error": "SIN_CUPOS",
-                              "note": str(r.get("note", "")),
-                              "request": r})
-                      return (201, {"ok": True, "request": r})
-
-                  def get(self, request_id) -> Tuple[int, dict]:
-                      r = self._hr.get_request(
-                          str(request_id or ""))
-                      if not r:
-                          return self._err(
-                              404, "solicitud no encontrada")
-                      return (200, {"ok": True, "request": r})
-
-                  def confirm(self, request_id, doc
-                              ) -> Tuple[int, dict]:
-                      d = doc if isinstance(doc, dict) else {}
-                      actor = str(
-                          d.get("director_actor", "")
-                          or d.get("actor", "") or "escuela")
-                      try:
-                          res = self._hr.confirm_by_school(
-                              str(request_id or ""),
-                              director_actor=actor)
-                      except KeyError:
-                          return self._err(
-                              404, "solicitud no encontrada")
-                      except ValueError as e:
-                          msg = str(e)
-                          code = (409 if "SIN_CUPOS" in msg
-                                  else 400)
-                          return self._err(code, msg)
-                      return (200, dict({"ok": True}, **res))
-
-                  def pending(self, institution_id
-                              ) -> Tuple[int, dict]:
-                      rows = self._hr.pending_requests(
-                          str(institution_id or ""))
-                      return (200, {"ok": True,
-                                    "pending": rows,
-                                    "count": len(rows)})
-
-                  def dispatch(self, *, method, segs,
-                               query=None, doc=None
-                               ) -> Tuple[int, dict]:
-                      """segs SIN prefijos semilla/api."""
-                      q = query or {}
-
-                      def q1(k):
-                          v = q.get(k)
-                          if isinstance(v, list):
-                              return str(v[0]) if v else ""
-                          return str(v or "")
-
-                      try:
-                          m = str(method or "GET").upper()
-                          if segs[:1] == ["home-registrations"]:
-                              if m != "GET":
-                                  return self._err(405,
-                                                   "solo GET")
-                              return self.pending(
-                                  q1("institution_id"))
-                          if segs[:1] == ["home-registration"]:
-                              rest = list(segs[1:])
-                              if not rest:
-                                  if m == "POST":
-                                      return self.start(doc)
-                                  return self._err(405,
-                                                   "solo POST")
-                              rid = str(rest[0])
-                              if (len(rest) >= 2
-                                      and rest[1] == "confirm"):
-                                  if m != "POST":
-                                      return self._err(
-                                          405, "solo POST")
-                                  return self.confirm(rid, doc)
-                              if m == "GET":
-                                  return self.get(rid)
-                              return self._err(405, "solo GET")
-                          return self._err(404,
-                                           "ruta desconocida")
-                      except Exception as e:
-                          return self._err(
-                              500, "error interno: " + str(e))
-
-
-              def patch_hr_routes():
-                  """Conecta las rutas S-4 al SemillaApiHandler
-                  del server vivo (regla 51: monkey-patch
-                  aditivo e idempotente)."""
-                  import json as _json
-                  from urllib.parse import urlparse, parse_qs
-                  from apps.semilla import server as _srv
-
-                  H = _srv.SemillaApiHandler
-                  if getattr(H, "_HR_V2", False):
-                      return
-
-                  def _segs(self):
-                      segs = [p for p in urlparse(
-                          self.path).path.split("/") if p]
-                      while segs and segs[0] in ("semilla",
-                                                 "api"):
-                          segs = segs[1:]
-                      return segs
-
-                  def _wants(self):
-                      s = _segs(self)
-                      return bool(s) and s[0] in (
-                          "home-registration",
-                          "home-registrations")
-
-                  def _router(self):
-                      st = getattr(self, "store", None)
-                      if st is None:
-                          return None
-                      r = getattr(st, "_hr_router_cache", None)
-                      if r is None:
+                      def _opciones(self, iid, *, school_year,
+                                    level, grade) -> List[dict]:
                           try:
-                              r = HomeRegistrationRouter(
-                                  st._db, st._clock)
+                              return list(
+                                  self._cls.available_sections(
+                                      institution_id=iid,
+                                      school_year=str(school_year),
+                                      level=str(level),
+                                      grade=str(grade)))
                           except Exception:
-                              return None
-                          try:
-                              st._hr_router_cache = r
-                          except Exception:
-                              pass
-                      return r
+                              return []
 
-                  def _compute(self, doc, method):
-                      u = urlparse(self.path)
-                      r = _router(self)
-                      if r is None:
-                          return (503, {
-                              "ok": False,
-                              "error": "matricula desde casa"
-                                       " no disponible"})
-                      return r.dispatch(
-                          method=str(method),
-                          segs=_segs(self),
-                          query=parse_qs(u.query), doc=doc)
+                      def preview(self, *, student_id, level,
+                                  grade, turn_order=None,
+                                  institution_id="",
+                                  school_year="2026") -> dict:
+                          """Plan sin enrollar (lectura)."""
+                          orden = [t for t in (
+                              turn_order or list(_TURNS))]
+                          iids = self._instituciones(
+                              student_id=student_id,
+                              institution_id=institution_id,
+                              school_year=school_year,
+                              level=level, grade=grade)
+                          plan = []
+                          for iid in iids:
+                              ops = self._opciones(
+                                  iid, school_year=school_year,
+                                  level=level, grade=grade)
+                              plan.append({
+                                  "institution_id": iid,
+                                  "turnos_con_cupo": sorted(
+                                      set(str(o["turn"])
+                                          for o in ops)),
+                                  "secciones": [
+                                      {"classroom_id":
+                                           str(o["classroom_id"]),
+                                       "turn": str(o["turn"])}
+                                      for o in ops]})
+                          return {"student_id":
+                                      str(student_id),
+                                  "level": str(level),
+                                  "grade": str(grade),
+                                  "turn_order": orden,
+                                  "plan": plan}
 
-                  def _handle(self, doc, method):
-                      code, payload = _compute(self, doc,
-                                               method)
-                      body = _json.dumps(
-                          payload, default=str).encode(
-                          "utf-8")
-                      self.send_response(int(code))
-                      self.send_header(
-                          "Content-Type",
-                          "application/json")
-                      self.send_header(
-                          "Content-Length",
-                          str(len(body)))
-                      self.end_headers()
-                      self.wfile.write(body)
-
-                  _orig_get = H._api_get
-                  _orig_post = H._api_post
-
-                  def _api_get(self, s):
-                      if _wants(self):
-                          return _handle(self, None, "GET")
-                      return _orig_get(self, s)
-
-                  def _api_post(self, s):
-                      if _wants(self):
-                          try:
-                              doc = self._read_json()
-                          except Exception:
-                              doc = None
-                          return _handle(self, doc, "POST")
-                      return _orig_post(self, s)
-
-                  H._api_get = _api_get
-                  H._api_post = _api_post
-                  H._hr_segs = _segs
-                  H._hr_wants = _wants
-                  H._hr_compute = _compute
-                  H._HR_V2 = True
+                      def assign(self, *, student_id, level,
+                                 grade, turn_order=None,
+                                 institution_id="",
+                                 school_year="2026") -> dict:
+                          """Asigna: escuela -> turno pedido ->
+                          seccion con cupo -> enroll (cupo UNA
+                          vez). NO_CUPOS honesto si nada aplica."""
+                          orden = [str(t).upper() for t in (
+                              turn_order or list(_TURNS))]
+                          iids = self._instituciones(
+                              student_id=student_id,
+                              institution_id=institution_id,
+                              school_year=school_year,
+                              level=level, grade=grade)
+                          tried = []
+                          for iid in iids:
+                              ops = self._opciones(
+                                  iid, school_year=school_year,
+                                  level=level, grade=grade)
+                              for turno in orden:
+                                  for op in ops:
+                                      if str(op["turn"]) \
+                                              != turno:
+                                          continue
+                                      enr = self._enr.enroll(
+                                          student_id=str(
+                                              student_id),
+                                          classroom_id=str(
+                                              op["classroom_id"]),
+                                          school_year=str(
+                                              school_year))
+                                      return {
+                                          "status": "ASIGNADO",
+                                          "student_id": str(
+                                              student_id),
+                                          "institution_id": iid,
+                                          "classroom_id": str(
+                                              op["classroom_id"]),
+                                          "turn": turno,
+                                          "enrollment": enr}
+                              tried.append({
+                                  "institution_id": iid,
+                                  "turnos_con_cupo": sorted(
+                                      set(str(o["turn"])
+                                          for o in ops)),
+                                  "turnos_pedidos": orden})
+                          return {
+                              "status": "NO_CUPOS",
+                              "student_id": str(student_id),
+                              "level": str(level),
+                              "grade": str(grade),
+                              "turn_order": orden,
+                              "tried": tried,
+                              "note": ("sin seccion con cupo"
+                                       " para " + str(level)
+                                       + " " + str(grade)
+                                       + " en turnos "
+                                       + ", ".join(orden)
+                                       + " (escuelas"
+                                         " intentadas: "
+                                       + str(len(tried))
+                                       + ")")}
               '''))
-              out("## FIN builder S-4")
+              out("## FIN builder S-7")
           except Exception:
               out("## ERROR")
               out("```\n" + traceback.format_exc().strip() + "\n```")
@@ -363,274 +272,236 @@ jobs:
               exit(0)
           PYEOF
 
-      - name: "[ESCRITURA] wiring server.py (4 lineas en ancla unica; revert si falla)"
-        if: always()
-        run: |
-          export PYTHONPATH="$(pwd):$(pwd)/shared_engines:$(pwd)"
-          python3 << 'PYEOF'
-          import ast, os, pathlib, py_compile, subprocess, traceback
-          SUM = os.environ.get("GITHUB_STEP_SUMMARY", "")
-          def out(t):
-              print(t, flush=True)
-              if SUM:
-                  with open(SUM, "a", encoding="utf-8") as f:
-                      f.write(t + "\n")
-          P = pathlib.Path("apps/semilla/server.py")
-          wired = "no"
-          orig = ""
-          try:
-              src = P.read_text(encoding="utf-8")
-              orig = src
-              if "_HR_V2" in src:
-                  wired = "yes"
-                  out("- server.py: YA cableado (idempotente)")
-              else:
-                  anchor = "    return SemillaServer((host, port))"
-                  if src.count(anchor) != 1:
-                      raise RuntimeError(
-                          "ancla serve_semilla no unica: "
-                          + str(src.count(anchor)))
-                  ins = (
-                      "    from apps.semilla.routers.student."
-                      "home_registration_router import (\n"
-                      "        patch_hr_routes,\n"
-                      "    )\n"
-                      "    patch_hr_routes()  # _HR_V2\n")
-                  new = src.replace(anchor, ins + anchor, 1)
-                  ast.parse(new)
-                  P.write_text(new, encoding="utf-8")
-                  py_compile.compile(str(P), doraise=True)
-                  env = dict(os.environ)
-                  env["PYTHONPATH"] = (os.getcwd() + ":"
-                                       + os.getcwd()
-                                       + "/shared_engines")
-                  r = subprocess.run(
-                      ["python3", "-c",
-                       "import apps.semilla.server"],
-                      capture_output=True, text=True, env=env)
-                  if r.returncode != 0:
-                      raise RuntimeError(
-                          "import fallo: " + r.stderr[-400:])
-                  wired = "yes"
-                  out("- **server.py: WIRING APLICADO**"
-                      " (patch aditivo en serve_semilla)")
-          except Exception:
-              try:
-                  if orig:
-                      P.write_text(orig, encoding="utf-8")
-                      py_compile.compile(str(P), doraise=True)
-              except Exception:
-                  pass
-              out("- **server.py: WIRING DIFERIDO (revertido"
-                  " intacto)** — el router S-4 queda"
-                  " committeable")
-              out("```\n" + traceback.format_exc().strip()
-                  + "\n```")
-          finally:
-              open("/tmp/hr_wired", "w").write(wired)
-              exit(0)
-          PYEOF
-
-      - name: "[ESCRITURA tests + LECTURA veredicto] tests S-4 (patch test CON aulas creadas)"
+      - name: "[ESCRITURA tests + LECTURA veredicto] tests S-7 + smoke HTTP real (RUN 1e)"
         if: always()
         run: |
           export PYTHONPATH="$(pwd):$(pwd)/shared_engines:$(pwd)"
           set +e
           find apps -name "__pycache__" -type d -prune -exec rm -rf {} + || true
           mkdir -p apps/semilla/tests
-          cat > apps/semilla/tests/test_s4_http_router.py << 'TSEOF'
+          cat > apps/semilla/tests/test_s7_autoassign.py << 'TSEOF'
           import pytest
           from shared_engines.common.clocks import FrozenClock
           from shared_engines.storage.database import SQLiteAdapter
+          from apps.semilla.domain.student.student_registry_engine import StudentRegistryEngine
           from apps.semilla.domain.classroom.classroom_engine import ClassroomEngine
-          from apps.semilla.infrastructure.persistence.semilla_store import SemillaStore
-          from apps.semilla.routers.student.home_registration_router import (
-              HomeRegistrationRouter, patch_hr_routes)
+          from apps.semilla.domain.academic.enrollment_engine import EnrollmentEngine
+          from apps.semilla.domain.academic.auto_assignment_engine import AutoAssignmentEngine
 
           PICK2 = [{"name": "Mama", "relation": "MADRE"},
                    {"name": "Papa", "relation": "PADRE"}]
           EMG = [{"name": "Tio", "relation": "TIO", "phone": "911"}]
 
-          def _env(tmp_path, cap_m=30, cap_t=5):
-              db = SQLiteAdapter(tmp_path / "r.db")
+          def _env(tmp_path):
+              db = SQLiteAdapter(tmp_path / "a.db")
               clock = FrozenClock()
+              students = StudentRegistryEngine(db, clock)
               cls = ClassroomEngine(db, clock)
-              man = cls.create(name="1A", institution_id="INST-1",
+              en = EnrollmentEngine(db, clock, classroom_engine=cls)
+              s7 = AutoAssignmentEngine(db, clock,
+                  student_registry=students,
+                  classroom_engine=cls, enrollment_engine=en)
+              return db, students, cls, en, s7
+
+          def _alumno(students, **over):
+              kw = {"full_name": "Alumno S7", "level": "BASICA",
+                    "grade": "1", "institution_id": "",
+                    "tutores": [{"name": "Mama",
+                                 "relation": "MADRE",
+                                 "zid": "ZID-M-7"}],
+                    "authorized_pickup": PICK2,
+                    "emergency_contacts": EMG,
+                    "zid": "ZID-S7", "zid_status": "PROVISIONAL"}
+              kw.update(over)
+              return students.register(**kw)
+
+          def test_asigna_escuela_indicada_preferencia_turno(tmp_path) -> None:
+              db, students, cls, en, s7 = _env(tmp_path)
+              am = cls.create(name="1A", institution_id="INST-1",
                   school_year="2026", level="BASICA", grade="1",
-                  section="A", turn="MATUTINA", capacity=cap_m)
-              tar = cls.create(name="1T", institution_id="INST-1",
-                  school_year="2026", level="BASICA", grade="1",
-                  section="A", turn="VESPERTINA", capacity=cap_t)
-              r = HomeRegistrationRouter(db, clock)
-              return db, cls, man, tar, r
-
-          def _doc(**over):
-              base = {"responsable_zid": "ZID-PADRE-1",
-                  "responsable_name": "Padre Perez",
-                  "relation": "PADRE", "child_name": "Nino HTTP",
-                  "birth_date": "2019-05-10",
-                  "child_zid": "ZID-BABY-9",
-                  "child_zid_status": "VERIFIED",
-                  "institution_id": "INST-1", "level": "BASICA",
-                  "grade": "1", "turn": "MATUTINA",
-                  "authorized_pickup": PICK2,
-                  "emergency_contacts": EMG}
-              base.update(over)
-              return base
-
-          def test_flujo_completo(tmp_path) -> None:
-              db, cls, man, tar, r = _env(tmp_path)
-              code, p = r.dispatch(method="POST",
-                  segs=["home-registration"], doc=_doc())
-              assert code == 201 and p["ok"] is True
-              rid = p["request"]["request_id"]
-              code2, p2 = r.dispatch(method="POST",
-                  segs=["home-registration", rid, "confirm"],
-                  doc={"director_actor": "DIR-1"})
-              assert code2 == 200 and p2["status"] == "ACTIVA"
-              assert p2["student"]["zid"] == "ZID-BABY-9"
-              assert p2["student"]["zid_status"] == "VERIFIED"
-              assert p2["student"]["tutores"][0]["zid"] == "ZID-PADRE-1"
-              assert cls.get(man["classroom_id"])["enrolled"] == 1
-              code3, p3 = r.dispatch(method="GET",
-                  segs=["home-registration", rid])
-              assert code3 == 200
-              assert p3["request"]["status"] == "ACTIVA"
-              code4, p4 = r.dispatch(method="GET",
-                  segs=["home-registrations"],
-                  query={"institution_id": ["INST-1"]})
-              assert code4 == 200 and p4["count"] == 0
-              print("OK flujo: start 201 -> confirm 200 ACTIVA -> ZID nacimiento (regla 78) -> cupo UNA vez -> detalle -> pendientes")
-
-          def test_sin_cupos_409_alternativas(tmp_path) -> None:
-              db, cls, man, tar, r = _env(tmp_path, cap_m=1, cap_t=5)
-              code, p = r.dispatch(method="POST",
-                  segs=["home-registration"],
-                  doc=_doc(child_zid="", child_zid_status="NONE"))
-              assert code == 201
-              rid = p["request"]["request_id"]
-              r.dispatch(method="POST",
-                  segs=["home-registration", rid, "confirm"],
-                  doc={"director_actor": "D"})
-              code2, p2 = r.dispatch(method="POST",
-                  segs=["home-registration"],
-                  doc=_doc(responsable_zid="ZID-2",
-                           child_name="Segundo", child_zid="",
-                           child_zid_status="NONE"))
-              assert code2 == 409
-              assert "MATUTINA COMPLETADA" in p2["note"]
-              assert "VESPERTINA" in p2["note"]
-              code3, p3 = r.dispatch(method="POST",
-                  segs=["home-registration"],
-                  doc=_doc(responsable_zid="ZID-3",
-                           child_name="Tercero", child_zid="",
-                           child_zid_status="NONE",
-                           turn="VESPERTINA"))
-              assert code3 == 201
-              rid3 = p3["request"]["request_id"]
-              code4, p4 = r.dispatch(method="POST",
-                  segs=["home-registration", rid3, "confirm"],
-                  doc={"director_actor": "D"})
-              assert code4 == 200
-              assert p4["enrollment"]["turn"] == "VESPERTINA"
-              print("OK SIN_CUPOS: 409 con alternativas y la tarde SI recibe")
-
-          def test_escuela_sin_aulas_409_honesto(tmp_path) -> None:
-              db = SQLiteAdapter(tmp_path / "v.db")
-              r = HomeRegistrationRouter(db, FrozenClock())
-              code, p = r.dispatch(method="POST",
-                  segs=["home-registration"], doc=_doc())
-              assert code == 409
-              assert "Sin cupos" in p["note"]
-              print("OK honesto (regla 66): escuela SIN aulas configuradas -> 409 SIN_CUPOS, jamas se inventa capacidad (esto es lo que el patch test piso sin querer: le faltaba crear aulas)")
-
-          def test_errores_honestos(tmp_path) -> None:
-              db, cls, man, tar, r = _env(tmp_path)
-              code, p = r.dispatch(method="POST",
-                  segs=["home-registration"],
-                  doc=_doc(responsable_zid=""))
-              assert code == 400
-              assert "faltan campos" in p["error"]
-              code2, p2 = r.dispatch(method="POST",
-                  segs=["home-registration"],
-                  doc=_doc(relation="PRIMO"))
-              assert code2 == 400
-              code3, p3 = r.dispatch(method="POST",
-                  segs=["home-registration"],
-                  doc=_doc(authorized_pickup=PICK2[:1]))
-              assert code3 == 400 and "retiro" in p3["error"]
-              code4, p4 = r.dispatch(method="POST",
-                  segs=["home-registration"], doc=None)
-              assert code4 == 400
-              code5, p5 = r.dispatch(method="GET",
-                  segs=["home-registration", "NO-EXISTS"])
-              assert code5 == 404
-              code6, p6 = r.dispatch(method="GET",
-                  segs=["home-registration"])
-              assert code6 == 405
-              code7, p7 = r.dispatch(method="GET",
-                  segs=["otra-cosa"])
-              assert code7 == 404
-              print("OK honesto: 400 faltantes/SE-3/body, 404, 405")
-
-          def test_patch_server_real(tmp_path) -> None:
-              import apps.semilla.server as srv
-              db = SQLiteAdapter(tmp_path / "w.db")
-              st = SemillaStore(db, FrozenClock())
-              cls = ClassroomEngine(db, FrozenClock())
-              man = cls.create(name="1A-W", institution_id="INST-1",
-                  school_year="2026", level="BASICA", grade="1",
-                  section="A", turn="MATUTINA", capacity=30)
-              tar = cls.create(name="1T-W", institution_id="INST-1",
+                  section="A", turn="MATUTINA", capacity=2)
+              at = cls.create(name="1T", institution_id="INST-1",
                   school_year="2026", level="BASICA", grade="1",
                   section="A", turn="VESPERTINA", capacity=5)
-              patch_hr_routes()
-              patch_hr_routes()
-              assert getattr(srv.SemillaApiHandler,
-                             "_HR_V2", False) is True
-              h = object.__new__(srv.SemillaApiHandler)
-              h.store = st
-              h.path = "/semilla/api/home-registration"
-              assert srv.SemillaApiHandler._hr_wants(h) is True
-              h.path = ("/semilla/api/home-registrations"
-                        "?institution_id=INST-1")
-              assert srv.SemillaApiHandler._hr_wants(h) is True
-              h.path = "/api/home-registration"
-              assert srv.SemillaApiHandler._hr_wants(h) is True
-              h.path = "/semilla/api/profile/ACC-1"
-              assert srv.SemillaApiHandler._hr_wants(h) is False
-              h.path = "/semilla/api/health"
-              assert srv.SemillaApiHandler._hr_wants(h) is False
-              h.path = "/semilla/register"
-              assert srv.SemillaApiHandler._hr_wants(h) is False
-              h.path = "/semilla/api/home-registration"
-              code, p = srv.SemillaApiHandler._hr_compute(
-                  h, _doc(), "POST")
-              assert code == 201
-              rid = p["request"]["request_id"]
-              h.path = ("/semilla/api/home-registration/"
-                        + rid + "/confirm")
-              code2, p2 = srv.SemillaApiHandler._hr_compute(
-                  h, {"director_actor": "DIR-9"}, "POST")
-              assert code2 == 200
-              assert p2["status"] == "ACTIVA"
-              assert cls.get(man["classroom_id"])["enrolled"] == 1
-              h.path = ("/semilla/api/home-registrations"
-                        "?institution_id=INST-1")
-              code3, p3 = srv.SemillaApiHandler._hr_compute(
-                  h, None, "GET")
-              assert code3 == 200 and p3["count"] == 0
-              h2 = object.__new__(srv.SemillaApiHandler)
-              h2.store = None
-              h2.path = "/semilla/api/home-registration"
-              code4, p4 = srv.SemillaApiHandler._hr_compute(
-                  h2, _doc(), "POST")
-              assert code4 == 503
-              print("OK patch REAL: aulas creadas en la db del store -> start 201 -> confirm 200 (cupo UNA vez) -> pendientes -> 503 honesto sin store; cache del router pegado al store (sin id() global)")
+              est = _alumno(students)
+              r = s7.assign(student_id=est["student_id"],
+                  level="BASICA", grade="1")
+              assert r["status"] == "ASIGNADO"
+              assert r["turn"] == "MATUTINA"
+              assert r["classroom_id"] == am["classroom_id"]
+              assert cls.get(am["classroom_id"])["enrolled"] == 1
+              assert cls.get(at["classroom_id"])["enrolled"] == 0
+              pv = s7.preview(student_id=est["student_id"],
+                  level="BASICA", grade="1")
+              assert any(p["turnos_con_cupo"] == ["MATUTINA",
+                         "VESPERTINA"] for p in pv["plan"])
+              print("OK S-7: asigna en la escuela indicada, preferencia MATUTINA primero, cupo contado UNA vez, preview sin enrollar")
+
+          def test_respeta_expediente_del_alumno(tmp_path) -> None:
+              db, students, cls, en, s7 = _env(tmp_path)
+              a1 = cls.create(name="1A-A", institution_id="INST-A",
+                  school_year="2026", level="BASICA", grade="1",
+                  section="A", turn="MATUTINA", capacity=1)
+              b1 = cls.create(name="1B-B", institution_id="INST-B",
+                  school_year="2026", level="BASICA", grade="1",
+                  section="A", turn="MATUTINA", capacity=30)
+              est = _alumno(students, institution_id="INST-A")
+              r = s7.assign(student_id=est["student_id"],
+                  level="BASICA", grade="1")
+              assert r["status"] == "ASIGNADO"
+              assert r["institution_id"] == "INST-A"
+              assert cls.get(b1["classroom_id"])["enrolled"] == 0
+              print("OK S-7: la escuela del expediente manda aunque otra tenga mas cupo")
+
+          def test_descubre_escuela_con_cupo(tmp_path) -> None:
+              db, students, cls, en, s7 = _env(tmp_path)
+              b1 = cls.create(name="2B", institution_id="INST-B",
+                  school_year="2026", level="BASICA", grade="2",
+                  section="A", turn="VESPERTINA", capacity=3)
+              est = _alumno(students)
+              r = s7.assign(student_id=est["student_id"],
+                  level="BASICA", grade="2",
+                  turn_order=["MATUTINA", "VESPERTINA"])
+              assert r["status"] == "ASIGNADO"
+              assert r["institution_id"] == "INST-B"
+              assert r["turn"] == "VESPERTINA"
+              print("OK S-7: sin escuela indicada DESCUBRE la que tiene cupo real para el grado y respeta el orden de turnos")
+
+          def test_no_cupos_honesto(tmp_path) -> None:
+              db, students, cls, en, s7 = _env(tmp_path)
+              a1 = cls.create(name="3A", institution_id="INST-1",
+                  school_year="2026", level="BASICA", grade="3",
+                  section="A", turn="MATUTINA", capacity=1)
+              en.enroll(student_id="OTRO-X",
+                  classroom_id=a1["classroom_id"],
+                  school_year="2026")
+              est = _alumno(students)
+              r = s7.assign(student_id=est["student_id"],
+                  level="BASICA", grade="3")
+              assert r["status"] == "NO_CUPOS"
+              assert "MATUTINA" in r["note"]
+              assert r["tried"][0]["turnos_con_cupo"] == []
+              assert cls.get(a1["classroom_id"])["enrolled"] == 1
+              print("OK S-7 honesto (regla 66): aula llena -> NO_CUPOS con nota clara, jamas inventa cupo")
           TSEOF
-          timeout 240 python3 -m pytest apps/semilla/tests/test_s4_http_router.py -vv --tb=long --timeout=45 --timeout-method=thread > /tmp/s4h.out 2>&1
-          echo $? > /tmp/s4h
-          if [ "$(cat /tmp/s4h)" = "0" ]; then echo "- S-4 HTTP: ✅" >> "$GITHUB_STEP_SUMMARY"; else echo "- S-4 HTTP: ❌" >> "$GITHUB_STEP_SUMMARY"; { echo "### S-4 HTTP detalle"; echo '```'; tail -80 /tmp/s4h.out; echo '```'; } >> "$GITHUB_STEP_SUMMARY"; fi
+          cat > apps/semilla/tests/test_1e_smoke_http.py << 'TSEOF'
+          import json
+          import pathlib
+          import threading
+          import urllib.error
+          import urllib.request
+          import pytest
+          from shared_engines.common.clocks import FrozenClock
+          from shared_engines.storage.database import SQLiteAdapter
+          from apps.semilla.infrastructure.persistence.semilla_store import SemillaStore
+          from apps.semilla.domain.classroom.classroom_engine import ClassroomEngine
+          from apps.semilla.server import serve_semilla
+
+
+          class _DummyClient:
+              pass
+
+
+          def _call(base, path, method="GET", doc=None):
+              data = None
+              headers = {}
+              if doc is not None:
+                  data = json.dumps(doc).encode("utf-8")
+                  headers["Content-Type"] = "application/json"
+              req = urllib.request.Request(base + path,
+                  data=data, headers=headers, method=method)
+              try:
+                  with urllib.request.urlopen(req,
+                                              timeout=10) as r:
+                      return (r.status, json.loads(
+                          r.read().decode("utf-8")))
+              except urllib.error.HTTPError as e:
+                  return (e.code, json.loads(
+                      e.read().decode("utf-8")))
+
+
+          def test_smoke_http_punta_a_punta(tmp_path) -> None:
+              src = pathlib.Path(
+                  "apps/semilla/server.py").read_text(
+                  encoding="utf-8")
+              if "_HR_V2" not in src:
+                  pytest.skip("wiring S-4 no presente")
+              db = SQLiteAdapter(tmp_path / "s.db")
+              st = SemillaStore(db, FrozenClock())
+              cls = ClassroomEngine(db, FrozenClock())
+              cls.create(name="1A", institution_id="INST-1",
+                  school_year="2026", level="BASICA",
+                  grade="1", section="A", turn="MATUTINA",
+                  capacity=30)
+              cls.create(name="1T", institution_id="INST-1",
+                  school_year="2026", level="BASICA",
+                  grade="1", section="A", turn="VESPERTINA",
+                  capacity=5)
+              server = serve_semilla(st, _DummyClient(),
+                  host="127.0.0.1", port=0)
+              base = ("http://127.0.0.1:"
+                      + str(server.bound_port))
+              t = threading.Thread(
+                  target=server.serve_forever, daemon=True)
+              t.start()
+              try:
+                  code, health = _call(base,
+                      "/semilla/api/health")
+                  assert code == 200
+                  assert health["ok"] is True
+                  doc = {
+                      "responsable_zid": "ZID-PADRE-SM",
+                      "responsable_name": "Padre Smoke",
+                      "relation": "PADRE",
+                      "child_name": "Nino Smoke",
+                      "birth_date": "2019-05-10",
+                      "child_zid": "ZID-BABY-SM",
+                      "child_zid_status": "VERIFIED",
+                      "institution_id": "INST-1",
+                      "level": "BASICA", "grade": "1",
+                      "turn": "MATUTINA",
+                      "authorized_pickup": [
+                          {"name": "Mama",
+                           "relation": "MADRE"},
+                          {"name": "Papa",
+                           "relation": "PADRE"}],
+                      "emergency_contacts": [
+                          {"name": "Tio",
+                           "relation": "TIO",
+                           "phone": "911"]}}
+                  code, p = _call(base,
+                      "/semilla/api/home-registration",
+                      method="POST", doc=doc)
+                  assert code == 201
+                  rid = p["request"]["request_id"]
+                  code2, p2 = _call(base,
+                      "/semilla/api/home-registration/"
+                      + rid + "/confirm", method="POST",
+                      doc={"director_actor": "DIR-SM"})
+                  assert code2 == 200
+                  assert p2["status"] == "ACTIVA"
+                  assert p2["student"]["zid"] == "ZID-BABY-SM"
+                  code3, p3 = _call(base,
+                      "/semilla/api/home-registrations"
+                      "?institution_id=INST-1")
+                  assert code3 == 200
+                  assert p3["count"] == 0
+                  code4, p4 = _call(base,
+                      "/semilla/api/home-registration",
+                      method="POST", doc={})
+                  assert code4 == 400
+                  print("OK SMOKE HTTP REAL: socket vivo -> health 200 -> start 201 -> confirm 200 ACTIVA (ZID nacimiento, cupo UNA vez) -> pendientes -> 400 honesto")
+              finally:
+                  server.shutdown()
+                  server.server_close()
+                  t.join(timeout=5)
+          TSEOF
+          timeout 240 python3 -m pytest apps/semilla/tests/test_1e_smoke_http.py -vv --tb=long --timeout=60 --timeout-method=thread > /tmp/smoke.out 2>&1
+          echo $? > /tmp/smoke
+          timeout 240 python3 -m pytest apps/semilla/tests/test_s7_autoassign.py -vv --tb=long --timeout=45 --timeout-method=thread > /tmp/s7.out 2>&1
+          echo $? > /tmp/s7
+          if [ "$(cat /tmp/smoke)" = "0" ]; then echo "- Smoke HTTP (1e): ✅" >> "$GITHUB_STEP_SUMMARY"; else echo "- Smoke HTTP (1e): ❌" >> "$GITHUB_STEP_SUMMARY"; { echo "### Smoke detalle"; echo '```'; tail -60 /tmp/smoke.out; echo '```'; } >> "$GITHUB_STEP_SUMMARY"; fi
+          if [ "$(cat /tmp/s7)" = "0" ]; then echo "- S-7: ✅" >> "$GITHUB_STEP_SUMMARY"; else echo "- S-7: ❌" >> "$GITHUB_STEP_SUMMARY"; { echo "### S-7 detalle"; echo '```'; tail -60 /tmp/s7.out; echo '```'; } >> "$GITHUB_STEP_SUMMARY"; fi
           exit 0
 
       - name: "[LECTURA] regresion 4 apps"
@@ -661,15 +532,15 @@ jobs:
           done
           exit 0
 
-      - name: "[ESCRITURA git] Veredicto + commit solo si SEMILLA verde"
+      - name: "[ESCRITURA git] Veredicto + commit solo si todo verde"
         if: always()
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           SUM="$GITHUB_STEP_SUMMARY"
           log() { echo "$1" >> "$SUM"; echo "$1"; }
-          if [ "$(cat /tmp/s4h 2>/dev/null || echo 1)" != "0" ] || [ "$(cat /tmp/x4 2>/dev/null || echo 1)" != "0" ]; then
-            log "**RESULTADO: SEMILLA roja — SIN commit**"
+          if [ "$(cat /tmp/smoke 2>/dev/null || echo 1)" != "0" ] || [ "$(cat /tmp/s7 2>/dev/null || echo 1)" != "0" ] || [ "$(cat /tmp/x4 2>/dev/null || echo 1)" != "0" ]; then
+            log "**RESULTADO: rojo — SIN commit**"
             exit 1
           fi
           find apps shared_engines -name "__pycache__" -type d -prune -exec rm -rf {} + || true
@@ -681,11 +552,11 @@ jobs:
           if git diff --cached --quiet; then
             log "**SIN CAMBIOS**"; exit 0
           fi
-          git commit -m "fix(SEMILLA S-4 HTTP): test del patch con aulas creadas en la db del store (el 409 anterior era la respuesta HONESTA correcta ante escuela sin capacidad — regla 66 funcionando; el test no habia configurado las aulas) + test dedicado escuela_sin_aulas_409_honesto + cache del router pegada al store (elimina riesgo de colision id() entre tests) + wiring patch aditivo en serve_semilla intacto"
+          git commit -m "feat(SEMILLA RUN2a): smoke HTTP REAL punta a punta (serve_semilla con socket vivo: health 200 -> start 201 -> confirm 200 ACTIVA con ZID de nacimiento y cupo UNA vez -> pendientes -> 400 honesto) + S-7 AutoAssignmentEngine (asignacion automatica: escuela del expediente manda, descubrimiento por cupo real via available_sections, orden de turnos respetado, enroll reclama cupo UNA vez, NO_CUPOS honesto con nota, preview sin enrollar) + auditoria LECTURA de la cadena academica (attendance/evaluation/calendar/family + promote) para RUN 2b"
           [ $? -ne 0 ] && { log "**COMMIT FALLO**"; exit 1; }
           log "**COMMIT OK**"
           git push "https://x-access-token:${GH_TOKEN}@github.com/${GITHUB_REPOSITORY}.git" "HEAD:main" > /tmp/qa.out 2> /tmp/qa.err
-          if [ $? -eq 0 ]; then log "**PUSH OK — S-4 HTTP CERRADO (matricula desde casa viva en /semilla/api/home-registration). RUN 1e: smoke HTTP real levantando serve_semilla + RUN 2 (S-5 a S-10 ciclo escolar).**"; exit 0; fi
+          if [ $? -eq 0 ]; then log "**PUSH OK — S-4 PUNTA A PUNTA + S-7 CERRADOS. RUN 2b: S-5 ciclo escolar + S-6 asistencia vinculada + S-9 flujo de notas + S-10 examenes (con la auditoria impresa arriba).**"; exit 0; fi
           git push origin "HEAD:main" > /tmp/qc.out 2> /tmp/qd.err
           if [ $? -eq 0 ]; then log "**PUSH OK (intento 2).**"; exit 0; fi
           log "**PUSH fallo:**"; { echo '```'; cat /tmp/qd.err; echo '```'; } >> "$SUM"

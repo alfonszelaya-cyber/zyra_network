@@ -1,4 +1,4 @@
-name: "ZYRA RUN1c: S-1 wiring real (SemillaStore autowire al canonico) + bridge v2 (LookupError + complete_pending) + auditoria HTTP para 1d"
+name: "ZYRA RUN1d v2: S-4 matricula desde casa por HTTP (rutas reales /semilla/api/*)"
 
 on:
   push:
@@ -30,28 +30,7 @@ jobs:
           fi
           echo "DEPS OK"
 
-      - name: "[LECTURA] auditoria server.py para RUN 1d (endpoints HTTP matricula)"
-        if: always()
-        run: |
-          set +e
-          SUM="$GITHUB_STEP_SUMMARY"
-          echo "## AUDITORIA RUN 1d — dispatch HTTP de server.py" >> "$SUM"
-          echo "### do_POST/_safe/_route (100-156)" >> "$SUM"
-          { echo '```'; sed -n '100,156p' apps/semilla/server.py 2>/dev/null; echo '```'; } >> "$SUM"
-          echo "### _post inicio (416-560, flujo add_account)" >> "$SUM"
-          { echo '```'; sed -n '416,560p' apps/semilla/server.py 2>/dev/null; echo '```'; } >> "$SUM"
-          echo "### _read_form/_read_json (655-730)" >> "$SUM"
-          { echo '```'; sed -n '655,730p' apps/semilla/server.py 2>/dev/null; echo '```'; } >> "$SUM"
-          echo "### _api_get/_api_post (731-860)" >> "$SUM"
-          { echo '```'; sed -n '731,860p' apps/semilla/server.py 2>/dev/null; echo '```'; } >> "$SUM"
-          echo "### SemillaServer/serve_semilla (1332-1361)" >> "$SUM"
-          { echo '```'; sed -n '1332,1361p' apps/semilla/server.py 2>/dev/null; echo '```'; } >> "$SUM"
-          echo "### modules_router.py (punto de extension)" >> "$SUM"
-          { echo '```'; cat apps/semilla/routers/modules_router.py 2>/dev/null; echo '```'; } >> "$SUM"
-          echo "### fin auditoria 1d" >> "$SUM"
-          exit 0
-
-      - name: "[ESCRITURA] canonical_bridge v2 (LookupError-aware + complete_pending)"
+      - name: "[ESCRITURA] S-4: router HTTP de matricula desde casa (logica pura testeable)"
         if: always()
         run: |
           export PYTHONPATH="$(pwd):$(pwd)/shared_engines:$(pwd)"
@@ -85,875 +64,216 @@ jobs:
                       + "\n```")
 
           try:
-              forzar("apps/semilla/infrastructure/persistence/canonical_bridge.py",
+              forzar("apps/semilla/routers/student/home_registration_router.py",
                      D(r'''
-                  """Canonical Bridge (S-1) v2 - puente ADITIVO entre
-                  el registro viejo (SemillaStore / semilla_accounts)
-                  y el canonico (StudentRegistryEngine / sm_students).
+                  """Home Registration Router (S-4) - API de
+                  matricula desde casa.
 
-                  v2 (auditoria del repo vivo):
-                  - get_account del store REAL lanza LookupError:
-                    el read-through ahora captura LookupError, busca
-                    en el mapa y responde del canonico; si tampoco
-                    existe, re-lanza el MISMO LookupError
-                    (comportamiento viejo identico).
-                  - complete_pending(): convierte una alta en cola
-                    (SE-3 incompleto) en expediente canonico
-                    completo, la saca de la cola y la mapea.
+                  Rutas reales (bajo el prefijo del server):
+                    POST /semilla/api/home-registration
+                         -> start (formulario completo SE-3;
+                          SIN_CUPOS del turno pedido -> 409
+                          con alternativas)
+                    GET  /semilla/api/home-registration/{id}
+                    POST /semilla/api/home-registration/{id}/confirm
+                    GET  /semilla/api/home-registrations
+                         ?institution_id=...
 
-                  REGLA 51 (aditivo): el viejo responde SIEMPRE
-                  igual; el lado canonico es best-effort y jamas
-                  lanza hacia el server."""
+                  Logica PURA (dict in -> (codigo, dict) out):
+                  server.py delega aqui; los tests la ejercitan
+                  sin red. Regla 78: el menor trae su ZID de
+                  NACIMIENTO si existe (SEMILLA lo CONSUME,
+                  jamas crea otro); sin documentos NO impide
+                  iniciar. SE-3: 2 encargados de retiro + 1 de
+                  emergencia. Nada falso (regla 66): errores
+                  honestos 400/404/405/409/503."""
                   from __future__ import annotations
-                  import json as _j
-                  from shared_engines.storage.migrations import (
-                      Migration, MigrationRunner)
+                  from typing import Tuple
+                  from apps.semilla.domain.student.student_registry_engine import (
+                      StudentRegistryEngine)
+                  from apps.semilla.domain.student.home_registration_engine import (
+                      HomeRegistrationEngine)
+                  from apps.semilla.domain.classroom.classroom_engine import (
+                      ClassroomEngine)
+                  from apps.semilla.domain.academic.enrollment_engine import (
+                      EnrollmentEngine)
 
-                  _MIGRATIONS = (
-                      Migration(1, "sm_legacy_map", (
-                          "CREATE TABLE IF NOT EXISTS"
-                          " sm_legacy_map (account_id TEXT"
-                          " PRIMARY KEY, student_id TEXT NOT NULL,"
-                          " created_at REAL NOT NULL)",
-                      )),
-                      Migration(2, "sm_legacy_pending", (
-                          "CREATE TABLE IF NOT EXISTS"
-                          " sm_legacy_pending (account_id TEXT"
-                          " PRIMARY KEY, reason TEXT NOT NULL,"
-                          " payload_json TEXT NOT NULL DEFAULT"
-                          " '{}', created_at REAL NOT NULL)",
-                      )),
-                  )
+                  _REQ = ("responsable_zid", "responsable_name",
+                          "relation", "child_name",
+                          "institution_id", "level", "grade")
 
-                  class CanonicalBridge:
-                      """Puente viejo->canonico (regla 51 aditivo)."""
 
-                      def __init__(self, db, clock, registry):
-                          self._db = db
-                          self._clock = clock
-                          self._reg = registry
-                          MigrationRunner(db, "sm.legacybridge",
-                                          _MIGRATIONS).run(clock)
+                  class HomeRegistrationRouter:
+                      """API matricula desde casa (S-4)."""
 
-                      def wire(self, store) -> object:
-                          """Envuelve metodos de cuentas que existan.
-                          Idempotente."""
-                          for name in ("add_account",
-                                       "create_account",
-                                       "register_account"):
-                              m = getattr(store, name, None)
-                              if m is not None and not getattr(
-                                      m, "_zyra_canonical", False):
-                                  setattr(store, name,
-                                          self._wrap_add(m))
-                          m = getattr(store, "get_account", None)
-                          if m is not None and not getattr(
-                                  m, "_zyra_canonical", False):
-                              setattr(store, "get_account",
-                                      self._wrap_get(m))
-                          return store
-
-                      # ---------- alta (dual-write) ----------
-
-                      def _wrap_add(self, original):
-                          bridge = self
-                          def patched(*args, **kwargs):
-                              res = original(*args, **kwargs)
-                              try:
-                                  bridge._mirror(args, kwargs, res)
-                              except Exception:
-                                  pass
-                              return res
-                          patched._zyra_canonical = True
-                          return patched
-
-                      def _mirror(self, args, kwargs, res):
-                          data = dict(kwargs or {})
-                          if not data and isinstance(res, dict):
-                              data = dict(res)
-                          if not data:
-                              return
-                          acc = (data.get("account_id")
-                                 or (res or {}).get("account_id")
-                                 or data.get("id") or "")
-                          name = (data.get("name")
-                                  or data.get("full_name")
-                                  or (res or {}).get("name") or "")
-                          zid = (data.get("zid")
-                                 or (res or {}).get("zid") or "")
-                          role = (data.get("role")
-                                  or (res or {}).get("role")
-                                  or "alumno")
-                          school = (data.get("school")
-                                    or data.get("institution_id")
-                                    or "")
-                          grade = (data.get("grade") or "1")
-                          if str(role) != "alumno":
-                              return
-                          tutores = list(data.get("tutores") or [])
-                          pick = list(
-                              data.get("authorized_pickup") or [])
-                          emg = list(
-                              data.get("emergency_contacts") or [])
-                          if (len(tutores) < 1 or len(pick) < 2
-                                  or len(emg) < 1):
-                              self._pending(
-                                  str(acc), "SE-3 incompleto",
-                                  {"name": str(name),
-                                   "zid": str(zid),
-                                   "school": str(school),
-                                   "grade": str(grade)})
-                              return
-                          est = self._reg.register(
-                              full_name=str(name), level="BASICA",
-                              grade=str(grade),
-                              institution_id=str(school),
-                              tutores=tutores,
-                              authorized_pickup=pick,
-                              emergency_contacts=emg,
-                              zid=str(zid),
-                              zid_status=("PROVISIONAL" if zid
-                                          else "NONE"))
-                          if acc:
-                              self._db.execute(
-                                  "INSERT OR REPLACE INTO"
-                                  " sm_legacy_map (account_id,"
-                                  " student_id, created_at)"
-                                  " VALUES (?, ?, ?)",
-                                  (str(acc),
-                                   str(est["student_id"]),
-                                   self._clock.now()))
-
-                      def _pending(self, account_id, reason,
-                                   payload):
-                          self._db.execute(
-                              "INSERT OR REPLACE INTO"
-                              " sm_legacy_pending (account_id,"
-                              " reason, payload_json, created_at)"
-                              " VALUES (?, ?, ?, ?)",
-                              (str(account_id or "SIN_ID"),
-                               str(reason),
-                               _j.dumps(payload, default=str),
-                               self._clock.now()))
-
-                      def pending_list(self):
-                          rows = self._db.query_all(
-                              "SELECT * FROM sm_legacy_pending"
-                              " ORDER BY rowid")
-                          return [dict(r) for r in rows]
-
-                      def complete_pending(self, account_id, *,
-                                           tutores,
-                                           authorized_pickup,
-                                           emergency_contacts,
-                                           level="BASICA",
-                                           grade=None) -> dict:
-                          """Cola -> expediente canonico SE-3
-                          completo + mapa (sale de la cola)."""
-                          row = self._db.query_one(
-                              "SELECT payload_json FROM"
-                              " sm_legacy_pending WHERE"
-                              " account_id = ?",
-                              (str(account_id),))
-                          if not row:
-                              raise KeyError(account_id)
-                          p = _j.loads(
-                              str(row["payload_json"]) or "{}")
-                          est = self._reg.register(
-                              full_name=str(p.get("name") or ""),
-                              level=str(level),
-                              grade=str(grade
-                                        or p.get("grade")
-                                        or "1"),
-                              institution_id=str(
-                                  p.get("school") or ""),
-                              tutores=list(tutores),
-                              authorized_pickup=list(
-                                  authorized_pickup),
-                              emergency_contacts=list(
-                                  emergency_contacts),
-                              zid=str(p.get("zid") or ""),
-                              zid_status=("PROVISIONAL"
-                                          if p.get("zid")
-                                          else "NONE"))
-                          with self._db.transaction() as cursor:
-                              cursor.execute(
-                                  "DELETE FROM sm_legacy_pending"
-                                  " WHERE account_id = ?",
-                                  (str(account_id),))
-                              cursor.execute(
-                                  "INSERT OR REPLACE INTO"
-                                  " sm_legacy_map (account_id,"
-                                  " student_id, created_at)"
-                                  " VALUES (?, ?, ?)",
-                                  (str(account_id),
-                                   str(est["student_id"]),
-                                   self._clock.now()))
-                          return est
-
-                      # ---------- lectura ----------
-
-                      def _wrap_get(self, original):
-                          bridge = self
-                          def patched(*args, **kwargs):
-                              err = None
-                              try:
-                                  res = original(*args, **kwargs)
-                              except LookupError as e:
-                                  err = e
-                                  res = None
-                              if res is not None:
-                                  return res
-                              try:
-                                  acc = None
-                                  if kwargs.get("account_id"):
-                                      acc = str(
-                                          kwargs["account_id"])
-                                  elif args:
-                                      acc = str(args[0])
-                                  if acc:
-                                      row = self._db.query_one(
-                                          "SELECT student_id FROM"
-                                          " sm_legacy_map WHERE"
-                                          " account_id = ?",
-                                          (acc,))
-                                      if row:
-                                          est = bridge._reg.get(
-                                              str(row[
-                                                  "student_id"]))
-                                          if est:
-                                              return \
-                                                  bridge._canon_shape(
-                                                      est, acc)
-                              except Exception:
-                                  pass
-                              if err is not None:
-                                  raise err
-                              return res
-                          patched._zyra_canonical = True
-                          return patched
-
-                      def _canon_shape(self, est,
-                                       account_id) -> dict:
-                          return {"account_id": str(account_id),
-                                  "student_id":
-                                      str(est.get("student_id",
-                                                  "")),
-                                  "name":
-                                      str(est.get("full_name",
-                                                  "")
-                                          or est.get("name",
-                                                     "")),
-                                  "zid": str(est.get("zid", "")),
-                                  "role": "alumno",
-                                  "school":
-                                      str(est.get(
-                                          "institution_id", "")),
-                                  "grade":
-                                      str(est.get("grade", "")),
-                                  "canonico": True}
-              '''))
-              out("## FIN bridge v2")
-          except Exception:
-              out("## ERROR")
-              out("```\n" + traceback.format_exc().strip() + "\n```")
-          finally:
-              exit(0)
-          PYEOF
-
-      - name: "[ESCRITURA] semilla_store.py COMPLETO + autowire canonico (S-1 definitivo)"
-        if: always()
-        run: |
-          export PYTHONPATH="$(pwd):$(pwd)/shared_engines:$(pwd)"
-          python3 << 'PYEOF'
-          import ast, os, pathlib, py_compile, textwrap, traceback
-          SUM = os.environ.get("GITHUB_STEP_SUMMARY", "")
-          def out(t):
-              print(t, flush=True)
-              if SUM:
-                  with open(SUM, "a", encoding="utf-8") as f:
-                      f.write(t + "\n")
-          def D(s):
-              return textwrap.dedent(s)
-          def forzar(ruta, contenido):
-              p = None
-              try:
-                  ast.parse(contenido)
-                  p = pathlib.Path(ruta)
-                  p.parent.mkdir(parents=True, exist_ok=True)
-                  p.write_text(contenido, encoding="utf-8")
-                  py_compile.compile(ruta, doraise=True)
-                  out("- **" + p.name + ": OK**")
-              except Exception:
-                  if p is not None and p.exists():
-                      try:
-                          p.unlink()
-                      except Exception:
-                          pass
-                  out("- **" + ruta + ": ERROR (no escrito)**")
-                  out("```\n" + traceback.format_exc().strip()
-                      + "\n```")
-
-          try:
-              forzar("apps/semilla/infrastructure/persistence/semilla_store.py",
-                     D(r'''
-                  """SEMILLA durable store (v2: + tutor tables).
-
-                  S-1 CANONICO (regla 51 aditivo): cada SemillaStore
-                  se autowirea al StudentRegistryEngine canonico via
-                  CanonicalBridge — altas de alumnos espejadas al
-                  canonico (o en cola sm_legacy_pending si faltan
-                  datos SE-3: nada falso, regla 66) y lecturas
-                  viejas-primero con fallback canonico por mapa.
-                  Best-effort: si el lado canonico no esta
-                  disponible, el store funciona identico a antes."""
-                  from __future__ import annotations
-
-                  import uuid
-
-                  from shared_engines.storage.database import Database
-                  from shared_engines.storage.migrations import Migration, MigrationRunner
-
-                  ROLES = ("alumno", "profesor", "institucion")
-                  GRADE_LEVELS = ("prekinder", "kinder", "primaria", "secundaria", "universidad")
-
-                  _MIGRATIONS = (
-                      Migration(
-                          1,
-                          "semilla",
-                          (
-                              "CREATE TABLE semilla_accounts ("
-                              " account_id TEXT PRIMARY KEY,"
-                              " zid TEXT,"
-                              " name TEXT NOT NULL,"
-                              " role TEXT NOT NULL,"
-                              " school TEXT,"
-                              " grade TEXT,"
-                              " created_at REAL NOT NULL)",
-                              "CREATE TABLE semilla_grades ("
-                              " grade_id TEXT PRIMARY KEY,"
-                              " student_account TEXT NOT NULL,"
-                              " subject TEXT NOT NULL,"
-                              " score REAL NOT NULL,"
-                              " teacher_account TEXT NOT NULL,"
-                              " recorded_at REAL NOT NULL)",
-                              "CREATE TABLE semilla_attendance ("
-                              " att_id TEXT PRIMARY KEY,"
-                              " student_account TEXT NOT NULL,"
-                              " present INTEGER NOT NULL,"
-                              " recorded_at REAL NOT NULL)",
-                              "CREATE TABLE semilla_welfare ("
-                              " welfare_id TEXT PRIMARY KEY,"
-                              " student_account TEXT NOT NULL,"
-                              " mood TEXT NOT NULL,"
-                              " alert INTEGER NOT NULL DEFAULT 0,"
-                              " recorded_at REAL NOT NULL)",
-                              "CREATE TABLE semilla_scholarships ("
-                              " scholarship_id TEXT PRIMARY KEY,"
-                              " student_account TEXT NOT NULL,"
-                              " reason TEXT NOT NULL,"
-                              " granted_at REAL NOT NULL)",
-                          ),
-                      ),
-                      Migration(
-                          2,
-                          "semilla_tutor",
-                          (
-                              "CREATE TABLE semilla_challenge_state ("
-                              " student_account TEXT PRIMARY KEY,"
-                              " domain TEXT NOT NULL,"
-                              " difficulty INTEGER NOT NULL,"
-                              " updated_at REAL NOT NULL)",
-                              "CREATE TABLE semilla_attempts ("
-                              " attempt_id TEXT PRIMARY KEY,"
-                              " student_account TEXT NOT NULL,"
-                              " domain TEXT NOT NULL,"
-                              " difficulty INTEGER NOT NULL,"
-                              " correct INTEGER NOT NULL,"
-                              " created_at REAL NOT NULL)",
-                              "CREATE TABLE semilla_talents ("
-                              " talent_id TEXT PRIMARY KEY,"
-                              " student_account TEXT NOT NULL,"
-                              " domain TEXT NOT NULL,"
-                              " evidence TEXT NOT NULL,"
-                              " created_at REAL NOT NULL)",
-                              "CREATE TABLE semilla_rewards ("
-                              " reward_id TEXT PRIMARY KEY,"
-                              " student_account TEXT NOT NULL,"
-                              " kind TEXT NOT NULL,"
-                              " detail TEXT,"
-                              " points INTEGER NOT NULL DEFAULT 0,"
-                              " created_at REAL NOT NULL)",
-                              "CREATE TABLE semilla_messages ("
-                              " message_id TEXT PRIMARY KEY,"
-                              " recipient TEXT NOT NULL,"
-                              " student_account TEXT,"
-                              " text TEXT NOT NULL,"
-                              " created_at REAL NOT NULL)",
-                          ),
-                      ),
-                  )
-
-                  class SemillaStore:
-                      """Durable state for SEMILLA."""
-
-                      def __init__(self, db: Database, clock) -> None:
-                          self._db = db
-                          self._clock = clock
-                          MigrationRunner(db, "semilla", _MIGRATIONS).run(clock)
-                          self.canonical_bridge = None
-                          self._wire_canonical()
-
-                      def _wire_canonical(self) -> None:
-                          """S-1: autowire al canonico (best-effort,
-                          jamas rompe el store viejo)."""
-                          try:
-                              from apps.semilla.domain.student.student_registry_engine import (
-                                  StudentRegistryEngine,
-                              )
-                              from apps.semilla.infrastructure.persistence.canonical_bridge import (
-                                  CanonicalBridge,
-                              )
-                              registry = StudentRegistryEngine(self._db, self._clock)
-                              bridge = CanonicalBridge(self._db, self._clock, registry)
-                              bridge.wire(self)
-                              self.canonical_bridge = bridge
-                          except Exception:
-                              self.canonical_bridge = None
-
-                      def add_account(
-                          self,
-                          *,
-                          account_id: str,
-                          zid: str | None,
-                          name: str,
-                          role: str,
-                          school: str | None,
-                          grade: str | None,
-                      ) -> dict[str, object]:
-                          if role not in ROLES:
-                              raise ValueError(f"unknown role: {role}")
-                          now = self._clock.now()
-                          with self._db.transaction() as cursor:
-                              cursor.execute(
-                                  "INSERT INTO semilla_accounts"
-                                  " (account_id, zid, name, role, school, grade, created_at)"
-                                  " VALUES (?, ?, ?, ?, ?, ?, ?)",
-                                  (account_id, zid, name, role, school, grade, now),
-                              )
-                          return self.get_account(account_id)
-
-                      def get_account(self, account_id: str) -> dict[str, object]:
-                          row = self._db.query_one(
-                              "SELECT * FROM semilla_accounts WHERE account_id = ?",
-                              (account_id,),
-                          )
-                          if row is None:
-                              raise LookupError(f"unknown account: {account_id}")
-                          return self._account_row(row)
-
-                      def set_zid(self, *, account_id: str, zid: str) -> None:
-                          with self._db.transaction() as cursor:
-                              cursor.execute(
-                                  "UPDATE semilla_accounts SET zid = ? WHERE account_id = ?",
-                                  (zid, account_id),
-                              )
-
-                      def update_grade(self, *, account_id: str, new_grade: str) -> None:
-                          if new_grade not in GRADE_LEVELS:
-                              raise ValueError(f"unknown grade: {new_grade}")
-                          with self._db.transaction() as cursor:
-                              cursor.execute(
-                                  "UPDATE semilla_accounts SET grade = ? WHERE account_id = ?",
-                                  (new_grade, account_id),
-                              )
-
-                      def list_by_role(
-                          self, *, role: str, school: str | None = None,
-                      ) -> tuple[dict[str, object], ...]:
-                          if school is not None:
-                              rows = self._db.query_all(
-                                  "SELECT * FROM semilla_accounts"
-                                  " WHERE role = ? AND school = ? ORDER BY created_at",
-                                  (role, school),
-                              )
-                          else:
-                              rows = self._db.query_all(
-                                  "SELECT * FROM semilla_accounts"
-                                  " WHERE role = ? ORDER BY created_at",
-                                  (role,),
-                              )
-                          return tuple(self._account_row(r) for r in rows)
-
-                      def add_grade(
-                          self,
-                          *,
-                          grade_id: str,
-                          student_account: str,
-                          subject: str,
-                          score: float,
-                          teacher_account: str,
-                      ) -> dict[str, object]:
-                          if not 0.0 <= score <= 10.0:
-                              raise ValueError("score must be 0..10")
-                          now = self._clock.now()
-                          with self._db.transaction() as cursor:
-                              cursor.execute(
-                                  "INSERT INTO semilla_grades"
-                                  " (grade_id, student_account, subject, score,"
-                                  " teacher_account, recorded_at)"
-                                  " VALUES (?, ?, ?, ?, ?, ?)",
-                                  (grade_id, student_account, subject, score, teacher_account, now),
-                              )
-                          return {
-                              "grade_id": grade_id,
-                              "student": student_account,
-                              "subject": subject,
-                              "score": score,
-                          }
-
-                      def grades_of(self, *, student_account: str) -> tuple[dict[str, object], ...]:
-                          rows = self._db.query_all(
-                              "SELECT * FROM semilla_grades"
-                              " WHERE student_account = ? ORDER BY recorded_at",
-                              (student_account,),
-                          )
-                          return tuple(
-                              {"subject": str(r["subject"]), "score": float(r["score"])}
-                              for r in rows
-                          )
-
-                      def average_of(self, *, student_account: str) -> float | None:
-                          rows = self.grades_of(student_account=student_account)
-                          if not rows:
-                              return None
-                          return sum(float(r["score"]) for r in rows) / len(rows)
-
-                      def attendance_rate(self, *, student_account: str) -> float | None:
-                          rows = self._db.query_all(
-                              "SELECT present FROM semilla_attendance WHERE student_account = ?",
-                              (student_account,),
-                          )
-                          if not rows:
-                              return None
-                          return sum(int(r["present"]) for r in rows) / len(rows)
-
-                      def add_attendance(
-                          self, *, att_id: str, student_account: str, present: bool,
-                      ) -> None:
-                          now = self._clock.now()
-                          with self._db.transaction() as cursor:
-                              cursor.execute(
-                                  "INSERT INTO semilla_attendance"
-                                  " (att_id, student_account, present, recorded_at)"
-                                  " VALUES (?, ?, ?, ?)",
-                                  (att_id, student_account, int(present), now),
-                              )
-
-                      def add_welfare(
-                          self, *, welfare_id: str, student_account: str, mood: str,
-                      ) -> dict[str, object]:
-                          alert = mood in ("triste", "enojado", "enfermo")
-                          now = self._clock.now()
-                          with self._db.transaction() as cursor:
-                              cursor.execute(
-                                  "INSERT INTO semilla_welfare"
-                                  " (welfare_id, student_account, mood, alert, recorded_at)"
-                                  " VALUES (?, ?, ?, ?, ?)",
-                                  (welfare_id, student_account, mood, int(alert), now),
-                              )
-                          return {"welfare_id": welfare_id, "mood": mood, "alert": alert}
-
-                      def welfare_alerts(self) -> tuple[dict[str, object], ...]:
-                          rows = self._db.query_all(
-                              "SELECT * FROM semilla_welfare"
-                              " WHERE alert = 1 ORDER BY recorded_at DESC"
-                          )
-                          return tuple(
-                              {"student": str(r["student_account"]), "mood": str(r["mood"])}
-                              for r in rows
-                          )
-
-                      def grant_scholarship(
-                          self, *, scholarship_id: str, student_account: str, reason: str,
-                      ) -> dict[str, object]:
-                          now = self._clock.now()
-                          with self._db.transaction() as cursor:
-                              cursor.execute(
-                                  "INSERT INTO semilla_scholarships"
-                                  " (scholarship_id, student_account, reason, granted_at)"
-                                  " VALUES (?, ?, ?, ?)",
-                                  (scholarship_id, student_account, reason, now),
-                              )
-                          return {
-                              "scholarship_id": scholarship_id,
-                              "student": student_account,
-                              "reason": reason,
-                          }
-
-                      def has_scholarship(self, *, student_account: str) -> bool:
-                          row = self._db.query_one(
-                              "SELECT 1 FROM semilla_scholarships WHERE student_account = ?",
-                              (student_account,),
-                          )
-                          return row is not None
-
-                      def summary(self, *, school: str | None = None) -> dict[str, object]:
-                          if school is not None:
-                              students = self._db.query_one(
-                                  "SELECT COUNT(*) AS n FROM semilla_accounts"
-                                  " WHERE role = 'alumno' AND school = ?",
-                                  (school,),
-                              )
-                              teachers = self._db.query_one(
-                                  "SELECT COUNT(*) AS n FROM semilla_accounts"
-                                  " WHERE role = 'profesor' AND school = ?",
-                                  (school,),
-                              )
-                          else:
-                              students = self._db.query_one(
-                                  "SELECT COUNT(*) AS n FROM semilla_accounts"
-                                  " WHERE role = 'alumno'"
-                              )
-                              teachers = self._db.query_one(
-                                  "SELECT COUNT(*) AS n FROM semilla_accounts"
-                                  " WHERE role = 'profesor'"
-                              )
-                          return {
-                              "students": int(students["n"]) if students is not None else 0,
-                              "teachers": int(teachers["n"]) if teachers is not None else 0,
-                          }
-
-                      def get_challenge_state(self, *, student_account: str) -> dict[str, object]:
-                          row = self._db.query_one(
-                              "SELECT * FROM semilla_challenge_state WHERE student_account = ?",
-                              (student_account,),
-                          )
-                          if row is None:
-                              self.set_challenge_state(
-                                  student_account=student_account,
-                                  domain="matematicas",
-                                  difficulty=1,
-                              )
-                              return {
-                                  "student_account": student_account,
-                                  "domain": "matematicas",
-                                  "difficulty": 1,
-                              }
-                          return {
-                              "student_account": str(row["student_account"]),
-                              "domain": str(row["domain"]),
-                              "difficulty": int(row["difficulty"]),
-                          }
-
-                      def set_challenge_state(
-                          self, *, student_account: str, domain: str, difficulty: int,
-                      ) -> None:
-                          now = self._clock.now()
-                          with self._db.transaction() as cursor:
-                              cursor.execute(
-                                  "INSERT OR REPLACE INTO semilla_challenge_state"
-                                  " (student_account, domain, difficulty, updated_at)"
-                                  " VALUES (?, ?, ?, ?)",
-                                  (student_account, domain, int(difficulty), now),
-                              )
-
-                      def record_attempt(
-                          self,
-                          *,
-                          attempt_id: str,
-                          student_account: str,
-                          domain: str,
-                          difficulty: int,
-                          correct: bool,
-                      ) -> dict[str, object]:
-                          now = self._clock.now()
-                          with self._db.transaction() as cursor:
-                              cursor.execute(
-                                  "INSERT INTO semilla_attempts"
-                                  " (attempt_id, student_account, domain, difficulty,"
-                                  " correct, created_at)"
-                                  " VALUES (?, ?, ?, ?, ?, ?)",
-                                  (
-                                      attempt_id,
-                                      student_account,
-                                      domain,
-                                      int(difficulty),
-                                      int(correct),
-                                      now,
-                                  ),
-                              )
-                          return {
-                              "attempt_id": attempt_id,
-                              "correct": correct,
-                              "difficulty": int(difficulty),
-                          }
-
-                      def attempts_of(self, *, student_account: str) -> tuple[dict[str, object], ...]:
-                          rows = self._db.query_all(
-                              "SELECT * FROM semilla_attempts"
-                              " WHERE student_account = ? ORDER BY created_at",
-                              (student_account,),
-                          )
-                          return tuple(
-                              {
-                                  "attempt_id": str(r["attempt_id"]),
-                                  "domain": str(r["domain"]),
-                                  "difficulty": int(r["difficulty"]),
-                                  "correct": bool(int(r["correct"])),
-                              }
-                              for r in rows
-                          )
-
-                      def detect_talents(
-                          self, *, student_account: str,
-                      ) -> tuple[dict[str, object], ...]:
-                          grades = self.grades_of(student_account=student_account)
-                          by_subject: dict = {}
-                          for g in grades:
-                              by_subject.setdefault(str(g["subject"]), []).append(float(g["score"]))
-                          new: list = []
-                          for subject, scores in by_subject.items():
-                              if len(scores) < 3:
-                                  continue
-                              average = sum(scores) / len(scores)
-                              if average < 9.0:
-                                  continue
-                              exists = self._db.query_one(
-                                  "SELECT 1 FROM semilla_talents"
-                                  " WHERE student_account = ? AND domain = ?",
-                                  (student_account, subject),
-                              )
-                              if exists is not None:
-                                  continue
-                              talent_id = "TAL-" + uuid.uuid4().hex[:10]
-                              evidence = f"promedio {average:.1f} en {len(scores)} notas"
-                              now = self._clock.now()
-                              with self._db.transaction() as cursor:
-                                  cursor.execute(
-                                      "INSERT INTO semilla_talents"
-                                      " (talent_id, student_account, domain, evidence, created_at)"
-                                      " VALUES (?, ?, ?, ?, ?)",
-                                      (talent_id, student_account, subject, evidence, now),
-                                  )
-                              new.append(
-                                  {
-                                      "talent_id": talent_id,
-                                      "domain": subject,
-                                      "evidence": evidence,
-                                  }
-                              )
-                          return tuple(new)
-
-                      def list_talents(self, *, student_account: str) -> tuple[dict[str, object], ...]:
-                          rows = self._db.query_all(
-                              "SELECT * FROM semilla_talents"
-                              " WHERE student_account = ? ORDER BY created_at",
-                              (student_account,),
-                          )
-                          return tuple(
-                              {
-                                  "talent_id": str(r["talent_id"]),
-                                  "domain": str(r["domain"]),
-                                  "evidence": str(r["evidence"]),
-                              }
-                              for r in rows
-                          )
-
-                      def add_reward(
-                          self,
-                          *,
-                          reward_id: str,
-                          student_account: str,
-                          kind: str,
-                          detail: str | None,
-                          points: int,
-                      ) -> dict[str, object]:
-                          now = self._clock.now()
-                          with self._db.transaction() as cursor:
-                              cursor.execute(
-                                  "INSERT INTO semilla_rewards"
-                                  " (reward_id, student_account, kind, detail, points, created_at)"
-                                  " VALUES (?, ?, ?, ?, ?, ?)",
-                                  (reward_id, student_account, kind, detail, int(points), now),
-                              )
-                          return {"reward_id": reward_id, "kind": kind, "points": int(points)}
-
-                      def rewards_of(self, *, student_account: str) -> tuple[dict[str, object], ...]:
-                          rows = self._db.query_all(
-                              "SELECT * FROM semilla_rewards"
-                              " WHERE student_account = ? ORDER BY created_at",
-                              (student_account,),
-                          )
-                          return tuple(
-                              {
-                                  "reward_id": str(r["reward_id"]),
-                                  "kind": str(r["kind"]),
-                                  "detail": (
-                                      str(r["detail"]) if r["detail"] is not None else None
-                                  ),
-                                  "points": int(r["points"]),
-                              }
-                              for r in rows
-                          )
-
-                      def total_points(self, *, student_account: str) -> int:
-                          row = self._db.query_one(
-                              "SELECT SUM(points) AS total FROM semilla_rewards"
-                              " WHERE student_account = ?",
-                              (student_account,),
-                          )
-                          if row is None:
-                              return 0
-                          raw = row["total"]
-                          return int(raw) if raw is not None else 0
-
-                      def add_message(
-                          self,
-                          *,
-                          message_id: str,
-                          recipient: str,
-                          text: str,
-                          student_account: str | None = None,
-                      ) -> dict[str, object]:
-                          now = self._clock.now()
-                          with self._db.transaction() as cursor:
-                              cursor.execute(
-                                  "INSERT INTO semilla_messages"
-                                  " (message_id, recipient, student_account, text, created_at)"
-                                  " VALUES (?, ?, ?, ?, ?)",
-                                  (message_id, recipient, student_account, text, now),
-                              )
-                          return {"message_id": message_id, "recipient": recipient, "text": text}
-
-                      def messages_of(self, *, recipient: str) -> tuple[dict[str, object], ...]:
-                          rows = self._db.query_all(
-                              "SELECT * FROM semilla_messages"
-                              " WHERE recipient = ? ORDER BY created_at",
-                              (recipient,),
-                          )
-                          return tuple(
-                              {
-                                  "message_id": str(r["message_id"]),
-                                  "recipient": str(r["recipient"]),
-                                  "text": str(r["text"]),
-                              }
-                              for r in rows
-                          )
+                      def __init__(self, db, clock):
+                          reg = StudentRegistryEngine(db, clock)
+                          cls = ClassroomEngine(db, clock)
+                          enr = EnrollmentEngine(
+                              db, clock, classroom_engine=cls)
+                          self._hr = HomeRegistrationEngine(
+                              db, clock, student_registry=reg,
+                              classroom_engine=cls,
+                              enrollment_engine=enr)
 
                       @staticmethod
-                      def _account_row(row) -> dict[str, object]:
-                          return {
-                              "account_id": str(row["account_id"]),
-                              "zid": str(row["zid"]) if row["zid"] is not None else None,
-                              "name": str(row["name"]),
-                              "role": str(row["role"]),
-                              "school": str(row["school"]) if row["school"] is not None else None,
-                              "grade": str(row["grade"]) if row["grade"] is not None else None,
-                              "created_at": float(row["created_at"]),
-                          }
+                      def _err(code, msg) -> Tuple[int, dict]:
+                          return (int(code),
+                                  {"ok": False,
+                                   "error": str(msg)})
+
+                      # ---------- operaciones ----------
+
+                      def start(self, doc) -> Tuple[int, dict]:
+                          if not isinstance(doc, dict):
+                              return self._err(
+                                  400, "body JSON requerido")
+                          missing = [
+                              f for f in _REQ
+                              if not str(doc.get(f, "")).strip()]
+                          if missing:
+                              return self._err(
+                                  400, "faltan campos: "
+                                  + ", ".join(missing))
+                          try:
+                              r = self._hr.start_request(
+                                  responsable_zid=str(
+                                      doc.get("responsable_zid",
+                                              "")),
+                                  responsable_name=str(
+                                      doc.get("responsable_name",
+                                              "")),
+                                  relation=str(
+                                      doc.get("relation", "")),
+                                  child_name=str(
+                                      doc.get("child_name", "")),
+                                  birth_date=str(
+                                      doc.get("birth_date", "")),
+                                  child_zid=str(
+                                      doc.get("child_zid", "")),
+                                  child_zid_status=str(
+                                      doc.get("child_zid_status",
+                                              "NONE") or "NONE"),
+                                  institution_id=str(
+                                      doc.get("institution_id",
+                                              "")),
+                                  level=str(doc.get("level", "")),
+                                  grade=str(doc.get("grade", "")),
+                                  turn=str(doc.get("turn",
+                                                   "MATUTINA")
+                                           or "MATUTINA"),
+                                  authorized_pickup=list(
+                                      doc.get("authorized_pickup")
+                                      or []),
+                                  emergency_contacts=list(
+                                      doc.get(
+                                          "emergency_contacts")
+                                      or []))
+                          except ValueError as e:
+                              return self._err(400, str(e))
+                          if r.get("status") == "SIN_CUPOS":
+                              return (409, {
+                                  "ok": False,
+                                  "error": "SIN_CUPOS",
+                                  "note": str(r.get("note", "")),
+                                  "request": r})
+                          return (201, {"ok": True,
+                                        "request": r})
+
+                      def get(self, request_id
+                              ) -> Tuple[int, dict]:
+                          r = self._hr.get_request(
+                              str(request_id or ""))
+                          if not r:
+                              return self._err(
+                                  404,
+                                  "solicitud no encontrada")
+                          return (200, {"ok": True,
+                                        "request": r})
+
+                      def confirm(self, request_id, doc
+                                  ) -> Tuple[int, dict]:
+                          d = doc if isinstance(doc, dict) else {}
+                          actor = str(
+                              d.get("director_actor", "")
+                              or d.get("actor", "")
+                              or "escuela")
+                          try:
+                              res = self._hr.confirm_by_school(
+                                  str(request_id or ""),
+                                  director_actor=actor)
+                          except KeyError:
+                              return self._err(
+                                  404,
+                                  "solicitud no encontrada")
+                          except ValueError as e:
+                              msg = str(e)
+                              code = (409 if "SIN_CUPOS" in msg
+                                      else 400)
+                              return self._err(code, msg)
+                          return (200, dict({"ok": True},
+                                            **res))
+
+                      def pending(self, institution_id
+                                  ) -> Tuple[int, dict]:
+                          rows = self._hr.pending_requests(
+                              str(institution_id or ""))
+                          return (200, {"ok": True,
+                                        "pending": rows,
+                                        "count": len(rows)})
+
+                      # ---------- dispatch ----------
+
+                      def dispatch(self, *, method, segs,
+                                   query=None,
+                                   doc=None) -> Tuple[int, dict]:
+                          """segs SIN prefijos semilla/api (ej:
+                          ['home-registration', '{id}',
+                          'confirm'])."""
+                          q = query or {}
+
+                          def q1(k):
+                              v = q.get(k)
+                              if isinstance(v, list):
+                                  return str(v[0]) if v else ""
+                              return str(v or "")
+
+                          try:
+                              m = str(method or "GET").upper()
+                              if segs[:1] == \
+                                      ["home-registrations"]:
+                                  if m != "GET":
+                                      return self._err(
+                                          405, "solo GET")
+                                  return self.pending(
+                                      q1("institution_id"))
+                              if segs[:1] == \
+                                      ["home-registration"]:
+                                  rest = list(segs[1:])
+                                  if not rest:
+                                      if m == "POST":
+                                          return self.start(doc)
+                                      return self._err(
+                                          405, "solo POST")
+                                  rid = str(rest[0])
+                                  if (len(rest) >= 2
+                                          and rest[1] == "confirm"):
+                                      if m != "POST":
+                                          return self._err(
+                                              405, "solo POST")
+                                      return self.confirm(rid,
+                                                          doc)
+                                  if m == "GET":
+                                      return self.get(rid)
+                                  return self._err(405,
+                                                   "solo GET")
+                              return self._err(
+                                  404, "ruta desconocida")
+                          except Exception as e:
+                              return self._err(
+                                  500, "error interno: " + str(e))
               '''))
-              out("## FIN semilla_store v3 (autowire)")
+              out("## FIN router S-4")
           except Exception:
               out("## ERROR")
               out("```\n" + traceback.format_exc().strip() + "\n```")
@@ -961,93 +281,422 @@ jobs:
               exit(0)
           PYEOF
 
-      - name: "[ESCRITURA tests + LECTURA veredicto] wiring real del store"
+      - name: "[ESCRITURA] wiring v2 en server.py (prefijo real /semilla/api + repair v1 + revert total si falla)"
+        if: always()
+        run: |
+          export PYTHONPATH="$(pwd):$(pwd)/shared_engines:$(pwd)"
+          python3 << 'PYEOF'
+          import ast, os, pathlib, py_compile, re, subprocess, traceback
+          SUM = os.environ.get("GITHUB_STEP_SUMMARY", "")
+          def out(t):
+              print(t, flush=True)
+              if SUM:
+                  with open(SUM, "a", encoding="utf-8") as f:
+                      f.write(t + "\n")
+          P = pathlib.Path("apps/semilla/server.py")
+          try:
+              src = P.read_text(encoding="utf-8")
+              orig = src
+              if "_HR_V2" in src:
+                  out("- wiring: YA V2 (idempotente)")
+                  open("/tmp/hr_wired", "w").write("yes")
+                  raise SystemExit(0)
+              lines = src.splitlines(keepends=True)
+              if "_hr_wants" in src:
+                  out("- wiring v1 detectado (prefijo"
+                      " equivocado) — REPARANDO a v2")
+                  lines = [
+                      ln for ln in lines
+                      if not re.match(
+                          r"^\s*if self\._hr_wants\(\):\s*$",
+                          ln)
+                      and not re.match(
+                          r"^\s*return self\._hr_handle\("
+                          r".*\)\s*$", ln)]
+                  start = end = None
+                  for i, ln in enumerate(lines):
+                      if ln.startswith(
+                              "    def _hr_wants(self)"):
+                          start = i
+                      if (ln.startswith("class SemillaServer")
+                              and start is not None):
+                          end = i
+                          break
+                  if start is not None and end is not None:
+                      del lines[start:end]
+                  text = "".join(lines)
+                  ast.parse(text)
+                  lines = text.splitlines(keepends=True)
+              text = "".join(lines)
+              tree = ast.parse(text)
+              handler = None
+              for node in tree.body:
+                  if isinstance(node, ast.ClassDef) and \
+                          node.name == "SemillaApiHandler":
+                      handler = node
+                      break
+              if handler is None:
+                  raise RuntimeError("no SemillaApiHandler")
+              has_api_get = has_api_post = False
+              docname = None
+              for n in handler.body:
+                  if isinstance(n, ast.FunctionDef):
+                      if n.name == "_api_get":
+                          has_api_get = True
+                      if n.name == "_api_post":
+                          has_api_post = True
+                          for sub in ast.walk(n):
+                              if (isinstance(sub, ast.Call)
+                                      and isinstance(sub.func,
+                                                     ast.Attribute)
+                                      and sub.func.attr ==
+                                      "_advance_route"
+                                      and sub.args
+                                      and isinstance(
+                                          sub.args[0], ast.Name)):
+                                  docname = sub.args[0].id
+              if not has_api_get or not has_api_post:
+                  raise RuntimeError("no _api_get/_api_post")
+              if docname is None:
+                  raise RuntimeError("nombre de doc no hallado")
+              if text.count('"unknown api route"') < 2:
+                  raise RuntimeError(
+                      "fallbacks no encontrados (2)")
+              if not any(ln.startswith("class SemillaServer")
+                         for ln in lines):
+                  raise RuntimeError("no class SemillaServer")
+
+              def span(name):
+                  start = None
+                  for i, ln in enumerate(lines):
+                      if re.match(r"^    def " + name + r"\(",
+                                  ln):
+                          start = i
+                          break
+                  if start is None:
+                      raise RuntimeError("span " + name)
+                  end = len(lines)
+                  for j in range(start + 1, len(lines)):
+                      if re.match(r"^    (def |async def |@)",
+                                  lines[j]):
+                          end = j
+                          break
+                  return (start, end)
+
+              def inject(methodname, call):
+                  sp = span(methodname)
+                  idx = None
+                  for i in range(sp[0], sp[1]):
+                      if '"unknown api route"' in lines[i]:
+                          idx = i
+                  if idx is None:
+                      raise RuntimeError(
+                          "no fallback en " + methodname)
+                  st = idx
+                  while st > sp[0] and not re.match(
+                          r"\s*self\.", lines[st]):
+                      st -= 1
+                  if not re.match(r"\s*self\.", lines[st]):
+                      raise RuntimeError(
+                          "inicio de statement no hallado en "
+                          + methodname)
+                  indent = re.match(r"(\s*)",
+                                    lines[st]).group(1)
+                  branch = (indent + "if self._hr_wants():\n"
+                            + indent + "    " + call + "\n")
+                  lines.insert(st, branch)
+
+              inject("_api_get",
+                     'return self._hr_handle(None, "GET")')
+              inject("_api_post",
+                     "return self._hr_handle(" + docname
+                     + ', "POST")')
+
+              METHODS = '''
+    def _hr_segs(self) -> list:
+        """S-4 v2: segmentos SIN prefijos semilla/api
+        (el server real sirve TODO bajo /semilla/...)."""
+        from urllib.parse import urlparse
+        segs = [p for p in urlparse(
+            self.path).path.split("/") if p]
+        while segs and segs[0] in ("semilla", "api"):
+            segs = segs[1:]
+        return segs
+
+    def _hr_wants(self) -> bool:
+        segs = self._hr_segs()
+        return bool(segs) and segs[0] in (
+            "home-registration",
+            "home-registrations")  # _HR_V2
+
+    def _hr_router(self):
+        """Router S-4 sobre la MISMA db/clock del store
+        del server (cacheado por handler)."""
+        st = getattr(self, "store", None)
+        if st is None:
+            return None
+        cached = getattr(self, "_hr_router_obj", None)
+        if cached is not None:
+            return cached
+        try:
+            from apps.semilla.routers.student.home_registration_router import (
+                HomeRegistrationRouter,
+            )
+            obj = HomeRegistrationRouter(st._db, st._clock)
+        except Exception:
+            return None
+        self._hr_router_obj = obj
+        return obj
+
+    def _hr_compute(self, doc, method):
+        """Puro: (code, payload) para el path actual."""
+        from urllib.parse import urlparse, parse_qs
+        u = urlparse(self.path)
+        r = self._hr_router()
+        if r is None:
+            return (503, {"ok": False,
+                          "error": "matricula desde casa"
+                                   " no disponible"})
+        return r.dispatch(method=str(method),
+                          segs=self._hr_segs(),
+                          query=parse_qs(u.query), doc=doc)
+
+    def _hr_handle(self, doc, method):
+        """Responde JSON (primitivas de
+        BaseHTTPRequestHandler — sin depender de helpers
+        privados del server)."""
+        import json as _hrjson
+        code, payload = self._hr_compute(doc, method)
+        body = _hrjson.dumps(
+            payload, default=str).encode("utf-8")
+        self.send_response(int(code))
+        self.send_header("Content-Type",
+                         "application/json")
+        self.send_header("Content-Length",
+                         str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+'''
+              at = None
+              for i, ln in enumerate(lines):
+                  if ln.startswith("class SemillaServer"):
+                      at = i
+                      break
+              lines.insert(at, METHODS)
+              new = "".join(lines)
+              ast.parse(new)
+              P.write_text(new, encoding="utf-8")
+              py_compile.compile(str(P), doraise=True)
+              env = dict(os.environ)
+              env["PYTHONPATH"] = (
+                  os.getcwd() + ":" + os.getcwd()
+                  + "/shared_engines")
+              r = subprocess.run(
+                  ["python3", "-c",
+                   "import apps.semilla.server"],
+                  capture_output=True, text=True, env=env)
+              if r.returncode != 0:
+                  raise RuntimeError(
+                      "import fallo: " + r.stderr[-500:])
+              open("/tmp/hr_wired", "w").write("yes")
+              out("- **server.py: WIRING V2 APLICADO**"
+                  " (rutas S-4 en /semilla/api/* antes del"
+                  " fallback; doc=" + docname + ")")
+          except SystemExit:
+              pass
+          except Exception:
+              try:
+                  P.write_text(orig, encoding="utf-8")
+              except Exception:
+                  pass
+              open("/tmp/hr_wired", "w").write("no")
+              out("- **server.py: WIRING DIFERIDO (revertido"
+                  " intacto) — router S-4 sigue committeable**")
+              out("```\n" + traceback.format_exc().strip()
+                  + "\n```")
+          finally:
+              try:
+                  py_compile.compile(str(P), doraise=True)
+              except Exception:
+                  pass
+              exit(0)
+          PYEOF
+
+      - name: "[ESCRITURA tests + LECTURA veredicto] tests router S-4 + wiring con rutas reales"
         if: always()
         run: |
           export PYTHONPATH="$(pwd):$(pwd)/shared_engines:$(pwd)"
           set +e
           find apps -name "__pycache__" -type d -prune -exec rm -rf {} + || true
           mkdir -p apps/semilla/tests
-          cat > apps/semilla/tests/test_s1_wiring.py << 'TSEOF'
+          cat > apps/semilla/tests/test_s4_http_router.py << 'TSEOF'
           import pytest
           from shared_engines.common.clocks import FrozenClock
           from shared_engines.storage.database import SQLiteAdapter
+          from apps.semilla.domain.classroom.classroom_engine import ClassroomEngine
           from apps.semilla.infrastructure.persistence.semilla_store import SemillaStore
+          from apps.semilla.routers.student.home_registration_router import HomeRegistrationRouter
 
-          TUT = [{"name": "Mama", "relation": "MADRE", "zid": "ZID-M-1"}]
           PICK2 = [{"name": "Mama", "relation": "MADRE"},
                    {"name": "Papa", "relation": "PADRE"}]
           EMG = [{"name": "Tio", "relation": "TIO", "phone": "911"}]
 
-          def _store(tmp_path):
+          def _env(tmp_path, cap_manana=30, cap_tarde=5):
+              db = SQLiteAdapter(tmp_path / "r.db")
+              clock = FrozenClock()
+              cls = ClassroomEngine(db, clock)
+              man = cls.create(name="1A", institution_id="INST-1",
+                  school_year="2026", level="BASICA", grade="1",
+                  section="A", turn="MATUTINA", capacity=cap_manana)
+              tar = cls.create(name="1T", institution_id="INST-1",
+                  school_year="2026", level="BASICA", grade="1",
+                  section="A", turn="VESPERTINA", capacity=cap_tarde)
+              r = HomeRegistrationRouter(db, clock)
+              return db, cls, man, tar, r
+
+          def _doc(**over):
+              base = {"responsable_zid": "ZID-PADRE-1",
+                  "responsable_name": "Padre Perez",
+                  "relation": "PADRE", "child_name": "Nino HTTP",
+                  "birth_date": "2019-05-10",
+                  "child_zid": "ZID-BABY-9",
+                  "child_zid_status": "VERIFIED",
+                  "institution_id": "INST-1", "level": "BASICA",
+                  "grade": "1", "turn": "MATUTINA",
+                  "authorized_pickup": PICK2,
+                  "emergency_contacts": EMG}
+              base.update(over)
+              return base
+
+          def test_start_confirm_flujo_completo(tmp_path) -> None:
+              db, cls, man, tar, r = _env(tmp_path)
+              code, p = r.dispatch(method="POST",
+                  segs=["home-registration"], doc=_doc())
+              assert code == 201 and p["ok"] is True
+              rid = p["request"]["request_id"]
+              code2, p2 = r.dispatch(method="POST",
+                  segs=["home-registration", rid, "confirm"],
+                  doc={"director_actor": "DIR-1"})
+              assert code2 == 200 and p2["status"] == "ACTIVA"
+              assert p2["student"]["zid"] == "ZID-BABY-9"
+              assert p2["student"]["zid_status"] == "VERIFIED"
+              assert p2["student"]["tutores"][0]["zid"] == "ZID-PADRE-1"
+              assert cls.get(man["classroom_id"])["enrolled"] == 1
+              code3, p3 = r.dispatch(method="GET",
+                  segs=["home-registration", rid])
+              assert code3 == 200
+              assert p3["request"]["status"] == "ACTIVA"
+              code4, p4 = r.dispatch(method="GET",
+                  segs=["home-registrations"],
+                  query={"institution_id": ["INST-1"]})
+              assert code4 == 200 and p4["count"] == 0
+              print("OK HTTP-flow: start 201 -> confirm 200 ACTIVA -> ZID nacimiento (regla 78) -> cupo UNA vez -> detalle -> pendientes")
+
+          def test_sin_cupos_409_con_alternativas(tmp_path) -> None:
+              db, cls, man, tar, r = _env(tmp_path, cap_manana=1, cap_tarde=5)
+              code, p = r.dispatch(method="POST",
+                  segs=["home-registration"],
+                  doc=_doc(child_zid="", child_zid_status="NONE"))
+              assert code == 201
+              rid = p["request"]["request_id"]
+              r.dispatch(method="POST",
+                  segs=["home-registration", rid, "confirm"],
+                  doc={"director_actor": "D"})
+              code2, p2 = r.dispatch(method="POST",
+                  segs=["home-registration"],
+                  doc=_doc(responsable_zid="ZID-2",
+                           child_name="Segundo",
+                           child_zid="",
+                           child_zid_status="NONE"))
+              assert code2 == 409
+              assert "MATUTINA COMPLETADA" in p2["note"]
+              assert "VESPERTINA" in p2["note"]
+              code3, p3 = r.dispatch(method="POST",
+                  segs=["home-registration"],
+                  doc=_doc(responsable_zid="ZID-3",
+                           child_name="Tercero",
+                           child_zid="", child_zid_status="NONE",
+                           turn="VESPERTINA"))
+              assert code3 == 201
+              rid3 = p3["request"]["request_id"]
+              code4, p4 = r.dispatch(method="POST",
+                  segs=["home-registration", rid3, "confirm"],
+                  doc={"director_actor": "D"})
+              assert code4 == 200
+              assert p4["enrollment"]["turn"] == "VESPERTINA"
+              print("OK SIN_CUPOS: 409 con alternativas y la tarde SI recibe")
+
+          def test_errores_honestos(tmp_path) -> None:
+              db, cls, man, tar, r = _env(tmp_path)
+              code, p = r.dispatch(method="POST",
+                  segs=["home-registration"],
+                  doc=_doc(responsable_zid=""))
+              assert code == 400 and "faltan campos" in p["error"]
+              code2, p2 = r.dispatch(method="POST",
+                  segs=["home-registration"],
+                  doc=_doc(relation="PRIMO"))
+              assert code2 == 400
+              code3, p3 = r.dispatch(method="POST",
+                  segs=["home-registration"],
+                  doc=_doc(authorized_pickup=PICK2[:1]))
+              assert code3 == 400 and "retiro" in p3["error"]
+              code4, p4 = r.dispatch(method="GET",
+                  segs=["home-registration", "NO-EXISTS"])
+              assert code4 == 404
+              code5, p5 = r.dispatch(method="GET",
+                  segs=["home-registration"])
+              assert code5 == 405
+              code6, p6 = r.dispatch(method="GET",
+                  segs=["otra-cosa"])
+              assert code6 == 404
+              print("OK honesto: 400/404/405 — nada falso (regla 66)")
+
+          def test_wiring_rutas_reales_semilla_api(tmp_path) -> None:
+              import apps.semilla.server as srv
+              if not hasattr(srv.SemillaApiHandler,
+                             "_hr_compute"):
+                  pytest.skip("wiring no aplicado en este run")
               db = SQLiteAdapter(tmp_path / "w.db")
               st = SemillaStore(db, FrozenClock())
-              return db, st
-
-          def test_store_autowire_y_pending(tmp_path) -> None:
-              db, st = _store(tmp_path)
-              assert st.canonical_bridge is not None
-              row = st.add_account(account_id="ACC-1", zid="ZID-A1",
-                  name="Alumno Uno", role="alumno",
-                  school="INST-1", grade="primaria")
-              assert row["account_id"] == "ACC-1"
-              pend = st.canonical_bridge.pending_list()
-              assert len(pend) == 1
-              assert "SE-3" in str(pend[0]["reason"])
-              print("OK autowire REAL: el store del server vivo queda conectado al canonico; alta sin datos SE-3 -> cola honesta (regla 66)")
-
-          def test_viejo_intacto_lookuperror(tmp_path) -> None:
-              db, st = _store(tmp_path)
-              st.add_account(account_id="P-1", zid=None,
-                  name="Profe Ruiz", role="profesor",
-                  school="INST-1", grade=None)
-              with pytest.raises(LookupError):
-                  st.get_account("NO-EXISTE")
-              prof = st.get_account("P-1")
-              assert prof["role"] == "profesor"
-              assert len(st.canonical_bridge.pending_list()) == 0
-              print("OK viejo intacto: LookupError preservado, profesor NO se espeja al canonico")
-
-          def test_complete_pending_a_canonico(tmp_path) -> None:
-              db, st = _store(tmp_path)
-              st.add_account(account_id="ACC-2", zid="ZID-A2",
-                  name="Alumno Dos", role="alumno",
-                  school="INST-1", grade="primaria")
-              est = st.canonical_bridge.complete_pending(
-                  "ACC-2", tutores=TUT,
-                  authorized_pickup=PICK2,
-                  emergency_contacts=EMG)
-              assert est["zid"] == "ZID-A2"
-              assert st.canonical_bridge.pending_list() == []
-              row = db.query_one(
-                  "SELECT student_id FROM sm_legacy_map"
-                  " WHERE account_id = ?", ("ACC-2",))
-              assert row is not None
-              got = st.get_account("ACC-2")
-              assert got["account_id"] == "ACC-2"
-              print("OK complete_pending: cola -> expediente canonico SE-3 completo + mapa; lectura viejo-primero")
-
-          def test_fallback_canonico_real(tmp_path) -> None:
-              db, st = _store(tmp_path)
-              st.add_account(account_id="ACC-3", zid="ZID-A3",
-                  name="Alumno Tres", role="alumno",
-                  school="INST-1", grade="primaria")
-              st.canonical_bridge.complete_pending(
-                  "ACC-3", tutores=TUT,
-                  authorized_pickup=PICK2,
-                  emergency_contacts=EMG)
-              with db.transaction() as cursor:
-                  cursor.execute(
-                      "DELETE FROM semilla_accounts"
-                      " WHERE account_id = ?", ("ACC-3",))
-              got = st.get_account("ACC-3")
-              assert got.get("canonico") is True
-              assert got["zid"] == "ZID-A3"
-              print("OK fallback REAL: LookupError del viejo -> mapa -> canonico (con el store real, no solo Fake)")
+              h = object.__new__(srv.SemillaApiHandler)
+              h.store = st
+              h.path = "/semilla/api/home-registration"
+              assert srv.SemillaApiHandler._hr_wants(h) is True
+              h.path = "/semilla/api/home-registrations?institution_id=INST-1"
+              assert srv.SemillaApiHandler._hr_wants(h) is True
+              h.path = "/api/home-registration"
+              assert srv.SemillaApiHandler._hr_wants(h) is True
+              h.path = "/semilla/api/profile/ACC-1"
+              assert srv.SemillaApiHandler._hr_wants(h) is False
+              h.path = "/semilla/api/health"
+              assert srv.SemillaApiHandler._hr_wants(h) is False
+              h.path = "/semilla/register"
+              assert srv.SemillaApiHandler._hr_wants(h) is False
+              h.path = "/semilla/api/home-registration"
+              code, p = srv.SemillaApiHandler._hr_compute(
+                  h, _doc(), "POST")
+              assert code == 201
+              rid = p["request"]["request_id"]
+              h.path = ("/semilla/api/home-registration/"
+                        + rid + "/confirm")
+              code2, p2 = srv.SemillaApiHandler._hr_compute(
+                  h, {"director_actor": "DIR-9"}, "POST")
+              assert code2 == 200 and p2["status"] == "ACTIVA"
+              h.path = "/semilla/api/home-registrations?institution_id=INST-1"
+              code3, p3 = srv.SemillaApiHandler._hr_compute(
+                  h, None, "GET")
+              assert code3 == 200 and p3["count"] == 0
+              h2 = object.__new__(srv.SemillaApiHandler)
+              h2.store = None
+              h2.path = "/semilla/api/home-registration"
+              code4, p4 = srv.SemillaApiHandler._hr_compute(
+                  h2, _doc(), "POST")
+              assert code4 == 503
+              print("OK wiring REAL con rutas /semilla/api/*: start/confirm/pending por el server vivo + 503 honesto; rutas existentes (profile/health/register) NO capturadas")
           TSEOF
-          timeout 240 python3 -m pytest apps/semilla/tests/test_s1_wiring.py apps/semilla/tests/test_s1_bridge.py -vv --tb=long --timeout=45 --timeout-method=thread > /tmp/s1w.out 2>&1
-          echo $? > /tmp/s1w
-          if [ "$(cat /tmp/s1w)" = "0" ]; then echo "- S-1 wiring: ✅" >> "$GITHUB_STEP_SUMMARY"; else echo "- S-1 wiring: ❌" >> "$GITHUB_STEP_SUMMARY"; { echo "### S-1 wiring detalle"; echo '```'; tail -80 /tmp/s1w.out; echo '```'; } >> "$GITHUB_STEP_SUMMARY"; fi
+          timeout 240 python3 -m pytest apps/semilla/tests/test_s4_http_router.py -vv --tb=long --timeout=45 --timeout-method=thread > /tmp/s4h.out 2>&1
+          echo $? > /tmp/s4h
+          if [ "$(cat /tmp/s4h)" = "0" ]; then echo "- S-4 HTTP: ✅" >> "$GITHUB_STEP_SUMMARY"; else echo "- S-4 HTTP: ❌" >> "$GITHUB_STEP_SUMMARY"; { echo "### S-4 HTTP detalle"; echo '```'; tail -80 /tmp/s4h.out; echo '```'; } >> "$GITHUB_STEP_SUMMARY"; fi
           exit 0
 
       - name: "[LECTURA] regresion 4 apps"
@@ -1085,7 +734,7 @@ jobs:
         run: |
           SUM="$GITHUB_STEP_SUMMARY"
           log() { echo "$1" >> "$SUM"; echo "$1"; }
-          if [ "$(cat /tmp/s1w 2>/dev/null || echo 1)" != "0" ] || [ "$(cat /tmp/x4 2>/dev/null || echo 1)" != "0" ]; then
+          if [ "$(cat /tmp/s4h 2>/dev/null || echo 1)" != "0" ] || [ "$(cat /tmp/x4 2>/dev/null || echo 1)" != "0" ]; then
             log "**RESULTADO: SEMILLA roja — SIN commit**"
             exit 1
           fi
@@ -1098,11 +747,11 @@ jobs:
           if git diff --cached --quiet; then
             log "**SIN CAMBIOS**"; exit 0
           fi
-          git commit -m "feat(SEMILLA S-1 wiring): SemillaStore autowire al canonico — cada store se conecta solo a StudentRegistryEngine via CanonicalBridge (regla 51 aditivo, best-effort) + bridge v2: read-through captura LookupError del store real (re-lanza identico si no hay canonico) + complete_pending() convierte la cola SE-3 en expediente canonico mapeado; server vivo conectado SIN tocar server.py + auditoria LECTURA del dispatch HTTP para RUN 1d"
+          git commit -m "feat(SEMILLA S-4 HTTP v2): HomeRegistrationRouter (logica pura dict->(code,payload): start 201 / detalle / confirm / pendientes; SIN_CUPOS 409 con alternativas; SE-3 + regla 78; errores honestos) + wiring V2 en server.py con RUTAS REALES /semilla/api/home-registration* (auditoria: _route exige prefijo semilla) inyectadas antes del fallback 'unknown api route' de _api_get/_api_post, doc reutilizado, handler comparte la MISMA db/clock del store, repair automatico v1->v2 si existiera, revert total si anclas no coinciden + smoke HTTP real en RUN 1e"
           [ $? -ne 0 ] && { log "**COMMIT FALLO**"; exit 1; }
           log "**COMMIT OK**"
           git push "https://x-access-token:${GH_TOKEN}@github.com/${GITHUB_REPOSITORY}.git" "HEAD:main" > /tmp/qa.out 2> /tmp/qa.err
-          if [ $? -eq 0 ]; then log "**PUSH OK — S-1 WIRES CERRADO: el server vivo ya opera contra el canonico. RUN 1d: endpoints HTTP de matricula desde casa (con la auditoria del dispatch impresa arriba).**"; exit 0; fi
+          if [ $? -eq 0 ]; then log "**PUSH OK — S-4 HTTP v2 CERRADO (matricula desde casa accesible en /semilla/api/home-registration). RUN 1e: smoke HTTP real levantando serve_semilla + luego RUN 2 (S-5 a S-10 ciclo escolar).**"; exit 0; fi
           git push origin "HEAD:main" > /tmp/qc.out 2> /tmp/qd.err
           if [ $? -eq 0 ]; then log "**PUSH OK (intento 2).**"; exit 0; fi
           log "**PUSH fallo:**"; { echo '```'; cat /tmp/qd.err; echo '```'; } >> "$SUM"

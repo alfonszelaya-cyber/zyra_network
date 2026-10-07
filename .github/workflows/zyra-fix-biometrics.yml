@@ -1,4 +1,4 @@
-name: "ZYRA RUN1d: S-4 matricula desde casa por HTTP (router + patch aditivo regla 51)"
+name: "ZYRA RUN1d fix: S-4 HTTP (test con aulas creadas + cache por store — el 409 era honesto)"
 
 on:
   push:
@@ -30,7 +30,7 @@ jobs:
           fi
           echo "DEPS OK"
 
-      - name: "[ESCRITURA] router S-4 (logica pura + patch_hr_routes)"
+      - name: "[ESCRITURA] router S-4 (cache por store, sin id() global)"
         if: always()
         run: |
           export PYTHONPATH="$(pwd):$(pwd)/shared_engines:$(pwd)"
@@ -83,12 +83,18 @@ jobs:
               IDEMPOTENTE (regla 51): las rutas existentes
               quedan intactas y el fallback 'unknown api
               route' sigue siendo el ultimo recurso.
+              El router se cachea PEGADO AL STORE (un router
+              por server vivo; sin claves id() globales que
+              pueden colisionar entre tests).
 
               Regla 78: el menor trae su ZID de NACIMIENTO si
               existe (SEMILLA lo CONSUME, jamas crea otro);
               sin documentos NO impide iniciar (zid NONE).
               SE-3: 2 encargados de retiro + 1 de emergencia.
-              Errores honestos 400/404/405/409/503 (regla 66)."""
+              Errores honestos 400/404/405/409/503 (regla 66)
+              — incluido 409 SIN_CUPOS si la escuela no tiene
+              aulas/cupo configurados: jamas se inventa
+              capacidad."""
               from __future__ import annotations
               from typing import Tuple
               from apps.semilla.domain.student.student_registry_engine import (
@@ -253,14 +259,10 @@ jobs:
                               500, "error interno: " + str(e))
 
 
-              _ROUTER_CACHE = {}
-
-
               def patch_hr_routes():
                   """Conecta las rutas S-4 al SemillaApiHandler
                   del server vivo (regla 51: monkey-patch
-                  aditivo e idempotente — lo existente sigue
-                  funcionando identico)."""
+                  aditivo e idempotente)."""
                   import json as _json
                   from urllib.parse import urlparse, parse_qs
                   from apps.semilla import server as _srv
@@ -287,15 +289,17 @@ jobs:
                       st = getattr(self, "store", None)
                       if st is None:
                           return None
-                      key = id(getattr(st, "_db", None))
-                      r = _ROUTER_CACHE.get(key)
+                      r = getattr(st, "_hr_router_cache", None)
                       if r is None:
                           try:
                               r = HomeRegistrationRouter(
                                   st._db, st._clock)
                           except Exception:
                               return None
-                          _ROUTER_CACHE[key] = r
+                          try:
+                              st._hr_router_cache = r
+                          except Exception:
+                              pass
                       return r
 
                   def _compute(self, doc, method):
@@ -419,7 +423,7 @@ jobs:
                   pass
               out("- **server.py: WIRING DIFERIDO (revertido"
                   " intacto)** — el router S-4 queda"
-                  " committeable y el smoke va en RUN 1e")
+                  " committeable")
               out("```\n" + traceback.format_exc().strip()
                   + "\n```")
           finally:
@@ -427,7 +431,7 @@ jobs:
               exit(0)
           PYEOF
 
-      - name: "[ESCRITURA tests + LECTURA veredicto] tests router S-4 + patch"
+      - name: "[ESCRITURA tests + LECTURA veredicto] tests S-4 (patch test CON aulas creadas)"
         if: always()
         run: |
           export PYTHONPATH="$(pwd):$(pwd)/shared_engines:$(pwd)"
@@ -529,7 +533,16 @@ jobs:
                   doc={"director_actor": "D"})
               assert code4 == 200
               assert p4["enrollment"]["turn"] == "VESPERTINA"
-              print("OK SIN_CUPOS: 409 con alternativas ('solo cupo por la tarde') y la tarde SI recibe")
+              print("OK SIN_CUPOS: 409 con alternativas y la tarde SI recibe")
+
+          def test_escuela_sin_aulas_409_honesto(tmp_path) -> None:
+              db = SQLiteAdapter(tmp_path / "v.db")
+              r = HomeRegistrationRouter(db, FrozenClock())
+              code, p = r.dispatch(method="POST",
+                  segs=["home-registration"], doc=_doc())
+              assert code == 409
+              assert "Sin cupos" in p["note"]
+              print("OK honesto (regla 66): escuela SIN aulas configuradas -> 409 SIN_CUPOS, jamas se inventa capacidad (esto es lo que el patch test piso sin querer: le faltaba crear aulas)")
 
           def test_errores_honestos(tmp_path) -> None:
               db, cls, man, tar, r = _env(tmp_path)
@@ -558,12 +571,19 @@ jobs:
               code7, p7 = r.dispatch(method="GET",
                   segs=["otra-cosa"])
               assert code7 == 404
-              print("OK honesto: 400 faltantes/SE-3/body, 404, 405 — nada falso (regla 66)")
+              print("OK honesto: 400 faltantes/SE-3/body, 404, 405")
 
           def test_patch_server_real(tmp_path) -> None:
               import apps.semilla.server as srv
               db = SQLiteAdapter(tmp_path / "w.db")
               st = SemillaStore(db, FrozenClock())
+              cls = ClassroomEngine(db, FrozenClock())
+              man = cls.create(name="1A-W", institution_id="INST-1",
+                  school_year="2026", level="BASICA", grade="1",
+                  section="A", turn="MATUTINA", capacity=30)
+              tar = cls.create(name="1T-W", institution_id="INST-1",
+                  school_year="2026", level="BASICA", grade="1",
+                  section="A", turn="VESPERTINA", capacity=5)
               patch_hr_routes()
               patch_hr_routes()
               assert getattr(srv.SemillaApiHandler,
@@ -594,6 +614,7 @@ jobs:
                   h, {"director_actor": "DIR-9"}, "POST")
               assert code2 == 200
               assert p2["status"] == "ACTIVA"
+              assert cls.get(man["classroom_id"])["enrolled"] == 1
               h.path = ("/semilla/api/home-registrations"
                         "?institution_id=INST-1")
               code3, p3 = srv.SemillaApiHandler._hr_compute(
@@ -605,7 +626,7 @@ jobs:
               code4, p4 = srv.SemillaApiHandler._hr_compute(
                   h2, _doc(), "POST")
               assert code4 == 503
-              print("OK patch REAL: rutas /semilla/api/* por el server vivo, idempotente, 503 honesto, rutas existentes NO capturadas")
+              print("OK patch REAL: aulas creadas en la db del store -> start 201 -> confirm 200 (cupo UNA vez) -> pendientes -> 503 honesto sin store; cache del router pegado al store (sin id() global)")
           TSEOF
           timeout 240 python3 -m pytest apps/semilla/tests/test_s4_http_router.py -vv --tb=long --timeout=45 --timeout-method=thread > /tmp/s4h.out 2>&1
           echo $? > /tmp/s4h
@@ -660,11 +681,11 @@ jobs:
           if git diff --cached --quiet; then
             log "**SIN CAMBIOS**"; exit 0
           fi
-          git commit -m "feat(SEMILLA S-4 HTTP): HomeRegistrationRouter (logica pura dict->(code,payload): start 201 / detalle / confirm / pendientes; SIN_CUPOS 409 con alternativas; SE-3 + regla 78; errores honestos 400/404/405/503) + patch_hr_routes (regla 51: monkey-patch aditivo e idempotente del SemillaApiHandler — rutas /semilla/api/home-registration* antes del fallback, lo existente intacto) + wiring de 4 lineas en serve_semilla con ancla unica y revert automatico"
+          git commit -m "fix(SEMILLA S-4 HTTP): test del patch con aulas creadas en la db del store (el 409 anterior era la respuesta HONESTA correcta ante escuela sin capacidad — regla 66 funcionando; el test no habia configurado las aulas) + test dedicado escuela_sin_aulas_409_honesto + cache del router pegada al store (elimina riesgo de colision id() entre tests) + wiring patch aditivo en serve_semilla intacto"
           [ $? -ne 0 ] && { log "**COMMIT FALLO**"; exit 1; }
           log "**COMMIT OK**"
           git push "https://x-access-token:${GH_TOKEN}@github.com/${GITHUB_REPOSITORY}.git" "HEAD:main" > /tmp/qa.out 2> /tmp/qa.err
-          if [ $? -eq 0 ]; then log "**PUSH OK — S-4 HTTP CERRADO. RUN 1e: smoke HTTP real levantando serve_semilla + RUN 2 (S-5 a S-10 ciclo escolar).**"; exit 0; fi
+          if [ $? -eq 0 ]; then log "**PUSH OK — S-4 HTTP CERRADO (matricula desde casa viva en /semilla/api/home-registration). RUN 1e: smoke HTTP real levantando serve_semilla + RUN 2 (S-5 a S-10 ciclo escolar).**"; exit 0; fi
           git push origin "HEAD:main" > /tmp/qc.out 2> /tmp/qd.err
           if [ $? -eq 0 ]; then log "**PUSH OK (intento 2).**"; exit 0; fi
           log "**PUSH fallo:**"; { echo '```'; cat /tmp/qd.err; echo '```'; } >> "$SUM"

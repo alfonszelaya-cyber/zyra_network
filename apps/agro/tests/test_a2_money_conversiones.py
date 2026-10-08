@@ -74,11 +74,16 @@ def test_ventas_ciclo_cuantizado(tmp_path) -> None:
 def test_plan_costs_suma_exacta(tmp_path) -> None:
     db = _db(tmp_path)
     db.execute(
-        "CREATE TABLE IF NOT EXISTS agro_units"
-        " (unit_id TEXT PRIMARY KEY)")
+        "CREATE TABLE IF NOT EXISTS agro_units ("
+        " unit_id TEXT PRIMARY KEY, producer_id TEXT"
+        " NOT NULL, name TEXT NOT NULL, unit_type TEXT"
+        " NOT NULL, land_id TEXT, created_at TEXT,"
+        " closed_at TEXT, closed_by TEXT)")
     db.execute(
-        "INSERT INTO agro_units (unit_id)"
-        " VALUES ('U-1')")
+        "INSERT INTO agro_units (unit_id, producer_id,"
+        " name, unit_type, created_at)"
+        " VALUES ('U-1', 'P1', 'Finca Norte',"
+        " 'parcela', '2026-01-01')")
     plan = create_plan_db(db, producer_id="P1",
         unit_id="U-1", crop="MAIZ", target=100.0)
     pid = plan["plan_id"]

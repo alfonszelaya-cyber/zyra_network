@@ -11,12 +11,12 @@ import uuid
 from shared_engines.storage.database import Database
 
 _DDL = (
-    "CREATE TABLE IF NOT EXISTS agro_harvest_lots ("
-    " lot_id TEXT PRIMARY KEY, harvest_id TEXT NOT"
-    " NULL, weight REAL NOT NULL, grade TEXT NOT"
-    " NULL DEFAULT '', rejected REAL NOT NULL"
-    " DEFAULT 0, storage TEXT NOT NULL DEFAULT '',"
-    " created_at TEXT)",
+        "CREATE TABLE IF NOT EXISTS"
+    " agro_harvest_lots (lot_id TEXT PRIMARY KEY,"
+    " harvest_id TEXT NOT NULL, weight REAL NOT"
+    " NULL, grade TEXT NOT NULL DEFAULT '',"
+    " rejected REAL NOT NULL DEFAULT 0, storage"
+    " TEXT NOT NULL DEFAULT '', created_at TEXT)",
     "CREATE TABLE IF NOT EXISTS agro_export_files ("
     " exp_id TEXT PRIMARY KEY, producer_id TEXT NOT"
     " NULL, destination TEXT NOT NULL, lot_id TEXT"

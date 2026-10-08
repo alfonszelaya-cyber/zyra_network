@@ -38,8 +38,8 @@ _TRANSITIONS = {
 }
 
 _MIGRATIONS = (
-    Migration(1, "nexo_operations", (
-        "CREATE TABLE IF NOT EXISTS nexo_operations (operation_id TEXT PRIMARY KEY, operation_number INTEGER NOT NULL, company_id TEXT NOT NULL, operation_type TEXT NOT NULL, description TEXT NOT NULL DEFAULT '', amount TEXT NOT NULL DEFAULT '0', currency TEXT NOT NULL DEFAULT 'USD', status TEXT NOT NULL DEFAULT 'DRAFT', priority TEXT NOT NULL DEFAULT 'NORMAL', requested_by TEXT NOT NULL DEFAULT '', approved_by TEXT, completed_at REAL, created_at REAL NOT NULL, updated_at REAL NOT NULL, metadata_json TEXT NOT NULL DEFAULT '{}')",
+    Migration(1, "nexo_op_flow", (
+        "CREATE TABLE IF NOT EXISTS nexo_op_flow (operation_id TEXT PRIMARY KEY, operation_number INTEGER NOT NULL, company_id TEXT NOT NULL, operation_type TEXT NOT NULL, description TEXT NOT NULL DEFAULT '', amount TEXT NOT NULL DEFAULT '0', currency TEXT NOT NULL DEFAULT 'USD', status TEXT NOT NULL DEFAULT 'DRAFT', priority TEXT NOT NULL DEFAULT 'NORMAL', requested_by TEXT NOT NULL DEFAULT '', approved_by TEXT, completed_at REAL, created_at REAL NOT NULL, updated_at REAL NOT NULL, metadata_json TEXT NOT NULL DEFAULT '{}')",
     )),
     Migration(2, "nexo_op_counter", (
         "CREATE TABLE IF NOT EXISTS nexo_op_counter (company_id TEXT PRIMARY KEY, last_number INTEGER NOT NULL)",
@@ -89,7 +89,7 @@ class OperationsEngine:
         with self._db.transaction() as cursor:
             num = self._next_number(cursor, company_id)
             cursor.execute(
-                "INSERT INTO nexo_operations"
+                "INSERT INTO nexo_op_flow"
                 " (operation_id, operation_number,"
                 " company_id, operation_type,"
                 " description, amount, currency,"
@@ -109,7 +109,7 @@ class OperationsEngine:
     def get_operation(self,
                       operation_id) -> Optional[dict]:
         row = self._db.query_one(
-            "SELECT * FROM nexo_operations"
+            "SELECT * FROM nexo_op_flow"
             " WHERE operation_id = ?", (operation_id,))
         return self._row(row) if row else None
 
@@ -148,7 +148,7 @@ class OperationsEngine:
         completed = (now if new_status == "COMPLETED"
                      else None)
         self._db.execute(
-            "UPDATE nexo_operations SET status = ?,"
+            "UPDATE nexo_op_flow SET status = ?,"
             " approved_by = CASE WHEN ? = 'APPROVED'"
             " THEN ? ELSE approved_by END,"
             " completed_at = CASE WHEN ? = 'COMPLETED'"
@@ -163,13 +163,13 @@ class OperationsEngine:
                         status="") -> List[dict]:
         if status:
             rows = self._db.query_all(
-                "SELECT * FROM nexo_operations"
+                "SELECT * FROM nexo_op_flow"
                 " WHERE company_id = ? AND status = ?"
                 " ORDER BY operation_number",
                 (company_id, status))
         else:
             rows = self._db.query_all(
-                "SELECT * FROM nexo_operations"
+                "SELECT * FROM nexo_op_flow"
                 " WHERE company_id = ?"
                 " ORDER BY operation_number",
                 (company_id,))
@@ -179,7 +179,7 @@ class OperationsEngine:
         from decimal import Decimal as _D
         rows = self._db.query_all(
             "SELECT amount, status FROM"
-            " nexo_operations"
+            " nexo_op_flow"
             " WHERE company_id = ?", (company_id,))
         total = _D("0")
         completed = 0

@@ -1,4 +1,5 @@
 import pytest
+from shared_engines.common.clocks import FrozenClock
 from shared_engines.storage.database import SQLiteAdapter
 from apps.agro.modules.recursos_y_activos.maquinaria.machinery_ops_engine import (
     ensure_db as e9, log_usage_db, log_maintenance_db,
@@ -25,31 +26,32 @@ from apps.agro.modules.gobierno.aid_governance_engine import (
 def test_a9_maquinaria_uso_mantenimiento_ordenes(tmp_path) -> None:
     db = SQLiteAdapter(tmp_path / "a9.db")
     e9(db)
-    db.execute(
-        "INSERT INTO agro_area_machinery (machine_id,"
-        " producer_id, machine_type, description,"
-        " created_at) VALUES ('MCH-1', 'P1',"
-        " 'tractor', 'John Deere', 0)")
+    from apps.agro.infrastructure.persistence.agro_area_store import (
+        AgroAreaStore,
+    )
+    mid = AgroAreaStore(db, FrozenClock()).add_machinery(
+        producer_id="P1", machine_type="tractor",
+        description="John Deere")["machine_id"]
     with pytest.raises(LookupError):
         log_usage_db(db, machine_id="NO", hours=1)
-    log_usage_db(db, machine_id="MCH-1", hours=4.5,
+    log_usage_db(db, machine_id=mid, hours=4.5,
         fuel_liters=12.0, operator="OP-1")
-    log_usage_db(db, machine_id="MCH-1", hours=3.5,
+    log_usage_db(db, machine_id=mid, hours=3.5,
         fuel_liters=10.0)
-    log_maintenance_db(db, machine_id="MCH-1",
+    log_maintenance_db(db, machine_id=mid,
         kind="PREVENTIVA", detail="aceite",
         cost="45.505", done_at="2026-02-01")
     with pytest.raises(ValueError):
-        log_maintenance_db(db, machine_id="MCH-1",
+        log_maintenance_db(db, machine_id=mid,
             kind="RUTINARIA")
-    o = open_order_db(db, machine_id="MCH-1",
+    o = open_order_db(db, machine_id=mid,
         task="cambio llantas")
     c = close_order_db(db, o["order_id"], ok=True,
         closed_at="2026-02-10")
     assert c["status"] == "done"
     with pytest.raises(ValueError):
         close_order_db(db, o["order_id"])
-    s = summary_of_db(db, "MCH-1")
+    s = summary_of_db(db, mid)
     assert s["hours_total"] == 8.0
     assert s["fuel_total"] == 22.0
     assert s["maintenance_cost"] == 45.51
@@ -133,6 +135,10 @@ def test_a11_contratos_oc_liquidacion(tmp_path) -> None:
 def test_a12_exportacion_expediente(tmp_path) -> None:
     db = SQLiteAdapter(tmp_path / "a12.db")
     e12(db)
+    from apps.agro.modules.produccion.planificacion.harvest_engine import (
+        ensure_db as e6h,
+    )
+    e6h(db)
     db.execute(
         "INSERT INTO agro_harvest_lots (lot_id,"
         " harvest_id, weight, grade, rejected,"

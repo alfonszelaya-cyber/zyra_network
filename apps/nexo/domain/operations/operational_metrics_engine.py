@@ -1,7 +1,7 @@
 
 """Operational Metrics Engine - NEXO / ZYRA (migrado
 mejorado). Metricas operativas por empresa y periodo,
-calculadas de nexo_operations y PERSISTIDAS (el viejo
+calculadas de nexo_op_flow y PERSISTIDAS (el viejo
 era en memoria). Montos Decimal (regla 61). Sirve para
 reportes a gobiernos, alcaldias y bancos."""
 from __future__ import annotations
@@ -32,7 +32,7 @@ class OperationalMetricsEngine:
         from decimal import Decimal as _D
         ops = self._db.query_all(
             "SELECT status, amount FROM"
-            " nexo_operations"
+            " nexo_op_flow"
             " WHERE company_id = ?", (company_id,))
         total = len(ops)
         completed = sum(1 for o in ops

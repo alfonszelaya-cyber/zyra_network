@@ -11,7 +11,7 @@ from shared_engines.storage.database import Database
 
 _DDL = (
     "CREATE TABLE IF NOT EXISTS agro_area_machinery"
-    " (machine_id TEXT PRIMARY KEY, producer_id TEXT"
+    " ( machine_id TEXT PRIMARY KEY, producer_id TEXT"
     " NOT NULL, machine_type TEXT NOT NULL,"
     " description TEXT, created_at REAL NOT NULL)",
     "CREATE TABLE IF NOT EXISTS agro_mach_usage ("

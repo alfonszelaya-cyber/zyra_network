@@ -2,7 +2,7 @@
 """Modulo 001 Super Bunker Gold - NEXO / ZYRA
 (v2: todas las funciones a nivel de modulo)."""
 from __future__ import annotations
-from datetime import datetime
+from datetime import datetime, timezone
 from typing import Dict, List
 
 _bunker_events: List[Dict] = []
@@ -11,7 +11,7 @@ def emit(event_name):
     """Registra evento del bunker."""
     _bunker_events.append({
         "event": event_name,
-        "timestamp": datetime.utcnow().isoformat()})
+        "timestamp": datetime.now(timezone.utc).isoformat()})
 
 def get_bunker_events():
     return list(_bunker_events)

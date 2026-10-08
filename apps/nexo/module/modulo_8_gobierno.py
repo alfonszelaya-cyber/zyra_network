@@ -2,14 +2,14 @@
 """Modulo 8 Gobierno del Sistema."""
 from __future__ import annotations
 from typing import Dict, List
-from datetime import datetime
+from datetime import datetime, timezone
 
 _gov8_events = []
 
 def emit(event_name, payload=None):
     _gov8_events.append({"event": event_name,
                          "payload": payload or {},
-                         "timestamp": datetime.utcnow().isoformat()})
+                         "timestamp": datetime.now(timezone.utc).isoformat()})
 
 def get_gov8_events():
     return list(_gov8_events)
@@ -41,7 +41,7 @@ class Modulo8Gobierno:
         registro = {"modulo": "M8",
                     "subdominio": subdominio,
                     "accion": accion,
-                    "timestamp": datetime.utcnow().isoformat()}
+                    "timestamp": datetime.now(timezone.utc).isoformat()}
         return registro
 
     def nucleo_gobierno(self):

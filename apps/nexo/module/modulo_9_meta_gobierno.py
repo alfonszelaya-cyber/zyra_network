@@ -2,14 +2,14 @@
 """Modulo 9 Meta Gobierno y Soberania."""
 from __future__ import annotations
 from typing import Dict, List
-from datetime import datetime
+from datetime import datetime, timezone
 
 _meta9_events = []
 
 def emit(event_name, payload=None):
     _meta9_events.append({"event": event_name,
                           "payload": payload or {},
-                          "timestamp": datetime.utcnow().isoformat()})
+                          "timestamp": datetime.now(timezone.utc).isoformat()})
 
 def get_meta9_events():
     return list(_meta9_events)

@@ -1,5 +1,5 @@
 
-from datetime import datetime
+from datetime import datetime, timezone
 
 class AgroAuditService:
     def record(self, actor_id, action, resource, resource_id):
@@ -8,7 +8,7 @@ class AgroAuditService:
             "action": action,
             "resource": resource,
             "resource_id": resource_id,
-            "timestamp": datetime.utcnow().isoformat()
+            "timestamp": datetime.now(timezone.utc).isoformat()
         }
 
 

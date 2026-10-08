@@ -1,3 +1,4 @@
+from datetime import timezone
 
 class ProducerDocumentService:
     def register(self, producer_id, document):
@@ -81,7 +82,7 @@ def verify_doc_plus_db(
     )
     if approve:
         exp = (
-            datetime.utcnow()
+            datetime.now(timezone.utc)
             + timedelta(days=DOC_EXPIRY_DAYS)
         ).strftime("%Y-%m-%dT%H:%M:%SZ")
         db.execute(

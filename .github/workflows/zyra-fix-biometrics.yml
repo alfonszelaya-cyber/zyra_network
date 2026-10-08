@@ -1,4 +1,4 @@
-name: "ZYRA RUN3b v3: N-2..N-6 + A-1 (fix self._clock en __init__) + A-3"
+name: "ZYRA RUN3c: A-2 prep frontera de dinero (shared/money.py regla 61 HALF_UP) + auditoria fuentes para RUN 3d"
 
 on:
   push:
@@ -30,9 +30,35 @@ jobs:
           fi
           echo "DEPS OK"
 
-      - name: "[ESCRITURA] NEXO ledger_integration (identico v2 — paso 3/3 verde)"
+      - name: "[LECTURA] fuentes de dinero AGRO + riesgo NEXO (RUN 3d conversiones + N-7)"
         if: always()
         run: |
+          set +e
+          SUM="$GITHUB_STEP_SUMMARY"
+          echo "## AUDITORIA RUN 3d — fuentes de dinero AGRO (A-2)" >> "$SUM"
+          for f in apps/agro/modules/comercializacion/mercado/market_service.py apps/agro/modules/comercializacion/venta_simple/simple_sale_service.py apps/agro/modules/produccion/planificacion/planning_service.py apps/agro/modules/recursos_y_activos/valoracion/valuation_service.py apps/agro/shared/utils.py; do
+            echo "### $f" >> "$SUM"
+            { echo '```python'; cat "$f" 2>/dev/null; echo '```'; } >> "$SUM"
+          done
+          echo "## AUDITORIA RUN 3d — riesgo NEXO (N-7)" >> "$SUM"
+          echo "### archivos domain/risk" >> "$SUM"
+          { echo '```'; ls apps/nexo/domain/risk/ 2>/dev/null; echo '```'; } >> "$SUM"
+          echo "### firmas de engines de riesgo" >> "$SUM"
+          { echo '```'; for f in apps/nexo/domain/risk/*.py; do [ -f "$f" ] || continue; case "$f" in *__init__*) continue;; esac; echo "== $f"; grep -n "^class \|    def " "$f" | head -30; done; echo '```'; } >> "$SUM"
+          echo "### fuentes completas de riesgo (hasta 3 archivos)" >> "$SUM"
+          { echo '```python'; for f in $(ls apps/nexo/domain/risk/*.py 2>/dev/null | grep -v __init__ | head -3); do echo "== $f"; cat "$f"; done; echo '```'; } >> "$SUM"
+          echo "### como usan el riesgo los tests existentes" >> "$SUM"
+          { echo '```'; grep -n "import\|Risk\|risk" apps/nexo/tests/test_risk.py 2>/dev/null | head -30; echo '```'; } >> "$SUM"
+          echo "### fin auditoria" >> "$SUM"
+          exit 0
+
+      - name: "[ESCRITURA] A-2 prep: shared/money.py (frontera de dinero regla 61)"
+        if: always()
+        run: |
+          if [ -d "apps/agro/shared" ] && [ ! -f "apps/agro/shared/__init__.py" ]; then
+            : > apps/agro/shared/__init__.py
+            echo "init creado: apps/agro/shared/__init__.py (carpeta existente, marcador de paquete)"
+          fi
           export PYTHONPATH="$(pwd):$(pwd)/shared_engines:$(pwd)"
           python3 << 'PYEOF'
           import ast, os, pathlib, py_compile, textwrap, traceback
@@ -64,532 +90,74 @@ jobs:
                       + "\n```")
 
           try:
-              forzar("apps/nexo/domain/accounting/ledger_integration_engine.py",
+              forzar("apps/agro/shared/money.py",
                      D(r'''
-                  """Ledger Integration Engine (N-2..N-6) - puente
-                  de EVENTOS DE NEGOCIO al libro mayor canonico
-                  (GeneralLedgerEngine, firma verificada):
-                  finanzas ingreso/gasto, CxC factura/cobro, CxP
-                  factura/pago, tesoreria deposito/retiro,
-                  depreciacion mensual, provision fiscal,
-                  budget_vs_actual contra el REAL del mayor
-                  (trial_balance) y ledger_is_balanced (integridad
-                  global: suma debitos == suma creditos).
+                  """money.py (A-2 prep) - FRONTERA DE DINERO de
+                  AGRO (regla 61: montos SIEMPRE Decimal 2d,
+                  fiscal = HALF_UP).
 
-                  Cada metodo genera un asiento BALANCEADO via
-                  post_balanced (el cuadre es ley) con source_ref
-                  "N2:<tipo>:<id>". Montos Decimal 2d (regla 61).
-                  Catalogo de cuentas sobreescribible. Los
-                  engines duenos de cada dominio siguen mandando
-                  (regla 69)."""
+                  D2(value) -> Decimal cuantizado a 0.01 con
+                  HALF_UP (acepta str/int/Decimal/float via
+                  str(); rechaza inválidos con ValueError
+                  honesto — NUNCA NaN/inf silencioso).
+                  money_str(value) -> str 2d (lo que se guarda
+                  en TEXT de la db).
+                  is_positive_money(value) -> bool seguro
+                  (reemplaza el patron float(value) > 0 de
+                  shared/utils.py en la frontera).
+                  safe_float(value) -> float SOLO DESPUES de
+                  cuantizar (para columnas SQLite REAL hasta
+                  la migracion completa del 3d).
+                  sum_money(iterable) -> str 2d (suma exacta,
+                  sin acumulacion de error binario).
+
+                  RUN 3d convertira los 4 services de dinero
+                  (market/simple_sale/valuation/planning) a
+                  usar esta frontera en escritura y lectura."""
                   from __future__ import annotations
-                  from decimal import Decimal
-                  from typing import List, Optional
-                  from shared_engines.common.clocks import Clock
-                  from shared_engines.storage.database import (
-                      Database)
+                  from decimal import Decimal, InvalidOperation, \
+                      ROUND_HALF_UP
 
                   _Q = Decimal("0.01")
 
-                  class LedgerIntegrationEngine:
-                      """Integraciones de negocio al mayor."""
 
-                      def __init__(self, db, clock, ledger):
-                          self._db = db
-                          self._clock = clock
-                          self._gl = ledger
-
-                      @staticmethod
-                      def _amt(amount) -> Decimal:
-                          d = Decimal(str(amount)).quantize(_Q)
-                          if d <= Decimal("0.00"):
-                              raise ValueError(
-                                  "amount debe ser > 0: "
-                                  + str(d))
-                          return d
-
-                      def _post(self, company_id, period, kind,
-                                ref, lines) -> dict:
-                          res = self._gl.post_balanced(
-                              company_id=str(company_id),
-                              period=str(period),
-                              lines=lines,
-                              source_ref=("N2:" + str(kind)
-                                          + ":" + str(ref)))
-                          return {"kind": str(kind),
-                                  "ref": str(ref),
-                                  "posted": res["posted"],
-                                  "total_debit":
-                                      res["total_debit"],
-                                  "total_credit":
-                                      res["total_credit"],
-                                  "entries": res["entries"]}
-
-                      def income_recorded(self, *, company_id,
-                                          period, record_id,
-                                          amount,
-                                          cash_account="1000",
-                                          income_account="4000"
-                                          ) -> dict:
-                          a = self._amt(amount)
-                          return self._post(
-                              company_id, period, "INGRESO",
-                              record_id,
-                              [{"account_code":
-                                    str(cash_account),
-                                "debit": str(a),
-                                "credit": "0"},
-                               {"account_code":
-                                    str(income_account),
-                                "debit": "0",
-                                "credit": str(a)}])
-
-                      def expense_recorded(self, *, company_id,
-                                           period, record_id,
-                                           amount,
-                                           expense_account="5000",
-                                           cash_account="1000"
-                                           ) -> dict:
-                          a = self._amt(amount)
-                          return self._post(
-                              company_id, period, "GASTO",
-                              record_id,
-                              [{"account_code":
-                                    str(expense_account),
-                                "debit": str(a),
-                                "credit": "0"},
-                               {"account_code":
-                                    str(cash_account),
-                                "debit": "0",
-                                "credit": str(a)}])
-
-                      def invoice_issued_ar(self, *, company_id,
-                                            period, invoice_id,
-                                            amount,
-                                            ar_account="1100",
-                                            income_account="4000"
-                                            ) -> dict:
-                          a = self._amt(amount)
-                          return self._post(
-                              company_id, period, "CXC_FACTURA",
-                              invoice_id,
-                              [{"account_code":
-                                    str(ar_account),
-                                "debit": str(a),
-                                "credit": "0"},
-                               {"account_code":
-                                    str(income_account),
-                                "debit": "0",
-                                "credit": str(a)}])
-
-                      def payment_received(self, *, company_id,
-                                           period, invoice_id,
-                                           amount,
-                                           bank_account="1000",
-                                           ar_account="1100"
-                                           ) -> dict:
-                          a = self._amt(amount)
-                          return self._post(
-                              company_id, period, "CXC_COBRO",
-                              invoice_id,
-                              [{"account_code":
-                                    str(bank_account),
-                                "debit": str(a),
-                                "credit": "0"},
-                               {"account_code":
-                                    str(ar_account),
-                                "debit": "0",
-                                "credit": str(a)}])
-
-                      def invoice_received_ap(self, *,
-                                              company_id, period,
-                                              invoice_id, amount,
-                                              expense_account="5000",
-                                              ap_account="2100"
-                                              ) -> dict:
-                          a = self._amt(amount)
-                          return self._post(
-                              company_id, period, "CXP_FACTURA",
-                              invoice_id,
-                              [{"account_code":
-                                    str(expense_account),
-                                "debit": str(a),
-                                "credit": "0"},
-                               {"account_code":
-                                    str(ap_account),
-                                "debit": "0",
-                                "credit": str(a)}])
-
-                      def payment_sent(self, *, company_id,
-                                       period, invoice_id,
-                                       amount,
-                                       ap_account="2100",
-                                       bank_account="1000"
-                                       ) -> dict:
-                          a = self._amt(amount)
-                          return self._post(
-                              company_id, period, "CXP_PAGO",
-                              invoice_id,
-                              [{"account_code":
-                                    str(ap_account),
-                                "debit": str(a),
-                                "credit": "0"},
-                               {"account_code":
-                                    str(bank_account),
-                                "debit": "0",
-                                "credit": str(a)}])
-
-                      def treasury_move(self, *, company_id,
-                                        period, move_id, direction,
-                                        amount,
-                                        bank_account="1000",
-                                        counter_account="3000"
-                                        ) -> dict:
-                          a = self._amt(amount)
-                          d = str(direction).upper()
-                          if d not in ("DEPOSIT", "WITHDRAW"):
-                              raise ValueError(
-                                  "direction DEPOSIT o"
-                                  " WITHDRAW")
-                          if d == "DEPOSIT":
-                              lines = [
-                                  {"account_code":
-                                       str(bank_account),
-                                   "debit": str(a),
-                                   "credit": "0"},
-                                  {"account_code":
-                                       str(counter_account),
-                                   "debit": "0",
-                                   "credit": str(a)}]
-                          else:
-                              lines = [
-                                  {"account_code":
-                                       str(counter_account),
-                                   "debit": str(a),
-                                   "credit": "0"},
-                                  {"account_code":
-                                       str(bank_account),
-                                   "debit": "0",
-                                   "credit": str(a)}]
-                          return self._post(
-                              company_id, period,
-                              "TESORERIA_" + d, move_id, lines)
-
-                      def depreciation_month(self, *,
-                                             company_id, period,
-                                             asset_id, amount,
-                                             expense_account="5200",
-                                             acc_dep_account="1590"
-                                             ) -> dict:
-                          a = self._amt(amount)
-                          return self._post(
-                              company_id, period,
-                              "DEPRECIACION", asset_id,
-                              [{"account_code":
-                                    str(expense_account),
-                                "debit": str(a),
-                                "credit": "0"},
-                               {"account_code":
-                                    str(acc_dep_account),
-                                "debit": "0",
-                                "credit": str(a)}])
-
-                      def tax_provision(self, *, company_id,
-                                        period, obligation_id,
-                                        amount,
-                                        expense_account="5300",
-                                        liability_account="2300"
-                                        ) -> dict:
-                          a = self._amt(amount)
-                          return self._post(
-                              company_id, period,
-                              "PROVISION_FISCAL",
-                              obligation_id,
-                              [{"account_code":
-                                    str(expense_account),
-                                "debit": str(a),
-                                "credit": "0"},
-                               {"account_code":
-                                    str(liability_account),
-                                "debit": "0",
-                                "credit": str(a)}])
-
-                      def budget_vs_actual(self, *,
-                                           company_id, period,
-                                           budgets) -> List[dict]:
-                          """budgets: {cuenta: monto}. El REAL
-                          sale del mayor (trial_balance)."""
-                          real = {r["account_code"]:
-                                  Decimal(r["debit"])
-                                  - Decimal(r["credit"])
-                                  for r in
-                                  self._gl.trial_balance(
-                                      company_id, str(period))}
-                          rows = []
-                          for acc in sorted(budgets):
-                              b = Decimal(
-                                  str(budgets[acc])).quantize(_Q)
-                              a = real.get(str(acc),
-                                           Decimal("0.00"))
-                              diff = (a - b).quantize(_Q)
-                              pct = (str(
-                                  (Decimal(a) * Decimal(100)
-                                   / b).quantize(_Q))
-                                  if b != Decimal("0.00")
-                                  else None)
-                              rows.append({
-                                  "account_code": str(acc),
-                                  "budget": str(b),
-                                  "actual": str(a.quantize(_Q)),
-                                  "diff": str(diff),
-                                  "usage_pct": pct,
-                                  "over": a > b})
-                          return rows
-
-                      def ledger_is_balanced(self, *,
-                                             company_id,
-                                             period=""
-                                             ) -> bool:
-                          rows = self._gl.trial_balance(
-                              company_id, str(period or ""))
-                          td = sum((Decimal(r["debit"])
-                                    for r in rows),
-                                   Decimal("0"))
-                          tc = sum((Decimal(r["credit"])
-                                    for r in rows),
-                                   Decimal("0"))
-                          return td == tc
-              '''))
-              out("## FIN nexo")
-          except Exception:
-              out("## ERROR")
-              out("```\n" + traceback.format_exc().strip() + "\n```")
-          finally:
-              exit(0)
-          PYEOF
-
-      - name: "[ESCRITURA] A-1 v3: sqlite_repository (FIX: self._clock = clock en __init__)"
-        if: always()
-        run: |
-          export PYTHONPATH="$(pwd):$(pwd)/shared_engines:$(pwd)"
-          python3 << 'PYEOF'
-          import ast, os, pathlib, py_compile, textwrap, traceback
-          SUM = os.environ.get("GITHUB_STEP_SUMMARY", "")
-          def out(t):
-              print(t, flush=True)
-              if SUM:
-                  with open(SUM, "a", encoding="utf-8") as f:
-                      f.write(t + "\n")
-          def D(s):
-              return textwrap.dedent(s)
-          def forzar(ruta, contenido):
-              p = None
-              try:
-                  ast.parse(contenido)
-                  p = pathlib.Path(ruta)
-                  p.parent.mkdir(parents=True, exist_ok=True)
-                  p.write_text(contenido, encoding="utf-8")
-                  py_compile.compile(ruta, doraise=True)
-                  out("- **" + p.name + ": OK**")
-              except Exception:
-                  if p is not None and p.exists():
+                  def D2(value) -> Decimal:
                       try:
-                          p.unlink()
-                      except Exception:
-                          pass
-                  out("- **" + ruta + ": ERROR (no escrito)**")
-                  out("```\n" + traceback.format_exc().strip()
-                      + "\n```")
-
-          try:
-              forzar("apps/agro/infrastructure/repositories/sqlite_repository.py",
-                     D(r'''
-                  """SqliteRepository (A-1) - persistencia REAL
-                  para AGRO con la MISMA interfaz del repositorio
-                  en memoria (save/get/list/delete).
-
-                  v3 (fix): self._clock = clock RESTAURADO en
-                  __init__ (v2 lo perdio al reordenar; save()
-                  lanzaba AttributeError).
-                  v2: migraciones con tupla explicita
-                  (migs = (Migration(...),) — coma DENTRO).
-                  _key acepta dicts (entity_id/id/producer_id/
-                  production_id) y objetos con atributos (.id,
-                  como el InMemoryRepository real).
-                  Regla 76: ORDER BY rowid."""
-                  from __future__ import annotations
-                  import json as _j
-                  import uuid
-                  from shared_engines.storage.database import (
-                      Database)
-                  from shared_engines.storage.migrations import (
-                      Migration, MigrationRunner)
+                          d = Decimal(str(value))
+                      except (InvalidOperation, TypeError,
+                              ValueError):
+                          raise ValueError(
+                              "monto invalido: " + repr(value))
+                      if not d.is_finite():
+                          raise ValueError(
+                              "monto no finito: " + repr(value))
+                      return d.quantize(_Q,
+                                        rounding=ROUND_HALF_UP)
 
 
-                  class SqliteRepository:
-                      """Repositorio SQLite generico (A-1)."""
-
-                      ENTITY = "generic"
-
-                      def __init__(self, db, clock=None):
-                          self._db = db
-                          self._clock = clock
-                          table = self._table()
-                          stmt = ("CREATE TABLE IF NOT EXISTS "
-                                  + table
-                                  + " (entity_id TEXT PRIMARY KEY,"
-                                  " payload_json TEXT NOT NULL,"
-                                  " created_at REAL NOT NULL,"
-                                  " updated_at REAL NOT NULL)")
-                          migs = (Migration(1, table,
-                                            (stmt,)),)
-                          MigrationRunner(
-                              db,
-                              "agro.repo." + self.ENTITY,
-                              migs).run(clock)
-
-                      @classmethod
-                      def _table(cls) -> str:
-                          return ("agro_"
-                                  + cls.ENTITY
-                                  + "_entities")
-
-                      @staticmethod
-                      def _key(entity) -> str:
-                          if isinstance(entity, dict):
-                              for k in ("entity_id", "id",
-                                        "producer_id",
-                                        "production_id"):
-                                  v = entity.get(k)
-                                  if v:
-                                      return str(v)
-                              new = ("AGR-"
-                                     + uuid.uuid4().hex[:12])
-                              entity["entity_id"] = new
-                              return new
-                          new = None
-                          for attr in ("entity_id", "id",
-                                       "producer_id",
-                                       "production_id"):
-                              v = getattr(entity, attr, None)
-                              if v:
-                                  new = str(v)
-                                  break
-                          if not new:
-                              new = ("AGR-"
-                                     + uuid.uuid4().hex[:12])
-                          try:
-                              if not getattr(entity,
-                                             "entity_id", None):
-                                  setattr(entity, "entity_id",
-                                          new)
-                          except Exception:
-                              pass
-                          return new
-
-                      def save(self, entity):
-                          k = self._key(entity)
-                          now = 0.0
-                          if self._clock is not None:
-                              now = self._clock.now()
-                          payload = _j.dumps(
-                              entity if isinstance(entity, dict)
-                              else getattr(entity, "__dict__",
-                                           {}),
-                              default=str, sort_keys=True)
-                          self._db.execute(
-                              "INSERT OR REPLACE INTO "
-                              + self._table()
-                              + " (entity_id, payload_json,"
-                                " created_at, updated_at)"
-                                " VALUES (?, ?,"
-                                " COALESCE((SELECT created_at"
-                                " FROM " + self._table()
-                                + " WHERE entity_id = ?), ?),"
-                                " ?)",
-                              (k, payload, k, now, now))
-                          return self.get(k)
-
-                      def get(self, entity_id):
-                          row = self._db.query_one(
-                              "SELECT payload_json FROM "
-                              + self._table()
-                              + " WHERE entity_id = ?",
-                              (str(entity_id),))
-                          if not row:
-                              return None
-                          d = _j.loads(str(row["payload_json"]))
-                          if isinstance(d, dict):
-                              d.setdefault("entity_id",
-                                           str(entity_id))
-                          return d
-
-                      def list(self):
-                          rows = self._db.query_all(
-                              "SELECT payload_json, entity_id"
-                              " FROM " + self._table()
-                              + " ORDER BY rowid")
-                          out = []
-                          for r in rows:
-                              d = _j.loads(
-                                  str(r["payload_json"]))
-                              if isinstance(d, dict):
-                                  d.setdefault(
-                                      "entity_id",
-                                      str(r["entity_id"]))
-                              out.append(d)
-                          return out
-
-                      def delete(self, entity_id) -> bool:
-                          row = self._db.query_one(
-                              "SELECT entity_id FROM "
-                              + self._table()
-                              + " WHERE entity_id = ?",
-                              (str(entity_id),))
-                          if not row:
-                              return False
-                          self._db.execute(
-                              "DELETE FROM " + self._table()
-                              + " WHERE entity_id = ?",
-                              (str(entity_id),))
-                          return True
-
-                      def count(self) -> int:
-                          row = self._db.query_one(
-                              "SELECT COUNT(*) AS n FROM "
-                              + self._table())
-                          return int(row["n"]) if row else 0
+                  def money_str(value) -> str:
+                      return str(D2(value))
 
 
-                  class SqliteProducerRepository(SqliteRepository):
-                      ENTITY = "producer"
+                  def is_positive_money(value) -> bool:
+                      try:
+                          return D2(value) > Decimal("0.00")
+                      except ValueError:
+                          return False
 
 
-                  class SqliteProductionRepository(
-                          SqliteRepository):
-                      ENTITY = "production"
+                  def safe_float(value) -> float:
+                      """Solo tras cuantizar (frontera REAL)."""
+                      return float(D2(value))
 
 
-                  def migrate_from_memory(src, dst) -> int:
-                      """Copia entidades del repo en memoria al
-                      SQLite (regla 51). Robusto con list() y
-                      _items.values()."""
-                      n = 0
-                      items = list(src.list() or [])
-                      if items and not any(
-                              isinstance(e, dict)
-                              or hasattr(e, "__dict__")
-                              for e in items):
-                          items = list(getattr(
-                              src, "_items", {}).values())
-                      for e in items:
-                          if (isinstance(e, dict)
-                                  or hasattr(e, "__dict__")):
-                              dst.save(e)
-                              n += 1
-                      return n
+                  def sum_money(values) -> str:
+                      total = Decimal("0.00")
+                      for v in (values or []):
+                          total += D2(v)
+                      return str(total)
               '''))
-              out("## FIN agro repo v3")
+              out("## FIN money helper")
           except Exception:
               out("## ERROR")
               out("```\n" + traceback.format_exc().strip() + "\n```")
@@ -597,340 +165,71 @@ jobs:
               exit(0)
           PYEOF
 
-      - name: "[ESCRITURA] A-3: verificacion utcnow (ya aplicado en v2; idempotente si faltara alguno)"
-        if: always()
-        run: |
-          export PYTHONPATH="$(pwd):$(pwd)/shared_engines:$(pwd)"
-          python3 << 'PYEOF'
-          import ast, os, pathlib, py_compile, re, traceback
-          SUM = os.environ.get("GITHUB_STEP_SUMMARY", "")
-          def out(t):
-              print(t, flush=True)
-              if SUM:
-                  with open(SUM, "a", encoding="utf-8") as f:
-                      f.write(t + "\n")
-          FILES = [
-              "apps/agro/modules/seguridad/auditoria/audit_service.py",
-              "apps/agro/modules/productores/documentos/document_service.py",
-              "apps/agro/domain/entities/base_entity.py",
-              "apps/agro/domain/events/domain_event.py",
-          ]
-          for p_str in FILES:
-              p = pathlib.Path(p_str)
-              try:
-                  src = p.read_text(encoding="utf-8")
-                  if "utcnow" not in src:
-                      out("- A-3 " + p.name
-                          + ": ya limpio (v2 aplicado)")
-                      continue
-                  orig = src
-                  new = src.replace(
-                      "datetime.utcnow()",
-                      "datetime.now(timezone.utc)")
-                  new = new.replace(
-                      "default_factory=datetime.utcnow",
-                      "default_factory=lambda: datetime"
-                      ".now(timezone.utc)")
-                  if re.search(r"^from datetime import",
-                               new, re.M):
-                      def _ext(m):
-                          line = m.group(0)
-                          if "timezone" in line:
-                              return line
-                          return (line.rstrip("\n")
-                                  + ", timezone\n")
-                      new = re.sub(r"^from datetime import"
-                                   r"[^\n]*\n", _ext, new,
-                                   count=1, flags=re.M)
-                  elif re.search(r"^import datetime\b",
-                                 new, re.M):
-                      new = re.sub(
-                          r"datetime\.now\(timezone\.utc\)",
-                          "datetime.datetime.now("
-                          "timezone.utc)", new)
-                      new = re.sub(
-                          r"^import datetime\b",
-                          "import datetime\n"
-                          "from datetime import timezone",
-                          new, count=1, flags=re.M)
-                  else:
-                      new = ("from datetime import timezone\n"
-                             + new)
-                  try:
-                      ast.parse(new)
-                  except SyntaxError:
-                      out("- A-3 " + p.name
-                          + ": ERROR sintaxis (revertido)")
-                      continue
-                  p.write_text(new, encoding="utf-8")
-                  try:
-                      py_compile.compile(p_str, doraise=True)
-                      out("- **A-3 " + p.name + ": OK**")
-                  except Exception:
-                      p.write_text(orig, encoding="utf-8")
-                      out("- A-3 " + p.name
-                          + ": fallo compile (revertido)")
-              except Exception:
-                  out("- A-3 " + p_str + ": EXCEPCION")
-                  out("```\n"
-                      + traceback.format_exc().strip()
-                      + "\n```")
-          exit(0)
-          PYEOF
-
-      - name: "[ESCRITURA tests + LECTURA veredicto] tests v2 (identicos al run anterior)"
+      - name: "[ESCRITURA tests + LECTURA veredicto] tests frontera de dinero"
         if: always()
         run: |
           export PYTHONPATH="$(pwd):$(pwd)/shared_engines:$(pwd)"
           set +e
           find apps -name "__pycache__" -type d -prune -exec rm -rf {} + || true
-          cat > apps/nexo/tests/test_n2_integraciones.py << 'TSEOF'
+          cat > apps/agro/tests/test_money_helper.py << 'TSEOF'
           import pytest
-          from shared_engines.common.clocks import FrozenClock
-          from shared_engines.storage.database import SQLiteAdapter
-          from apps.nexo.domain.accounting.general_ledger_engine import GeneralLedgerEngine
-          from apps.nexo.domain.accounting.ledger_integration_engine import LedgerIntegrationEngine
+          from decimal import Decimal
+          from apps.agro.shared.money import (
+              D2, money_str, is_positive_money, safe_float,
+              sum_money)
 
 
-          def _env(tmp_path):
-              db = SQLiteAdapter(tmp_path / "n.db")
-              clock = FrozenClock()
-              gl = GeneralLedgerEngine(db, clock)
-              itg = LedgerIntegrationEngine(db, clock, gl)
-              return db, gl, itg
+          def test_d2_half_up_regla61() -> None:
+              assert money_str("2.675") == "2.68"
+              assert money_str("1.005") == "1.01"
+              assert money_str("-1.239") == "-1.24"
+              assert money_str(3) == "3.00"
+              assert money_str("10") == "10.00"
+              assert D2(Decimal("7.129")) == Decimal("7.13")
+              assert str(D2("2.5")) == "2.50"
+              print("OK A-2 prep: D2 cuantiza 2d con HALF_UP (regla 61) desde str/int/Decimal")
 
 
-          def test_cxc_ciclo_factura_y_cobro(tmp_path) -> None:
-              db, gl, itg = _env(tmp_path)
-              r1 = itg.invoice_issued_ar(company_id="EMP-1",
-                  period="2026-01", invoice_id="INV-1",
-                  amount="1000.00")
-              assert r1["total_debit"] == "1000.00"
-              assert r1["total_credit"] == "1000.00"
-              bal_ar = gl.account_balance("EMP-1", "1100",
-                                          "2026-01")
-              assert bal_ar["balance"] == "1000.00"
-              bal_inc = gl.account_balance("EMP-1", "4000",
-                                           "2026-01")
-              assert bal_inc["balance"] == "-1000.00"
-              r2 = itg.payment_received(company_id="EMP-1",
-                  period="2026-01", invoice_id="INV-1",
-                  amount="1000.00")
-              assert r2["total_debit"] == "1000.00"
-              bal_ar2 = gl.account_balance("EMP-1", "1100",
-                                           "2026-01")
-              assert bal_ar2["balance"] == "0.00"
-              bal_bank = gl.account_balance("EMP-1", "1000",
-                                            "2026-01")
-              assert bal_bank["balance"] == "1000.00"
-              assert itg.ledger_is_balanced(
-                  company_id="EMP-1") is True
-              assert all(e["source_ref"].startswith("N2:")
-                         for e in gl.entries_of("EMP-1",
-                                                "1100"))
-              print("OK N-2 CxC: factura -> D CxC / C Ingreso; cobro -> D Bancos / C CxC; mayor cuadrado global + source_ref N2:*")
-
-
-          def test_cxp_tesoreria_activo_fiscal(tmp_path) -> None:
-              db, gl, itg = _env(tmp_path)
-              itg.invoice_received_ap(company_id="EMP-2",
-                  period="2026-02", invoice_id="INV-9",
-                  amount="400.00")
-              itg.payment_sent(company_id="EMP-2",
-                  period="2026-02", invoice_id="INV-9",
-                  amount="400.00")
-              ap = gl.account_balance("EMP-2", "2100",
-                                      "2026-02")
-              assert ap["balance"] == "0.00"
+          def test_d2_rechaza_invalidos_honesto() -> None:
               with pytest.raises(ValueError):
-                  itg.treasury_move(company_id="EMP-2",
-                      period="2026-02", move_id="M1",
-                      direction="OTRO", amount="10")
-              itg.treasury_move(company_id="EMP-2",
-                  period="2026-02", move_id="M2",
-                  direction="DEPOSIT", amount="500.00")
-              bank = gl.account_balance("EMP-2", "1000",
-                                        "2026-02")
-              assert bank["balance"] == "100.00"
-              itg.depreciation_month(company_id="EMP-2",
-                  period="2026-02", asset_id="ACT-1",
-                  amount="50.00")
-              dep = gl.account_balance("EMP-2", "1590",
-                                       "2026-02")
-              assert dep["balance"] == "-50.00"
-              itg.tax_provision(company_id="EMP-2",
-                  period="2026-02", obligation_id="OBL-1",
-                  amount="30.00")
+                  D2("abc")
               with pytest.raises(ValueError):
-                  itg.expense_recorded(company_id="EMP-2",
-                      period="2026-02", record_id="X",
-                      amount="0")
-              assert itg.ledger_is_balanced(
-                  company_id="EMP-2",
-                  period="2026-02") is True
-              print("OK N-2 CxP/Tesoreria/Activos/Fiscal: pagos cancelan CxP, deposito cuadrado, depreciacion y provision; amount<=0 rechazado")
+                  D2(None)
+              with pytest.raises(ValueError):
+                  D2(float("nan"))
+              with pytest.raises(ValueError):
+                  D2(float("inf"))
+              print("OK A-2 prep: montos invalidos -> ValueError honesto (regla 66: nunca NaN/inf silencioso)")
 
 
-          def test_presupuesto_vs_real_y_descuadre(tmp_path) -> None:
-              db, gl, itg = _env(tmp_path)
-              itg.expense_recorded(company_id="EMP-3",
-                  period="2026-03", record_id="G1",
-                  amount="120.00",
-                  expense_account="5000")
-              itg.expense_recorded(company_id="EMP-3",
-                  period="2026-03", record_id="G2",
-                  amount="80.00",
-                  expense_account="5000")
-              rows = itg.budget_vs_actual(company_id="EMP-3",
-                  period="2026-03",
-                  budgets={"5000": "150.00",
-                           "6000": "10.00"})
-              r5 = [r for r in rows
-                    if r["account_code"] == "5000"][0]
-              assert r5["actual"] == "200.00"
-              assert r5["over"] is True
-              assert r5["usage_pct"] == "133.33"
-              r6 = [r for r in rows
-                    if r["account_code"] == "6000"][0]
-              assert r6["actual"] == "0.00"
-              assert r6["over"] is False
-              itg._gl._db.execute(
-                  "DELETE FROM nexo_gl_entries WHERE"
-                  " company_id = 'EMP-3' AND account_code ="
-                  " '1000' AND period = '2026-03'")
-              assert itg.ledger_is_balanced(
-                  company_id="EMP-3",
-                  period="2026-03") is False
-              print("OK N-2/N-6: budget_vs_actual contra REAL del mayor + descuadre REAL detectado al eliminar una pata del asiento")
-          TSEOF
-          cat > apps/agro/tests/test_a1_a3_persistencia.py << 'TSEOF'
-          import dataclasses
-          import inspect as _insp
-          import pathlib
-          import pytest
-          from shared_engines.common.clocks import FrozenClock
-          from shared_engines.storage.database import SQLiteAdapter
-          from apps.agro.infrastructure.database.repository import InMemoryRepository
-          from apps.agro.infrastructure.repositories.sqlite_repository import (
-              SqliteProducerRepository,
-              SqliteProductionRepository,
-              migrate_from_memory)
+          def test_is_positive_y_suma() -> None:
+              assert is_positive_money("0.01") is True
+              assert is_positive_money("0.00") is False
+              assert is_positive_money("-5") is False
+              assert is_positive_money("junk") is False
+              assert sum_money(["0.1", "0.2"]) == "0.30"
+              assert sum_money(["1.005", "2.005"]) == "3.02"
+              assert sum_money([]) == "0.00"
+              assert sum_money(None) == "0.00"
+              print("OK A-2 prep: is_positive seguro (reemplaza float()>0) + suma exacta sin error binario")
 
 
-          class _Ent:
-              """Imita las entidades reales del InMemoryRepository
-              (objetos con .id)."""
-
-              def __init__(self, eid, data):
-                  self.id = eid
-                  self.data = data
-
-
-          def test_a1_producer_persistencia_real(tmp_path) -> None:
-              db = SQLiteAdapter(tmp_path / "p.db")
-              repo = SqliteProducerRepository(db, FrozenClock())
-              e1 = repo.save({"producer_id": "PR-1",
-                              "name": "Juan",
-                              "hectares": 12.5})
-              assert e1["entity_id"] == "PR-1"
-              assert e1["name"] == "Juan"
-              got = repo.get("PR-1")
-              assert got is not None
-              assert got["hectares"] == 12.5
-              repo.save({"producer_id": "PR-2",
-                         "name": "Maria"})
-              assert repo.count() == 2
-              assert len(repo.list()) == 2
-              upd = repo.save({"producer_id": "PR-1",
-                               "name": "Juan Perez"})
-              assert upd["name"] == "Juan Perez"
-              assert repo.count() == 2
-              assert repo.delete("PR-2") is True
-              assert repo.delete("PR-2") is False
-              assert repo.get("PR-2") is None
-              db2 = SQLiteAdapter(tmp_path / "p.db")
-              repo2 = SqliteProducerRepository(db2,
-                                               FrozenClock())
-              assert repo2.count() == 1
-              assert repo2.get("PR-1")["name"] == "Juan Perez"
-              print("OK A-1 producer: save/get/list/update/delete contra SQLite REAL + sobrevive reinicio de conexion")
-
-
-          def test_a1_migration_desde_memoria(tmp_path) -> None:
-              mem = InMemoryRepository()
-              mem.save(_Ent("X-1", "algo"))
-              mem.save(_Ent("X-2", "otro"))
-              db = SQLiteAdapter(tmp_path / "m.db")
-              dst = SqliteProductionRepository(db,
-                                               FrozenClock())
-              n = migrate_from_memory(mem, dst)
-              assert n == 2
-              assert dst.count() == 2
-              got = dst.get("X-1")
-              assert got["data"] == "algo"
-              n2 = migrate_from_memory(mem, dst)
-              assert n2 == 2
-              assert dst.count() == 2
-              print("OK A-1: migracion memoria->SQLite idempotente con entidades OBJETO (.id) como el InMemoryRepository real; interfaz IDENTICA (regla 51)")
-
-
-          def test_a3_utcnow_eliminado(tmp_path) -> None:
-              root = pathlib.Path("apps/agro")
-              offenders = []
-              for f in root.rglob("*.py"):
-                  if ("__pycache__" in f.parts
-                          or "tests" in f.parts):
-                      continue
-                  try:
-                      t = f.read_text(encoding="utf-8")
-                  except Exception:
-                      continue
-                  if ("datetime.utcnow()" in t
-                          or "default_factory="
-                          "datetime.utcnow" in t):
-                      offenders.append(str(f))
-              assert offenders == []
-              from apps.agro.domain.entities import \
-                  base_entity as be
-              from apps.agro.domain.events import \
-                  domain_event as de
-              s1 = _insp.getsource(be)
-              s2 = _insp.getsource(de)
-              assert "utcnow" not in s1
-              assert "utcnow" not in s2
-              assert "datetime.now(timezone.utc)" in s1
-              assert ("default_factory=lambda: datetime"
-                      ".now(timezone.utc)") in s1
-              dcs = [o for o in vars(be).values()
-                     if dataclasses.is_dataclass(o)]
-              found_tz = False
-              for dc in dcs:
-                  for fd in dataclasses.fields(dc):
-                      fct = fd.default_factory
-                      if fct is dataclasses.MISSING:
-                          continue
-                      if not callable(fct):
-                          continue
-                      try:
-                          v = fct()
-                      except Exception:
-                          continue
-                      if getattr(v, "tzinfo",
-                                 None) is not None:
-                          found_tz = True
-              assert found_tz is True
-              print("OK A-3: cero utcnow en produccion (ambos patrones) + factories TZ-AWARE verificados")
+          def test_safe_float_tras_cuantizar() -> None:
+              assert safe_float("12.345") == 12.35
+              assert safe_float("7") == 7.0
+              with pytest.raises(ValueError):
+                  safe_float("junk")
+              print("OK A-2 prep: safe_float SOLO despues de cuantizar (frontera REAL hasta migracion 3d)")
           TSEOF
           python3 - << 'ASTEOF'
           import ast
-          for f in ("apps/nexo/tests/test_n2_integraciones.py",
-                    "apps/agro/tests/test_a1_a3_persistencia.py"):
-              ast.parse(open(f, encoding="utf-8").read())
-              print("AST OK:", f)
+          ast.parse(open("apps/agro/tests/test_money_helper.py",
+                         encoding="utf-8").read())
+          print("AST OK test_money_helper.py")
           ASTEOF
-          timeout 240 python3 -m pytest apps/nexo/tests/test_n2_integraciones.py apps/agro/tests/test_a1_a3_persistencia.py -vv --tb=long --timeout=45 --timeout-method=thread > /tmp/r3b.out 2>&1
-          echo $? > /tmp/r3b
-          if [ "$(cat /tmp/r3b)" = "0" ]; then echo "- RUN 3b (N-2..N-6 + A-1 + A-3): ✅" >> "$GITHUB_STEP_SUMMARY"; else echo "- RUN 3b: ❌" >> "$GITHUB_STEP_SUMMARY"; { echo "### RUN 3b detalle"; echo '```'; tail -90 /tmp/r3b.out; echo '```'; } >> "$GITHUB_STEP_SUMMARY"; fi
+          timeout 180 python3 -m pytest apps/agro/tests/test_money_helper.py -vv --tb=long --timeout=45 --timeout-method=thread > /tmp/r3c.out 2>&1
+          echo $? > /tmp/r3c
+          if [ "$(cat /tmp/r3c)" = "0" ]; then echo "- RUN 3c (money helper): ✅" >> "$GITHUB_STEP_SUMMARY"; else echo "- RUN 3c: ❌" >> "$GITHUB_STEP_SUMMARY"; { echo "### RUN 3c detalle"; echo '```'; tail -80 /tmp/r3c.out; echo '```'; } >> "$GITHUB_STEP_SUMMARY"; fi
           exit 0
 
       - name: "[LECTURA] regresion 4 apps"
@@ -968,7 +267,7 @@ jobs:
         run: |
           SUM="$GITHUB_STEP_SUMMARY"
           log() { echo "$1" >> "$SUM"; echo "$1"; }
-          if [ "$(cat /tmp/r3b 2>/dev/null || echo 1)" != "0" ] || [ "$(cat /tmp/x1 2>/dev/null || echo 1)" != "0" ] || [ "$(cat /tmp/x2 2>/dev/null || echo 1)" != "0" ] || [ "$(cat /tmp/x3 2>/dev/null || echo 1)" != "0" ] || [ "$(cat /tmp/x4 2>/dev/null || echo 1)" != "0" ]; then
+          if [ "$(cat /tmp/r3c 2>/dev/null || echo 1)" != "0" ] || [ "$(cat /tmp/x1 2>/dev/null || echo 1)" != "0" ] || [ "$(cat /tmp/x2 2>/dev/null || echo 1)" != "0" ] || [ "$(cat /tmp/x3 2>/dev/null || echo 1)" != "0" ] || [ "$(cat /tmp/x4 2>/dev/null || echo 1)" != "0" ]; then
             log "**RESULTADO: rojo — SIN commit**"
             exit 1
           fi
@@ -976,16 +275,16 @@ jobs:
           rm -rf .pytest_cache || true
           git config user.name "zyra-bot"
           git config user.email "zyra-bot@users.noreply.github.com"
-          git add apps/nexo apps/agro
+          git add apps/agro
           set +e
           if git diff --cached --quiet; then
             log "**SIN CAMBIOS**"; exit 0
           fi
-          git commit -m "feat(RUN3b v3): N-2..N-6 LedgerIntegrationEngine (eventos de negocio al mayor via post_balanced: CxC/CxP/tesoreria/depreciacion/provision fiscal; budget_vs_actual contra trial_balance; ledger_is_balanced integridad global; source_ref N2:*) + A-1 SqliteRepository v3 (FIX: self._clock = clock restaurado en __init__ — v2 lo perdio al reordenar el constructor) + A-3 utcnow eliminado (ambos patrones: llamada y default_factory lambda tz-aware) + tests con entidades objeto .id como el InMemoryRepository real; scan A-3 excluye tests/"
+          git commit -m "feat(AGRO A-2 prep): shared/money.py — FRONTERA DE DINERO (D2 Decimal 2d HALF_UP regla 61; money_str para TEXT; is_positive_money reemplaza el patron float()>0; safe_float solo tras cuantizar para columnas REAL hasta migracion 3d; sum_money exacta sin error binario; ValueError honesto en invalidos/NaN/inf regla 66) + auditoria LECTURA de las 4 fuentes de dinero (market/simple_sale/valuation/planning) y domain/risk NEXO para las conversiones y N-7 del RUN 3d"
           [ $? -ne 0 ] && { log "**COMMIT FALLO**"; exit 1; }
           log "**COMMIT OK**"
           git push "https://x-access-token:${GH_TOKEN}@github.com/${GITHUB_REPOSITORY}.git" "HEAD:main" > /tmp/qa.out 2> /tmp/qa.err
-          if [ $? -eq 0 ]; then log "**PUSH OK — N-2..N-6 + A-1 + A-3 CERRADOS. RUN 3c: A-2 (Decimal 2d en frontera de market/simple_sale/valuation/planning) + N-7 (riesgo unificado) — con auditoria previa de esas fuentes.**"; exit 0; fi
+          if [ $? -eq 0 ]; then log "**PUSH OK — A-2 prep CERRADA. RUN 3d: convertir los 4 services de dinero a la frontera money.py (con las fuentes impresas arriba) + N-7 riesgo unificado.**"; exit 0; fi
           git push origin "HEAD:main" > /tmp/qc.out 2> /tmp/qd.err
           if [ $? -eq 0 ]; then log "**PUSH OK (intento 2).**"; exit 0; fi
           log "**PUSH fallo:**"; { echo '```'; cat /tmp/qd.err; echo '```'; } >> "$SUM"

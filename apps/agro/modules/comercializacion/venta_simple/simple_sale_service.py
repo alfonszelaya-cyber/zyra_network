@@ -1,4 +1,7 @@
 
+from apps.agro.shared.money import D2 as _D2, safe_float as _sf
+
+
 class SimpleSaleService:
     def create(self, producer_id, product, quantity, buyer, price):
         if quantity <= 0 or price < 0:
@@ -143,7 +146,7 @@ def place_offer_db(
             " ofertas (estado: " + status
             + ")"
         )
-    amt = float(amount or 0)
+    amt = _sf(amount or 0)
     if amt <= 0:
         raise ValueError(
             "oferta debe ser positiva"
@@ -276,7 +279,7 @@ def accept_offer_db(
         "buyer": buyer,
         "amount": amount,
         "currency": currency,
-        "total": total,
+        "total": _sf(total),
         "remaining": remaining,
     }
 
@@ -334,13 +337,13 @@ def pay_sale_db(
         "UPDATE agro_sales_plus SET"
         " status = 'paid', paid_at = ?,"
         " total = ? WHERE sale_id = ?",
-        (ts, total, sale_id),
+        (ts, _sf(total), sale_id),
     )
     return {
         "sale_id": sale_id,
         "status": "paid",
         "buyer": buyer,
-        "total": total,
+        "total": _sf(total),
         "currency": currency,
         "paid_at": ts,
     }

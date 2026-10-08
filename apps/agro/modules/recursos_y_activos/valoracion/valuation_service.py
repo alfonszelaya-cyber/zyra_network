@@ -1,4 +1,7 @@
 
+from apps.agro.shared.money import safe_float as _sf
+
+
 class AssetValuationService:
     def value(self, asset_id, amount, currency):
         if amount < 0:
@@ -22,7 +25,7 @@ def value_asset_db(
     import time as _t
     import uuid as _u
     base = AssetValuationService().value(
-        asset_id, float(amount or 0), currency
+        asset_id, _sf(amount or 0), currency
     )
     db.execute(
         "CREATE TABLE IF NOT EXISTS"
@@ -50,7 +53,7 @@ def value_asset_db(
         " VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
         (valuation_id, producer_id,
          asset_kind, asset_id,
-         float(amount),
+         _sf(amount),
          str(currency).upper(), actor, ts),
     )
     out = dict(base)

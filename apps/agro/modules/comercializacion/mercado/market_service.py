@@ -1,16 +1,20 @@
 
+from decimal import Decimal as _DEC, ROUND_HALF_UP
+from apps.agro.shared.money import D2 as _D2, safe_float as _sf
+
+
 class MarketService:
     def snapshot(self, product, prices):
-        values = [float(p) for p in prices]
+        values = [_D2(p) for p in prices]
 
         if not values:
             raise ValueError("Prices are required")
 
         return {
             "product": product,
-            "minimum": min(values),
-            "maximum": max(values),
-            "average": sum(values) / len(values)
+            "minimum": _sf(min(values)),
+            "maximum": _sf(max(values)),
+            "average": _sf((sum(values) / _DEC(len(values))).quantize(_DEC("0.01"), rounding=ROUND_HALF_UP))
         }
 
 
@@ -19,7 +23,7 @@ def add_price_db(
     db, *, product, price, actor="anon",
 ):
     import time as _t
-    p = float(price or 0)
+    p = _sf(price or 0)
     if p <= 0:
         raise ValueError(
             "precio debe ser positivo"
@@ -70,10 +74,10 @@ def market_snapshot_db(db, product):
     prices = []
     for r in rows:
         try:
-            prices.append(float(r["price"]))
+            prices.append(_sf(r["price"]))
         except Exception:
             try:
-                prices.append(float(r[0]))
+                prices.append(_sf(r[0]))
             except Exception:
                 pass
     if not prices:

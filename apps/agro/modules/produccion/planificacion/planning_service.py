@@ -1,4 +1,7 @@
 
+from apps.agro.shared.money import safe_float as _sf, sum_money as _sum_money
+
+
 class ProductionPlanning:
     def create_plan(self, producer_id, product, target):
         if target <= 0:
@@ -206,7 +209,7 @@ def add_plan_cost_db(
     amount, currency, actor="anon",
 ):
     import time as _t
-    amt = float(amount or 0)
+    amt = _sf(amount or 0)
     if amt < 0:
         raise ValueError(
             "costo no puede ser negativo"
@@ -273,7 +276,7 @@ def plan_costs_summary_db(db, plan_id):
         except Exception:
             continue
         by_currency[cur] = (
-            by_currency.get(cur, 0.0) + amt
+            _sf(_sum_money([by_currency.get(cur, 0.0), amt]))
         )
     return {
         "plan_id": plan_id,

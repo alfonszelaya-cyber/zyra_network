@@ -1,8 +1,8 @@
 """Servicio de UI: construye las vistas desde las fuentes unicas.
 
-Fase 4 EN VIVO: cuatro_d se suma a los menus vivos con datos
-reales de timeline, luz e interacciones. Ley 3: maximo 3 botones
-de accion por vista. Ley 1: lo no disponible declara fase.
+Fase 5 EN VIVO: simular (evolucion), probar, comparar y optimizar
+usan datos reales. Ley 3: maximo 3 botones de accion por vista.
+Ley 1: lo no disponible declara fase.
 """
 import json
 from pathlib import Path
@@ -23,7 +23,7 @@ RUTA_PLANTILLAS = RAIZ_APP / "templates" / "dashboards"
 RUTA_TRADUCCIONES = RAIZ_APP / "assets" / "translations"
 
 MENUS_VIVOS = ("inicio", "simular", "capturar", "comprender", "disenar",
-               "crear", "biblioteca", "cuatro_d")
+               "crear", "biblioteca", "cuatro_d", "probar", "comparar", "optimizar")
 
 FORMATOS_GENERACION = (
     ("imagen", "Imagen"), ("pagina", "Pagina"), ("modelo", "Modelo"),
@@ -147,6 +147,25 @@ def _opciones_escenas(escenas) -> str:
     )
 
 
+def _opciones_escenarios(proyectos, repo_escenarios) -> str:
+    """Select de escenarios con data-proyecto para JS."""
+    if not proyectos:
+        return '<option value="">sin proyectos</option>'
+    opciones = []
+    for p in proyectos:
+        escs = repo_escenarios.listar({"proyecto_id": p.id}, 50, 0)
+        for e in escs:
+            opciones.append(
+                '<option value="' + escapar(str(e.id)) + '" data-proyecto="'
+                + escapar(str(p.id)) + '">' + escapar(
+                    p.titulo + " | " + e.tipo.value + ": " + e.titulo
+                ) + "</option>"
+            )
+    if not opciones:
+        return '<option value="">sin escenarios</option>'
+    return "\n".join(opciones)
+
+
 def render_home(identidad, repo_proyectos) -> str:
     proyectos = repo_proyectos.listar({"propietario_zid": identidad.zid}, 50, 0)
     filas = []
@@ -185,28 +204,6 @@ def render_home(identidad, repo_proyectos) -> str:
         "filas": cuerpo_tabla,
     })
     return _pagina("Inicio - ZYRA LABORATORIO", _nav(identidad, "inicio"), contenido, identidad)
-
-
-def _tabla_simulacion(identidad, repo_proyectos, repo_escenarios) -> str:
-    proyectos = repo_proyectos.listar({"propietario_zid": identidad.zid}, 50, 0)
-    filas = []
-    for p in proyectos:
-        escs = repo_escenarios.listar({"proyecto_id": p.id}, 20, 0)
-        resumen = ", ".join(e.tipo.value + ": " + e.titulo for e in escs)
-        filas.append(
-            "<tr><td>" + escapar(p.titulo) + "</td><td>"
-            + escapar(resumen or "sin escenarios") + "</td>"
-            + '<td><a class="link" href="/laboratorio/api/v1/projects/'
-            + str(p.id) + '/scenarios">ver JSON</a></td></tr>'
-        )
-    cuerpo = "\n".join(filas) or (
-        '<tr><td colspan="3" class="vacio">' + escapar(_t("ui.sin_proyectos")) + "</td></tr>"
-    )
-    return (
-        '<section class="tarjeta"><h2>Proyectos y escenarios (datos reales)</h2>'
-        + '<table><thead><tr><th>Proyecto</th><th>Escenarios</th><th>API</th></tr></thead>'
-        + "<tbody>" + cuerpo + "</tbody></table></section>"
-    )
 
 
 def _extra_capturar(identidad, repo_proyectos, repo_inputs) -> str:
@@ -417,6 +414,117 @@ def _extra_cuatro_d(identidad, repos) -> str:
     })
 
 
+def _extra_simular(identidad, repos) -> str:
+    proyectos = repos["proyectos"].listar({"propietario_zid": identidad.zid}, 50, 0)
+    ids = [p.id for p in proyectos]
+    sims = repos["simulaciones"].listar_por_proyectos(ids) if ids else []
+    filas_sim = []
+    for s in sims[:20]:
+        m = s.metricas or {}
+        filas_sim.append(
+            "<tr><td>" + escapar(str(s.escenario_id)) + "</td>"
+            + "<td>" + str(s.horizonte_anios) + " anios (+" + str(s.crecimiento_pct) + "%)</td>"
+            + "<td>" + escapar("equilibrio: anio " + str(m.get("punto_equilibrio_anio", 0))
+                               + " · ROI " + str(m.get("roi_pct", 0)) + "% · "
+                               + str(m.get("tendencia", "-"))) + "</td>"
+            + "<td>" + str(round(float(m.get("puntaje_final", 0.0)), 1)) + "</td></tr>"
+        )
+    cuerpo_sim = "\n".join(filas_sim) or (
+        '<tr><td colspan="4" class="vacio">' + escapar(_t("ui.sin_simulaciones")) + "</td></tr>"
+    )
+    return render(cargar_plantilla("simular.html"), {
+        "ayuda_simular": _t("ui.ayuda_simular"),
+        "btn_simular_evolucion": _t("ui.btn_simular_evolucion"),
+        "opciones_escenarios": _opciones_escenarios(proyectos, repos["escenarios"]),
+        "filas_simulaciones": cuerpo_sim,
+    })
+
+
+def _extra_probar(identidad, repos) -> str:
+    proyectos = repos["proyectos"].listar({"propietario_zid": identidad.zid}, 50, 0)
+    filas = []
+    for p in proyectos[:20]:
+        evaluaciones = repos["evaluaciones"].listar({"proyecto_id": p.id}, 20, 0)
+        for ev in evaluaciones[:5]:
+            m = ev.metricas or {}
+            filas.append(
+                "<tr><td>" + escapar(p.titulo) + "</td>"
+                + "<td>" + escapar(str(ev.escenario_id)) + "</td>"
+                + "<td>" + str(round(ev.puntaje_total, 2)) + "</td>"
+                + "<td>" + escapar("costo " + str(m.get("costo", "-"))
+                                   + " · beneficio " + str(m.get("beneficio", "-"))
+                                   + " · riesgo " + str(m.get("riesgo", "-"))) + "</td></tr>"
+            )
+    cuerpo = "\n".join(filas) or (
+        '<tr><td colspan="4" class="vacio">' + escapar(_t("ui.sin_evaluaciones")) + "</td></tr>"
+    )
+    return (
+        '<p class="ayuda">' + escapar(_t("ui.ayuda_probar")) + "</p>"
+        '<section class="tarjeta"><h2>Evaluaciones reales (formula oficial)</h2>'
+        + '<table><thead><tr><th>Proyecto</th><th>Escenario</th><th>Puntaje</th><th>Dimensiones</th></tr></thead>'
+        + "<tbody>" + cuerpo + "</tbody></table></section>"
+    )
+
+
+def _extra_comparar(identidad, repos) -> str:
+    proyectos = repos["proyectos"].listar({"propietario_zid": identidad.zid}, 50, 0)
+    ids = [p.id for p in proyectos]
+    comparaciones = repos["comparaciones"].listar_por_proyectos(ids) if ids else []
+    filas = []
+    for c in comparaciones[:20]:
+        ganador_titulo = ""
+        for p in c.participantes:
+            if str(p.get("escenario_id", "")) == c.ganador:
+                ganador_titulo = p.get("titulo", "")
+                break
+        filas.append(
+            "<tr><td>" + escapar(ganador_titulo or c.ganador) + "</td>"
+            + '<td><span class="pill">+' + escapar(c.brecha) + "</span></td>"
+            + "<td>" + str(len(c.participantes)) + " escenarios</td>"
+            + '<td><a class="link" href="/laboratorio/api/v1/comparisons/'
+            + str(c.id) + '/report.html">informe</a></td></tr>'
+        )
+    cuerpo = "\n".join(filas) or (
+        '<tr><td colspan="4" class="vacio">' + escapar(_t("ui.sin_comparaciones")) + "</td></tr>"
+    )
+    return render(cargar_plantilla("comparar.html"), {
+        "ayuda_comparar": _t("ui.ayuda_comparar"),
+        "btn_comparar": _t("ui.btn_comparar"),
+        "opciones_proyectos": _opciones_proyectos(proyectos),
+        "filas": cuerpo,
+    })
+
+
+def _extra_optimizar(identidad, repos) -> str:
+    proyectos = repos["proyectos"].listar({"propietario_zid": identidad.zid}, 50, 0)
+    ids = [p.id for p in proyectos]
+    propuestas = repos["optimizaciones"].listar_por_proyectos(ids) if ids else []
+    filas = []
+    for o in propuestas[:20]:
+        estado_pill = "ok" if o.estado == "aplicada" else "pill"
+        boton = ""
+        if o.estado == "sugerida":
+            boton = ('<button class="btn btn-primary btn-gen" data-aplicar="'
+                     + escapar(str(o.id)) + '">Aplicar</button>')
+        filas.append(
+            "<tr><td>" + escapar(str(o.escenario_id)) + "</td>"
+            + "<td>" + str(round(o.puntaje_actual, 1)) + " → "
+            + str(round(o.puntaje_proyectado, 1)) + " (+" + str(o.mejora_estimada) + ")</td>"
+            + "<td>" + str(len(o.recomendaciones)) + " acciones</td>"
+            + '<td><span class="' + estado_pill + '">' + escapar(o.estado) + "</span></td>"
+            + "<td>" + boton + "</td></tr>"
+        )
+    cuerpo = "\n".join(filas) or (
+        '<tr><td colspan="5" class="vacio">' + escapar(_t("ui.sin_optimizaciones")) + "</td></tr>"
+    )
+    return render(cargar_plantilla("optimizar.html"), {
+        "ayuda_optimizar": _t("ui.ayuda_optimizar"),
+        "btn_optimizar": _t("ui.btn_optimizar"),
+        "opciones_escenarios": _opciones_escenarios(proyectos, repos["escenarios"]),
+        "filas": cuerpo,
+    })
+
+
 def render_panel(identidad, menu_id: str, sub_nombre: str, repos: dict) -> str:
     if not existe_menu(menu_id):
         raise EntidadNoEncontradaError("Menu inexistente.", menu_id)
@@ -452,7 +560,7 @@ def render_panel(identidad, menu_id: str, sub_nombre: str, repos: dict) -> str:
     )
     extra = ""
     if menu_id == "simular":
-        extra = _tabla_simulacion(identidad, repos["proyectos"], repos["escenarios"])
+        extra = _extra_simular(identidad, repos)
     elif menu_id == "capturar":
         extra = _extra_capturar(identidad, repos["proyectos"], repos["inputs"])
     elif menu_id == "comprender":
@@ -465,6 +573,12 @@ def render_panel(identidad, menu_id: str, sub_nombre: str, repos: dict) -> str:
         extra = _extra_biblioteca(identidad, repos)
     elif menu_id == "cuatro_d":
         extra = _extra_cuatro_d(identidad, repos)
+    elif menu_id == "probar":
+        extra = _extra_probar(identidad, repos)
+    elif menu_id == "comparar":
+        extra = _extra_comparar(identidad, repos)
+    elif menu_id == "optimizar":
+        extra = _extra_optimizar(identidad, repos)
     contenido = render(cargar_plantilla("panel.html"), {
         "menu_nombre": menu["nombre"],
         "sub_nombre": sub_actual["nombre"] if sub_actual else "Vista general",

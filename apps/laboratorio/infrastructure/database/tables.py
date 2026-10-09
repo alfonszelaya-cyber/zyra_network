@@ -1,4 +1,4 @@
-"""Esquema oficial de LABORATORIO: v1 a v4 (nucleo, fase 2, 3 y 4)."""
+"""Esquema oficial de LABORATORIO: v1 a v5 (nucleo a fase 5)."""
 ESQUEMA_V1 = """
 CREATE TABLE IF NOT EXISTS lab_schema_version (
     version INTEGER NOT NULL,
@@ -184,7 +184,49 @@ CREATE TABLE IF NOT EXISTS lab_interactions (
 CREATE INDEX IF NOT EXISTS idx_interactions_escena ON lab_interactions(escena_id);
 """
 
-MIGRACIONES_SQL = {1: ESQUEMA_V1, 2: ESQUEMA_V2, 3: ESQUEMA_V3, 4: ESQUEMA_V4}
+ESQUEMA_V5 = """
+CREATE TABLE IF NOT EXISTS lab_simulations (
+    id TEXT PRIMARY KEY,
+    proyecto_id TEXT NOT NULL REFERENCES lab_projects(id) ON DELETE CASCADE,
+    escenario_id TEXT NOT NULL REFERENCES lab_scenarios(id) ON DELETE CASCADE,
+    horizonte INTEGER NOT NULL,
+    crecimiento REAL NOT NULL,
+    serie TEXT NOT NULL DEFAULT '[]',
+    metricas TEXT NOT NULL DEFAULT '{}',
+    creado_en TEXT NOT NULL,
+    actualizado_en TEXT NOT NULL
+);
+CREATE TABLE IF NOT EXISTS lab_comparisons (
+    id TEXT PRIMARY KEY,
+    proyecto_id TEXT NOT NULL REFERENCES lab_projects(id) ON DELETE CASCADE,
+    participantes TEXT NOT NULL DEFAULT '[]',
+    ganador TEXT NOT NULL DEFAULT '',
+    brecha REAL NOT NULL DEFAULT 0.0,
+    detalle TEXT NOT NULL DEFAULT '{}',
+    informe TEXT NOT NULL DEFAULT '',
+    creado_en TEXT NOT NULL,
+    actualizado_en TEXT NOT NULL
+);
+CREATE TABLE IF NOT EXISTS lab_optimizations (
+    id TEXT PRIMARY KEY,
+    proyecto_id TEXT NOT NULL REFERENCES lab_projects(id) ON DELETE CASCADE,
+    escenario_id TEXT NOT NULL REFERENCES lab_scenarios(id) ON DELETE CASCADE,
+    recomendaciones TEXT NOT NULL DEFAULT '[]',
+    parametros_optimizados TEXT NOT NULL DEFAULT '{}',
+    puntaje_actual REAL NOT NULL DEFAULT 0.0,
+    puntaje_proyectado REAL NOT NULL DEFAULT 0.0,
+    estado TEXT NOT NULL DEFAULT 'sugerida',
+    aplicado_como TEXT NOT NULL DEFAULT '',
+    creado_en TEXT NOT NULL,
+    actualizado_en TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_simulations_proyecto ON lab_simulations(proyecto_id);
+CREATE INDEX IF NOT EXISTS idx_comparisons_proyecto ON lab_comparisons(proyecto_id);
+CREATE INDEX IF NOT EXISTS idx_optimizations_proyecto ON lab_optimizations(proyecto_id);
+CREATE INDEX IF NOT EXISTS idx_optimizations_escenario ON lab_optimizations(escenario_id);
+"""
+
+MIGRACIONES_SQL = {1: ESQUEMA_V1, 2: ESQUEMA_V2, 3: ESQUEMA_V3, 4: ESQUEMA_V4, 5: ESQUEMA_V5}
 
 TABLAS_ESPERADAS = (
     "lab_projects", "lab_scenarios", "lab_evaluations",
@@ -192,6 +234,7 @@ TABLAS_ESPERADAS = (
     "lab_inputs", "lab_understandings", "lab_designs",
     "lab_scenes", "lab_artifacts", "lab_assets",
     "lab_timelines", "lab_lightprograms", "lab_interactions",
+    "lab_simulations", "lab_comparisons", "lab_optimizations",
 )
 
 

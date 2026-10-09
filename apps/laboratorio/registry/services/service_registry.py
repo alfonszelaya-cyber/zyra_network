@@ -8,6 +8,22 @@ from apps.laboratorio.application.use_cases.create_project import CasoCrearProye
 from apps.laboratorio.application.handlers.input_handler import ManejadorCapturas
 from apps.laboratorio.application.handlers.understanding_handler import ManejadorComprension
 from apps.laboratorio.application.handlers.scene_handler import ManejadorCreacion
+from apps.laboratorio.application.handlers.decision_handler import ManejadorDecisiones
+from apps.laboratorio.application.use_cases.decide import (
+    CasoSimularEvolucion,
+    CasoCompararEscenarios,
+    CasoOptimizarEscenario,
+    CasoAplicarOptimizacion,
+)
+from apps.laboratorio.infrastructure.providers.simulation_engine import MotorEvolucionReal
+from apps.laboratorio.infrastructure.providers.comparison_engine import MotorComparacionReal
+from apps.laboratorio.infrastructure.providers.optimization_engine import MotorOptimizacionReal
+from apps.laboratorio.infrastructure.persistence.simulation_store import SimulationStore
+from apps.laboratorio.infrastructure.persistence.comparison_store import ComparisonStore
+from apps.laboratorio.infrastructure.persistence.optimization_store import OptimizationStore
+from apps.laboratorio.infrastructure.repositories.simulation_repository import SimulationRepository
+from apps.laboratorio.infrastructure.repositories.comparison_repository import ComparisonRepository
+from apps.laboratorio.infrastructure.repositories.optimization_repository import OptimizationRepository
 from apps.laboratorio.application.handlers.world4d_handler import ManejadorCuatroD
 from apps.laboratorio.application.use_cases.world4d import (
     CasoCrearLineaTiempo,
@@ -236,5 +252,19 @@ def construir_contenedor(ruta_bd: str = ":memory:") -> Contenedor:
     c.registrar("caso_luz", lambda _c: CasoCrearProgramaLuz(_c.obtener("repo_luces"), _c.obtener("repo_escenas"), _c.obtener("repo_proyectos"), _c.obtener("repo_historial"), _c.obtener("auditoria_sink")))
     c.registrar("caso_interaccion", lambda _c: CasoCrearInteraccion(_c.obtener("repo_interacciones"), _c.obtener("repo_escenas"), _c.obtener("repo_proyectos"), _c.obtener("repo_historial"), _c.obtener("auditoria_sink")))
     c.registrar("manejador_cuatro_d", lambda _c: ManejadorCuatroD(_c.obtener("caso_timeline"), _c.obtener("caso_luz"), _c.obtener("caso_interaccion"), _c.obtener("repo_timelines"), _c.obtener("repo_luces"), _c.obtener("repo_interacciones"), _c.obtener("repo_escenas"), _c.obtener("repo_proyectos"), _c.obtener("auditoria_sink")))
+    c.registrar("simulation_store", lambda _c: SimulationStore(conexion))
+    c.registrar("comparison_store", lambda _c: ComparisonStore(conexion))
+    c.registrar("optimization_store", lambda _c: OptimizationStore(conexion))
+    c.registrar("repo_simulaciones", lambda _c: SimulationRepository(_c.obtener("simulation_store")))
+    c.registrar("repo_comparaciones", lambda _c: ComparisonRepository(_c.obtener("comparison_store")))
+    c.registrar("repo_optimizaciones", lambda _c: OptimizationRepository(_c.obtener("optimization_store")))
+    c.registrar("motor_evolucion", lambda _c: MotorEvolucionReal())
+    c.registrar("motor_comparacion", lambda _c: MotorComparacionReal())
+    c.registrar("motor_optimizacion", lambda _c: MotorOptimizacionReal())
+    c.registrar("caso_simular", lambda _c: CasoSimularEvolucion(_c.obtener("repo_simulaciones"), _c.obtener("repo_escenarios"), _c.obtener("repo_proyectos"), _c.obtener("repo_historial"), _c.obtener("motor_evolucion"), _c.obtener("auditoria_sink")))
+    c.registrar("caso_comparar", lambda _c: CasoCompararEscenarios(_c.obtener("repo_comparaciones"), _c.obtener("repo_escenarios"), _c.obtener("repo_evaluaciones"), _c.obtener("repo_proyectos"), _c.obtener("repo_historial"), _c.obtener("motor_comparacion"), _c.obtener("auditoria_sink")))
+    c.registrar("caso_optimizar", lambda _c: CasoOptimizarEscenario(_c.obtener("repo_optimizaciones"), _c.obtener("repo_escenarios"), _c.obtener("repo_proyectos"), _c.obtener("repo_historial"), _c.obtener("motor_optimizacion"), _c.obtener("auditoria_sink")))
+    c.registrar("caso_aplicar", lambda _c: CasoAplicarOptimizacion(_c.obtener("repo_optimizaciones"), _c.obtener("repo_escenarios"), _c.obtener("repo_proyectos"), _c.obtener("repo_historial"), _c.obtener("auditoria_sink")))
+    c.registrar("manejador_decisiones", lambda _c: ManejadorDecisiones(_c.obtener("caso_simular"), _c.obtener("caso_comparar"), _c.obtener("caso_optimizar"), _c.obtener("caso_aplicar"), _c.obtener("repo_simulaciones"), _c.obtener("repo_comparaciones"), _c.obtener("repo_optimizaciones"), _c.obtener("repo_proyectos"), _c.obtener("repo_escenarios"), _c.obtener("repo_evaluaciones"), _c.obtener("auditoria_sink")))
     c.obtener("suscriptor_zyra")
     return c

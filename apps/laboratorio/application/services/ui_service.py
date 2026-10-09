@@ -1,7 +1,6 @@
 """Servicio de UI: construye las vistas desde las fuentes unicas.
 
-Fase 6 EN VIVO: renderizar se suma con la escalera fotoreal real
-(SVG, PNG, 3D y fotorreal 4K) y el canal de profundidad. Ley 3:
+Fase 7 EN VIVO: presentar y exportar usan datos reales. Ley 3:
 maximo 3 botones de accion por vista. Ley 1: lo no disponible
 declara fase.
 """
@@ -25,7 +24,7 @@ RUTA_TRADUCCIONES = RAIZ_APP / "assets" / "translations"
 
 MENUS_VIVOS = ("inicio", "simular", "capturar", "comprender", "disenar",
                "crear", "biblioteca", "cuatro_d", "probar", "comparar",
-               "optimizar", "renderizar")
+               "optimizar", "renderizar", "presentar", "exportar")
 
 FORMATOS_GENERACION = (
     ("imagen", "Imagen"), ("pagina", "Pagina"), ("modelo", "Modelo"),
@@ -150,7 +149,6 @@ def _opciones_escenas(escenas) -> str:
 
 
 def _opciones_escenarios(proyectos, repo_escenarios) -> str:
-    """Select de escenarios con data-proyecto para JS."""
     if not proyectos:
         return '<option value="">sin proyectos</option>'
     opciones = []
@@ -558,6 +556,74 @@ def _extra_renderizar(identidad, repos) -> str:
     })
 
 
+def _extra_presentar(identidad, repos) -> str:
+    proyectos = repos["proyectos"].listar({"propietario_zid": identidad.zid}, 50, 0)
+    ids = [p.id for p in proyectos]
+    escenas = repos["escenas"].listar_por_proyectos(ids) if ids else []
+    presentaciones = repos["presentaciones"].listar_por_proyectos(ids) if ids else []
+    filas = []
+    for p in presentaciones[:20]:
+        estado = (
+            '<span class="ok">sellada</span>' if p.sellada
+            else '<span class="pill">borrador</span>'
+        )
+        filas.append(
+            "<tr><td>" + escapar(p.titulo) + "</td>"
+            + "<td>" + str(len(p.pasos)) + " pasos · "
+            + str(round(p.duracion_total, 1)) + "s</td>"
+            + "<td>" + estado + "</td>"
+            + '<td><a class="link" href="/laboratorio/api/v1/presentations/'
+            + str(p.id) + '/play">reproducir</a></td></tr>'
+        )
+    cuerpo = "\n".join(filas) or (
+        '<tr><td colspan="4" class="vacio">' + escapar(_t("ui.sin_presentaciones")) + "</td></tr>"
+    )
+    opciones_pasos = "\n".join(
+        '<option value="' + escapar(str(s.id)) + '" data-proyecto="'
+        + escapar(str(s.proyecto_id)) + '">' + escapar(s.nombre) + "</option>"
+        for s in escenas[:10]
+    ) or '<option value="">sin escenas</option>'
+    opciones_presentaciones = "\n".join(
+        '<option value="' + escapar(str(p.id)) + '" data-proyecto="'
+        + escapar(str(p.proyecto_id)) + '">'
+        + escapar(p.titulo + (" (sellada)" if p.sellada else "")) + "</option>"
+        for p in presentaciones if not p.sellada
+    ) or '<option value="">sin presentaciones por sellar</option>'
+    return render(cargar_plantilla("presentar.html"), {
+        "ayuda_presentar": _t("ui.ayuda_presentar"),
+        "btn_crear_presentacion": _t("ui.btn_crear_presentacion"),
+        "btn_sellar": _t("ui.btn_sellar"),
+        "opciones_proyectos": _opciones_proyectos(proyectos),
+        "opciones_pasos": opciones_pasos,
+        "opciones_presentaciones": opciones_presentaciones,
+        "filas": cuerpo,
+    })
+
+
+def _extra_exportar(identidad, repos) -> str:
+    proyectos = repos["proyectos"].listar({"propietario_zid": identidad.zid}, 50, 0)
+    ids = [p.id for p in proyectos]
+    exportaciones = repos["exportaciones"].listar_por_proyectos(ids) if ids else []
+    filas = []
+    for e in exportaciones[:20]:
+        filas.append(
+            "<tr><td>" + escapar(e.tipo) + "</td>"
+            + "<td>" + escapar(e.destino or "-") + "</td>"
+            + "<td>" + str(len(e.piezas)) + " piezas · "
+            + str(e.tamano_total) + " B</td>"
+            + "<td>" + escapar(e.hash_sha256[:12]) + "</td></tr>"
+        )
+    cuerpo = "\n".join(filas) or (
+        '<tr><td colspan="4" class="vacio">' + escapar(_t("ui.sin_exports")) + "</td></tr>"
+    )
+    return render(cargar_plantilla("exportar.html"), {
+        "ayuda_exportar": _t("ui.ayuda_exportar"),
+        "btn_exportar": _t("ui.btn_exportar"),
+        "opciones_proyectos": _opciones_proyectos(proyectos),
+        "filas": cuerpo,
+    })
+
+
 def render_panel(identidad, menu_id: str, sub_nombre: str, repos: dict) -> str:
     if not existe_menu(menu_id):
         raise EntidadNoEncontradaError("Menu inexistente.", menu_id)
@@ -614,6 +680,10 @@ def render_panel(identidad, menu_id: str, sub_nombre: str, repos: dict) -> str:
         extra = _extra_optimizar(identidad, repos)
     elif menu_id == "renderizar":
         extra = _extra_renderizar(identidad, repos)
+    elif menu_id == "presentar":
+        extra = _extra_presentar(identidad, repos)
+    elif menu_id == "exportar":
+        extra = _extra_exportar(identidad, repos)
     contenido = render(cargar_plantilla("panel.html"), {
         "menu_nombre": menu["nombre"],
         "sub_nombre": sub_actual["nombre"] if sub_actual else "Vista general",

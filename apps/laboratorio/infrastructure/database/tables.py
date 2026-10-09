@@ -1,4 +1,4 @@
-"""Esquema oficial de LABORATORIO: v1 a v6 (nucleo a fase 6)."""
+"""Esquema oficial de LABORATORIO: v1 a v7 (nucleo a fase 7)."""
 ESQUEMA_V1 = """
 CREATE TABLE IF NOT EXISTS lab_schema_version (
     version INTEGER NOT NULL,
@@ -246,7 +246,35 @@ CREATE INDEX IF NOT EXISTS idx_renders_proyecto ON lab_renders(proyecto_id);
 CREATE INDEX IF NOT EXISTS idx_renders_escena ON lab_renders(escena_id);
 """
 
-MIGRACIONES_SQL = {1: ESQUEMA_V1, 2: ESQUEMA_V2, 3: ESQUEMA_V3, 4: ESQUEMA_V4, 5: ESQUEMA_V5, 6: ESQUEMA_V6}
+ESQUEMA_V7 = """
+CREATE TABLE IF NOT EXISTS lab_presentations (
+    id TEXT PRIMARY KEY,
+    proyecto_id TEXT NOT NULL REFERENCES lab_projects(id) ON DELETE CASCADE,
+    titulo TEXT NOT NULL,
+    pasos TEXT NOT NULL DEFAULT '[]',
+    sellada INTEGER NOT NULL DEFAULT 0,
+    sello_zid TEXT NOT NULL DEFAULT '',
+    duracion_total REAL NOT NULL DEFAULT 0.0,
+    creado_en TEXT NOT NULL,
+    actualizado_en TEXT NOT NULL
+);
+CREATE TABLE IF NOT EXISTS lab_exports (
+    id TEXT PRIMARY KEY,
+    proyecto_id TEXT NOT NULL REFERENCES lab_projects(id) ON DELETE CASCADE,
+    tipo TEXT NOT NULL,
+    destino TEXT NOT NULL DEFAULT '',
+    piezas TEXT NOT NULL DEFAULT '[]',
+    tamano_total INTEGER NOT NULL DEFAULT 0,
+    hash TEXT NOT NULL DEFAULT '',
+    creado_en TEXT NOT NULL,
+    actualizado_en TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_presentations_proyecto ON lab_presentations(proyecto_id);
+CREATE INDEX IF NOT EXISTS idx_exports_proyecto ON lab_exports(proyecto_id);
+"""
+
+MIGRACIONES_SQL = {1: ESQUEMA_V1, 2: ESQUEMA_V2, 3: ESQUEMA_V3, 4: ESQUEMA_V4,
+                   5: ESQUEMA_V5, 6: ESQUEMA_V6, 7: ESQUEMA_V7}
 
 TABLAS_ESPERADAS = (
     "lab_projects", "lab_scenarios", "lab_evaluations",
@@ -255,7 +283,7 @@ TABLAS_ESPERADAS = (
     "lab_scenes", "lab_artifacts", "lab_assets",
     "lab_timelines", "lab_lightprograms", "lab_interactions",
     "lab_simulations", "lab_comparisons", "lab_optimizations",
-    "lab_renders",
+    "lab_renders", "lab_presentations", "lab_exports",
 )
 
 

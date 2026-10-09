@@ -8,6 +8,18 @@ from apps.laboratorio.application.use_cases.create_project import CasoCrearProye
 from apps.laboratorio.application.handlers.input_handler import ManejadorCapturas
 from apps.laboratorio.application.handlers.understanding_handler import ManejadorComprension
 from apps.laboratorio.application.handlers.scene_handler import ManejadorCreacion
+from apps.laboratorio.application.handlers.presentation_handler import ManejadorPresentaciones
+from apps.laboratorio.application.handlers.export_handler import ManejadorExportaciones
+from apps.laboratorio.application.use_cases.build_presentation import (
+    CasoCrearPresentacion,
+    CasoReproducirPresentacion,
+    CasoSellarPresentacion,
+)
+from apps.laboratorio.application.use_cases.export_deliverables import CasoExportarBundle
+from apps.laboratorio.infrastructure.persistence.presentation_store import PresentationStore
+from apps.laboratorio.infrastructure.persistence.export_store import ExportStore
+from apps.laboratorio.infrastructure.repositories.presentation_repository import PresentationRepository
+from apps.laboratorio.infrastructure.repositories.export_repository import ExportRepository
 from apps.laboratorio.application.handlers.render_handler import ManejadorRenders
 from apps.laboratorio.application.use_cases.render_world import CasoRenderizarEscena
 from apps.laboratorio.application.workflows.photoreal_ladder import EscaleraFotoreal
@@ -276,5 +288,15 @@ def construir_contenedor(ruta_bd: str = ":memory:") -> Contenedor:
     c.registrar("escalera_fotoreal", lambda _c: EscaleraFotoreal())
     c.registrar("caso_renderizar", lambda _c: CasoRenderizarEscena(_c.obtener("repo_renders"), _c.obtener("repo_escenas"), _c.obtener("repo_proyectos"), _c.obtener("repo_luces"), _c.obtener("repo_historial"), _c.obtener("escalera_fotoreal"), _c.obtener("auditoria_sink")))
     c.registrar("manejador_renders", lambda _c: ManejadorRenders(_c.obtener("caso_renderizar"), _c.obtener("repo_renders"), _c.obtener("repo_escenas"), _c.obtener("repo_proyectos"), _c.obtener("auditoria_sink")))
+    c.registrar("presentation_store", lambda _c: PresentationStore(conexion))
+    c.registrar("export_store", lambda _c: ExportStore(conexion))
+    c.registrar("repo_presentaciones", lambda _c: PresentationRepository(_c.obtener("presentation_store")))
+    c.registrar("repo_exportaciones", lambda _c: ExportRepository(_c.obtener("export_store")))
+    c.registrar("caso_crear_presentacion", lambda _c: CasoCrearPresentacion(_c.obtener("repo_presentaciones"), _c.obtener("repo_proyectos"), _c.obtener("repo_historial"), _c.obtener("auditoria_sink")))
+    c.registrar("caso_reproducir", lambda _c: CasoReproducirPresentacion(_c.obtener("repo_presentaciones"), _c.obtener("repo_escenas"), _c.obtener("repo_proyectos"), _c.obtener("auditoria_sink")))
+    c.registrar("caso_sellar_presentacion", lambda _c: CasoSellarPresentacion(_c.obtener("repo_presentaciones"), _c.obtener("repo_proyectos"), _c.obtener("repo_historial"), _c.obtener("bus"), _c.obtener("outbox"), _c.obtener("cliente_zyra"), _c.obtener("auditoria_sink")))
+    c.registrar("caso_exportar_bundle", lambda _c: CasoExportarBundle(_c.obtener("repo_exportaciones"), _c.obtener("repo_proyectos"), _c.obtener("repo_escenas"), _c.obtener("repo_artefactos"), _c.obtener("repo_evaluaciones"), _c.obtener("repo_presentaciones"), _c.obtener("repo_historial"), _c.obtener("outbox"), _c.obtener("cliente_zyra"), _c.obtener("auditoria_sink")))
+    c.registrar("manejador_presentaciones", lambda _c: ManejadorPresentaciones(_c.obtener("caso_crear_presentacion"), _c.obtener("caso_reproducir"), _c.obtener("caso_sellar_presentacion"), _c.obtener("repo_presentaciones"), _c.obtener("repo_proyectos"), _c.obtener("auditoria_sink")))
+    c.registrar("manejador_exportaciones", lambda _c: ManejadorExportaciones(_c.obtener("caso_exportar_bundle"), _c.obtener("repo_exportaciones"), _c.obtener("repo_proyectos"), _c.obtener("auditoria_sink")))
     c.obtener("suscriptor_zyra")
     return c

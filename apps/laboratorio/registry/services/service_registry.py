@@ -7,6 +7,18 @@ from apps.laboratorio.application.handlers.scenario_handler import ManejadorEsce
 from apps.laboratorio.application.use_cases.create_project import CasoCrearProyecto
 from apps.laboratorio.application.handlers.input_handler import ManejadorCapturas
 from apps.laboratorio.application.handlers.understanding_handler import ManejadorComprension
+from apps.laboratorio.application.handlers.scene_handler import ManejadorCreacion
+from apps.laboratorio.application.handlers.library_handler import ManejadorBiblioteca
+from apps.laboratorio.application.use_cases.create_scene import CasoCrearEscena
+from apps.laboratorio.application.use_cases.generate_artifact import CasoGenerarArtefacto
+from apps.laboratorio.application.use_cases.create_asset import CasoCrearActivo
+from apps.laboratorio.infrastructure.providers.generation_engine import MotorGeneracionReal
+from apps.laboratorio.infrastructure.persistence.scene_store import SceneStore
+from apps.laboratorio.infrastructure.persistence.artifact_store import ArtifactStore
+from apps.laboratorio.infrastructure.persistence.asset_store import AssetStore
+from apps.laboratorio.infrastructure.repositories.scene_repository import SceneRepository
+from apps.laboratorio.infrastructure.repositories.artifact_repository import ArtifactRepository
+from apps.laboratorio.infrastructure.repositories.asset_repository import AssetRepository
 from apps.laboratorio.application.handlers.design_handler import ManejadorDisenos
 from apps.laboratorio.application.use_cases.capture_input import CasoCapturarEntrada
 from apps.laboratorio.application.use_cases.understand_input import CasoComprenderEntrada
@@ -184,5 +196,17 @@ def construir_contenedor(ruta_bd: str = ":memory:") -> Contenedor:
     c.registrar("manejador_capturas", lambda _c: ManejadorCapturas(_c.obtener("caso_capturar"), _c.obtener("repo_inputs"), _c.obtener("repo_proyectos"), _c.obtener("auditoria_sink")))
     c.registrar("manejador_comprension", lambda _c: ManejadorComprension(_c.obtener("caso_comprender"), _c.obtener("repo_inputs"), _c.obtener("repo_comprensiones"), _c.obtener("repo_proyectos"), _c.obtener("auditoria_sink")))
     c.registrar("manejador_disenos", lambda _c: ManejadorDisenos(_c.obtener("caso_disenar"), _c.obtener("repo_disenos"), _c.obtener("repo_proyectos"), _c.obtener("auditoria_sink")))
+    c.registrar("scene_store", lambda _c: SceneStore(conexion))
+    c.registrar("artifact_store", lambda _c: ArtifactStore(conexion))
+    c.registrar("asset_store", lambda _c: AssetStore(conexion))
+    c.registrar("repo_escenas", lambda _c: SceneRepository(_c.obtener("scene_store")))
+    c.registrar("repo_artefactos", lambda _c: ArtifactRepository(_c.obtener("artifact_store")))
+    c.registrar("repo_activos", lambda _c: AssetRepository(_c.obtener("asset_store")))
+    c.registrar("motor_generacion", lambda _c: MotorGeneracionReal())
+    c.registrar("caso_crear_escena", lambda _c: CasoCrearEscena(_c.obtener("repo_escenas"), _c.obtener("repo_proyectos"), _c.obtener("repo_historial"), _c.obtener("auditoria_sink")))
+    c.registrar("caso_generar", lambda _c: CasoGenerarArtefacto(_c.obtener("repo_escenas"), _c.obtener("repo_artefactos"), _c.obtener("repo_proyectos"), _c.obtener("repo_historial"), _c.obtener("motor_generacion"), _c.obtener("auditoria_sink")))
+    c.registrar("caso_crear_activo", lambda _c: CasoCrearActivo(_c.obtener("repo_activos"), _c.obtener("auditoria_sink")))
+    c.registrar("manejador_creacion", lambda _c: ManejadorCreacion(_c.obtener("caso_crear_escena"), _c.obtener("caso_generar"), _c.obtener("repo_escenas"), _c.obtener("repo_artefactos"), _c.obtener("repo_proyectos"), _c.obtener("auditoria_sink")))
+    c.registrar("manejador_biblioteca", lambda _c: ManejadorBiblioteca(_c.obtener("caso_crear_activo"), _c.obtener("repo_activos"), _c.obtener("auditoria_sink")))
     c.obtener("suscriptor_zyra")
     return c

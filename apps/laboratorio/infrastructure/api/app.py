@@ -151,6 +151,8 @@ def montar_aplicacion(ruta_bd: str = ":memory:") -> AplicacionLab:
     """Compone TODA la app: contenedor + modulo + routers + intermediario."""
     from apps.laboratorio.modules.simulation_module import conectar as conectar_simulacion
     from apps.laboratorio.routers.public.health import registrar_rutas as registrar_salud
+    from apps.laboratorio.modules.library_module import conectar as conectar_biblioteca
+    from apps.laboratorio.modules.creation_module import conectar as conectar_creacion
     from apps.laboratorio.modules.design_module import conectar as conectar_diseno
     from apps.laboratorio.modules.understanding_module import conectar as conectar_comprension
     from apps.laboratorio.modules.capture_module import conectar as conectar_captura
@@ -160,6 +162,8 @@ def montar_aplicacion(ruta_bd: str = ":memory:") -> AplicacionLab:
     app = AplicacionLab(contenedor)
     conectar_simulacion(app)
     registrar_salud(app)
+    conectar_biblioteca(app)
+    conectar_creacion(app)
     conectar_diseno(app)
     conectar_comprension(app)
     conectar_captura(app)

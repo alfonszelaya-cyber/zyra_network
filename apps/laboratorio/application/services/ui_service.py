@@ -1,8 +1,8 @@
 """Servicio de UI: construye las vistas desde las fuentes unicas.
 
-Fase 2 EN VIVO: capturar, comprender y disenar usan datos reales.
-Ley 3: maximo 3 botones de accion por vista. Ley 1: paneles sin
-backend declaran su fase. Seguridad: todo dato pasa por escapar().
+Fase 3 EN VIVO: crear y biblioteca usan datos reales ademas de
+inicio, simular, capturar, comprender y disenar. Ley 3: maximo
+3 botones de accion por vista. Ley 1: lo no disponible declara fase.
 """
 import json
 from pathlib import Path
@@ -22,7 +22,7 @@ RAIZ_APP = Path(__file__).resolve().parents[2]
 RUTA_PLANTILLAS = RAIZ_APP / "templates" / "dashboards"
 RUTA_TRADUCCIONES = RAIZ_APP / "assets" / "translations"
 
-MENUS_VIVOS = ("inicio", "simular", "capturar", "comprender", "disenar")
+MENUS_VIVOS = ("inicio", "simular", "capturar", "comprender", "disenar", "crear", "biblioteca")
 
 ICONO_POR_MENU = {
     "inicio": "i-home", "capturar": "i-capturar", "comprender": "i-comprender",
@@ -278,6 +278,66 @@ def _extra_disenar(identidad, repo_proyectos, repo_disenos) -> str:
     })
 
 
+def _extra_crear(identidad, repos) -> str:
+    proyectos = repos["proyectos"].listar({"propietario_zid": identidad.zid}, 50, 0)
+    ids = [p.id for p in proyectos]
+    escenas = repos["escenas"].listar_por_proyectos(ids) if ids else []
+    artefactos = repos["artefactos"].listar_por_proyectos(ids) if ids else []
+    filas_esc = []
+    for s in escenas[:20]:
+        filas_esc.append(
+            "<tr><td>" + escapar(s.nombre) + "</td>"
+            + "<td>" + str(s.ancho) + "x" + str(s.alto) + "</td>"
+            + "<td>" + str(len(s.objetos)) + "</td>"
+            + '<td><button class="btn btn-primary btn-gen" data-generar="' + escapar(str(s.id))
+            + '" data-formato="imagen">Imagen</button></td></tr>'
+        )
+    cuerpo_esc = "\n".join(filas_esc) or (
+        '<tr><td colspan="4" class="vacio">' + escapar(_t("ui.sin_escenas")) + "</td></tr>"
+    )
+    filas_art = []
+    for a in artefactos[:20]:
+        filas_art.append(
+            "<tr><td>" + escapar(a.nombre) + "</td>"
+            + '<td><span class="pill">' + escapar(a.formato) + "</span></td>"
+            + "<td>" + str(a.tamano_bytes) + " B</td>"
+            + '<td><a class="link" href="/laboratorio/api/v1/artifacts/' + str(a.id)
+            + '">abrir</a></td></tr>'
+        )
+    cuerpo_art = "\n".join(filas_art) or (
+        '<tr><td colspan="4" class="vacio">' + escapar(_t("ui.sin_artefactos")) + "</td></tr>"
+    )
+    return render(cargar_plantilla("creacion.html"), {
+        "ayuda_escena": _t("ui.ayuda_escena"),
+        "placeholder_objetos": _t("ui.placeholder_objetos"),
+        "btn_crear_escena": _t("ui.btn_crear_escena"),
+        "opciones_proyectos": _opciones_proyectos(proyectos),
+        "filas_escenas": cuerpo_esc,
+        "filas_artefactos": cuerpo_art,
+    })
+
+
+def _extra_biblioteca(identidad, repos) -> str:
+    activos = repos["activos"].listar_por_propietario(identidad.zid)
+    filas = []
+    for a in activos[:20]:
+        filas.append(
+            "<tr><td>" + escapar(a.nombre) + "</td>"
+            + '<td><span class="pill">' + escapar(a.tipo) + "</span></td>"
+            + "<td>" + str(a.tamano_bytes) + " B</td>"
+            + "<td>" + escapar(", ".join(a.etiquetas)) + "</td>"
+            + "<td>" + escapar(a.hash_sha256[:12]) + "</td></tr>"
+        )
+    cuerpo = "\n".join(filas) or (
+        '<tr><td colspan="5" class="vacio">' + escapar(_t("ui.sin_activos")) + "</td></tr>"
+    )
+    return render(cargar_plantilla("biblioteca.html"), {
+        "ayuda_activo": _t("ui.ayuda_activo"),
+        "btn_guardar_activo": _t("ui.btn_guardar_activo"),
+        "filas": cuerpo,
+    })
+
+
 def render_panel(identidad, menu_id: str, sub_nombre: str, repos: dict) -> str:
     if not existe_menu(menu_id):
         raise EntidadNoEncontradaError("Menu inexistente.", menu_id)
@@ -320,6 +380,10 @@ def render_panel(identidad, menu_id: str, sub_nombre: str, repos: dict) -> str:
         extra = _extra_comprender(identidad, repos["proyectos"], repos["comprensiones"])
     elif menu_id == "disenar":
         extra = _extra_disenar(identidad, repos["proyectos"], repos["disenos"])
+    elif menu_id == "crear":
+        extra = _extra_crear(identidad, repos)
+    elif menu_id == "biblioteca":
+        extra = _extra_biblioteca(identidad, repos)
     contenido = render(cargar_plantilla("panel.html"), {
         "menu_nombre": menu["nombre"],
         "sub_nombre": sub_actual["nombre"] if sub_actual else "Vista general",

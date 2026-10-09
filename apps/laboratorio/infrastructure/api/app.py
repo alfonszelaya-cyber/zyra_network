@@ -151,10 +151,14 @@ def montar_aplicacion(ruta_bd: str = ":memory:") -> AplicacionLab:
     """Compone TODA la app: contenedor + modulo + routers + intermediario."""
     from apps.laboratorio.modules.simulation_module import conectar as conectar_simulacion
     from apps.laboratorio.routers.public.health import registrar_rutas as registrar_salud
+    from apps.laboratorio.modules.capture_module import conectar as conectar_captura
+    from apps.laboratorio.routers.public.ui import registrar_rutas as registrar_ui
 
     contenedor = construir_contenedor(ruta_bd)
     app = AplicacionLab(contenedor)
     conectar_simulacion(app)
     registrar_salud(app)
+    conectar_captura(app)
+    registrar_ui(app)
     app.activar_intermediario(contenedor.obtener("auditoria_sink"))
     return app

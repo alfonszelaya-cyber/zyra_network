@@ -5,6 +5,8 @@ import secrets
 from apps.laboratorio.application.handlers.project_handler import ManejadorProyectos
 from apps.laboratorio.application.handlers.scenario_handler import ManejadorEscenarios
 from apps.laboratorio.application.use_cases.create_project import CasoCrearProyecto
+from apps.laboratorio.application.handlers.document_handler import ManejadorDocumentos
+from apps.laboratorio.application.use_cases.create_project_from_document import CasoCrearProyectoDesdeDocumento
 from apps.laboratorio.application.use_cases.evaluate_scenario import CasoEvaluarEscenario
 from apps.laboratorio.config.application.app_config import AppConfig
 from apps.laboratorio.config.database.db_config import DbConfig
@@ -154,5 +156,7 @@ def construir_contenedor(ruta_bd: str = ":memory:") -> Contenedor:
         _c.obtener("repo_proyectos"), _c.obtener("caso_evaluar_escenario"),
         _c.obtener("auditoria_sink"),
     ))
+    c.registrar("caso_crear_desde_documento", lambda _c: CasoCrearProyectoDesdeDocumento(_c.obtener("caso_crear_proyecto")))
+    c.registrar("manejador_documentos", lambda _c: ManejadorDocumentos(_c.obtener("caso_crear_desde_documento"), _c.obtener("auditoria_sink")))
     c.obtener("suscriptor_zyra")
     return c

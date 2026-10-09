@@ -1,20 +1,26 @@
 """Artefacto: entregable generado desde una escena.
 
-Todo artefacto guarda su contenido real, su hash SHA-256 y su
-formato. Ningun artefacto finge: si el formato no existe, no se
-genera (video_mp4 llega en fase 6 con el motor de secuencia).
+Fase 4: ademas de imagen, pagina, modelo y animacion, se generan
+naked3d (pantalla 3D sin lentes), holograma y oligrama. Ningun
+artefacto finge: el video_mp4 llega en fase 6.
 """
 from dataclasses import dataclass
 
 from apps.laboratorio.shared.models.base import EntidadBase
 from apps.laboratorio.shared.models.identifiers import Identificador
 
-FORMATOS_GENERACION = ("imagen", "pagina", "modelo", "animacion")
+FORMATOS_GENERACION = (
+    "imagen", "pagina", "modelo", "animacion",
+    "naked3d", "holograma", "oligrama",
+)
 MIME_POR_FORMATO = {
     "imagen": "image/svg+xml",
     "pagina": "text/html; charset=utf-8",
     "modelo": "application/json",
     "animacion": "image/svg+xml",
+    "naked3d": "image/svg+xml",
+    "holograma": "image/svg+xml",
+    "oligrama": "image/svg+xml",
 }
 
 

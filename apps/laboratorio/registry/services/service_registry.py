@@ -8,6 +8,21 @@ from apps.laboratorio.application.use_cases.create_project import CasoCrearProye
 from apps.laboratorio.application.handlers.input_handler import ManejadorCapturas
 from apps.laboratorio.application.handlers.understanding_handler import ManejadorComprension
 from apps.laboratorio.application.handlers.scene_handler import ManejadorCreacion
+from apps.laboratorio.application.handlers.world4d_handler import ManejadorCuatroD
+from apps.laboratorio.application.use_cases.world4d import (
+    CasoCrearLineaTiempo,
+    CasoCrearProgramaLuz,
+    CasoCrearInteraccion,
+)
+from apps.laboratorio.infrastructure.providers.naked3d_engine import MotorNaked3D
+from apps.laboratorio.infrastructure.providers.hologram_engine import MotorHolograma
+from apps.laboratorio.infrastructure.providers.oligram_engine import MotorOligrama
+from apps.laboratorio.infrastructure.persistence.timeline_store import TimelineStore
+from apps.laboratorio.infrastructure.persistence.lighting_store import LightingStore
+from apps.laboratorio.infrastructure.persistence.interaction_store import InteractionStore
+from apps.laboratorio.infrastructure.repositories.timeline_repository import TimelineRepository
+from apps.laboratorio.infrastructure.repositories.lighting_repository import LightingRepository
+from apps.laboratorio.infrastructure.repositories.interaction_repository import InteractionRepository
 from apps.laboratorio.application.handlers.library_handler import ManejadorBiblioteca
 from apps.laboratorio.application.use_cases.create_scene import CasoCrearEscena
 from apps.laboratorio.application.use_cases.generate_artifact import CasoGenerarArtefacto
@@ -208,5 +223,18 @@ def construir_contenedor(ruta_bd: str = ":memory:") -> Contenedor:
     c.registrar("caso_crear_activo", lambda _c: CasoCrearActivo(_c.obtener("repo_activos"), _c.obtener("auditoria_sink")))
     c.registrar("manejador_creacion", lambda _c: ManejadorCreacion(_c.obtener("caso_crear_escena"), _c.obtener("caso_generar"), _c.obtener("repo_escenas"), _c.obtener("repo_artefactos"), _c.obtener("repo_proyectos"), _c.obtener("auditoria_sink")))
     c.registrar("manejador_biblioteca", lambda _c: ManejadorBiblioteca(_c.obtener("caso_crear_activo"), _c.obtener("repo_activos"), _c.obtener("auditoria_sink")))
+    c.registrar("timeline_store", lambda _c: TimelineStore(conexion))
+    c.registrar("lighting_store", lambda _c: LightingStore(conexion))
+    c.registrar("interaction_store", lambda _c: InteractionStore(conexion))
+    c.registrar("repo_timelines", lambda _c: TimelineRepository(_c.obtener("timeline_store")))
+    c.registrar("repo_luces", lambda _c: LightingRepository(_c.obtener("lighting_store")))
+    c.registrar("repo_interacciones", lambda _c: InteractionRepository(_c.obtener("interaction_store")))
+    c.registrar("motor_naked3d", lambda _c: MotorNaked3D())
+    c.registrar("motor_holograma", lambda _c: MotorHolograma())
+    c.registrar("motor_oligrama", lambda _c: MotorOligrama())
+    c.registrar("caso_timeline", lambda _c: CasoCrearLineaTiempo(_c.obtener("repo_timelines"), _c.obtener("repo_escenas"), _c.obtener("repo_proyectos"), _c.obtener("repo_historial"), _c.obtener("auditoria_sink")))
+    c.registrar("caso_luz", lambda _c: CasoCrearProgramaLuz(_c.obtener("repo_luces"), _c.obtener("repo_escenas"), _c.obtener("repo_proyectos"), _c.obtener("repo_historial"), _c.obtener("auditoria_sink")))
+    c.registrar("caso_interaccion", lambda _c: CasoCrearInteraccion(_c.obtener("repo_interacciones"), _c.obtener("repo_escenas"), _c.obtener("repo_proyectos"), _c.obtener("repo_historial"), _c.obtener("auditoria_sink")))
+    c.registrar("manejador_cuatro_d", lambda _c: ManejadorCuatroD(_c.obtener("caso_timeline"), _c.obtener("caso_luz"), _c.obtener("caso_interaccion"), _c.obtener("repo_timelines"), _c.obtener("repo_luces"), _c.obtener("repo_interacciones"), _c.obtener("repo_escenas"), _c.obtener("repo_proyectos"), _c.obtener("auditoria_sink")))
     c.obtener("suscriptor_zyra")
     return c

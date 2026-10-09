@@ -34,6 +34,9 @@ def registrar_rutas(app) -> None:
         "escenas": app.contenedor.obtener("repo_escenas"),
         "artefactos": app.contenedor.obtener("repo_artefactos"),
         "activos": app.contenedor.obtener("repo_activos"),
+        "timelines": app.contenedor.obtener("repo_timelines"),
+        "luces": app.contenedor.obtener("repo_luces"),
+        "interacciones": app.contenedor.obtener("repo_interacciones"),
     }
 
     def _home(ctx):

@@ -5,12 +5,12 @@ from apps.laboratorio.application.services.ui_service import cargar_plantilla
 PLANTILLAS_OFICIALES = (
     "base.html", "home.html", "panel.html", "crear.html",
     "capturar.html", "comprender.html", "disenar.html",
-    "creacion.html", "biblioteca.html",
+    "creacion.html", "biblioteca.html", "cuatro_d.html",
 )
 
 
 def verificar_plantillas() -> int:
-    """Valida que las 9 plantillas existan y sean legibles."""
+    """Valida que las 10 plantillas existan y sean legibles."""
     total = 0
     for nombre in PLANTILLAS_OFICIALES:
         cargar_plantilla(nombre)

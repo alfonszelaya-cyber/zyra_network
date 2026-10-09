@@ -1,8 +1,8 @@
 """Servicio de UI: construye las vistas desde las fuentes unicas.
 
-Fase 3 EN VIVO: crear y biblioteca usan datos reales ademas de
-inicio, simular, capturar, comprender y disenar. Ley 3: maximo
-3 botones de accion por vista. Ley 1: lo no disponible declara fase.
+Fase 4 EN VIVO: cuatro_d se suma a los menus vivos con datos
+reales de timeline, luz e interacciones. Ley 3: maximo 3 botones
+de accion por vista. Ley 1: lo no disponible declara fase.
 """
 import json
 from pathlib import Path
@@ -22,7 +22,14 @@ RAIZ_APP = Path(__file__).resolve().parents[2]
 RUTA_PLANTILLAS = RAIZ_APP / "templates" / "dashboards"
 RUTA_TRADUCCIONES = RAIZ_APP / "assets" / "translations"
 
-MENUS_VIVOS = ("inicio", "simular", "capturar", "comprender", "disenar", "crear", "biblioteca")
+MENUS_VIVOS = ("inicio", "simular", "capturar", "comprender", "disenar",
+               "crear", "biblioteca", "cuatro_d")
+
+FORMATOS_GENERACION = (
+    ("imagen", "Imagen"), ("pagina", "Pagina"), ("modelo", "Modelo"),
+    ("animacion", "Animacion"), ("naked3d", "Naked-3D"),
+    ("holograma", "Holograma"), ("oligrama", "Oligrama"),
+)
 
 ICONO_POR_MENU = {
     "inicio": "i-home", "capturar": "i-capturar", "comprender": "i-comprender",
@@ -128,6 +135,15 @@ def _opciones_proyectos(proyectos) -> str:
     return "".join(
         '<option value="' + escapar(str(p.id)) + '">' + escapar(p.titulo) + "</option>"
         for p in proyectos
+    )
+
+
+def _opciones_escenas(escenas) -> str:
+    if not escenas:
+        return '<option value="">sin escenas</option>'
+    return "".join(
+        '<option value="' + escapar(str(s.id)) + '">' + escapar(s.nombre) + "</option>"
+        for s in escenas
     )
 
 
@@ -278,6 +294,13 @@ def _extra_disenar(identidad, repo_proyectos, repo_disenos) -> str:
     })
 
 
+def _select_formatos() -> str:
+    return "".join(
+        '<option value="' + escapar(v) + '">' + escapar(nombre) + "</option>"
+        for v, nombre in FORMATOS_GENERACION
+    )
+
+
 def _extra_crear(identidad, repos) -> str:
     proyectos = repos["proyectos"].listar({"propietario_zid": identidad.zid}, 50, 0)
     ids = [p.id for p in proyectos]
@@ -289,8 +312,10 @@ def _extra_crear(identidad, repos) -> str:
             "<tr><td>" + escapar(s.nombre) + "</td>"
             + "<td>" + str(s.ancho) + "x" + str(s.alto) + "</td>"
             + "<td>" + str(len(s.objetos)) + "</td>"
-            + '<td><button class="btn btn-primary btn-gen" data-generar="' + escapar(str(s.id))
-            + '" data-formato="imagen">Imagen</button></td></tr>'
+            + '<td><select class="sel-gen" data-escena="' + escapar(str(s.id)) + '">'
+            + _select_formatos()
+            + '</select> <button class="btn btn-primary btn-gen" data-generar="'
+            + escapar(str(s.id)) + '">Generar</button></td></tr>'
         )
     cuerpo_esc = "\n".join(filas_esc) or (
         '<tr><td colspan="4" class="vacio">' + escapar(_t("ui.sin_escenas")) + "</td></tr>"
@@ -335,6 +360,60 @@ def _extra_biblioteca(identidad, repos) -> str:
         "ayuda_activo": _t("ui.ayuda_activo"),
         "btn_guardar_activo": _t("ui.btn_guardar_activo"),
         "filas": cuerpo,
+    })
+
+
+def _extra_cuatro_d(identidad, repos) -> str:
+    proyectos = repos["proyectos"].listar({"propietario_zid": identidad.zid}, 50, 0)
+    ids = [p.id for p in proyectos]
+    escenas = repos["escenas"].listar_por_proyectos(ids) if ids else []
+    filas_tl = []
+    filas_luz = []
+    filas_int = []
+    for s in escenas[:20]:
+        linea = repos["timelines"].obtener_por_escena(s.id)
+        if linea is not None:
+            filas_tl.append(
+                "<tr><td>" + escapar(s.nombre) + "</td>"
+                + "<td>" + str(linea.duracion_s) + "s @ " + str(linea.fps) + "fps</td>"
+                + "<td>" + str(len(linea.pistas)) + " pistas / "
+                + str(linea.total_keyframes) + " keyframes</td></tr>"
+            )
+        luz = repos["luces"].obtener_por_escena(s.id)
+        if luz is not None:
+            filas_luz.append(
+                "<tr><td>" + escapar(s.nombre) + "</td>"
+                + "<td>" + str(len(luz.pasos)) + " pasos</td>"
+                + '<td><span class="pill">' + escapar(luz.color_dominate) + "</span></td></tr>"
+            )
+        zonas = repos["interacciones"].listar_por_escena(s.id)
+        for z in zonas[:5]:
+            filas_int.append(
+                "<tr><td>" + escapar(s.nombre) + "</td>"
+                + "<td>" + escapar(z.titulo) + "</td>"
+                + '<td><span class="pill">' + escapar(z.accion) + "</span></td>"
+                + "<td>" + escapar("(%.0f,%.0f %.0fx%.0f)" % (z.x, z.y, z.w, z.h)) + "</td></tr>"
+            )
+    cuerpo_tl = "\n".join(filas_tl) or (
+        '<tr><td colspan="3" class="vacio">' + escapar(_t("ui.sin_timelines")) + "</td></tr>"
+    )
+    cuerpo_luz = "\n".join(filas_luz) or (
+        '<tr><td colspan="3" class="vacio">' + escapar(_t("ui.sin_luces")) + "</td></tr>"
+    )
+    cuerpo_int = "\n".join(filas_int) or (
+        '<tr><td colspan="4" class="vacio">' + escapar(_t("ui.sin_interacciones")) + "</td></tr>"
+    )
+    return render(cargar_plantilla("cuatro_d.html"), {
+        "ayuda_4d": _t("ui.ayuda_4d"),
+        "ayuda_luz": _t("ui.ayuda_luz"),
+        "ayuda_interaccion": _t("ui.ayuda_interaccion"),
+        "btn_timeline": _t("ui.btn_timeline"),
+        "btn_luz": _t("ui.btn_luz"),
+        "btn_interaccion": _t("ui.btn_interaccion"),
+        "opciones_escenas": _opciones_escenas(escenas),
+        "filas_timelines": cuerpo_tl,
+        "filas_luces": cuerpo_luz,
+        "filas_interacciones": cuerpo_int,
     })
 
 
@@ -384,6 +463,8 @@ def render_panel(identidad, menu_id: str, sub_nombre: str, repos: dict) -> str:
         extra = _extra_crear(identidad, repos)
     elif menu_id == "biblioteca":
         extra = _extra_biblioteca(identidad, repos)
+    elif menu_id == "cuatro_d":
+        extra = _extra_cuatro_d(identidad, repos)
     contenido = render(cargar_plantilla("panel.html"), {
         "menu_nombre": menu["nombre"],
         "sub_nombre": sub_actual["nombre"] if sub_actual else "Vista general",

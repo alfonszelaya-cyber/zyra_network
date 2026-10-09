@@ -1,8 +1,8 @@
-"""Escena 3D: el mundo que se renderiza y se genera.
+"""Escena 3D con PROFUNDIDAD: capas fondo/medio/frente (canal 4D).
 
 Arquitectura invertida: primero el mundo (SCENE/WORLD), despues
-el render y el destino. Los objetos se validan contra lo que el
-motor SVG real puede dibujar (rect, circle, texto).
+el render y el destino. Cada objeto declara su capa de
+profundidad; los motores naked3d usan las capas para el parallax.
 """
 import re
 from dataclasses import dataclass, field
@@ -13,6 +13,7 @@ from apps.laboratorio.shared.models.identifiers import Identificador
 
 PATRON_HEX = re.compile(r"^#[0-9A-Fa-f]{6}$")
 FORMAS_VALIDAS = ("rect", "circle", "texto")
+CAPAS_VALIDAS = ("fondo", "medio", "frente")
 MIN_DIM = 16
 MAX_DIM = 4096
 MAX_OBJETOS = 200
@@ -20,7 +21,7 @@ MAX_OBJETOS = 200
 
 @dataclass
 class Escena3D(EntidadBase):
-    """Mundo con objetos: base de imagen, pagina, modelo y animacion."""
+    """Mundo con objetos y capas de profundidad."""
 
     prefijo_id = "scn"
 
@@ -42,7 +43,7 @@ class Escena3D(EntidadBase):
             raise ValueError("alto fuera de rango 16-4096.")
 
     def agregar_objeto(self, objeto: dict) -> dict:
-        """Agrega un objeto validado; devuelve el objeto limpio."""
+        """Agrega un objeto validado con su capa de profundidad."""
         if not isinstance(objeto, dict):
             raise ValueError("El objeto debe ser un objeto JSON.")
         forma = str(objeto.get("forma", "")).strip().lower()
@@ -54,7 +55,13 @@ class Escena3D(EntidadBase):
         color = str(objeto.get("color", "#64748B")).strip()
         if not PATRON_HEX.match(color):
             raise ValueError("Color invalido: " + repr(color))
-        limpio = {"forma": forma, "color": color}
+        capa = str(objeto.get("capa", "medio")).strip().lower()
+        if capa not in CAPAS_VALIDAS:
+            raise ValueError(
+                "Capa de profundidad invalida: " + repr(capa)
+                + ". Validas: " + ", ".join(CAPAS_VALIDAS)
+            )
+        limpio = {"forma": forma, "color": color, "capa": capa}
         try:
             if forma == "rect":
                 limpio.update(
@@ -79,7 +86,7 @@ class Escena3D(EntidadBase):
                     contenido=contenido[:300],
                 )
         except (TypeError, ValueError) as exc:
-            if "rect" in str(exc) or "circle" in str(exc) or "texto" in str(exc):
+            if any(p in str(exc) for p in ("rect", "circle", "texto", "Capa")):
                 raise
             raise ValueError("Coordenadas del objeto invalidas.") from exc
         if len(self.objetos) >= MAX_OBJETOS:
@@ -87,6 +94,13 @@ class Escena3D(EntidadBase):
         self.objetos.append(limpio)
         self.marcar_actualizacion()
         return limpio
+
+    def objetos_por_capa(self) -> dict:
+        """Agrupa los objetos por capa de profundidad."""
+        grupos = {"fondo": [], "medio": [], "frente": []}
+        for obj in self.objetos:
+            grupos.get(obj.get("capa", "medio"), grupos["medio"]).append(obj)
+        return grupos
 
     @property
     def es_renderizable(self) -> bool:

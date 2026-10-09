@@ -1,4 +1,4 @@
-"""Esquema oficial de LABORATORIO: v1 nucleo + v2 fase 2 + v3 fase 3."""
+"""Esquema oficial de LABORATORIO: v1 a v4 (nucleo, fase 2, 3 y 4)."""
 ESQUEMA_V1 = """
 CREATE TABLE IF NOT EXISTS lab_schema_version (
     version INTEGER NOT NULL,
@@ -151,13 +151,47 @@ CREATE INDEX IF NOT EXISTS idx_artifacts_escena ON lab_artifacts(escena_id);
 CREATE INDEX IF NOT EXISTS idx_assets_propietario ON lab_assets(propietario_zid);
 """
 
-MIGRACIONES_SQL = {1: ESQUEMA_V1, 2: ESQUEMA_V2, 3: ESQUEMA_V3}
+ESQUEMA_V4 = """
+CREATE TABLE IF NOT EXISTS lab_timelines (
+    id TEXT PRIMARY KEY,
+    escena_id TEXT NOT NULL UNIQUE REFERENCES lab_scenes(id) ON DELETE CASCADE,
+    duracion REAL NOT NULL,
+    fps INTEGER NOT NULL,
+    pistas TEXT NOT NULL DEFAULT '[]',
+    creado_en TEXT NOT NULL,
+    actualizado_en TEXT NOT NULL
+);
+CREATE TABLE IF NOT EXISTS lab_lightprograms (
+    id TEXT PRIMARY KEY,
+    escena_id TEXT NOT NULL UNIQUE REFERENCES lab_scenes(id) ON DELETE CASCADE,
+    pasos TEXT NOT NULL DEFAULT '[]',
+    ambientar INTEGER NOT NULL DEFAULT 0,
+    creado_en TEXT NOT NULL,
+    actualizado_en TEXT NOT NULL
+);
+CREATE TABLE IF NOT EXISTS lab_interactions (
+    id TEXT PRIMARY KEY,
+    escena_id TEXT NOT NULL REFERENCES lab_scenes(id) ON DELETE CASCADE,
+    x REAL NOT NULL,
+    y REAL NOT NULL,
+    w REAL NOT NULL,
+    h REAL NOT NULL,
+    accion TEXT NOT NULL,
+    titulo TEXT NOT NULL,
+    creado_en TEXT NOT NULL,
+    actualizado_en TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_interactions_escena ON lab_interactions(escena_id);
+"""
+
+MIGRACIONES_SQL = {1: ESQUEMA_V1, 2: ESQUEMA_V2, 3: ESQUEMA_V3, 4: ESQUEMA_V4}
 
 TABLAS_ESPERADAS = (
     "lab_projects", "lab_scenarios", "lab_evaluations",
     "lab_history", "lab_audit", "lab_outbox", "lab_schema_version",
     "lab_inputs", "lab_understandings", "lab_designs",
     "lab_scenes", "lab_artifacts", "lab_assets",
+    "lab_timelines", "lab_lightprograms", "lab_interactions",
 )
 
 

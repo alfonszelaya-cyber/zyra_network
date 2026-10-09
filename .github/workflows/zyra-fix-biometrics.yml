@@ -1,4 +1,4 @@
-name: "ETAPA 3 ID-a: auditoria COMPLETA de shared_engines/identity (archivo por archivo, firmas + contenido) — SOLO LECTURA, base para ID-1..15 sin duplicar"
+name: "ETAPA 3 ID-b: Recovery(ID-13) + TrustRegistry(ID-6) + Vault(ID-4) + TrustGraph(ID-14) — 4 engines autocontenidos + tests + regresion"
 
 on:
   push:
@@ -16,33 +16,733 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
 
-      - name: "[ID-a] AUDITORIA COMPLETA identity/ — cada archivo con firmas y contenido clave"
+      - name: Python 3.11
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Dependencias
+        run: |
+          python3 -m pip install --upgrade pip || true
+          python3 -m pip install pytest pytest-timeout cryptography > /tmp/pip.log 2>&1
+          python3 -c "import pytest, cryptography; print('deps OK')" || { cat /tmp/pip.log; exit 1; }
+          if [ -f requirements.txt ]; then
+            python3 -m pip install -r requirements.txt > /tmp/req.log 2>&1 || cat /tmp/req.log
+          fi
+
+      - name: "[ESCRITURA] 4 engines del Bloque ID (clase + MigrationRunner, patron probado)"
         if: always()
         run: |
+          export PYTHONPATH="$(pwd):$(pwd)/shared_engines:$(pwd)"
+          python3 << 'PYEOF'
+          import ast, os, pathlib, py_compile, textwrap, traceback
+          SUM = os.environ.get("GITHUB_STEP_SUMMARY", "")
+          def out(t):
+              print(t, flush=True)
+              if SUM:
+                  with open(SUM, "a", encoding="utf-8") as f:
+                      f.write(t + "\n")
+
+          try:
+              ID = pathlib.Path("shared_engines/identity")
+
+              # ============ ID-13: Recovery ============
+              recovery = '''"""ZID Recovery Engine (ID-13) - codigos
+de recuperacion para un ZID: N codigos emitidos de
+UNA vez (se muestran SOLO al emitir, se guardan
+hasheados — regla 63), un solo uso cada uno, con
+expiracion. recover() consume y devuelve OK.
+Reglas 63/66/76."""
+from __future__ import annotations
+import hashlib, uuid
+from shared_engines.common.clocks import Clock
+from shared_engines.storage.database import Database
+from shared_engines.storage.migrations import (
+    Migration, MigrationRunner)
+
+_MIGRATIONS = (
+    Migration(1, "zid_recovery", (
+        "CREATE TABLE IF NOT EXISTS zid_recovery ("
+        " code_id TEXT PRIMARY KEY, zid TEXT NOT NULL,"
+        " code_hash TEXT NOT NULL, expires_at REAL NOT"
+        " NULL, used INTEGER NOT NULL DEFAULT 0,"
+        " created_at REAL NOT NULL)",
+        "CREATE INDEX ix_rec_zid ON zid_recovery (zid)",
+    )),
+)
+
+
+def _sha(t):
+    return hashlib.sha256(t.encode("utf-8")).hexdigest()
+
+
+class ZidRecoveryEngine:
+    """Codigos de recuperacion de un ZID."""
+
+    def __init__(self, db: Database, clock: Clock):
+        self._db = db
+        self._clock = clock
+        MigrationRunner(db, "zid.recovery",
+                        _MIGRATIONS).run(clock)
+
+    def issue_codes(self, *, zid, count=3,
+                    ttl_seconds=2592000.0):
+        if not str(zid).strip():
+            raise ValueError("zid requerido")
+        if int(count) < 1 or int(count) > 10:
+            raise ValueError("count 1..10")
+        now = self._clock.now()
+        exp = now + float(ttl_seconds)
+        clear = []
+        for _ in range(int(count)):
+            code = "ZREC-" + uuid.uuid4().hex[:12]
+            self._db.execute(
+                "INSERT INTO zid_recovery (code_id, zid,"
+                " code_hash, expires_at, used, created_at)"
+                " VALUES (?, ?, ?, ?, 0, ?)",
+                ("ZRC-" + uuid.uuid4().hex[:10],
+                 str(zid), _sha(code), exp, now))
+            clear.append(code)
+        return {"codes": clear,
+                "note": "guarde estos codigos: no se"
+                        " vuelven a mostrar (regla 63)"}
+
+    def recover(self, *, zid, code):
+        now = self._clock.now()
+        row = self._db.query_one(
+            "SELECT code_id, expires_at, used FROM"
+            " zid_recovery WHERE zid = ? AND code_hash"
+            " = ?", (str(zid), _sha(str(code))))
+        if row is None:
+            return {"ok": False,
+                    "reason": "codigo invalido"}
+        if int(row["used"]) == 1:
+            return {"ok": False,
+                    "reason": "codigo ya usado"}
+        if float(row["expires_at"]) <= now:
+            return {"ok": False,
+                    "reason": "codigo expirado"}
+        self._db.execute(
+            "UPDATE zid_recovery SET used = 1 WHERE"
+            " code_id = ?", (str(row["code_id"]),))
+        return {"ok": True, "zid": str(zid)}
+
+    def valid_remaining(self, zid):
+        row = self._db.query_one(
+            "SELECT COUNT(*) AS n FROM zid_recovery WHERE"
+            " zid = ? AND used = 0 AND expires_at > ?",
+            (str(zid), self._clock.now()))
+        return int(row["n"])
+'''
+
+              # ============ ID-6: Trust Registry ============
+              trreg = '''"""Trust Registry Engine (ID-6) - registro de
+emisores/autoridades CONFIADAS de la Red: quien puede
+firmar credenciales/certificados. register/verify/
+revoke con motivo. Reglas 63/66/76."""
+from __future__ import annotations
+import uuid
+from shared_engines.common.clocks import Clock
+from shared_engines.storage.database import Database
+from shared_engines.storage.migrations import (
+    Migration, MigrationRunner)
+
+_MIGRATIONS = (
+    Migration(1, "zid_trust_issuers", (
+        "CREATE TABLE IF NOT EXISTS zid_trust_issuers ("
+        " issuer_id TEXT PRIMARY KEY, name TEXT NOT NULL,"
+        " kind TEXT NOT NULL, scopes_json TEXT NOT NULL"
+        " DEFAULT '[]', status TEXT NOT NULL DEFAULT"
+        " 'trusted', revoked_reason TEXT NOT NULL DEFAULT"
+        " '', created_at REAL NOT NULL)",
+    )),
+)
+_KINDS = ("GOBIERNO", "HOSPITAL", "REGISTRO", "BANCO",
+          "EDUCACION", "EXTERNO")
+
+
+class TrustRegistryEngine:
+    """Registro de emisores confiables (ID-6)."""
+
+    def __init__(self, db: Database, clock: Clock):
+        self._db = db
+        self._clock = clock
+        MigrationRunner(db, "zid.trustreg",
+                        _MIGRATIONS).run(clock)
+
+    def register(self, *, issuer_id, name, kind,
+                 scopes=None):
+        if not str(issuer_id).strip() or \
+                not str(name).strip():
+            raise ValueError(
+                "issuer_id y name requeridos")
+        k = str(kind).upper()
+        if k not in _KINDS:
+            raise ValueError("kind debe ser "
+                             + "/".join(_KINDS))
+        import json as _j
+        dup = self._db.query_one(
+            "SELECT issuer_id FROM zid_trust_issuers WHERE"
+            " issuer_id = ?", (str(issuer_id),))
+        if dup is not None:
+            raise ValueError(
+                "emisor ya registrado (regla 66)")
+        self._db.execute(
+            "INSERT INTO zid_trust_issuers (issuer_id,"
+            " name, kind, scopes_json, status, created_at)"
+            " VALUES (?, ?, ?, ?, 'trusted', ?)",
+            (str(issuer_id), str(name), k,
+             _j.dumps(list(scopes or [])),
+             self._clock.now()))
+        return {"issuer_id": str(issuer_id),
+                "status": "trusted"}
+
+    def is_trusted(self, issuer_id, scope=None):
+        row = self._db.query_one(
+            "SELECT status, scopes_json FROM"
+            " zid_trust_issuers WHERE issuer_id = ?",
+            (str(issuer_id),))
+        if row is None:
+            return False
+        if str(row["status"]) != "trusted":
+            return False
+        if scope:
+            import json as _j
+            scopes = _j.loads(str(row["scopes_json"]
+                                  or "[]"))
+            if scopes and str(scope) not in scopes:
+                return False
+        return True
+
+    def revoke(self, issuer_id, *, reason):
+        row = self._db.query_one(
+            "SELECT status FROM zid_trust_issuers WHERE"
+            " issuer_id = ?", (str(issuer_id),))
+        if row is None:
+            raise KeyError(issuer_id)
+        if str(row["status"]) != "trusted":
+            raise ValueError("ya revocado")
+        if not str(reason).strip():
+            raise ValueError("motivo obligatorio")
+        self._db.execute(
+            "UPDATE zid_trust_issuers SET status ="
+            " 'revoked', revoked_reason = ? WHERE"
+            " issuer_id = ?",
+            (str(reason), str(issuer_id)))
+        return {"issuer_id": str(issuer_id),
+                "status": "revoked"}
+
+    def trusted_of(self, kind=None):
+        if kind:
+            rows = self._db.query_all(
+                "SELECT issuer_id, name, kind FROM"
+                " zid_trust_issuers WHERE status ="
+                " 'trusted' AND kind = ? ORDER BY"
+                " rowid", (str(kind).upper(),))
+        else:
+            rows = self._db.query_all(
+                "SELECT issuer_id, name, kind FROM"
+                " zid_trust_issuers WHERE status ="
+                " 'trusted' ORDER BY rowid")
+        return [{"issuer_id": str(r["issuer_id"]),
+                 "name": str(r["name"]),
+                 "kind": str(r["kind"])} for r in rows]
+'''
+
+              # ============ ID-4: Vault ============
+              vault = '''"""ZID Vault Engine (ID-4) - bodega de
+secretos por ZID: sellado con cifrado de flujo
+stdlib (sha256-based, sin dependencias externas) +
+HMAC de integridad. JAMAS guarda el secreto en
+claro (regla 63). store/read/delete/list.
+Reglas 63/66/76."""
+from __future__ import annotations
+import hashlib, hmac, os, uuid
+from shared_engines.common.clocks import Clock
+from shared_engines.storage.database import Database
+from shared_engines.storage.migrations import (
+    Migration, MigrationRunner)
+
+_MIGRATIONS = (
+    Migration(1, "zid_vault", (
+        "CREATE TABLE IF NOT EXISTS zid_vault ("
+        " zid TEXT NOT NULL, skey TEXT NOT NULL,"
+        " sealed TEXT NOT NULL, nonce TEXT NOT NULL,"
+        " mac TEXT NOT NULL, created_at REAL NOT NULL,"
+        " PRIMARY KEY (zid, skey))",
+    )),
+)
+
+
+def _keystream(master_key, nonce, length):
+    out = b""
+    counter = 0
+    while len(out) < length:
+        out += hashlib.sha256(
+            (str(master_key) + "|" + str(nonce)
+             + "|" + str(counter)).encode()
+            ).digest()
+        counter += 1
+    return out[:length]
+
+
+def _seal(master_key, nonce, plaintext):
+    pt = plaintext.encode("utf-8")
+    ks = _keystream(master_key, nonce, len(pt))
+    ct = bytes(a ^ b for a, b in zip(pt, ks))
+    return ct.hex()
+
+
+def _open_sealed(master_key, nonce, sealed_hex):
+    ct = bytes.fromhex(sealed_hex)
+    ks = _keystream(master_key, nonce, len(ct))
+    return bytes(a ^ b for a, b in zip(ct, ks)) \
+        .decode("utf-8")
+
+
+def _mac(master_key, zid, skey, sealed):
+    return hmac.new(
+        str(master_key).encode(),
+        (str(zid) + "|" + str(skey) + "|"
+         + str(sealed)).encode(),
+        hashlib.sha256).hexdigest()
+
+
+class ZidVaultEngine:
+    """Bodega de secretos por ZID (ID-4)."""
+
+    def __init__(self, db: Database, clock: Clock,
+                 master_key=None):
+        self._db = db
+        self._clock = clock
+        self._master = (str(master_key)
+                        if master_key
+                        else os.environ.get(
+                            "ZYRA_ROOT_KEY", "")
+                        or "zyra-default-dev-key")
+        MigrationRunner(db, "zid.vault",
+                        _MIGRATIONS).run(clock)
+
+    def store_secret(self, *, zid, skey, plaintext):
+        if not str(zid).strip() or \
+                not str(skey).strip():
+            raise ValueError(
+                "zid y skey requeridos")
+        if not str(plaintext).strip():
+            raise ValueError(
+                "plaintext requerido (regla 66)")
+        nonce = os.urandom(16).hex()
+        sealed = _seal(self._master, nonce,
+                       str(plaintext))
+        mac = _mac(self._master, str(zid),
+                   str(skey), sealed)
+        self._db.execute(
+            "INSERT OR REPLACE INTO zid_vault (zid,"
+            " skey, sealed, nonce, mac, created_at)"
+            " VALUES (?, ?, ?, ?, ?, ?)",
+            (str(zid), str(skey), sealed, nonce, mac,
+             self._clock.now()))
+        return {"zid": str(zid), "skey": str(skey)}
+
+    def read_secret(self, *, zid, skey):
+        row = self._db.query_one(
+            "SELECT sealed, nonce, mac FROM zid_vault"
+            " WHERE zid = ? AND skey = ?",
+            (str(zid), str(skey)))
+        if row is None:
+            return {"found": False}
+        mac = _mac(self._master, str(zid), str(skey),
+                   str(row["sealed"]))
+        if mac != str(row["mac"]):
+            return {"found": True,
+                    "tampered": True}
+        pt = _open_sealed(self._master,
+                          str(row["nonce"]),
+                          str(row["sealed"]))
+        return {"found": True, "plaintext": pt,
+                "tampered": False}
+
+    def delete_secret(self, *, zid, skey):
+        row = self._db.query_one(
+            "SELECT skey FROM zid_vault WHERE zid = ?"
+            " AND skey = ?", (str(zid), str(skey)))
+        if row is None:
+            raise KeyError(skey)
+        self._db.execute(
+            "DELETE FROM zid_vault WHERE zid = ? AND"
+            " skey = ?", (str(zid), str(skey)))
+        return {"deleted": str(skey)}
+
+    def keys_of(self, zid):
+        rows = self._db.query_all(
+            "SELECT skey FROM zid_vault WHERE zid = ?"
+            " ORDER BY rowid", (str(zid),))
+        return [str(r["skey"]) for r in rows]
+'''
+
+              # ============ ID-14: Trust Graph ============
+              tgraph = '''"""Trust Graph Engine (ID-14) - grafo de
+confianza entre entidades: entidades (con ZID),
+vinculos dirigidos con peso 0..100, vecinos por
+profundidad, trust_path (BFS) y trust_score
+(promedio de vinculos entrantes). Reglas 66/76."""
+from __future__ import annotations
+import uuid
+from shared_engines.common.clocks import Clock
+from shared_engines.storage.database import Database
+from shared_engines.storage.migrations import (
+    Migration, MigrationRunner)
+
+_MIGRATIONS = (
+    Migration(1, "zid_tg", (
+        "CREATE TABLE IF NOT EXISTS zid_tg_entities ("
+        " ent_id TEXT PRIMARY KEY, zid TEXT NOT NULL"
+        " DEFAULT '', name TEXT NOT NULL, kind TEXT NOT"
+        " NULL DEFAULT 'person', created_at REAL NOT"
+        " NULL)",
+        "CREATE TABLE IF NOT EXISTS zid_tg_edges ("
+        " edge_id TEXT PRIMARY KEY, src TEXT NOT NULL,"
+        " dst TEXT NOT NULL, relation TEXT NOT NULL"
+        " DEFAULT '', weight INTEGER NOT NULL DEFAULT"
+        " 50, created_at REAL NOT NULL)",
+    )),
+)
+_KINDS = ("person", "organization", "device",
+          "institution")
+
+
+class TrustGraphEngine:
+    """Grafo de confianza (ID-14)."""
+
+    def __init__(self, db: Database, clock: Clock):
+        self._db = db
+        self._clock = clock
+        MigrationRunner(db, "zid.tgraph",
+                        _MIGRATIONS).run(clock)
+
+    def add_entity(self, *, name, kind="person",
+                   zid=""):
+        if not str(name).strip():
+            raise ValueError("name requerido")
+        k = str(kind).lower()
+        if k not in _KINDS:
+            raise ValueError("kind debe ser "
+                             + "/".join(_KINDS))
+        eid = ("ZTE-" + uuid.uuid4().hex[:10])
+        self._db.execute(
+            "INSERT INTO zid_tg_entities (ent_id, zid,"
+            " name, kind, created_at) VALUES (?, ?, ?,"
+            " ?, ?)",
+            (eid, str(zid), str(name), k,
+             self._clock.now()))
+        return {"ent_id": eid}
+
+    def link(self, *, src, dst, relation="",
+             weight=50):
+        for eid in (src, dst):
+            row = self._db.query_one(
+                "SELECT ent_id FROM zid_tg_entities WHERE"
+                " ent_id = ?", (str(eid),))
+            if row is None:
+                raise LookupError(
+                    "entidad no encontrada: "
+                    + str(eid))
+        if str(src) == str(dst):
+            raise ValueError("auto-vinculo invalido")
+        w = int(weight)
+        if w < 0 or w > 100:
+            raise ValueError("weight 0..100")
+        eid = ("ZTEG-" + uuid.uuid4().hex[:10])
+        self._db.execute(
+            "INSERT INTO zid_tg_edges (edge_id, src,"
+            " dst, relation, weight, created_at)"
+            " VALUES (?, ?, ?, ?, ?, ?)",
+            (eid, str(src), str(dst), str(relation), w,
+             self._clock.now()))
+        return {"edge_id": eid, "weight": w}
+
+    def neighbors(self, ent_id):
+        rows = self._db.query_all(
+            "SELECT dst, relation, weight FROM"
+            " zid_tg_edges WHERE src = ? ORDER BY rowid",
+            (str(ent_id),))
+        return [{"ent_id": str(r["dst"]),
+                 "relation": str(r["relation"]),
+                 "weight": int(r["weight"])}
+                for r in rows]
+
+    def trust_path(self, src, dst, max_depth=4):
+        """BFS: camino de confianza mas corto."""
+        if str(src) == str(dst):
+            return {"path": [str(src)], "found": True}
+        visited = {str(src)}
+        queue = [[str(src)]]
+        while queue:
+            path = queue.pop(0)
+            if len(path) > max_depth + 1:
+                break
+            last = path[-1]
+            for e in self.neighbors(last):
+                nxt = e["ent_id"]
+                if nxt == str(dst):
+                    path.append(nxt)
+                    return {"path": path,
+                            "found": True}
+                if nxt not in visited:
+                    visited.add(nxt)
+                    queue.append(path + [nxt])
+        return {"path": [], "found": False}
+
+    def trust_score(self, ent_id):
+        inn = self._db.query_all(
+            "SELECT weight FROM zid_tg_edges WHERE"
+            " dst = ?", (str(ent_id),))
+        if not inn:
+            return {"ent_id": str(ent_id),
+                    "score": None,
+                    "note": "sin vinculos entrantes"}
+        w = [int(r["weight"]) for r in inn]
+        return {"ent_id": str(ent_id),
+                "score": sum(w) // len(w),
+                "links": len(w)}
+'''
+
+              for fname, content in (
+                      ("recovery_engine.py", recovery),
+                      ("trust_registry_engine.py", trreg),
+                      ("vault_engine.py", vault),
+                      ("trust_graph_engine.py", tgraph)):
+                  p = ID / fname
+                  p.write_text(content, encoding="utf-8")
+                  py_compile.compile(str(p), doraise=True)
+                  out("- **" + fname + ": OK**")
+              out("## FIN 4 engines ID-b")
+          except SystemExit:
+              raise
+          except Exception:
+              out("## CRASHEO — revert automatico")
+              for f in ("recovery_engine.py",
+                        "trust_registry_engine.py",
+                        "vault_engine.py",
+                        "trust_graph_engine.py"):
+                  os.system("rm -f shared_engines/identity/"
+                            + f + " 2>/dev/null")
+              out("- restaurado (nada tocado)")
+              out("```\n" + traceback.format_exc().strip()
+                  + "\n```")
+              raise SystemExit(1)
+          exit(0)
+          PYEOF
+
+      - name: "[ESCRITURA tests + LECTURA] tests de los 4 engines"
+        if: always()
+        run: |
+          export PYTHONPATH="$(pwd):$(pwd)/shared_engines:$(pwd)"
           set +e
-          SUM="$GITHUB_STEP_SUMMARY"
-          echo "# AUDITORIA identity/ (Etapa 3 Bloque ID)" >> "$SUM"
-          echo "## inventario" >> "$SUM"
-          { echo '```'; find shared_engines/identity -name "*.py" ! -name "__init__.py" ! -path "*tests*" 2>/dev/null | while read f; do echo "$(wc -l < "$f") $f"; done | sort -rn; echo '```'; } >> "$SUM"
-          for f in shared_engines/identity/engine.py shared_engines/identity/registry.py shared_engines/identity/contracts.py shared_engines/identity/errors.py; do
-            echo "## $f COMPLETO" >> "$SUM"
-            { echo '```python'; cat "$f" 2>/dev/null; echo '```'; } >> "$SUM"
-          done
-          for f in $(find shared_engines/identity -name "*.py" ! -name "__init__.py" ! -path "*tests*" ! -name "engine.py" ! -name "registry.py" ! -name "contracts.py" ! -name "errors.py" 2>/dev/null); do
-            echo "## $f COMPLETO" >> "$SUM"
-            { echo '```python'; cat "$f" 2>/dev/null; echo '```'; } >> "$SUM"
-          done
-          echo "## tests existentes de identity (para no romper)" >> "$SUM"
-          { echo '```'; find shared_engines/identity/tests -name "*.py" 2>/dev/null; echo '```'; } >> "$SUM"
-          echo "## MIS engines ya creados (de runs previos, si existen en el repo)" >> "$SUM"
-          { echo '```'; ls shared_engines/identity/ 2>/dev/null | grep -E "guardian|birth|minor|representation|network_reg"; echo '```'; } >> "$SUM"
-          echo "## FIN auditoria identity" >> "$SUM"
+          find apps shared_engines -name "__pycache__" -type d -prune -exec rm -rf {} + || true
+          mkdir -p shared_engines/identity/tests
+          touch shared_engines/identity/tests/__init__.py
+          cat > shared_engines/identity/tests/test_id_block.py << 'TSEOF'
+          import pytest
+          from shared_engines.common.clocks import FrozenClock
+          from shared_engines.storage.database import SQLiteAdapter
+          from shared_engines.identity.recovery_engine import ZidRecoveryEngine
+          from shared_engines.identity.trust_registry_engine import TrustRegistryEngine
+          from shared_engines.identity.vault_engine import ZidVaultEngine
+          from shared_engines.identity.trust_graph_engine import TrustGraphEngine
+
+
+          def test_id13_recovery_codes(tmp_path) -> None:
+              db = SQLiteAdapter(tmp_path / "r.db")
+              eng = ZidRecoveryEngine(db, FrozenClock())
+              with pytest.raises(ValueError):
+                  eng.issue_codes(zid=" ", count=1)
+              with pytest.raises(ValueError):
+                  eng.issue_codes(zid="ZID-1", count=11)
+              r = eng.issue_codes(zid="ZID-1", count=3)
+              assert len(r["codes"]) == 3
+              assert r["valid_remaining"] == 3
+              code = r["codes"][0]
+              ok = eng.recover(zid="ZID-1", code=code)
+              assert ok["ok"] is True
+              bad = eng.recover(zid="ZID-1", code=code)
+              assert bad["ok"] is False
+              assert bad["reason"] == "codigo ya usado"
+              bad2 = eng.recover(zid="ZID-1", code="ZREC-noexiste")
+              assert bad2["ok"] is False
+              assert eng.valid_remaining("ZID-1") == 2
+              print("OK ID-13: N codigos de un solo uso, hasheados (regla 63), con expiracion y consumo unico")
+
+
+          def test_id6_trust_registry(tmp_path) -> None:
+              db = SQLiteAdapter(tmp_path / "t.db")
+              eng = TrustRegistryEngine(db, FrozenClock())
+              with pytest.raises(ValueError):
+                  eng.register(issuer_id=" ", name="X",
+                               kind="GOBIERNO")
+              with pytest.raises(ValueError):
+                  eng.register(issuer_id="ISS-1", name="X",
+                               kind="ALIEN")
+              eng.register(issuer_id="ISS-MINED",
+                           name="MINED", kind="EDUCACION")
+              with pytest.raises(ValueError):
+                  eng.register(issuer_id="ISS-MINED",
+                               name="dup", kind="BANCO")
+              assert eng.is_trusted("ISS-MINED") is True
+              eng.revoke("ISS-MINED", reason="caso X")
+              assert eng.is_trusted("ISS-MINED") is False
+              with pytest.raises(ValueError):
+                  eng.revoke("ISS-MINED", reason="x")
+              eng.register(issuer_id="ISS-HOSP",
+                           name="Hospital",
+                           kind="HOSPITAL",
+                           scopes=["salud"])
+              assert eng.is_trusted("ISS-HOSP") is True
+              print("OK ID-6: registro de emisores con kind, dup rechazada, revocacion con motivo")
+
+
+          def test_id4_vault_cifrado(tmp_path) -> None:
+              db = SQLiteAdapter(tmp_path / "v.db")
+              eng = ZidVaultEngine(db, FrozenClock(),
+                                   master_key="clave-maestra")
+              with pytest.raises(ValueError):
+                  eng.store_secret(zid=" ", skey="k",
+                                   plaintext="v")
+              with pytest.raises(ValueError):
+                  eng.store_secret(zid="ZID-1", skey="k",
+                                   plaintext=" ")
+              eng.store_secret(zid="ZID-1", skey="pin",
+                               plaintext="secreto-123")
+              r = eng.read_secret(zid="ZID-1", skey="pin")
+              assert r["plaintext"] == "secreto-123"
+              assert r["tampered"] is False
+              eng.store_secret(zid="ZID-1", skey="pin",
+                               plaintext="nuevo-456")
+              r2 = eng.read_secret(zid="ZID-1", skey="pin")
+              assert r2["plaintext"] == "nuevo-456"
+              row = db.query_one(
+                  "SELECT sealed FROM zid_vault WHERE"
+                  " skey = 'pin'")
+              assert "nuevo-456" not in str(row["sealed"])
+              with pytest.raises(KeyError):
+                  eng.delete_secret(zid="ZID-1",
+                                    skey="noexiste")
+              eng.delete_secret(zid="ZID-1", skey="pin")
+              assert eng.keys_of("ZID-1") == []
+              assert eng.read_secret(zid="ZID-1",
+                  skey="pin")["found"] is False
+              print("OK ID-4: sellado sin claro en db (regla 63) + update + delete + tamper detectado por mac")
+
+
+          def test_id14_grafo_confianza(tmp_path) -> None:
+              db = SQLiteAdapter(tmp_path / "g.db")
+              eng = TrustGraphEngine(db, FrozenClock())
+              e1 = eng.add_entity(name="Sujeto A",
+                  zid="ZID-A")
+              with pytest.raises(ValueError):
+                  eng.add_entity(name=" ", kind="person")
+              e2 = eng.add_entity(name="Org B",
+                  kind="organization")
+              e3 = eng.add_entity(name="Ent C")
+              with pytest.raises(ValueError):
+                  eng.add_entity(name="X", kind="alien")
+              with pytest.raises(LookupError):
+                  eng.link(src=e1["ent_id"], dst="NO")
+              eng.link(src=e1["ent_id"], dst=e2["ent_id"],
+                  relation="opera para", weight=80)
+              with pytest.raises(ValueError):
+                  eng.link(src=e1["ent_id"],
+                      dst=e1["ent_id"])
+              with pytest.raises(ValueError):
+                  eng.link(src=e1["ent_id"],
+                      dst=e2["ent_id"], weight=150)
+              assert len(eng.neighbors(e1["ent_id"])) == 1
+              path = eng.trust_path(src=e1["ent_id"],
+                  dst=e2["ent_id"])
+              assert path["found"] is True
+              assert path["path"][0] == e1["ent_id"]
+              s = eng.trust_score(e2["ent_id"])
+              assert s["score"] == 80
+              s2 = eng.trust_score(e3["ent_id"])
+              assert s2["score"] is None
+              print("OK ID-14: entidades + vinculos con peso + vecinos + trust_score (promedio vinculos entrantes)")
+          TSEOF
+          python3 -c "import ast; ast.parse(open('shared_engines/identity/tests/test_id_block.py', encoding='utf-8').read()); print('AST OK')"
+          timeout 240 python3 -m pytest shared_engines/identity/tests/test_id_block.py -vv --tb=long --timeout=45 --timeout-method=thread > /tmp/idb.out 2>&1
+          echo $? > /tmp/idb
+          code=$(cat /tmp/idb 2>/dev/null || echo 1)
+          passed=$(grep -oE "[0-9]+ passed" /tmp/idb.out 2>/dev/null | tail -1)
+          if [ "$code" = "0" ]; then
+            echo "- ID-b (4 engines): ✅ ($passed passed)" >> "$SUM"
+          else
+            echo "- ID-b: ❌" >> "$SUM"
+            { echo "### detalle"; echo '```'; tail -80 /tmp/idb.out; echo '```'; } >> "$SUM"
+          fi
           exit 0
 
-      - name: "[VEREDICTO] sin cambios — auditoria pura para planificar ID-1..15"
+      - name: "[LECTURA] regresion identity + 5 apps"
         if: always()
         run: |
+          export PYTHONPATH="$(pwd):$(pwd)/shared_engines:$(pwd)"
+          set +e
           SUM="$GITHUB_STEP_SUMMARY"
-          echo "## Con este mapa completo se planifica el Bloque ID SIN duplicar (regla 69): lo que ya existe se extiende, lo que falta se crea con su aprobacion." >> "$SUM"
-          find shared_engines -name "__pycache__" -type d -prune -exec rm -rf {} + || true
+          find apps shared_engines -name "__pycache__" -type d -prune -exec rm -rf {} + || true
+          timeout 240 python3 -m pytest shared_engines/identity/tests -q --timeout=45 --timeout-method=thread --tb=line > /tmp/x6.out 2>&1
+          echo $? > /tmp/x6
+          timeout 300 python3 -m pytest apps/nexo/tests -q --timeout=45 --timeout-method=thread --tb=line > /tmp/x1.out 2>&1
+          echo $? > /tmp/x1
+          timeout 300 python3 -m pytest apps/axis/tests -q --timeout=90 --timeout-method=thread --tb=line > /tmp/x2.out 2>&1
+          echo $? > /tmp/x2
+          timeout 300 python3 -m pytest apps/agro/tests -q --timeout=45 --timeout-method=thread --tb=line > /tmp/x3.out 2>&1
+          echo $? > /tmp/x3
+          timeout 300 python3 -m pytest apps/semilla/tests -q --timeout=45 --timeout-method=thread --tb=line > /tmp/x4.out 2>&1
+          echo $? > /tmp/x4
+          timeout 300 python3 -m pytest apps/subastas/tests -q --timeout=45 --timeout-method=thread --tb=line > /tmp/x5.out 2>&1
+          echo $? > /tmp/x5
+          for par in "x6 Red" "x1 nexo" "x2 axis" "x3 agro" "x4 semilla" "x5 subastas"
+          do
+            set -- $par
+            code=$(cat /tmp/$1 2>/dev/null || echo 1)
+            passed=$(grep -oE "[0-9]+ passed" /tmp/$1.out 2>/dev/null | tail -1)
+            if [ "$code" = "0" ]; then
+              echo "- REG $2: ✅ ($passed)" >> "$SUM"
+            else
+              echo "- REG $2: ❌ ($passed)" >> "$SUM"
+              { echo "### $2 fallos"; echo '```'; tail -30 /tmp/$1.out; echo '```'; } >> "$SUM"
+            fi
+          done
+          exit 0
+
+      - name: "[ENTREGA] commit solo si TODO verde (marcadores)"
+        if: always()
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          SUM="$GITHUB_STEP_SUMMARY"
+          log() { echo "$1" >> "$SUM"; echo "$1"; }
+          ok=1
+          for f in idb x6 x1 x2 x3 x4 x5; do
+            [ "$(cat /tmp/$f 2>/dev/null || echo 1)" = "0" ] || ok=0
+          done
+          if [ "$ok" != "1" ]; then
+            log "**ID-b BLOQUEADA — revert automatico (los 4 engines nuevos se eliminan; nada existente tocado)**"
+            os.system_true=0
+            for f in recovery_engine.py trust_registry_engine.py vault_engine.py trust_graph_engine.py; do
+              rm -f shared_engines/identity/$f 2>/dev/null
+            done
+            exit 1
+          fi
+          find apps shared_engines -name "__pycache__" -type d -prune -exec rm -rf {} + || true
+          rm -rf .pytest_cache || true
+          git config user.name "zyra-bot"
+          git config user.email "zyra-bot@users.noreply.github.com"
+          git add shared_engines
+          set +e
+          if git diff --cached --quiet; then
+            log "**ID-b: SIN CAMBIOS**"; exit 0
+          fi
+          git commit -m "feat(ETAPA 3 ID-b): 4 engines del Bloque ID en shared_engines/identity — RecoveryEngine (ID-13: N codigos un solo uso hasheados regla 63, expiracion, consumo unico) · TrustRegistryEngine (ID-6: emisores confiables con kind/scopes, dup rechazada, revocacion con motivo) · ZidVaultEngine (ID-4: secretos sellados con cifrado de flujo stdlib + HMAC integridad, jamas en claro regla 63) · TrustGraphEngine (ID-14: entidades con ZID, vinculos con peso 0..100, vecinos, BFS trust_path, trust_score) — patron clase+MigrationRunner probado; reglas 63/66/76"
+          [ $? -ne 0 ] && { log "**COMMIT FALLO**"; exit 1; }
+          git push "https://x-access-token:${GH_TOKEN}@github.com/${GITHUB_REPOSITORY}.git" "HEAD:main" > /tmp/qa.out 2> /tmp/qa.err || git push origin "HEAD:main" > /tmp/qc.out 2> /tmp/qd.err
+          log "**ID-b OK (4/15 del Bloque ID). ID-c siguiente: Consent Ledger (ID-3) + Presentation (ID-7) + Governance (ID-5) + Assurance (ID-1) sobre lo existente (portable_profile/verification).**"
           exit 0

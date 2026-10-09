@@ -25,19 +25,20 @@ def _html(status: int, texto: str) -> tuple:
 
 
 def registrar_rutas(app) -> None:
-    repo_proyectos = app.contenedor.obtener("repo_proyectos")
-    repo_escenarios = app.contenedor.obtener("repo_escenarios")
+    repos = {
+        "proyectos": app.contenedor.obtener("repo_proyectos"),
+        "escenarios": app.contenedor.obtener("repo_escenarios"),
+        "inputs": app.contenedor.obtener("repo_inputs"),
+        "comprensiones": app.contenedor.obtener("repo_comprensiones"),
+        "disenos": app.contenedor.obtener("repo_disenos"),
+    }
 
     def _home(ctx):
-        return _html(200, ui_service.render_home(ctx.identidad, repo_proyectos))
+        return _html(200, ui_service.render_home(ctx.identidad, repos["proyectos"]))
 
     def _panel(ctx):
         return _html(200, ui_service.render_panel(
-            ctx.identidad,
-            ctx.ruta_params["menu_id"],
-            ctx.query.get("sub", ""),
-            repo_proyectos,
-            repo_escenarios,
+            ctx.identidad, ctx.ruta_params["menu_id"], ctx.query.get("sub", ""), repos,
         ))
 
     def _asset(ctx):

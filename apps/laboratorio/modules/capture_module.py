@@ -1,5 +1,4 @@
-"""Modulo vertical de CAPTURA: manifiesto + router de documentos."""
-
+"""Modulo vertical de CAPTURA: documentos y entradas de material."""
 from apps.laboratorio.registry.modules.module_manifest import ManifiestoModulo
 
 
@@ -7,8 +6,8 @@ def manifiesto() -> ManifiestoModulo:
     return ManifiestoModulo(
         id="capture",
         nombre="Captura",
-        version="0.1.0",
-        descripcion="Capturador de documentos: cualquier texto se convierte en proyecto",
+        version="0.2.0",
+        descripcion="Captura de documentos, texto y foto con sellado SHA-256",
     )
 
 
@@ -18,7 +17,6 @@ def routers() -> tuple:
 
 
 def conectar(app) -> None:
-    """Registra el modulo y conecta sus routers."""
     app.contenedor.obtener("registro_modulos").registrar(manifiesto())
     for router in routers():
         router.registrar_rutas(app)

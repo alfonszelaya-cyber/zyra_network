@@ -1,4 +1,4 @@
-"""Esquema oficial v1 de LABORATORIO: tablas e indices."""
+"""Esquema oficial de LABORATORIO: v1 (nucleo) + v2 (fase 2)."""
 ESQUEMA_V1 = """
 CREATE TABLE IF NOT EXISTS lab_schema_version (
     version INTEGER NOT NULL,
@@ -72,14 +72,54 @@ CREATE INDEX IF NOT EXISTS idx_history_proyecto ON lab_history(proyecto_id);
 CREATE INDEX IF NOT EXISTS idx_audit_momento ON lab_audit(momento);
 """
 
+ESQUEMA_V2 = """
+CREATE TABLE IF NOT EXISTS lab_inputs (
+    id TEXT PRIMARY KEY,
+    proyecto_id TEXT NOT NULL REFERENCES lab_projects(id) ON DELETE CASCADE,
+    tipo TEXT NOT NULL,
+    titulo TEXT NOT NULL,
+    contenido TEXT NOT NULL DEFAULT '',
+    hash TEXT NOT NULL DEFAULT '',
+    tamano INTEGER NOT NULL DEFAULT 0,
+    creado_en TEXT NOT NULL,
+    actualizado_en TEXT NOT NULL
+);
+CREATE TABLE IF NOT EXISTS lab_understandings (
+    id TEXT PRIMARY KEY,
+    entrada_id TEXT NOT NULL REFERENCES lab_inputs(id) ON DELETE CASCADE,
+    proyecto_id TEXT NOT NULL REFERENCES lab_projects(id) ON DELETE CASCADE,
+    resumen TEXT NOT NULL DEFAULT '',
+    hallazgos TEXT NOT NULL DEFAULT '[]',
+    entidades TEXT NOT NULL DEFAULT '{}',
+    dominio TEXT NOT NULL DEFAULT '',
+    confianza REAL NOT NULL DEFAULT 0.0,
+    creado_en TEXT NOT NULL,
+    actualizado_en TEXT NOT NULL
+);
+CREATE TABLE IF NOT EXISTS lab_designs (
+    id TEXT PRIMARY KEY,
+    proyecto_id TEXT NOT NULL REFERENCES lab_projects(id) ON DELETE CASCADE,
+    nombre TEXT NOT NULL,
+    tipo TEXT NOT NULL,
+    componentes TEXT NOT NULL DEFAULT '[]',
+    creado_en TEXT NOT NULL,
+    actualizado_en TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_inputs_proyecto ON lab_inputs(proyecto_id);
+CREATE INDEX IF NOT EXISTS idx_understandings_entrada ON lab_understandings(entrada_id);
+CREATE INDEX IF NOT EXISTS idx_designs_proyecto ON lab_designs(proyecto_id);
+"""
+
+MIGRACIONES_SQL = {1: ESQUEMA_V1, 2: ESQUEMA_V2}
+
 TABLAS_ESPERADAS = (
     "lab_projects", "lab_scenarios", "lab_evaluations",
     "lab_history", "lab_audit", "lab_outbox", "lab_schema_version",
+    "lab_inputs", "lab_understandings", "lab_designs",
 )
 
 
 def tablas_existentes(conexion) -> tuple:
-    """Nombres reales de tablas presentes en la base."""
     filas = conexion.consultar(
         "SELECT name FROM sqlite_master WHERE type='table' AND name LIKE 'lab_%'"
     )

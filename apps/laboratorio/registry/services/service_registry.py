@@ -5,6 +5,19 @@ import secrets
 from apps.laboratorio.application.handlers.project_handler import ManejadorProyectos
 from apps.laboratorio.application.handlers.scenario_handler import ManejadorEscenarios
 from apps.laboratorio.application.use_cases.create_project import CasoCrearProyecto
+from apps.laboratorio.application.handlers.input_handler import ManejadorCapturas
+from apps.laboratorio.application.handlers.understanding_handler import ManejadorComprension
+from apps.laboratorio.application.handlers.design_handler import ManejadorDisenos
+from apps.laboratorio.application.use_cases.capture_input import CasoCapturarEntrada
+from apps.laboratorio.application.use_cases.understand_input import CasoComprenderEntrada
+from apps.laboratorio.application.use_cases.create_blueprint import CasoCrearBlueprint
+from apps.laboratorio.infrastructure.providers.understanding_engine import MotorComprensionTextual
+from apps.laboratorio.infrastructure.persistence.input_store import InputStore
+from apps.laboratorio.infrastructure.persistence.understanding_store import UnderstandingStore
+from apps.laboratorio.infrastructure.persistence.design_store import DesignStore
+from apps.laboratorio.infrastructure.repositories.input_repository import InputRepository
+from apps.laboratorio.infrastructure.repositories.understanding_repository import UnderstandingRepository
+from apps.laboratorio.infrastructure.repositories.design_repository import DesignRepository
 from apps.laboratorio.application.handlers.document_handler import ManejadorDocumentos
 from apps.laboratorio.application.use_cases.create_project_from_document import CasoCrearProyectoDesdeDocumento
 from apps.laboratorio.application.use_cases.evaluate_scenario import CasoEvaluarEscenario
@@ -158,5 +171,18 @@ def construir_contenedor(ruta_bd: str = ":memory:") -> Contenedor:
     ))
     c.registrar("caso_crear_desde_documento", lambda _c: CasoCrearProyectoDesdeDocumento(_c.obtener("caso_crear_proyecto")))
     c.registrar("manejador_documentos", lambda _c: ManejadorDocumentos(_c.obtener("caso_crear_desde_documento"), _c.obtener("auditoria_sink")))
+    c.registrar("input_store", lambda _c: InputStore(conexion))
+    c.registrar("understanding_store", lambda _c: UnderstandingStore(conexion))
+    c.registrar("design_store", lambda _c: DesignStore(conexion))
+    c.registrar("repo_inputs", lambda _c: InputRepository(_c.obtener("input_store")))
+    c.registrar("repo_comprensiones", lambda _c: UnderstandingRepository(_c.obtener("understanding_store")))
+    c.registrar("repo_disenos", lambda _c: DesignRepository(_c.obtener("design_store")))
+    c.registrar("motor_comprension", lambda _c: MotorComprensionTextual())
+    c.registrar("caso_capturar", lambda _c: CasoCapturarEntrada(_c.obtener("repo_inputs"), _c.obtener("repo_proyectos"), _c.obtener("repo_historial"), _c.obtener("auditoria_sink")))
+    c.registrar("caso_comprender", lambda _c: CasoComprenderEntrada(_c.obtener("repo_inputs"), _c.obtener("repo_comprensiones"), _c.obtener("repo_proyectos"), _c.obtener("repo_historial"), _c.obtener("motor_comprension"), _c.obtener("auditoria_sink")))
+    c.registrar("caso_disenar", lambda _c: CasoCrearBlueprint(_c.obtener("repo_disenos"), _c.obtener("repo_proyectos"), _c.obtener("repo_historial"), _c.obtener("auditoria_sink")))
+    c.registrar("manejador_capturas", lambda _c: ManejadorCapturas(_c.obtener("caso_capturar"), _c.obtener("repo_inputs"), _c.obtener("repo_proyectos"), _c.obtener("auditoria_sink")))
+    c.registrar("manejador_comprension", lambda _c: ManejadorComprension(_c.obtener("caso_comprender"), _c.obtener("repo_inputs"), _c.obtener("repo_comprensiones"), _c.obtener("repo_proyectos"), _c.obtener("auditoria_sink")))
+    c.registrar("manejador_disenos", lambda _c: ManejadorDisenos(_c.obtener("caso_disenar"), _c.obtener("repo_disenos"), _c.obtener("repo_proyectos"), _c.obtener("auditoria_sink")))
     c.obtener("suscriptor_zyra")
     return c

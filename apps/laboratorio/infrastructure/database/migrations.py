@@ -2,13 +2,12 @@
 import sqlite3
 from datetime import datetime, timezone
 
-from apps.laboratorio.infrastructure.database.tables import ESQUEMA_V1
+from apps.laboratorio.infrastructure.database.tables import MIGRACIONES_SQL
 
-MIGRACIONES = ((1, ESQUEMA_V1),)
+MIGRACIONES = tuple(sorted(MIGRACIONES_SQL.items()))
 
 
 def version_actual(conexion) -> int:
-    """Version vigente; 0 si el esquema aun no existe."""
     try:
         fila = conexion.consultar_uno(
             "SELECT MAX(version) AS v FROM lab_schema_version"
@@ -21,7 +20,6 @@ def version_actual(conexion) -> int:
 
 
 def aplicar_migraciones(conexion) -> int:
-    """Aplica en orden las migraciones pendientes; devuelve cuantas."""
     aplicadas = 0
     for version, sql in MIGRACIONES:
         if version <= version_actual(conexion):

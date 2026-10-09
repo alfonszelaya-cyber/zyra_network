@@ -1,8 +1,6 @@
 """AGRO HTTP surface v4: role screens + JSON API
 dual mode."""
 from __future__ import annotations
-from apps.agro.routers.aid_mixin import AidMixin
-from apps.agro.routers.screens_mixin import ScreensMixin
 
 import json
 import uuid
@@ -61,7 +59,10 @@ def _page(title: str, body: str) -> str:
         "</html>"
     )
 
-class AgroApiHandler(AidMixin, ScreensMixin, BaseHTTPRequestHandler):
+
+class AgroApiHandler(
+    BaseHTTPRequestHandler
+):
     store: ClassVar[AgroStore]
     link: ClassVar[ZyraLink]
     client: ClassVar[NetworkClient]

@@ -8,6 +8,11 @@ from apps.laboratorio.application.use_cases.create_project import CasoCrearProye
 from apps.laboratorio.application.handlers.input_handler import ManejadorCapturas
 from apps.laboratorio.application.handlers.understanding_handler import ManejadorComprension
 from apps.laboratorio.application.handlers.scene_handler import ManejadorCreacion
+from apps.laboratorio.application.handlers.render_handler import ManejadorRenders
+from apps.laboratorio.application.use_cases.render_world import CasoRenderizarEscena
+from apps.laboratorio.application.workflows.photoreal_ladder import EscaleraFotoreal
+from apps.laboratorio.infrastructure.persistence.render_store import RenderStore
+from apps.laboratorio.infrastructure.repositories.render_repository import RenderRepository
 from apps.laboratorio.application.handlers.decision_handler import ManejadorDecisiones
 from apps.laboratorio.application.use_cases.decide import (
     CasoSimularEvolucion,
@@ -266,5 +271,10 @@ def construir_contenedor(ruta_bd: str = ":memory:") -> Contenedor:
     c.registrar("caso_optimizar", lambda _c: CasoOptimizarEscenario(_c.obtener("repo_optimizaciones"), _c.obtener("repo_escenarios"), _c.obtener("repo_proyectos"), _c.obtener("repo_historial"), _c.obtener("motor_optimizacion"), _c.obtener("auditoria_sink")))
     c.registrar("caso_aplicar", lambda _c: CasoAplicarOptimizacion(_c.obtener("repo_optimizaciones"), _c.obtener("repo_escenarios"), _c.obtener("repo_proyectos"), _c.obtener("repo_historial"), _c.obtener("auditoria_sink")))
     c.registrar("manejador_decisiones", lambda _c: ManejadorDecisiones(_c.obtener("caso_simular"), _c.obtener("caso_comparar"), _c.obtener("caso_optimizar"), _c.obtener("caso_aplicar"), _c.obtener("repo_simulaciones"), _c.obtener("repo_comparaciones"), _c.obtener("repo_optimizaciones"), _c.obtener("repo_proyectos"), _c.obtener("repo_escenarios"), _c.obtener("repo_evaluaciones"), _c.obtener("auditoria_sink")))
+    c.registrar("render_store", lambda _c: RenderStore(conexion))
+    c.registrar("repo_renders", lambda _c: RenderRepository(_c.obtener("render_store")))
+    c.registrar("escalera_fotoreal", lambda _c: EscaleraFotoreal())
+    c.registrar("caso_renderizar", lambda _c: CasoRenderizarEscena(_c.obtener("repo_renders"), _c.obtener("repo_escenas"), _c.obtener("repo_proyectos"), _c.obtener("repo_luces"), _c.obtener("repo_historial"), _c.obtener("escalera_fotoreal"), _c.obtener("auditoria_sink")))
+    c.registrar("manejador_renders", lambda _c: ManejadorRenders(_c.obtener("caso_renderizar"), _c.obtener("repo_renders"), _c.obtener("repo_escenas"), _c.obtener("repo_proyectos"), _c.obtener("auditoria_sink")))
     c.obtener("suscriptor_zyra")
     return c

@@ -1,4 +1,4 @@
-"""Esquema oficial de LABORATORIO: v1 a v5 (nucleo a fase 5)."""
+"""Esquema oficial de LABORATORIO: v1 a v6 (nucleo a fase 6)."""
 ESQUEMA_V1 = """
 CREATE TABLE IF NOT EXISTS lab_schema_version (
     version INTEGER NOT NULL,
@@ -226,7 +226,27 @@ CREATE INDEX IF NOT EXISTS idx_optimizations_proyecto ON lab_optimizations(proye
 CREATE INDEX IF NOT EXISTS idx_optimizations_escenario ON lab_optimizations(escenario_id);
 """
 
-MIGRACIONES_SQL = {1: ESQUEMA_V1, 2: ESQUEMA_V2, 3: ESQUEMA_V3, 4: ESQUEMA_V4, 5: ESQUEMA_V5}
+ESQUEMA_V6 = """
+CREATE TABLE IF NOT EXISTS lab_renders (
+    id TEXT PRIMARY KEY,
+    proyecto_id TEXT NOT NULL REFERENCES lab_projects(id) ON DELETE CASCADE,
+    escena_id TEXT NOT NULL REFERENCES lab_scenes(id) ON DELETE CASCADE,
+    calidad TEXT NOT NULL,
+    formato TEXT NOT NULL,
+    ancho INTEGER NOT NULL,
+    alto INTEGER NOT NULL,
+    imagen BLOB NOT NULL,
+    profundidad BLOB,
+    hash TEXT NOT NULL DEFAULT '',
+    duracion_ms REAL NOT NULL DEFAULT 0.0,
+    creado_en TEXT NOT NULL,
+    actualizado_en TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_renders_proyecto ON lab_renders(proyecto_id);
+CREATE INDEX IF NOT EXISTS idx_renders_escena ON lab_renders(escena_id);
+"""
+
+MIGRACIONES_SQL = {1: ESQUEMA_V1, 2: ESQUEMA_V2, 3: ESQUEMA_V3, 4: ESQUEMA_V4, 5: ESQUEMA_V5, 6: ESQUEMA_V6}
 
 TABLAS_ESPERADAS = (
     "lab_projects", "lab_scenarios", "lab_evaluations",
@@ -235,6 +255,7 @@ TABLAS_ESPERADAS = (
     "lab_scenes", "lab_artifacts", "lab_assets",
     "lab_timelines", "lab_lightprograms", "lab_interactions",
     "lab_simulations", "lab_comparisons", "lab_optimizations",
+    "lab_renders",
 )
 
 

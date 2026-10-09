@@ -1,8 +1,9 @@
 """Servicio de UI: construye las vistas desde las fuentes unicas.
 
-Fase 5 EN VIVO: simular (evolucion), probar, comparar y optimizar
-usan datos reales. Ley 3: maximo 3 botones de accion por vista.
-Ley 1: lo no disponible declara fase.
+Fase 6 EN VIVO: renderizar se suma con la escalera fotoreal real
+(SVG, PNG, 3D y fotorreal 4K) y el canal de profundidad. Ley 3:
+maximo 3 botones de accion por vista. Ley 1: lo no disponible
+declara fase.
 """
 import json
 from pathlib import Path
@@ -23,7 +24,8 @@ RUTA_PLANTILLAS = RAIZ_APP / "templates" / "dashboards"
 RUTA_TRADUCCIONES = RAIZ_APP / "assets" / "translations"
 
 MENUS_VIVOS = ("inicio", "simular", "capturar", "comprender", "disenar",
-               "crear", "biblioteca", "cuatro_d", "probar", "comparar", "optimizar")
+               "crear", "biblioteca", "cuatro_d", "probar", "comparar",
+               "optimizar", "renderizar")
 
 FORMATOS_GENERACION = (
     ("imagen", "Imagen"), ("pagina", "Pagina"), ("modelo", "Modelo"),
@@ -525,6 +527,37 @@ def _extra_optimizar(identidad, repos) -> str:
     })
 
 
+def _extra_renderizar(identidad, repos) -> str:
+    proyectos = repos["proyectos"].listar({"propietario_zid": identidad.zid}, 50, 0)
+    ids = [p.id for p in proyectos]
+    escenas = repos["escenas"].listar_por_proyectos(ids) if ids else []
+    resumenes = repos["renders"].listar_resumen_por_proyectos(ids) if ids else []
+    filas_r = []
+    for r in resumenes[:20]:
+        prof = "si" if r.get("con_profundidad") else "no"
+        filas_r.append(
+            "<tr><td>" + escapar(str(r["escena_id"])) + "</td>"
+            + '<td><span class="pill">' + escapar(r["calidad"]) + "</span></td>"
+            + "<td>" + str(r["ancho"]) + "x" + str(r["alto"]) + " · "
+            + str(round(float(r["duracion_ms"]), 1)) + " ms</td>"
+            + "<td>prof: " + prof + "</td>"
+            + '<td><a class="link" href="/laboratorio/api/v1/renders/' + str(r["id"])
+            + '">imagen</a>'
+            + (' <a class="link" href="/laboratorio/api/v1/renders/' + str(r["id"])
+               + '/depth.png">profundidad</a>' if r.get("con_profundidad") else "")
+            + "</td></tr>"
+        )
+    cuerpo_r = "\n".join(filas_r) or (
+        '<tr><td colspan="5" class="vacio">' + escapar(_t("ui.sin_renders")) + "</td></tr>"
+    )
+    return render(cargar_plantilla("renderizar.html"), {
+        "ayuda_renderizar": _t("ui.ayuda_renderizar"),
+        "btn_renderizar": _t("ui.btn_renderizar"),
+        "opciones_escenas": _opciones_escenas(escenas),
+        "filas_renders": cuerpo_r,
+    })
+
+
 def render_panel(identidad, menu_id: str, sub_nombre: str, repos: dict) -> str:
     if not existe_menu(menu_id):
         raise EntidadNoEncontradaError("Menu inexistente.", menu_id)
@@ -579,6 +612,8 @@ def render_panel(identidad, menu_id: str, sub_nombre: str, repos: dict) -> str:
         extra = _extra_comparar(identidad, repos)
     elif menu_id == "optimizar":
         extra = _extra_optimizar(identidad, repos)
+    elif menu_id == "renderizar":
+        extra = _extra_renderizar(identidad, repos)
     contenido = render(cargar_plantilla("panel.html"), {
         "menu_nombre": menu["nombre"],
         "sub_nombre": sub_actual["nombre"] if sub_actual else "Vista general",

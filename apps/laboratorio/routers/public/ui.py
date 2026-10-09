@@ -41,6 +41,7 @@ def registrar_rutas(app) -> None:
         "simulaciones": app.contenedor.obtener("repo_simulaciones"),
         "comparaciones": app.contenedor.obtener("repo_comparaciones"),
         "optimizaciones": app.contenedor.obtener("repo_optimizaciones"),
+        "renders": app.contenedor.obtener("repo_renders"),
     }
 
     def _home(ctx):

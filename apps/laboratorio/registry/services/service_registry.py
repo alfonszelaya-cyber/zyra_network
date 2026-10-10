@@ -9,6 +9,29 @@ from apps.laboratorio.application.handlers.input_handler import ManejadorCaptura
 from apps.laboratorio.application.handlers.understanding_handler import ManejadorComprension
 from apps.laboratorio.application.handlers.scene_handler import ManejadorCreacion
 from apps.laboratorio.application.handlers.presentation_handler import ManejadorPresentaciones
+from apps.laboratorio.application.handlers.projection_handler import ManejadorProyeccion
+from apps.laboratorio.application.handlers.display_handler import ManejadorSalidas
+from apps.laboratorio.application.handlers.scan_handler import ManejadorEscaneo
+from apps.laboratorio.application.use_cases.projection import (
+    CasoRegistrarSuperficie,
+    CasoCalibrarSuperficie,
+    CasoProyectarEnVivo,
+)
+from apps.laboratorio.application.use_cases.displays import (
+    CasoRegistrarSalida,
+    CasoProbarSalida,
+)
+from apps.laboratorio.application.use_cases.scan_photo import (
+    CasoAvatarDesdeFoto,
+    CasoEscanearFoto,
+)
+from apps.laboratorio.infrastructure.providers.calibrator_manual import CalibradorManual
+from apps.laboratorio.infrastructure.providers.scanner_photo import MotorEscaneoFoto
+from apps.laboratorio.infrastructure.providers.avatar_engine import MotorAvatar
+from apps.laboratorio.infrastructure.persistence.surface_store import SurfaceStore
+from apps.laboratorio.infrastructure.persistence.display_store import DisplayStore
+from apps.laboratorio.infrastructure.repositories.surface_repository import SurfaceRepository
+from apps.laboratorio.infrastructure.repositories.display_repository import DisplayRepository
 from apps.laboratorio.application.handlers.export_handler import ManejadorExportaciones
 from apps.laboratorio.application.use_cases.build_presentation import (
     CasoCrearPresentacion,
@@ -151,9 +174,9 @@ def _capacidades_honestas() -> DisponibilidadCapacidades:
     capacidades = DisponibilidadCapacidades()
     capacidades.declarar(Capacidad.RENDER_SVG, True)
     capacidades.declarar(Capacidad.RENDER_RASTER, False, "motor raster llega en fase 6")
-    capacidades.declarar(Capacidad.RENDER_3D, False, "motor 3D llega en fase 6")
-    capacidades.declarar(Capacidad.PROFUNDIDAD, False, "canal de profundidad llega en fase 4")
-    capacidades.declarar(Capacidad.PROYECCION_WARP, False, "pipeline de proyeccion llega en fase 8")
+    capacidades.declarar(Capacidad.RENDER_3D, True)
+    capacidades.declarar(Capacidad.PROFUNDIDAD, True)
+    capacidades.declarar(Capacidad.PROYECCION_WARP, True)
     capacidades.declarar(Capacidad.HOLO_3D, False, "hardware holografico no conectado")
     capacidades.declarar(Capacidad.LIGHT_FIELD, False, "hardware light-field no conectado")
     capacidades.declarar(Capacidad.AR_VR, False, "hardware AR/VR no conectado")
@@ -298,5 +321,22 @@ def construir_contenedor(ruta_bd: str = ":memory:") -> Contenedor:
     c.registrar("caso_exportar_bundle", lambda _c: CasoExportarBundle(_c.obtener("repo_exportaciones"), _c.obtener("repo_proyectos"), _c.obtener("repo_escenas"), _c.obtener("repo_artefactos"), _c.obtener("repo_evaluaciones"), _c.obtener("repo_presentaciones"), _c.obtener("repo_historial"), _c.obtener("outbox"), _c.obtener("cliente_zyra"), _c.obtener("auditoria_sink")))
     c.registrar("manejador_presentaciones", lambda _c: ManejadorPresentaciones(_c.obtener("caso_crear_presentacion"), _c.obtener("caso_reproducir"), _c.obtener("caso_sellar_presentacion"), _c.obtener("repo_presentaciones"), _c.obtener("repo_proyectos"), _c.obtener("auditoria_sink")))
     c.registrar("manejador_exportaciones", lambda _c: ManejadorExportaciones(_c.obtener("caso_exportar_bundle"), _c.obtener("repo_exportaciones"), _c.obtener("repo_proyectos"), _c.obtener("auditoria_sink")))
+    c.registrar("surface_store", lambda _c: SurfaceStore(conexion))
+    c.registrar("display_store", lambda _c: DisplayStore(conexion))
+    c.registrar("repo_superficies", lambda _c: SurfaceRepository(_c.obtener("surface_store")))
+    c.registrar("repo_salidas", lambda _c: DisplayRepository(_c.obtener("display_store")))
+    c.registrar("calibrador", lambda _c: CalibradorManual())
+    c.registrar("motor_scanner", lambda _c: MotorEscaneoFoto())
+    c.registrar("motor_avatar", lambda _c: MotorAvatar())
+    c.registrar("caso_registrar_superficie", lambda _c: CasoRegistrarSuperficie(_c.obtener("repo_superficies"), _c.obtener("auditoria_sink")))
+    c.registrar("caso_calibrar", lambda _c: CasoCalibrarSuperficie(_c.obtener("repo_superficies"), _c.obtener("calibrador"), _c.obtener("auditoria_sink")))
+    c.registrar("caso_proyectar", lambda _c: CasoProyectarEnVivo(_c.obtener("repo_superficies"), _c.obtener("repo_escenas"), _c.obtener("repo_proyectos"), _c.obtener("auditoria_sink")))
+    c.registrar("caso_registrar_salida", lambda _c: CasoRegistrarSalida(_c.obtener("repo_salidas"), _c.obtener("auditoria_sink")))
+    c.registrar("caso_probar_salida", lambda _c: CasoProbarSalida(_c.obtener("repo_salidas"), _c.obtener("auditoria_sink")))
+    c.registrar("caso_escanear_foto", lambda _c: CasoEscanearFoto(_c.obtener("repo_inputs"), _c.obtener("repo_proyectos"), _c.obtener("motor_scanner"), _c.obtener("auditoria_sink")))
+    c.registrar("caso_avatar_foto", lambda _c: CasoAvatarDesdeFoto(_c.obtener("repo_inputs"), _c.obtener("repo_proyectos"), _c.obtener("caso_crear_activo"), _c.obtener("motor_avatar"), _c.obtener("auditoria_sink")))
+    c.registrar("manejador_escaneo", lambda _c: ManejadorEscaneo(_c.obtener("caso_escanear_foto"), _c.obtener("caso_avatar_foto")))
+    c.registrar("manejador_proyeccion", lambda _c: ManejadorProyeccion(_c.obtener("caso_registrar_superficie"), _c.obtener("caso_calibrar"), _c.obtener("caso_proyectar"), _c.obtener("repo_superficies"), _c.obtener("auditoria_sink")))
+    c.registrar("manejador_salidas", lambda _c: ManejadorSalidas(_c.obtener("caso_registrar_salida"), _c.obtener("caso_probar_salida"), _c.obtener("repo_salidas"), _c.obtener("auditoria_sink")))
     c.obtener("suscriptor_zyra")
     return c

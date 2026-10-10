@@ -1,7 +1,7 @@
 """Encoder PNG real con stdlib (struct + zlib).
 
-Produce PNGs validos sin dependencias externas. Verificable con
-shared/utilities/image_utils (firma y dimensiones IHDR).
+Produce PNGs validos sin dependencias externas. Los mensajes de
+error incluyen el tamano real recibido para diagnostico exacto.
 """
 import struct
 import zlib
@@ -24,9 +24,15 @@ def encode_png_rgb(ancho: int, alto: int, pixeles: bytes) -> bytes:
     if ancho < 1 or alto < 1:
         raise ValueError("Dimensiones del PNG invalidas.")
     esperado = ancho * alto * 3
-    if not isinstance(pixeles, (bytes, bytearray)) or len(pixeles) != esperado:
+    if not isinstance(pixeles, (bytes, bytearray)):
         raise ValueError(
-            "El buffer RGB debe tener " + str(esperado) + " bytes."
+            "El buffer RGB debe ser bytes; recibido: " + type(pixeles).__name__
+        )
+    if len(pixeles) != esperado:
+        raise ValueError(
+            "El buffer RGB debe tener " + str(esperado)
+            + " bytes para " + str(ancho) + "x" + str(alto)
+            + "; recibido: " + str(len(pixeles))
         )
     ihdr = struct.pack(">IIBBBBB", ancho, alto, 8, 2, 0, 0, 0)
     filas = bytearray()
@@ -46,9 +52,15 @@ def encode_png_gray(ancho: int, alto: int, pixeles: bytes) -> bytes:
     if ancho < 1 or alto < 1:
         raise ValueError("Dimensiones del PNG invalidas.")
     esperado = ancho * alto
-    if not isinstance(pixeles, (bytes, bytearray)) or len(pixeles) != esperado:
+    if not isinstance(pixeles, (bytes, bytearray)):
         raise ValueError(
-            "El buffer de grises debe tener " + str(esperado) + " bytes."
+            "El buffer de grises debe ser bytes; recibido: " + type(pixeles).__name__
+        )
+    if len(pixeles) != esperado:
+        raise ValueError(
+            "El buffer de grises debe tener " + str(esperado)
+            + " bytes para " + str(ancho) + "x" + str(alto)
+            + "; recibido: " + str(len(pixeles))
         )
     ihdr = struct.pack(">IIBBBBB", ancho, alto, 8, 0, 0, 0, 0)
     filas = bytearray()

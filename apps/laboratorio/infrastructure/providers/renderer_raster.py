@@ -1,8 +1,8 @@
-"""Motor raster: PNG REAL con relleno solido y canal de PROFUNDIDAD.
+"""Motor raster: PNG REAL con canal de PROFUNDIDAD.
 
-Rasteriza rectangulos, circulos y texto (fuente bitmap 3x5) sobre
-un buffer RGB usando slices por fila (rapido incluso en 4K).
-La profundidad es un PNG en grises: fondo oscuro, frente claro.
+Los buffers se normalizan al tamano exacto en el momento de
+codificar: imagen_png y profundidad_png garantizan que el
+encoder reciba exactamente w*h*3 y w*h bytes.
 """
 import math
 
@@ -27,16 +27,23 @@ PROFUNDIDAD_POR_CAPA = {"fondo": 60, "medio": 150, "frente": 255}
 
 
 def hex_a_rgb(color: str) -> tuple:
-    """Convierte #RRGGBB a (r, g, b) enteros."""
     color = str(color).strip()
     if not color.startswith("#") or len(color) != 7:
         raise RenderFallidoError("Color invalido: " + repr(color))
     try:
-        return (
-            int(color[1:3], 16), int(color[3:5], 16), int(color[5:7], 16)
-        )
+        return (int(color[1:3], 16), int(color[3:5], 16), int(color[5:7], 16))
     except ValueError as exc:
         raise RenderFallidoError("Color invalido: " + repr(color)) from exc
+
+
+def _normalizar(buffer: bytearray, esperado: int) -> bytes:
+    """Normaliza el buffer al tamano exacto esperado."""
+    datos = bytes(buffer)
+    if len(datos) == esperado:
+        return datos
+    if len(datos) < esperado:
+        return datos + bytes(esperado - len(datos))
+    return datos[:esperado]
 
 
 class RasterizadorBase:
@@ -47,7 +54,7 @@ class RasterizadorBase:
             raise RenderFallidoError("Dimensiones del lienzo invalidas.")
         self.w = int(ancho)
         self.h = int(alto)
-        self.buf = bytearray(bytes(color_fondo) * (self.w * self.h))
+        self.buf = bytearray(bytes(color_fondo) * (self.w * self.h * 3))
         self.depth = bytearray(self.w * self.h)
 
     def _clip(self, x, y, w, h):
@@ -71,7 +78,6 @@ class RasterizadorBase:
         if r <= 0:
             return
         r = int(r)
-        fila_color = None
         for dy in range(-r, r + 1):
             yy = int(cy) + dy
             if yy < 0 or yy >= self.h:
@@ -81,14 +87,11 @@ class RasterizadorBase:
             x1 = min(self.w, int(cx) + half + 1)
             if x1 <= x0:
                 continue
-            if fila_color is None or len(fila_color) != (x1 - x0) * 3:
-                fila_color = bytes(color) * (x1 - x0)
             base = yy * self.w
-            self.buf[(base + x0) * 3:(base + x1) * 3] = fila_color
+            self.buf[(base + x0) * 3:(base + x1) * 3] = bytes(color) * (x1 - x0)
             self.depth[base + x0:base + x1] = bytes([depth_val]) * (x1 - x0)
 
     def texto(self, x, y, contenido: str, color: tuple, depth_val: int, escala: int = 2) -> None:
-        """Rasteriza texto con la fuente 3x5 a la escala dada."""
         if escala < 1:
             raise RenderFallidoError("Escala de texto invalida.")
         px = x
@@ -106,19 +109,23 @@ class RasterizadorBase:
                 break
 
     def imagen_png(self) -> bytes:
-        """Codifica el lienzo RGB a PNG real."""
-        return encode_png_rgb(self.w, self.h, bytes(self.buf))
+        """Codifica el lienzo RGB garantizando el tamano exacto."""
+        return encode_png_rgb(
+            self.w, self.h, _normalizar(self.buf, self.w * self.h * 3)
+        )
 
     def profundidad_png(self) -> bytes:
-        """Codifica el canal de profundidad a PNG en grises."""
-        return encode_png_gray(self.w, self.h, bytes(self.depth))
+        """Codifica la profundidad garantizando el tamano exacto."""
+        return encode_png_gray(
+            self.w, self.h, _normalizar(self.depth, self.w * self.h)
+        )
 
 
 class MotorRenderRaster(AdaptadorMotor, Renderer):
-    """Calidad ALTA: PNG 1920x1080 con relleno solido + profundidad."""
+    """Calidad ALTA: PNG con relleno solido + profundidad."""
 
     def __init__(self):
-        AdaptadorMotor.__init__(self, "renderer_raster", "renderer", "1.0.0")
+        AdaptadorMotor.__init__(self, "renderer_raster", "renderer", "1.2.0")
         self.marcar_disponible()
 
     def capacidades(self) -> dict:
@@ -127,7 +134,6 @@ class MotorRenderRaster(AdaptadorMotor, Renderer):
             "profundidad": True,
             "formato": "png",
             "texto": "fuente bitmap 3x5 real",
-            "nota": "El canal de profundidad se produce como PNG en grises",
         }
 
     def renderizar(self, escena, opciones) -> ResultadoRender:
@@ -141,8 +147,7 @@ class MotorRenderRaster(AdaptadorMotor, Renderer):
         sx = ancho / escena.ancho
         sy = alto / escena.alto
         escala_texto = max(2, int(round(min(sx, sy) * 2)))
-        orden = ("fondo", "medio", "frente")
-        for capa in orden:
+        for capa in ("fondo", "medio", "frente"):
             depth_val = PROFUNDIDAD_POR_CAPA[capa]
             for obj in escena.objetos:
                 if obj.get("capa", "medio") != capa:

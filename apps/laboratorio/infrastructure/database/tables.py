@@ -1,4 +1,4 @@
-"""Esquema oficial de LABORATORIO: v1 a v7 (nucleo a fase 7)."""
+"""Esquema oficial de LABORATORIO: v1 a v8."""
 ESQUEMA_V1 = """
 CREATE TABLE IF NOT EXISTS lab_schema_version (
     version INTEGER NOT NULL,
@@ -273,8 +273,32 @@ CREATE INDEX IF NOT EXISTS idx_presentations_proyecto ON lab_presentations(proye
 CREATE INDEX IF NOT EXISTS idx_exports_proyecto ON lab_exports(proyecto_id);
 """
 
+ESQUEMA_V8 = """
+CREATE TABLE IF NOT EXISTS lab_surfaces (
+    id TEXT PRIMARY KEY,
+    propietario_zid TEXT NOT NULL,
+    nombre TEXT NOT NULL,
+    tipo TEXT NOT NULL,
+    corners TEXT NOT NULL DEFAULT '[]',
+    homografia TEXT NOT NULL DEFAULT '[]',
+    calibrada INTEGER NOT NULL DEFAULT 0,
+    creado_en TEXT NOT NULL,
+    actualizado_en TEXT NOT NULL
+);
+CREATE TABLE IF NOT EXISTS lab_displays (
+    id TEXT PRIMARY KEY,
+    propietario_zid TEXT NOT NULL,
+    nombre TEXT NOT NULL,
+    kind TEXT NOT NULL,
+    creado_en TEXT NOT NULL,
+    actualizado_en TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_surfaces_propietario ON lab_surfaces(propietario_zid);
+CREATE INDEX IF NOT EXISTS idx_displays_propietario ON lab_displays(propietario_zid);
+"""
+
 MIGRACIONES_SQL = {1: ESQUEMA_V1, 2: ESQUEMA_V2, 3: ESQUEMA_V3, 4: ESQUEMA_V4,
-                   5: ESQUEMA_V5, 6: ESQUEMA_V6, 7: ESQUEMA_V7}
+                   5: ESQUEMA_V5, 6: ESQUEMA_V6, 7: ESQUEMA_V7, 8: ESQUEMA_V8}
 
 TABLAS_ESPERADAS = (
     "lab_projects", "lab_scenarios", "lab_evaluations",
@@ -284,6 +308,7 @@ TABLAS_ESPERADAS = (
     "lab_timelines", "lab_lightprograms", "lab_interactions",
     "lab_simulations", "lab_comparisons", "lab_optimizations",
     "lab_renders", "lab_presentations", "lab_exports",
+    "lab_surfaces", "lab_displays",
 )
 
 

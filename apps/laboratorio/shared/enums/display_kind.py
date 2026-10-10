@@ -4,11 +4,7 @@ from enum import Enum
 
 
 class DisplayKind(str, Enum):
-    """El mismo contenido puede salir por cualquiera de estos destinos.
-
-    La arquitectura es invertida: primero el mundo (SCENE/WORLD),
-    despues el render, y al final el destino de salida sustituible.
-    """
+    """El mismo contenido puede salir por cualquiera de estos destinos."""
 
     PANTALLA = "pantalla"
     PROYECTOR = "proyector"
@@ -17,3 +13,18 @@ class DisplayKind(str, Enum):
     AR = "ar"
     VR = "vr"
     FUTURO = "futuro"
+
+    @classmethod
+    def validar(cls, valor: str) -> "DisplayKind":
+        """Convierte y valida un texto a DisplayKind."""
+        if not isinstance(valor, str):
+            raise ValueError("El tipo de salida debe ser texto.")
+        limpio = valor.strip().lower()
+        try:
+            return cls(limpio)
+        except ValueError:
+            validos = ", ".join(t.value for t in cls)
+            raise ValueError(
+                "Tipo de salida invalido: " + repr(valor)
+                + ". Validos: " + validos
+            )

@@ -7,12 +7,12 @@ PLANTILLAS_OFICIALES = (
     "capturar.html", "comprender.html", "disenar.html",
     "creacion.html", "biblioteca.html", "cuatro_d.html",
     "simular.html", "comparar.html", "optimizar.html", "renderizar.html",
-    "presentar.html", "exportar.html",
+    "presentar.html", "exportar.html", "proyectar.html", "salidas.html",
 )
 
 
 def verificar_plantillas() -> int:
-    """Valida que las 16 plantillas existan y sean legibles."""
+    """Valida que las 18 plantillas existan y sean legibles."""
     total = 0
     for nombre in PLANTILLAS_OFICIALES:
         cargar_plantilla(nombre)

@@ -1,9 +1,4 @@
-"""Servicio de UI: construye las vistas desde las fuentes unicas.
-
-Fase 7 EN VIVO: presentar y exportar usan datos reales. Ley 3:
-maximo 3 botones de accion por vista. Ley 1: lo no disponible
-declara fase.
-"""
+"""Servicio de UI: Fase 8 EN VIVO con proyectar, salidas, escaneo y avatar."""
 import json
 from pathlib import Path
 from urllib.parse import quote
@@ -15,7 +10,9 @@ from apps.laboratorio.infrastructure.services.template_render import render
 from apps.laboratorio.permissions.roles.role_definitions import menus_de
 from apps.laboratorio.registry.menus.menu_tree import MENUS, existe as existe_menu
 from apps.laboratorio.shared.enums.creation_type import CreationType
+from apps.laboratorio.shared.enums.display_kind import DisplayKind
 from apps.laboratorio.shared.enums.input_kind import InputKind
+from apps.laboratorio.shared.enums.surface_kind import SurfaceKind
 from apps.laboratorio.shared.exceptions.domain_errors import EntidadNoEncontradaError
 
 RAIZ_APP = Path(__file__).resolve().parents[2]
@@ -24,7 +21,8 @@ RUTA_TRADUCCIONES = RAIZ_APP / "assets" / "translations"
 
 MENUS_VIVOS = ("inicio", "simular", "capturar", "comprender", "disenar",
                "crear", "biblioteca", "cuatro_d", "probar", "comparar",
-               "optimizar", "renderizar", "presentar", "exportar")
+               "optimizar", "renderizar", "presentar", "exportar",
+               "proyectar", "salidas")
 
 FORMATOS_GENERACION = (
     ("imagen", "Imagen"), ("pagina", "Pagina"), ("modelo", "Modelo"),
@@ -214,12 +212,19 @@ def _extra_capturar(identidad, repo_proyectos, repo_inputs) -> str:
     for e in entradas[:20]:
         es_media = e.tipo.value in ("foto", "escaneo")
         contenido = "[sellado " + e.hash_sha256[:12] + "]" if es_media else e.contenido[:80]
+        acciones = ""
+        if es_media:
+            acciones = (
+                '<a class="link" href="#" onclick="return false" data-scan="'
+                + escapar(str(e.id)) + '">escanear</a> '
+                '<a class="link" href="#" onclick="return false" data-avatar="'
+                + escapar(str(e.id)) + '">avatar</a>'
+            )
         filas.append(
             "<tr><td>" + escapar(e.titulo) + "</td>"
             + '<td><span class="pill">' + escapar(e.tipo.value) + "</span></td>"
             + "<td>" + escapar(contenido) + "</td>"
-            + '<td><a class="link" href="/laboratorio/api/v1/inputs/' + str(e.id)
-            + '/understand">comprender</a></td></tr>'
+            + "<td>" + acciones + "</td></tr>"
         )
     cuerpo = "\n".join(filas) or (
         '<tr><td colspan="4" class="vacio">' + escapar(_t("ui.sin_entradas")) + "</td></tr>"
@@ -624,6 +629,83 @@ def _extra_exportar(identidad, repos) -> str:
     })
 
 
+def _extra_proyectar(identidad, repos) -> str:
+    proyectos = repos["proyectos"].listar({"propietario_zid": identidad.zid}, 50, 0)
+    ids = [p.id for p in proyectos]
+    escenas = repos["escenas"].listar_por_proyectos(ids) if ids else []
+    superficies = repos["superficies"].listar_por_propietario(identidad.zid)
+    filas = []
+    for s in superficies[:20]:
+        estado = (
+            '<span class="ok">calibrada</span>' if s.calibrada
+            else '<span class="pill">sin calibrar</span>'
+        )
+        filas.append(
+            "<tr><td>" + escapar(s.nombre) + "</td>"
+            + '<td><span class="pill">' + escapar(s.tipo.value) + "</span></td>"
+            + "<td>" + estado + "</td></tr>"
+        )
+    cuerpo = "\n".join(filas) or (
+        '<tr><td colspan="3" class="vacio">' + escapar(_t("ui.sin_superficies")) + "</td></tr>"
+    )
+    opciones_tipos = "".join(
+        '<option value="' + escapar(t.value) + '">' + escapar(t.value) + "</option>"
+        for t in SurfaceKind
+    )
+    opciones_superficies = "\n".join(
+        '<option value="' + escapar(str(s.id)) + '">'
+        + escapar(s.nombre + (" (calibrada)" if s.calibrada else " (sin calibrar)"))
+        + "</option>"
+        for s in superficies if s.calibrada
+    ) or '<option value="">sin superficies calibradas</option>'
+    return render(cargar_plantilla("proyectar.html"), {
+        "ayuda_proyectar": _t("ui.ayuda_proyectar"),
+        "ayuda_calibrar": _t("ui.ayuda_calibrar"),
+        "btn_registrar": _t("ui.btn_registrar_superficie"),
+        "btn_calibrar": _t("ui.btn_calibrar"),
+        "btn_proyectar": _t("ui.btn_proyectar"),
+        "opciones_tipos": opciones_tipos,
+        "opciones_superficies": opciones_superficies,
+        "opciones_escenas": _opciones_escenas(escenas),
+        "opciones_proyectos": _opciones_proyectos(proyectos),
+        "filas": cuerpo,
+    })
+
+
+def _extra_salidas(identidad, repos) -> str:
+    salidas = repos["salidas"].listar_por_propietario(identidad.zid)
+    filas = []
+    for d in salidas[:20]:
+        estado = (
+            '<span class="ok">disponible</span>' if d.disponible
+            else '<span class="pill">no disponible</span>'
+        )
+        boton = ""
+        if d.disponible:
+            boton = ('<button class="btn btn-primary btn-gen" data-test="'
+                     + escapar(str(d.id)) + '">Probar</button>')
+        filas.append(
+            "<tr><td>" + escapar(d.nombre) + "</td>"
+            + '<td><span class="pill">' + escapar(d.kind.value) + "</span></td>"
+            + "<td>" + estado + "</td>"
+            + "<td>" + escapar(d.motivo_estado or "-") + "</td>"
+            + "<td>" + boton + "</td></tr>"
+        )
+    cuerpo = "\n".join(filas) or (
+        '<tr><td colspan="5" class="vacio">' + escapar(_t("ui.sin_salidas")) + "</td></tr>"
+    )
+    opciones_kinds = "".join(
+        '<option value="' + escapar(k.value) + '">' + escapar(k.value) + "</option>"
+        for k in DisplayKind
+    )
+    return render(cargar_plantilla("salidas.html"), {
+        "ayuda_salidas": _t("ui.ayuda_salidas"),
+        "btn_registrar_salida": _t("ui.btn_registrar_salida"),
+        "opciones_kinds": opciones_kinds,
+        "filas": cuerpo,
+    })
+
+
 def render_panel(identidad, menu_id: str, sub_nombre: str, repos: dict) -> str:
     if not existe_menu(menu_id):
         raise EntidadNoEncontradaError("Menu inexistente.", menu_id)
@@ -684,6 +766,10 @@ def render_panel(identidad, menu_id: str, sub_nombre: str, repos: dict) -> str:
         extra = _extra_presentar(identidad, repos)
     elif menu_id == "exportar":
         extra = _extra_exportar(identidad, repos)
+    elif menu_id == "proyectar":
+        extra = _extra_proyectar(identidad, repos)
+    elif menu_id == "salidas":
+        extra = _extra_salidas(identidad, repos)
     contenido = render(cargar_plantilla("panel.html"), {
         "menu_nombre": menu["nombre"],
         "sub_nombre": sub_actual["nombre"] if sub_actual else "Vista general",

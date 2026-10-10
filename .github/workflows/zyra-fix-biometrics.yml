@@ -1,133 +1,373 @@
-name: ZYRA LABORATORIO - Lote 10A (Fase 10 final - gobierno, idempotencia y cierre)
+name: ZYRA AUDITORIA - LABORATORIO (arbol completo y conexiones) [LECTURA]
 
 on:
-  push:
   workflow_dispatch:
+  push:
+    paths:
+      - "apps/laboratorio/**"
 
 permissions:
-  contents: write
+  contents: read
 
 jobs:
-  lote:
+  auditoria:
     runs-on: ubuntu-latest
     steps:
       - name: Descargar repositorio
         uses: actions/checkout@v4
-        with:
-          fetch-depth: 0
 
       - name: Configurar Python
         uses: actions/setup-python@v5
         with:
           python-version: "3.11"
 
-      - name: Instalar dependencias
-        run: |
-          python -m pip install --upgrade pip
-          if [ -f requirements.txt ]; then pip install -r requirements.txt; fi
-          pip install pytest
-
-      - name: Gate de sintaxis (ast.parse)
+      - name: Auditar arbol completo de apps/laboratorio
         run: |
           python - <<'PY'
-          import ast, pathlib, sys
-          errores = []
-          for p in pathlib.Path('.').rglob('*.py'):
-              try:
-                  ast.parse(p.read_text(encoding='utf-8'), filename=str(p))
-              except SyntaxError as e:
-                  errores.append(f"{p}:{e.lineno} {e.msg}")
-          if errores:
-              print("ERRORES DE SINTAXIS:")
-              print("\n".join(errores))
-              sys.exit(1)
-          print("OK - sintaxis limpia en todo el repositorio")
-          PY
+          import ast, json, os, re, sys
+          from pathlib import Path
+          from collections import defaultdict, Counter
 
-      - name: Ejecutar tests (resumen en Summary)
-        run: |
-          python - <<'PY'
-          import os, subprocess, sys, pathlib, time
-
-          summary = os.environ.get('GITHUB_STEP_SUMMARY')
-          carpetas = sorted(
-              {p for p in pathlib.Path('.').rglob('tests')
-               if p.is_dir() and '.git' not in p.parts and '__pycache__' not in p.parts}
-          )
-          if not carpetas:
-              print("No se encontraron carpetas tests/")
+          RAIZ = Path("apps/laboratorio")
+          if not RAIZ.is_dir():
+              print(f"ERROR: no existe {RAIZ}")
               sys.exit(1)
 
-          logs = pathlib.Path('pytest_logs')
-          logs.mkdir(exist_ok=True)
+          OUT_MD = Path("auditoria_laboratorio.md")
+          OUT_JSON = Path("auditoria_laboratorio.json")
 
-          resultados = []
-          for c in carpetas:
-              destino = logs / (str(c).replace('/', '__') + '.log')
-              t0 = time.time()
-              with open(destino, 'w') as fh:
-                  r = subprocess.run(
-                      [sys.executable, '-m', 'pytest', str(c), '-q', '--tb=long'],
-                      stdout=fh, stderr=subprocess.STDOUT
-                  )
-              dur = time.time() - t0
-              resultados.append((str(c), r.returncode, dur, destino))
+          PAT_HTTP = re.compile(r'@(\w+)\.(get|post|put|delete|patch|route)\s*\(\s*["\']([^"\']+)["\']')
+          PAT_PREFIX = re.compile(r'APIRouter\s*\([^)]*prefix\s*=\s*["\']([^"\']+)["\']')
+          PAT_ZYRA = re.compile(r'(zyra[_-]?(core|nucleo)|core_url|base_url|ZYRA_CORE)', re.I)
+          PAT_TODO = re.compile(r'\b(TODO|FIXME|XXX|HACK)\b')
+          PAT_NOIMPL = re.compile(r'(not_implemented|no implementado|no implemented)', re.I)
 
-          md = []
-          md.append("# 🧪 Resultado de tests - Lote 10A\n")
-          md.append("| Carpeta | Estado | Duracion |")
-          md.append("|---|---|---|")
-          fallos = []
-          sin_tests = []
-          for ruta, code, dur, _ in resultados:
-              if code == 0:
-                  estado = "✅ OK"
-              elif code == 5:
-                  estado = "⏭️ SIN TESTS (omitida)"
-                  sin_tests.append(ruta)
+          archivos_info = []
+          simbolos = []
+          endpoints = []
+          marcadores = []
+          configs_zyra = []
+          stubs_lista = []
+          errores_parse = []
+          imports_ext = Counter()
+          conn_shared = Counter()
+          conn_apps = Counter()
+          conn_internas = Counter()
+          duplicados = defaultdict(list)
+          tests_py = []
+          iniciales_vacios = []
+
+          def cuerpo_stub(nodo):
+              b = list(nodo.body)
+              if b and isinstance(b[0], ast.Expr) and isinstance(b[0].value, ast.Constant) and isinstance(b[0].value.value, str):
+                  b = b[1:]
+              if not b:
+                  return "declarativo"
+              if len(b) == 1 and isinstance(b[0], ast.Pass):
+                  return "vacío"
+              if len(b) == 1 and isinstance(b[0], ast.Expr) and isinstance(b[0].value, ast.Constant) and b[0].value.value is Ellipsis:
+                  return "vacío"
+              for n in ast.walk(nodo):
+                  if isinstance(n, ast.Raise):
+                      txt = ast.unparse(n) if hasattr(ast, "unparse") else "raise"
+                      if "NotImplemented" in txt:
+                          return "NotImplementedError"
+              return None
+
+          def clasificar(mod, archivo):
+              partes = mod.split(".")
+              if mod.startswith("apps.laboratorio"):
+                  conn_internas[".".join(partes[:3]) if len(partes) > 2 else mod] += 1
+              elif mod.startswith("shared_engines"):
+                  conn_shared[partes[1] if len(partes) > 1 else "(raiz)"] += 1
+              elif mod.startswith("apps."):
+                  conn_apps[partes[1] if len(partes) > 1 else "(raiz)"] += 1
               else:
-                  estado = "❌ FALLO"
-                  fallos.append(ruta)
-              md.append(f"| `{ruta}` | {estado} | {dur:.1f}s |")
+                  imports_ext[partes[0] if partes else mod] += 1
 
-          if sin_tests:
-              md.append(f"\n## ⏭️ Carpetas sin tests de pytest ({len(sin_tests)})\n")
-              for s in sin_tests:
-                  md.append(f"- `{s}` (no contiene tests — no es fallo)")
-              md.append("")
+          py_files = sorted(RAIZ.rglob("*.py"))
+          todos_archivos = sorted(p for p in RAIZ.rglob("*") if p.is_file())
 
-          if fallos:
-              md.append(f"\n## 🔴 Detalle de fallos ({len(fallos)})\n")
-              for ruta in fallos:
-                  destino = logs / (ruta.replace('/', '__') + '.log')
-                  completo = destino.read_text(errors='replace')
-                  md.append(f"\n### ❌ {ruta}\n")
-                  md.append("<details open><summary>Log completo</summary>\n")
-                  md.append("```")
-                  md.append(completo if completo.strip() else "(log vacio — posible crash sin salida)")
-                  md.append("```")
-                  md.append("</details>\n")
+          for p in todos_archivos:
+              try:
+                  contenido = p.read_text(encoding="utf-8", errors="replace")
+              except Exception:
+                  contenido = ""
+              lineas = contenido.count("\n") + (1 if contenido and not contenido.endswith("\n") else 0)
+              archivos_info.append({
+                  "ruta": str(p), "bytes": p.stat().st_size, "lineas": lineas,
+                  "ext": p.suffix or "(sin ext)", "vacío": p.stat().st_size <= 1
+              })
+
+          carpetas_todas = sorted(p for p in RAIZ.rglob("*") if p.is_dir())
+          carpetas_vacias = [c for c in carpetas_todas if not any(c.rglob("*"))]
+
+          for p in py_files:
+              fuente = p.read_text(encoding="utf-8", errors="replace")
+              paq = str(p.parent)
+              if p.name.startswith("test_") and ("test" in paq or "tests" in paq):
+                  tests_py.append(str(p))
+              if p.stat().st_size <= 1:
+                  iniciales_vacios.append(str(p))
+              try:
+                  arbol = ast.parse(fuente)
+              except SyntaxError as e:
+                  errores_parse.append(f"{p}:{e.lineno} {e.msg}")
+                  continue
+              for nodo in arbol.body:
+                  if isinstance(nodo, ast.ClassDef):
+                      st = cuerpo_stub(nodo)
+                      simbolos.append({"tipo": "clase", "nombre": nodo.name, "archivo": str(p), "linea": nodo.lineno, "stub": st})
+                      if st: stubs_lista.append(f"{p}:{nodo.lineno} clase {nodo.name} [{st}]")
+                  elif isinstance(nodo, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                      st = cuerpo_stub(nodo)
+                      simbolos.append({"tipo": "funcion", "nombre": nodo.name, "archivo": str(p), "linea": nodo.lineno, "stub": st})
+                      if st: stubs_lista.append(f"{p}:{nodo.lineno} funcion {nodo.name} [{st}]")
+              for nodo in ast.walk(arbol):
+                  if isinstance(nodo, ast.Import):
+                      for a in nodo.names:
+                          clasificar(a.name, str(p))
+                  elif isinstance(nodo, ast.ImportFrom):
+                      mod = nodo.module or ""
+                      if nodo.level > 0:
+                          conn_internas[paq] += 1
+                      else:
+                          clasificar(mod, str(p))
+              for i, linea in enumerate(fuente.splitlines(), 1):
+                  m = PAT_HTTP.search(linea)
+                  if m:
+                      endpoints.append(f"{p}:{i} {m.group(2).upper()} {m.group(3)} (via {m.group(1)})")
+                  if PAT_TODO.search(linea) or PAT_NOIMPL.search(linea):
+                      marcadores.append(f"{p}:{i} {linea.strip()[:130]}")
+                  if PAT_ZYRA.search(linea):
+                      configs_zyra.append(f"{p}:{i} {linea.strip()[:130]}")
+
+          for s in simbolos:
+              if not s["stub"]:
+                  duplicados[(s["archivo"].rsplit("/", 1)[0], s["tipo"], s["nombre"])].append(s["archivo"] + ":" + str(s["linea"]))
+          dup_reales = {k: v for k, v in duplicados.items() if len(v) > 1}
+
+          motores = [a for a in archivos_info if "engine" in a["ruta"].lower() and a["ext"] == ".py"]
+
+          submods = sorted({p.relative_to(RAIZ).parts[0] for p in RAIZ.rglob("*.py")})
+          salud = []
+          for sm in submods:
+              sub = [a for a in archivos_info if a["ruta"].startswith(str(RAIZ / sm))]
+              py_sub = [a for a in sub if a["ext"] == ".py"]
+              salud.append({
+                  "modulo": sm, "archivos": len(sub), "py": len(py_sub),
+                  "lineas": sum(a["lineas"] for a in py_sub),
+                  "vacios": sum(1 for a in sub if a["vacío"]),
+                  "stubs": sum(1 for s in stubs_lista if s.startswith(str(RAIZ / sm))),
+                  "todos": sum(1 for m in marcadores if m.startswith(str(RAIZ / sm))),
+                  "endpoints": sum(1 for e in endpoints if e.startswith(str(RAIZ / sm))),
+              })
+
+          def arbol_md():
+              lineas = ["```"]
+              def rec(d, prefijo=""):
+                  entradas = sorted(d.iterdir(), key=lambda x: (x.is_file(), x.name.lower()))
+                  for idx, e in enumerate(entradas):
+                      ultimo = idx == len(entradas) - 1
+                      conector = "└─ " if ultimo else "├─ "
+                      if e.is_dir():
+                          n_arch = sum(1 for _ in e.rglob("*") if _.is_file())
+                          vacia = " [VACÍA]" if n_arch == 0 else ""
+                          lineas.append(prefijo + conector + e.name + "/" + f" ({n_arch} archivos){vacia}")
+                          rec(e, prefijo + ("   " if ultimo else "│  "))
+                      else:
+                          marca = " [VACÍO]" if e.stat().st_size <= 1 else ""
+                          extra = ""
+                          if e.suffix == ".py":
+                              try:
+                                  extra = f" [{e.read_text(errors='replace').count(chr(10))+1} líneas]"
+                              except Exception:
+                                  pass
+                          lineas.append(prefijo + conector + e.name + marca + extra)
+              lineas.append("apps/laboratorio/")
+              rec(RAIZ)
+              lineas.append("```")
+              return "\n".join(lineas)
+
+          L = []
+          L.append("# 🔬 AUDITORÍA COMPLETA — apps/laboratorio\n")
+          L.append("**Modo: LECTURA PURA — nada fue modificado.**\n")
+          total_lineas = sum(a["lineas"] for a in archivos_info if a["ext"] == ".py")
+          L.append("## 1. Panorama general\n")
+          L.append("| Métrica | Valor |")
+          L.append("|---|---|")
+          L.append(f"| Carpetas totales | {len(carpetas_todas)+1} |")
+          L.append(f"| Carpetas VACÍAS (regla 68) | {len(carpetas_vacias)} |")
+          L.append(f"| Archivos totales | {len(archivos_info)} |")
+          L.append(f"| Archivos .py | {len(py_files)} |")
+          L.append(f"| Líneas de Python | {total_lineas} |")
+          L.append(f"| Archivos VACÍOS (≤1 byte) | {len(iniciales_vacios)} |")
+          L.append(f"| Clases+funciones | {len(simbolos)} |")
+          L.append(f"| Stubs (vacíos/NotImplemented) | {len(stubs_lista)} |")
+          L.append(f"| Endpoints HTTP | {len(endpoints)} |")
+          L.append(f"| Motores (archivos *engine*) | {len(motores)} |")
+          L.append(f"| Tests propios (test_*.py) | {len(tests_py)} |")
+          L.append(f"| Errores de sintaxis | {len(errores_parse)} |\n")
+
+          L.append("## 2. Árbol completo con estado\n")
+          L.append(arbol_md() + "\n")
+
+          L.append("## 3. Carpetas VACÍAS (llenado futuro — regla 68)\n")
+          if carpetas_vacias:
+              for c in carpetas_vacias:
+                  L.append(f"- `{c}`")
           else:
-              md.append("\n## ✅ TODOS LOS TESTS EN VERDE\n")
+              L.append("(ninguna)")
+          L.append("")
 
+          L.append("## 4. Archivos VACÍOS o de 1 byte\n")
+          if iniciales_vacios:
+              for f in iniciales_vacios:
+                  L.append(f"- `{f}`")
+          else:
+              L.append("(ninguno)")
+          L.append("")
+
+          L.append("## 5. Inventario Python — clases y funciones por módulo\n")
+          por_arch = defaultdict(list)
+          for s in simbolos:
+              por_arch[s["archivo"]].append(s)
+          for arch in sorted(por_arch):
+              ss = por_arch[arch]
+              clases = [x for x in ss if x["tipo"] == "clase"]
+              funcs = [x for x in ss if x["tipo"] == "funcion"]
+              L.append(f"### `{arch}`\n")
+              L.append(f"- Clases: {len(clases)} · Funciones: {len(funcs)} · Stubs: {sum(1 for x in ss if x['stub'])}")
+              for c in clases:
+                  marca = f" ⚠️[{c['stub']}]" if c["stub"] else ""
+                  L.append(f"  - clase `{c['nombre']}` (L{c['linea']}){marca}")
+              for f in funcs:
+                  marca = f" ⚠️[{f['stub']}]" if f["stub"] else ""
+                  L.append(f"  - func `{f['nombre']}` (L{f['linea']}){marca}")
+              L.append("")
+
+          L.append("## 6. Motores detectados (archivos *engine*)\n")
+          if motores:
+              L.append("| Motor | Líneas | Estado |")
+              L.append("|---|---|---|")
+              for m in motores:
+                  estado = "🔴 vacío" if m["vacío"] else ("⚠️ pequeño (<100 líneas)" if m["lineas"] < 100 else "✅ con cuerpo")
+                  L.append(f"| `{m['ruta']}` | {m['lineas']} | {estado} |")
+          else:
+              L.append("(ninguno)")
+          L.append("")
+
+          L.append("## 7. Endpoints HTTP detectados\n")
+          if endpoints:
+              for e in endpoints:
+                  L.append(f"- {e}")
+          else:
+              L.append("(ninguno)")
+          L.append("")
+
+          L.append("## 8. Mapa de conexiones\n")
+          L.append("### Internas (dentro de apps/laboratorio)\n")
+          for k, v in conn_internas.most_common():
+              L.append(f"- `{k}` ← {v} imports")
+          L.append("\n### shared_engines (motores compartidos que consume)\n")
+          if conn_shared:
+              for k, v in conn_shared.most_common():
+                  L.append(f"- shared_engines.`{k}` ← {v} imports")
+          else:
+              L.append("- **NINGUNA — laboratorio aislado de la Red**")
+          L.append("\n### Otras apps\n")
+          if conn_apps:
+              for k, v in conn_apps.most_common():
+                  L.append(f"- apps.`{k}` ← {v} imports")
+          else:
+              L.append("- ninguna")
+          L.append("\n### Librerías externas principales\n")
+          for k, v in imports_ext.most_common(25):
+              L.append(f"- {k} ({v})")
+          L.append("")
+
+          L.append("## 9. Integración ZYRA Core — estado\n")
+          if configs_zyra:
+              for c in configs_zyra:
+                  L.append(f"- `{c}`")
+          else:
+              L.append("**SIN REFERENCIAS — la integración con el núcleo no existe en el código**")
+          L.append("")
+
+          L.append("## 10. Marcadores pendientes (TODO/FIXME/no implementado)\n")
+          if marcadores:
+              for m in marcadores:
+                  L.append(f"- `{m}`")
+          else:
+              L.append("(ninguno)")
+          L.append("")
+
+          L.append("## 11. Duplicados (mismo nombre en el mismo paquete)\n")
+          if dup_reales:
+              for (paq, tipo, nombre), sitios in sorted(dup_reales.items()):
+                  L.append(f"- {tipo} `{nombre}` en `{paq}` → {' , '.join(sitios)}")
+          else:
+              L.append("(ninguno)")
+          L.append("")
+
+          L.append("## 12. Stubs (cuerpos vacíos / NotImplementedError)\n")
+          if stubs_lista:
+              for s in stubs_lista:
+                  L.append(f"- `{s}`")
+          else:
+              L.append("(ninguno)")
+          L.append("")
+
+          L.append("## 13. Tests propios de LABORATORIO\n")
+          if tests_py:
+              for t in tests_py:
+                  L.append(f"- `{t}`")
+          else:
+              L.append("**NINGUNO — sin cobertura de pruebas propia**")
+          L.append("")
+
+          L.append("## 14. Salud por submódulo\n")
+          L.append("| Submódulo | Archivos | .py | Líneas | Vacíos | Stubs | TODOs | Endpoints |")
+          L.append("|---|---|---|---|---|---|---|---|")
+          for s in salud:
+              L.append(f"| {s['modulo']} | {s['archivos']} | {s['py']} | {s['lineas']} | {s['vacios']} | {s['stubs']} | {s['todos']} | {s['endpoints']} |")
+          L.append("")
+
+          if errores_parse:
+              L.append("## 15. ERRORES DE SINTAXIS\n")
+              for e in errores_parse:
+                  L.append(f"- {e}")
+              L.append("")
+
+          md = "\n".join(L)
+          OUT_MD.write_text(md, encoding="utf-8")
+          OUT_JSON.write_text(json.dumps({
+              "archivos": archivos_info, "simbolos": simbolos, "endpoints": endpoints,
+              "marcadores": marcadores, "configs_zyra": configs_zyra, "stubs": stubs_lista,
+              "carpetas_vacias": [str(c) for c in carpetas_vacias],
+              "archivos_vacios": iniciales_vacios, "motores": motores,
+              "conn_shared": dict(conn_shared), "conn_apps": dict(conn_apps),
+              "conn_internas": dict(conn_internas), "imports_ext": dict(imports_ext),
+              "duplicados": {f"{k[0]}|{k[1]}|{k[2]}": v for k, v in dup_reales.items()},
+              "tests": tests_py, "salud": salud, "errores_parse": errores_parse,
+          }, indent=2, ensure_ascii=False), encoding="utf-8")
+
+          summary = os.environ.get("GITHUB_STEP_SUMMARY")
           if summary:
-              with open(summary, 'a') as fh:
-                  fh.write("\n".join(md) + "\n")
+              salida = md
+              if len(salida) > 900000:
+                  salida = salida[:900000] + "\n\n**(RECORTE por límite — reporte COMPLETO en el artefacto descargable)**\n"
+              with open(summary, "a") as fh:
+                  fh.write(salida)
 
-          print("\n".join(md))
-          if fallos:
-              sys.exit(1)
+          print(f"Reporte generado: {OUT_MD} ({len(md)} chars) + {OUT_JSON}")
+          print(f"Carpetas vacías: {len(carpetas_vacias)} | Stubs: {len(stubs_lista)} | Endpoints: {len(endpoints)} | Tests: {len(tests_py)}")
           PY
 
-      - name: Commit y push solo si esta verde
-        run: |
-          rm -rf pytest_logs
-          git config user.name "zyra-bot"
-          git config user.email "zyra-bot@users.noreply.github.com"
-          git add -A
-          if git diff --cached --quiet; then
-            echo "Sin cambios que commitear"
-          else
-            git commit -m "Lote 10A - fase 10 final - gobierno idempotencia y cierre (verde)"
-            git push
-          fi
+      - name: Publicar reporte como artefacto
+        uses: actions/upload-artifact@v4
+        with:
+          name: auditoria-laboratorio
+          path: |
+            auditoria_laboratorio.md
+            auditoria_laboratorio.json

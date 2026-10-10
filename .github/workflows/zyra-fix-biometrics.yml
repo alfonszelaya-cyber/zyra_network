@@ -1,10 +1,11 @@
-name: ZYRA AUDITORIA - LABORATORIO (arbol completo y conexiones) [LECTURA]
+name: ZYRA AUDITORIA - REPO COMPLETO (funciona, no funciona, duplicados, borrables) [LECTURA]
 
 on:
   workflow_dispatch:
   push:
     paths:
-      - "apps/laboratorio/**"
+      - "apps/**"
+      - "shared_engines/**"
 
 permissions:
   contents: read
@@ -15,359 +16,405 @@ jobs:
     steps:
       - name: Descargar repositorio
         uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
 
       - name: Configurar Python
         uses: actions/setup-python@v5
         with:
           python-version: "3.11"
 
-      - name: Auditar arbol completo de apps/laboratorio
+      - name: Auditoria total del repositorio
         run: |
           python - <<'PY'
-          import ast, json, os, re, sys
+          import ast, hashlib, json, os, re, subprocess, sys, time
           from pathlib import Path
           from collections import defaultdict, Counter
 
-          RAIZ = Path("apps/laboratorio")
-          if not RAIZ.is_dir():
-              print(f"ERROR: no existe {RAIZ}")
-              sys.exit(1)
+          RAIZ = Path(".")
+          EXCL_PARTS = {".git", "__pycache__"}
+          summary = os.environ.get("GITHUB_STEP_SUMMARY")
 
-          OUT_MD = Path("auditoria_laboratorio.md")
-          OUT_JSON = Path("auditoria_laboratorio.json")
+          # ---------- FASE 0: censo de archivos ----------
+          todos = [p for p in RAIZ.rglob("*")
+                   if p.is_file() and not (EXCL_PARTS & set(p.parts))]
+          py_files = [p for p in todos if p.suffix == ".py"]
+          pyc_files = [p for p in todos if p.suffix == ".pyc"]
+          pycache_dirs = [p for p in RAIZ.rglob("*") if p.is_dir() and p.name == "__pycache__"]
+          vacios = [p for p in todos if p.stat().st_size <= 1]
+          vacios_py = [p for p in vacios if p.suffix == ".py"]
+          inits_vacios = [p for p in vacios_py if p.name == "__init__.py"]
+          noinit_vacios = [p for p in vacios_py if p.name != "__init__.py"]
+          carpetas = [p for p in RAIZ.rglob("*") if p.is_dir() and ".git" not in p.parts]
+          carpetas_vacias = [c for c in carpetas
+                             if not any(f.is_file() for f in c.rglob("*"))
+                             and c.name != "__pycache__"]
 
-          PAT_HTTP = re.compile(r'@(\w+)\.(get|post|put|delete|patch|route)\s*\(\s*["\']([^"\']+)["\']')
-          PAT_PREFIX = re.compile(r'APIRouter\s*\([^)]*prefix\s*=\s*["\']([^"\']+)["\']')
-          PAT_ZYRA = re.compile(r'(zyra[_-]?(core|nucleo)|core_url|base_url|ZYRA_CORE)', re.I)
-          PAT_TODO = re.compile(r'\b(TODO|FIXME|XXX|HACK)\b')
-          PAT_NOIMPL = re.compile(r'(not_implemented|no implementado|no implemented)', re.I)
+          por_top = Counter()
+          bytes_top = Counter()
+          for p in todos:
+              top = p.parts[0] if len(p.parts) > 1 else "(raiz)"
+              por_top[top] += 1
+              try: bytes_top[top] += p.stat().st_size
+              except Exception: pass
 
-          archivos_info = []
-          simbolos = []
-          endpoints = []
-          marcadores = []
-          configs_zyra = []
-          stubs_lista = []
-          errores_parse = []
-          imports_ext = Counter()
-          conn_shared = Counter()
-          conn_apps = Counter()
-          conn_internas = Counter()
-          duplicados = defaultdict(list)
-          tests_py = []
-          iniciales_vacios = []
-
-          def cuerpo_stub(nodo):
-              b = list(nodo.body)
-              if b and isinstance(b[0], ast.Expr) and isinstance(b[0].value, ast.Constant) and isinstance(b[0].value.value, str):
-                  b = b[1:]
-              if not b:
-                  return "declarativo"
-              if len(b) == 1 and isinstance(b[0], ast.Pass):
-                  return "vacío"
-              if len(b) == 1 and isinstance(b[0], ast.Expr) and isinstance(b[0].value, ast.Constant) and b[0].value.value is Ellipsis:
-                  return "vacío"
-              for n in ast.walk(nodo):
-                  if isinstance(n, ast.Raise):
-                      txt = ast.unparse(n) if hasattr(ast, "unparse") else "raise"
-                      if "NotImplemented" in txt:
-                          return "NotImplementedError"
-              return None
-
-          def clasificar(mod, archivo):
-              partes = mod.split(".")
-              if mod.startswith("apps.laboratorio"):
-                  conn_internas[".".join(partes[:3]) if len(partes) > 2 else mod] += 1
-              elif mod.startswith("shared_engines"):
-                  conn_shared[partes[1] if len(partes) > 1 else "(raiz)"] += 1
-              elif mod.startswith("apps."):
-                  conn_apps[partes[1] if len(partes) > 1 else "(raiz)"] += 1
-              else:
-                  imports_ext[partes[0] if partes else mod] += 1
-
-          py_files = sorted(RAIZ.rglob("*.py"))
-          todos_archivos = sorted(p for p in RAIZ.rglob("*") if p.is_file())
-
-          for p in todos_archivos:
-              try:
-                  contenido = p.read_text(encoding="utf-8", errors="replace")
-              except Exception:
-                  contenido = ""
-              lineas = contenido.count("\n") + (1 if contenido and not contenido.endswith("\n") else 0)
-              archivos_info.append({
-                  "ruta": str(p), "bytes": p.stat().st_size, "lineas": lineas,
-                  "ext": p.suffix or "(sin ext)", "vacío": p.stat().st_size <= 1
-              })
-
-          carpetas_todas = sorted(p for p in RAIZ.rglob("*") if p.is_dir())
-          carpetas_vacias = [c for c in carpetas_todas if not any(c.rglob("*"))]
-
+          # ---------- FASE 1: sintaxis ----------
+          errores_sintaxis = []
+          fuentes = {}
           for p in py_files:
-              fuente = p.read_text(encoding="utf-8", errors="replace")
-              paq = str(p.parent)
-              if p.name.startswith("test_") and ("test" in paq or "tests" in paq):
-                  tests_py.append(str(p))
-              if p.stat().st_size <= 1:
-                  iniciales_vacios.append(str(p))
               try:
-                  arbol = ast.parse(fuente)
-              except SyntaxError as e:
-                  errores_parse.append(f"{p}:{e.lineno} {e.msg}")
+                  t = p.read_text(encoding="utf-8", errors="replace")
+              except Exception as e:
+                  errores_sintaxis.append(f"{p}: lectura {e}")
                   continue
-              for nodo in arbol.body:
-                  if isinstance(nodo, ast.ClassDef):
-                      st = cuerpo_stub(nodo)
-                      simbolos.append({"tipo": "clase", "nombre": nodo.name, "archivo": str(p), "linea": nodo.lineno, "stub": st})
-                      if st: stubs_lista.append(f"{p}:{nodo.lineno} clase {nodo.name} [{st}]")
-                  elif isinstance(nodo, (ast.FunctionDef, ast.AsyncFunctionDef)):
-                      st = cuerpo_stub(nodo)
-                      simbolos.append({"tipo": "funcion", "nombre": nodo.name, "archivo": str(p), "linea": nodo.lineno, "stub": st})
-                      if st: stubs_lista.append(f"{p}:{nodo.lineno} funcion {nodo.name} [{st}]")
+              fuentes[str(p)] = t
+              try:
+                  ast.parse(t)
+              except SyntaxError as e:
+                  errores_sintaxis.append(f"{p}:{e.lineno} {e.msg}")
+
+          # ---------- FASE 2: mapa de modulos + imports rotos ----------
+          mod_paths = set()
+          for p in py_files:
+              rel = p.relative_to(RAIZ).with_suffix("")
+              partes = list(rel.parts)
+              if partes[-1] == "__init__":
+                  partes = partes[:-1]
+              if partes:
+                  mod_paths.add(".".join(partes))
+          top_names = {m.split(".")[0] for m in mod_paths}
+          stdlib = set(getattr(sys, "stdlib_module_names", set()))
+          installed_cache = {}
+          def top_existe(name):
+              if name in top_names or name in stdlib:
+                  return True
+              if name not in installed_cache:
+                  try:
+                      installed_cache[name] = __import__("importlib.util", fromlist=["x"]).find_spec(name) is not None
+                  except Exception:
+                      installed_cache[name] = True  # no bloquear por duda
+              return installed_cache[name]
+
+          imports_rotos = []
+          for ruta, t in fuentes.items():
+              p = Path(ruta)
+              try:
+                  arbol = ast.parse(t)
+              except SyntaxError:
+                  continue
+              paq_dir = p.parent
               for nodo in ast.walk(arbol):
                   if isinstance(nodo, ast.Import):
                       for a in nodo.names:
-                          clasificar(a.name, str(p))
+                          top = a.name.split(".")[0]
+                          if top not in top_names and not top_existe(top):
+                              imports_rotos.append(f"{ruta}: import {a.name} (modulo inexistente)")
                   elif isinstance(nodo, ast.ImportFrom):
-                      mod = nodo.module or ""
                       if nodo.level > 0:
-                          conn_internas[paq] += 1
+                          base = paq_dir
+                          for _ in range(nodo.level - 1):
+                              base = base.parent
+                          obj = base / (nodo.module.replace(".", "/") if nodo.module else "")
+                          ok = (obj.with_suffix(".py").is_file() or (obj / "__init__.py").is_file()
+                                or obj.is_dir() or (nodo.module is None))
+                          if not ok:
+                              imports_rotos.append(f"{ruta}: from {'.'*nodo.level}{nodo.module or ''} (ruta inexistente)")
                       else:
-                          clasificar(mod, str(p))
-              for i, linea in enumerate(fuente.splitlines(), 1):
-                  m = PAT_HTTP.search(linea)
-                  if m:
-                      endpoints.append(f"{p}:{i} {m.group(2).upper()} {m.group(3)} (via {m.group(1)})")
-                  if PAT_TODO.search(linea) or PAT_NOIMPL.search(linea):
-                      marcadores.append(f"{p}:{i} {linea.strip()[:130]}")
-                  if PAT_ZYRA.search(linea):
-                      configs_zyra.append(f"{p}:{i} {linea.strip()[:130]}")
+                          top = (nodo.module or "").split(".")[0]
+                          if nodo.module and top not in top_names and not top_existe(top):
+                              imports_rotos.append(f"{ruta}: from {nodo.module} (modulo inexistente)")
+          imports_rotos = sorted(set(imports_rotos))
 
-          for s in simbolos:
-              if not s["stub"]:
-                  duplicados[(s["archivo"].rsplit("/", 1)[0], s["tipo"], s["nombre"])].append(s["archivo"] + ":" + str(s["linea"]))
-          dup_reales = {k: v for k, v in duplicados.items() if len(v) > 1}
-
-          motores = [a for a in archivos_info if "engine" in a["ruta"].lower() and a["ext"] == ".py"]
-
-          submods = sorted({p.relative_to(RAIZ).parts[0] for p in RAIZ.rglob("*.py")})
-          salud = []
-          for sm in submods:
-              sub = [a for a in archivos_info if a["ruta"].startswith(str(RAIZ / sm))]
-              py_sub = [a for a in sub if a["ext"] == ".py"]
-              salud.append({
-                  "modulo": sm, "archivos": len(sub), "py": len(py_sub),
-                  "lineas": sum(a["lineas"] for a in py_sub),
-                  "vacios": sum(1 for a in sub if a["vacío"]),
-                  "stubs": sum(1 for s in stubs_lista if s.startswith(str(RAIZ / sm))),
-                  "todos": sum(1 for m in marcadores if m.startswith(str(RAIZ / sm))),
-                  "endpoints": sum(1 for e in endpoints if e.startswith(str(RAIZ / sm))),
+          # ---------- FASE 3: pruebas completas con conteos ----------
+          carpetas_tests = sorted({p.parent for p in py_files if p.parent.name == "tests"})
+          resultados_tests = []
+          for c in carpetas_tests:
+              t0 = time.time()
+              try:
+                  r = subprocess.run([sys.executable, "-m", "pytest", str(c), "-q", "--tb=short"],
+                                     capture_output=True, text=True, timeout=900)
+                  salida = (r.stdout or "") + (r.stderr or "")
+                  code = r.returncode
+              except subprocess.TimeoutExpired:
+                  salida, code = "TIMEOUT 900s", -1
+              dur = time.time() - t0
+              lineas = salida.splitlines()
+              conteo = ""
+              for l in reversed(lineas):
+                  if "passed" in l or "failed" in l or "error" in l or "no tests ran" in l:
+                      conteo = l.strip(); break
+              resultados_tests.append({
+                  "carpeta": str(c), "code": code, "duracion": round(dur, 1),
+                  "conteo": conteo, "cola": "\n".join(lineas[-40:]),
+                  "fallos": [l for l in lineas if l.startswith("FAILED") or l.startswith("ERROR")][:50],
               })
 
-          def arbol_md():
-              lineas = ["```"]
-              def rec(d, prefijo=""):
-                  entradas = sorted(d.iterdir(), key=lambda x: (x.is_file(), x.name.lower()))
-                  for idx, e in enumerate(entradas):
-                      ultimo = idx == len(entradas) - 1
-                      conector = "└─ " if ultimo else "├─ "
-                      if e.is_dir():
-                          n_arch = sum(1 for _ in e.rglob("*") if _.is_file())
-                          vacia = " [VACÍA]" if n_arch == 0 else ""
-                          lineas.append(prefijo + conector + e.name + "/" + f" ({n_arch} archivos){vacia}")
-                          rec(e, prefijo + ("   " if ultimo else "│  "))
-                      else:
-                          marca = " [VACÍO]" if e.stat().st_size <= 1 else ""
-                          extra = ""
-                          if e.suffix == ".py":
-                              try:
-                                  extra = f" [{e.read_text(errors='replace').count(chr(10))+1} líneas]"
-                              except Exception:
-                                  pass
-                          lineas.append(prefijo + conector + e.name + marca + extra)
-              lineas.append("apps/laboratorio/")
-              rec(RAIZ)
-              lineas.append("```")
-              return "\n".join(lineas)
+          # ---------- FASE 4: duplicados ----------
+          pat_ruta = re.compile(r'@\s*\w+\.(get|post|put|delete|patch|websocket)\s*\(\s*["\']([^"\']+)["\']')
+          rutas = defaultdict(list)
+          for ruta, t in fuentes.items():
+              for i, l in enumerate(t.splitlines(), 1):
+                  m = pat_ruta.search(l)
+                  if m:
+                      rutas[(m.group(1).upper(), m.group(2))].append(f"{ruta}:{i}")
+          rutas_dup = {k: v for k, v in rutas.items() if len(v) > 1}
 
+          sim_dup = defaultdict(list)
+          for ruta, t in fuentes.items():
+              try:
+                  arbol = ast.parse(t)
+              except SyntaxError:
+                  continue
+              paq = str(p.parent)
+              for nodo in arbol.body:
+                  if isinstance(nodo, (ast.ClassDef, ast.FunctionDef, ast.AsyncFunctionDef)):
+                      sim_dup[(paq, type(nodo).__name__, nodo.name)].append(f"{ruta}:{nodo.lineno}")
+          sim_dup = {k: v for k, v in sim_dup.items() if len(v) > 1}
+
+          hash_groups = defaultdict(list)
+          for p in py_files:
+              if p.stat().st_size <= 1:
+                  continue
+              try:
+                  h = hashlib.sha256(p.read_bytes()).hexdigest()
+                  hash_groups[h].append(str(p))
+              except Exception:
+                  pass
+          archivos_identicos = [v for v in hash_groups.values() if len(v) > 1]
+
+          # ---------- FASE 5: shims y market_service ----------
+          shims = []
+          for p in py_files:
+              t = fuentes.get(str(p), "")
+              if not t or len(t.splitlines()) > 40:
+                  continue
+              try:
+                  arbol = ast.parse(t)
+              except SyntaxError:
+                  continue
+              cuerpo = [n for n in arbol.body
+                        if not (isinstance(n, ast.Expr) and isinstance(n.value, ast.Constant))]
+              if cuerpo and all(isinstance(n, (ast.Import, ast.ImportFrom)) or
+                                (isinstance(n, ast.Assign) and any(getattr(d, "id", "") == "__all__" for d in n.targets))
+                                for n in cuerpo):
+                  objetivos = []
+                  for n in arbol.body:
+                      if isinstance(n, ast.ImportFrom) and n.module:
+                          objetivos.append(n.module)
+                  shims.append({"archivo": str(p), "lineas": len(t.splitlines()), "objetivos": objetivos,
+                                "objetivo_existe": all(o in mod_paths or o.split(".")[0] in stdlib or top_existe(o.split(".")[0]) for o in objetivos)})
+
+          market = Path("apps/agro/services/market_service.py")
+          market_estado = {
+              "existe": market.is_file(),
+              "bytes": market.stat().st_size if market.is_file() else 0,
+              "lineas": len(fuentes.get(str(market), "").splitlines()) if str(market) in fuentes else 0,
+          }
+          refs_market = []
+          patron_market = re.compile(r'\bmarket_service\b|\bfrom\s+[\w.]*market_service')
+          for ruta, t in fuentes.items():
+              if ruta == str(market):
+                  continue
+              for i, l in enumerate(t.splitlines(), 1):
+                  if patron_market.search(l):
+                      refs_market.append(f"{ruta}:{i} {l.strip()[:120]}")
+
+          # ---------- FASE 6: vacios no-init clasificados ----------
+          contenidos = {r: t for r, t in fuentes.items() if t}
+          stems = sorted({p.stem for p in noinit_vacios}, key=len, reverse=True)
+          refs = defaultdict(set)
+          if stems:
+              gran_regex = re.compile(r'\b(' + "|".join(re.escape(s) for s in stems) + r')\b')
+              for ruta, t in contenidos.items():
+                  for m in gran_regex.finditer(t):
+                      refs[m.group(1)].add(ruta)
+          vacios_huerfanos, vacios_referenciados, vacios_pruebas = [], [], []
+          ref_detalle = {}
+          for p in noinit_vacios:
+              es_test = p.parent.name == "tests" or p.name.startswith("test_")
+              docena = refs.get(p.stem, set())
+              docena = {x for x in docena if x != str(p)}
+              dot = str(p.relative_to(RAIZ).with_suffix("")).replace("/", ".")
+              refs_dot = [r for r, t in contenidos.items() if r != str(p) and dot in t]
+              total_refs = sorted(set(docena) | set(refs_dot))
+              if es_test:
+                  vacios_pruebas.append(str(p))
+              elif total_refs:
+                  vacios_referenciados.append(str(p))
+                  ref_detalle[str(p)] = total_refs[:8]
+              else:
+                  vacios_huerfanos.append(str(p))
+
+          # ---------- FASE 7: punto a punto entre apps / inversiones ----------
+          p2p = []
+          for ruta, t in fuentes.items():
+              for m in re.finditer(r'^\s*(?:from|import)\s+(apps\.(\w+))', t, re.M):
+                  destino = m.group(2)
+                  origen = ruta.split("/")[1] if ruta.startswith("apps/") and len(ruta.split("/")) > 2 else None
+                  if origen and origen != destino:
+                      p2p.append(f"{ruta} -> apps.{destino}")
+          inversion = [f"{ruta}: shared_engines importa apps.*" for ruta, t in fuentes.items()
+                       if ruta.startswith("shared_engines/") and re.search(r'^\s*(?:from|import)\s+apps\.', t, re.M)]
+
+          # ---------- FASE 8: stubs y TODOs ----------
+          stubs, todos_mk = [], []
+          for ruta, t in fuentes.items():
+              try:
+                  arbol = ast.parse(t)
+              except SyntaxError:
+                  continue
+              for nodo in arbol.body:
+                  if isinstance(nodo, (ast.ClassDef, ast.FunctionDef, ast.AsyncFunctionDef)):
+                      cuerpo = list(nodo.body)
+                      if cuerpo and isinstance(cuerpo[0], ast.Expr) and isinstance(cuerpo[0].value, ast.Constant):
+                          cuerpo = cuerpo[1:]
+                      if not cuerpo or (len(cuerpo) == 1 and isinstance(cuerpo[0], ast.Pass)) or \
+                         (len(cuerpo) == 1 and isinstance(cuerpo[0], ast.Expr) and cuerpo[0].value is Ellipsis):
+                          stubs.append(f"{ruta}:{nodo.lineno} {nodo.name}")
+              for i, l in enumerate(t.splitlines(), 1):
+                  if re.search(r'\b(TODO|FIXME|XXX|HACK)\b', l):
+                      todos_mk.append(f"{ruta}:{i}")
+
+          # ---------- SALIDA ----------
           L = []
-          L.append("# 🔬 AUDITORÍA COMPLETA — apps/laboratorio\n")
-          L.append("**Modo: LECTURA PURA — nada fue modificado.**\n")
-          total_lineas = sum(a["lineas"] for a in archivos_info if a["ext"] == ".py")
-          L.append("## 1. Panorama general\n")
-          L.append("| Métrica | Valor |")
-          L.append("|---|---|")
-          L.append(f"| Carpetas totales | {len(carpetas_todas)+1} |")
-          L.append(f"| Carpetas VACÍAS (regla 68) | {len(carpetas_vacias)} |")
-          L.append(f"| Archivos totales | {len(archivos_info)} |")
-          L.append(f"| Archivos .py | {len(py_files)} |")
-          L.append(f"| Líneas de Python | {total_lineas} |")
-          L.append(f"| Archivos VACÍOS (≤1 byte) | {len(iniciales_vacios)} |")
-          L.append(f"| Clases+funciones | {len(simbolos)} |")
-          L.append(f"| Stubs (vacíos/NotImplemented) | {len(stubs_lista)} |")
-          L.append(f"| Endpoints HTTP | {len(endpoints)} |")
-          L.append(f"| Motores (archivos *engine*) | {len(motores)} |")
-          L.append(f"| Tests propios (test_*.py) | {len(tests_py)} |")
-          L.append(f"| Errores de sintaxis | {len(errores_parse)} |\n")
+          A = lambda s: L.append(s)
+          A("# 🔬 AUDITORIA TOTAL DEL REPOSITORIO — LECTURA PURA\n")
+          A("**Nada fue modificado ni borrado. La lista de borrado es PROPUESTA y requiere aprobacion del dueno.**\n")
 
-          L.append("## 2. Árbol completo con estado\n")
-          L.append(arbol_md() + "\n")
+          A("## 1. CENSO (explica el salto de archivos)\n")
+          total_relevante = len(todos) - len(pyc_files)
+          A(f"- Archivos del proyecto (sin .pyc): **{total_relevante}**")
+          A(f"- Basura de distribucion: {len(pyc_files)} archivos .pyc en {len(pycache_dirs)} carpetas __pycache__ (**excluir del ZIP — candidatos de limpieza**)")
+          A(f"- Archivos .py: {len(py_files)} · vacios (<=1 byte): {len(vacios_py)} ({len(inits_vacios)} __init__ normales + {len(noinit_vacios)} funcionales)")
+          A(f"- Carpetas vacias: {len(carpetas_vacias)}\n")
+          A("| Directorio | Archivos | KB |")
+          A("|---|---|---|")
+          for top, n in por_top.most_common():
+              A(f"| {top} | {n} | {bytes_top[top]//1024} |")
+          A("")
 
-          L.append("## 3. Carpetas VACÍAS (llenado futuro — regla 68)\n")
-          if carpetas_vacias:
-              for c in carpetas_vacias:
-                  L.append(f"- `{c}`")
+          A("## 2. ✅ LO QUE FUNCIONA (evidencia)\n")
+          A("| Carpeta de pruebas | Resultado | Conteo | Duracion |")
+          A("|---|---|---|---|")
+          for r in resultados_tests:
+              e = "✅" if r["code"] == 0 else ("⏭ SIN TESTS" if r["code"] == 5 else "❌")
+              A(f"| {r['carpeta']} | {e} | {r['conteo']} | {r['duracion']}s |")
+          A("")
+          verdes = [r for r in resultados_tests if r["code"] == 0]
+          A(f"**Suites en verde: {len(verdes)}/{len(resultados_tests)}** — estos modulos estan acreditados por pruebas ejecutadas.\n")
+
+          A("## 3. ❌ LO QUE NO FUNCIONA\n")
+          fallidos = [r for r in resultados_tests if r["code"] not in (0, 5)]
+          if fallidos:
+              for r in fallidos:
+                  A(f"### ❌ {r['carpeta']} ({r['conteo']})\n")
+                  if r["fallos"]:
+                      A("**Tests fallidos:**\n```")
+                      A("\n".join(r["fallos"])); A("```")
+                  A("<details><summary>Salida completa</summary>\n```")
+                  A(r["cola"]); A("```\n</details>\n")
           else:
-              L.append("(ninguna)")
-          L.append("")
+              A("(ningun fallo de pruebas)\n")
+          if errores_sintaxis:
+              A("### Errores de sintaxis\n```"); A("\n".join(errores_sintaxis)); A("```\n")
+          if imports_rotos:
+              A(f"### Imports rotos ({len(imports_rotos)}) — codigo que pide modulos inexistentes\n```")
+              A("\n".join(imports_rotos[:200])); A("```\n")
+          if inversion:
+              A("### Inversion arquitectonica (shared_engines importa apps)\n```")
+              A("\n".join(inversion)); A("```\n")
 
-          L.append("## 4. Archivos VACÍOS o de 1 byte\n")
-          if iniciales_vacios:
-              for f in iniciales_vacios:
-                  L.append(f"- `{f}`")
+          A("## 4. 🔁 ERRORES Y DUPLICADOS\n")
+          A(f"### Rutas HTTP duplicadas: {len(rutas_dup)}\n")
+          for (met, path), sitios in sorted(rutas_dup.items()):
+              A(f"- `{met} {path}` -> {', '.join(sitios)}")
+          A("")
+          A(f"### Simbolos duplicados en el mismo paquete: {len(sim_dup)}\n")
+          for (paq, tipo, nom), sitios in sorted(sim_dup.items()):
+              A(f"- {tipo} `{nom}` en `{paq}` -> {', '.join(sitios)}")
+          A("")
+          A(f"### Archivos .py con contenido IDENTICO: {len(archivos_identicos)} grupos\n")
+          for g in archivos_identicos[:60]:
+              A(f"- {', '.join(g)}")
+          A("")
+
+          A("## 5. SHIMS de red (validacion de los clientes sustituidos)\n")
+          A(f"Detectados: {len(shims)}\n")
+          for s in shims:
+              A(f"- `{s['archivo']}` ({s['lineas']} lineas) -> {s['objetivos']} [{'✅ OK' if s['objetivo_existe'] else '❌ OBJETIVO ROTO'}]")
+          A("")
+
+          A("## 6. apps/agro/services/market_service.py\n")
+          A(f"- Existe: **{market_estado['existe']}** · bytes: {market_estado['bytes']} · lineas: {market_estado['lineas']}")
+          A(f"- Referencias en el repo: {len(refs_market)}")
+          for r in refs_market[:30]:
+              A(f"  - {r}")
+          A("")
+
+          A("## 7. 🗑️ CLASIFICACION DE VACIOS FUNCIONALES (base de la lista de borrado)\n")
+          A(f"### HUERFANOS (0 referencias -> CANDIDATOS A BORRAR, requiere tu aprobacion): {len(vacios_huerfanos)}\n```")
+          A("\n".join(vacios_huerfanos) if vacios_huerfanos else "(ninguno)"); A("```")
+          A(f"### REFERENCIADOS (NO se pueden borrar -> A IMPLEMENTAR): {len(vacios_referenciados)}\n")
+          for v in vacios_referenciados[:120]:
+              A(f"- `{v}` <- referenciado por {', '.join(ref_detalle.get(v, []))}")
+          A("")
+          A(f"### PRUEBAS VACIAS (reemplazar por pruebas reales): {len(vacios_pruebas)}\n```")
+          A("\n".join(vacios_pruebas) if vacios_pruebas else "(ninguna)"); A("```")
+          A("")
+
+          A(f"## 8. Stubs: {len(stubs)} · TODO/FIXME: {len(todos_mk)}\n")
+          if stubs:
+              A("```"); A("\n".join(stubs[:80])); A("```")
+          A("")
+
+          A("## 9. LISTA DE BORRADO PROPUESTA (NADA SE BORRA AUN)\n")
+          A("| Categoria | Cantidad | Accion propuesta |")
+          A("|---|---|---|")
+          A(f"| {len(pyc_files)} archivos .pyc + {len(pycache_dirs)} __pycache__ | {len(pycache_dirs)} | Excluir del ZIP de distribucion (limpieza) |")
+          A(f"| Vacios huerfanos (0 referencias) | {len(vacios_huerfanos)} | Borrar con tu aprobacion |")
+          A(f"| Archivos identicos duplicados | {len(archivos_identicos)} grupos | Consolidar 1, revisar imports |")
+          A(f"| Vacios referenciados | {len(vacios_referenciados)} | NO borrar: implementar |")
+          A(f"| Pruebas vacias | {len(vacios_pruebas)} | NO borrar: reemplazar |")
+          A("")
+          A("## 10. Conexiones punto a punto entre apps\n")
+          if p2p:
+              for c in sorted(set(p2p))[:60]:
+                  A(f"- {c}")
           else:
-              L.append("(ninguno)")
-          L.append("")
-
-          L.append("## 5. Inventario Python — clases y funciones por módulo\n")
-          por_arch = defaultdict(list)
-          for s in simbolos:
-              por_arch[s["archivo"]].append(s)
-          for arch in sorted(por_arch):
-              ss = por_arch[arch]
-              clases = [x for x in ss if x["tipo"] == "clase"]
-              funcs = [x for x in ss if x["tipo"] == "funcion"]
-              L.append(f"### `{arch}`\n")
-              L.append(f"- Clases: {len(clases)} · Funciones: {len(funcs)} · Stubs: {sum(1 for x in ss if x['stub'])}")
-              for c in clases:
-                  marca = f" ⚠️[{c['stub']}]" if c["stub"] else ""
-                  L.append(f"  - clase `{c['nombre']}` (L{c['linea']}){marca}")
-              for f in funcs:
-                  marca = f" ⚠️[{f['stub']}]" if f["stub"] else ""
-                  L.append(f"  - func `{f['nombre']}` (L{f['linea']}){marca}")
-              L.append("")
-
-          L.append("## 6. Motores detectados (archivos *engine*)\n")
-          if motores:
-              L.append("| Motor | Líneas | Estado |")
-              L.append("|---|---|---|")
-              for m in motores:
-                  estado = "🔴 vacío" if m["vacío"] else ("⚠️ pequeño (<100 líneas)" if m["lineas"] < 100 else "✅ con cuerpo")
-                  L.append(f"| `{m['ruta']}` | {m['lineas']} | {estado} |")
-          else:
-              L.append("(ninguno)")
-          L.append("")
-
-          L.append("## 7. Endpoints HTTP detectados\n")
-          if endpoints:
-              for e in endpoints:
-                  L.append(f"- {e}")
-          else:
-              L.append("(ninguno)")
-          L.append("")
-
-          L.append("## 8. Mapa de conexiones\n")
-          L.append("### Internas (dentro de apps/laboratorio)\n")
-          for k, v in conn_internas.most_common():
-              L.append(f"- `{k}` ← {v} imports")
-          L.append("\n### shared_engines (motores compartidos que consume)\n")
-          if conn_shared:
-              for k, v in conn_shared.most_common():
-                  L.append(f"- shared_engines.`{k}` ← {v} imports")
-          else:
-              L.append("- **NINGUNA — laboratorio aislado de la Red**")
-          L.append("\n### Otras apps\n")
-          if conn_apps:
-              for k, v in conn_apps.most_common():
-                  L.append(f"- apps.`{k}` ← {v} imports")
-          else:
-              L.append("- ninguna")
-          L.append("\n### Librerías externas principales\n")
-          for k, v in imports_ext.most_common(25):
-              L.append(f"- {k} ({v})")
-          L.append("")
-
-          L.append("## 9. Integración ZYRA Core — estado\n")
-          if configs_zyra:
-              for c in configs_zyra:
-                  L.append(f"- `{c}`")
-          else:
-              L.append("**SIN REFERENCIAS — la integración con el núcleo no existe en el código**")
-          L.append("")
-
-          L.append("## 10. Marcadores pendientes (TODO/FIXME/no implementado)\n")
-          if marcadores:
-              for m in marcadores:
-                  L.append(f"- `{m}`")
-          else:
-              L.append("(ninguno)")
-          L.append("")
-
-          L.append("## 11. Duplicados (mismo nombre en el mismo paquete)\n")
-          if dup_reales:
-              for (paq, tipo, nombre), sitios in sorted(dup_reales.items()):
-                  L.append(f"- {tipo} `{nombre}` en `{paq}` → {' , '.join(sitios)}")
-          else:
-              L.append("(ninguno)")
-          L.append("")
-
-          L.append("## 12. Stubs (cuerpos vacíos / NotImplementedError)\n")
-          if stubs_lista:
-              for s in stubs_lista:
-                  L.append(f"- `{s}`")
-          else:
-              L.append("(ninguno)")
-          L.append("")
-
-          L.append("## 13. Tests propios de LABORATORIO\n")
-          if tests_py:
-              for t in tests_py:
-                  L.append(f"- `{t}`")
-          else:
-              L.append("**NINGUNO — sin cobertura de pruebas propia**")
-          L.append("")
-
-          L.append("## 14. Salud por submódulo\n")
-          L.append("| Submódulo | Archivos | .py | Líneas | Vacíos | Stubs | TODOs | Endpoints |")
-          L.append("|---|---|---|---|---|---|---|---|")
-          for s in salud:
-              L.append(f"| {s['modulo']} | {s['archivos']} | {s['py']} | {s['lineas']} | {s['vacios']} | {s['stubs']} | {s['todos']} | {s['endpoints']} |")
-          L.append("")
-
-          if errores_parse:
-              L.append("## 15. ERRORES DE SINTAXIS\n")
-              for e in errores_parse:
-                  L.append(f"- {e}")
-              L.append("")
+              A("(ninguna)")
+          A("")
 
           md = "\n".join(L)
-          OUT_MD.write_text(md, encoding="utf-8")
-          OUT_JSON.write_text(json.dumps({
-              "archivos": archivos_info, "simbolos": simbolos, "endpoints": endpoints,
-              "marcadores": marcadores, "configs_zyra": configs_zyra, "stubs": stubs_lista,
-              "carpetas_vacias": [str(c) for c in carpetas_vacias],
-              "archivos_vacios": iniciales_vacios, "motores": motores,
-              "conn_shared": dict(conn_shared), "conn_apps": dict(conn_apps),
-              "conn_internas": dict(conn_internas), "imports_ext": dict(imports_ext),
-              "duplicados": {f"{k[0]}|{k[1]}|{k[2]}": v for k, v in dup_reales.items()},
-              "tests": tests_py, "salud": salud, "errores_parse": errores_parse,
+          Path("auditoria_repo_completo.md").write_text(md, encoding="utf-8")
+          Path("auditoria_repo_completo.json").write_text(json.dumps({
+              "censo": {"total": total_relevante, "pyc": len(pyc_files), "py": len(py_files),
+                        "vacios_noinit": len(noinit_vacios), "carpetas_vacias": len(carpetas_vacias)},
+              "sintaxis": errores_sintaxis, "imports_rotos": imports_rotos,
+              "tests": [{k: v for k, v in r.items()} for r in resultados_tests],
+              "rutas_dup": {f"{k[0]} {k[1]}": v for k, v in rutas_dup.items()},
+              "sim_dup": {f"{k[0]}|{k[1]}|{k[2]}": v for k, v in sim_dup.items()},
+              "identicos": archivos_identicos, "shims": shims,
+              "market_service": {"estado": market_estado, "referencias": refs_market},
+              "vacios_huerfanos": vacios_huerfanos, "vacios_referenciados": vacios_referenciados,
+              "vacios_pruebas": vacios_pruebas, "stubs": stubs, "todos": todos_mk,
+              "p2p": sorted(set(p2p)), "inversion": inversion,
           }, indent=2, ensure_ascii=False), encoding="utf-8")
 
-          summary = os.environ.get("GITHUB_STEP_SUMMARY")
           if summary:
               salida = md
               if len(salida) > 900000:
-                  salida = salida[:900000] + "\n\n**(RECORTE por límite — reporte COMPLETO en el artefacto descargable)**\n"
+                  salida = salida[:900000] + "\n\n**(RECORTE — reporte COMPLETO en el artefacto)**\n"
               with open(summary, "a") as fh:
                   fh.write(salida)
-
-          print(f"Reporte generado: {OUT_MD} ({len(md)} chars) + {OUT_JSON}")
-          print(f"Carpetas vacías: {len(carpetas_vacias)} | Stubs: {len(stubs_lista)} | Endpoints: {len(endpoints)} | Tests: {len(tests_py)}")
+          print(f"OK auditoria: {total_relevante} archivos proyecto, {len(pyc_files)} pyc, "
+                f"{len(vacios_huerfanos)} huerfanos, {len(vacios_referenciados)} referenciados, "
+                f"{len(imports_rotos)} imports rotos")
           PY
 
       - name: Publicar reporte como artefacto
         uses: actions/upload-artifact@v4
         with:
-          name: auditoria-laboratorio
+          name: auditoria-repo-completo
           path: |
-            auditoria_laboratorio.md
-            auditoria_laboratorio.json
+            auditoria_repo_completo.md
+            auditoria_repo_completo.json

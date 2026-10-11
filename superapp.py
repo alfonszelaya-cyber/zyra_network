@@ -1,13 +1,13 @@
 """ZYRA SuperApp: una sola entrada bonita.
 
-Arranca los 7 servidores internos (cada uno con su
+Arranca los servidores internos (cada uno con su
 store y su cliente de red, independientes entre si)
 y los expone bajo UNA sola entrada publica:
-/          portal
-/verificar verificador publico (gratis)
-/verify    proxy a la Red
-/mpe /agro /axis /semilla /nexo /subastas /ciclo
-/health    estado del servicio
+/             portal
+/verificar    verificador publico (gratis)
+/verify       proxy a la Red
+/mpe /agro /axis /semilla /nexo /subastas /ciclo /laboratorio
+/health       estado del servicio
 """
 from __future__ import annotations
 
@@ -139,20 +139,12 @@ def _start_nexo():
     store = NexoStore(_db("nexo.db"), _clock())
     client = NetworkClient(ZYRA_URL)
     server = serve_nexo(store, client, host="127.0.0.1", port=0)
-    return server, "NEXO"
-
-def _start_nexo(*args, **kwargs):
-    _result = _ng_start_nexo_base(
-        *args, **kwargs)
     try:
-        from apps.nexo.services.startup import (
-            attach_live_runtime as
-            _ng_attach)
-        _ng_attach(_result)
+        from apps.nexo.services.startup import attach_live_runtime as _ng_attach
+        _ng_attach(server)
     except Exception:
         pass
-    return _result
-
+    return server, "NEXO"
 
 def _start_subastas():
     from apps.subastas.infrastructure.persistence.subastas_store import SubastasStore
@@ -175,6 +167,45 @@ def _start_ciclo():
     server = serve_ciclo(store, client, host="127.0.0.1", port=0)
     return server, "CICLO-DIGITAL"
 
+def _start_laboratorio():
+    from apps.laboratorio.infrastructure.api.app import montar_aplicacion
+    app_lab = montar_aplicacion(str(DATA_DIR / "laboratorio.db"))
+
+    class _ManejadorLab(BaseHTTPRequestHandler):
+        def _atender(self):
+            largo = int(self.headers.get("Content-Length", 0) or 0)
+            cuerpo = self.rfile.read(largo) if largo else b""
+            status, headers_out, salida = app_lab.despachar(
+                self.command, self.path, dict(self.headers), cuerpo
+            )
+            self.send_response(int(status))
+            for clave, valor in headers_out.items():
+                self.send_header(clave, valor)
+            self.send_header("Content-Length", str(len(salida)))
+            self.end_headers()
+            self.wfile.write(salida)
+
+        def do_GET(self):
+            self._atender()
+
+        def do_POST(self):
+            self._atender()
+
+        def do_PUT(self):
+            self._atender()
+
+        def do_PATCH(self):
+            self._atender()
+
+        def do_DELETE(self):
+            self._atender()
+
+        def log_message(self, formato, *args):
+            return
+
+    servidor = ThreadingHTTPServer(("127.0.0.1", 0), _ManejadorLab)
+    return servidor, "LABORATORIO"
+
 STARTERS = [
     ("/mpe", _start_mpe),
     ("/agro", _start_agro),
@@ -183,6 +214,7 @@ STARTERS = [
     ("/nexo", _start_nexo),
     ("/subastas", _start_subastas),
     ("/ciclo", _start_ciclo),
+    ("/laboratorio", _start_laboratorio),
 ]
 
 def boot_apps():

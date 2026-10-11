@@ -1,4 +1,4 @@
-name: ZYRA LOTE - glTF GLB Monte Carlo (escena real, auto-escritor)
+name: ZYRA RUM 5 - Feed de eventos en vivo + Cache TTL real (auto-escritor)
 
 on:
   push:
@@ -14,619 +14,301 @@ jobs:
       - name: Descargar repositorio
         uses: actions/checkout@v4
 
-      - name: Escribir monte_carlo_engine.py
+      - name: Escribir infrastructure/cache/__init__.py (Cache TTL real)
         run: |
-          cat > apps/laboratorio/infrastructure/providers/monte_carlo_engine.py <<'MC_EOF'
-          """Motor MONTE CARLO: simulacion estocastica real y reproducible.
+          cat > apps/laboratorio/infrastructure/cache/__init__.py <<'CACHE_EOF'
+          """Cache TTL en memoria: real, con expiracion y estadisticas.
 
-          Distribuciones (por variable): normal{media,desv} uniforme{minimo,maximo}
-          triangular{minimo,modo,maximo}. Semilla determinista (auditable).
-          Formula declarada: puntaje = (w_b*beneficio + w_c*(100-costo)
-          + w_r*(100-riesgo)) / suma_pesos, acotado 0..100.
-          Estadisticas: media, desv, min, max, P5/P25/P50/P75/P95,
-          IC95 de la media y convergencia en 10 lotes.
+          - time.monotonic (inmune a cambios de reloj del sistema)
+          - expiracion perezosa en lectura + barrido en escritura
+          - maxlen con eviction FIFO
+          - estadisticas honestas: hits, misses, expiraciones, evictions
+          - seguro para hilos (Lock)
           """
-          import math
-          import random
-
-          DISTRIBUCIONES = ("normal", "uniforme", "triangular")
-          MAX_CORRIDAS = 200_000
-          DEF_CORRIDAS = 10_000
-          UMBRAL_DEFECTO = 60.0
-          LOTES_CONVERGENCIA = 10
-          PESOS_DEFECTO = {"costo": 1.0, "beneficio": 1.0, "riesgo": 1.0}
-          VARIABLES_VALIDAS = ("costo", "beneficio", "riesgo")
+          import threading
+          import time
 
 
-          def _numero(valor, nombre):
-              if isinstance(valor, bool) or not isinstance(valor, (int, float)):
-                  raise ValueError("Parametro " + nombre + " debe ser numerico.")
-              return float(valor)
+          class CacheTTL:
+              """Cache clave->valor con TTL en segundos."""
 
-
-          class MotorMonteCarlo:
-              """Simulacion Monte Carlo con semilla reproducible."""
-
-              def capacidades(self) -> dict:
-                  return {
-                      "distribuciones": DISTRIBUCIONES,
-                      "corridas": {"defecto": DEF_CORRIDAS, "max": MAX_CORRIDAS},
-                      "salidas": (
-                          "media", "desv", "min", "max",
-                          "p5", "p25", "p50", "p75", "p95",
-                          "ic95", "prob_alcanza_umbral", "convergencia",
-                      ),
-                      "reproducible": "semilla entera opcional",
-                      "formula": (
-                          "puntaje = (w_b*beneficio + w_c*(100-costo)"
-                          " + w_r*(100-riesgo)) / (w_b+w_c+w_r)"
-                      ),
-                      "rango": "variables y puntaje acotados a 0..100",
-                  }
+              def __init__(self, ttl_segundos: float = 60.0, maxlen: int = 1000):
+                  ttl = float(ttl_segundos)
+                  if ttl <= 0:
+                      raise ValueError("ttl_segundos debe ser positivo.")
+                  if int(maxlen) < 1:
+                      raise ValueError("maxlen debe ser mayor o igual a 1.")
+                  self._ttl = ttl
+                  self._maxlen = int(maxlen)
+                  self._datos = {}
+                  self._vencimientos = {}
+                  self._orden = []
+                  self._lock = threading.Lock()
+                  self._hits = 0
+                  self._misses = 0
+                  self._expiraciones = 0
+                  self._evictions = 0
 
               @staticmethod
-              def _muestrear(rng, definicion, nombre):
-                  dist = str(definicion.get("dist", "")).strip()
-                  if dist == "normal":
-                      media = _numero(definicion.get("media"), nombre + ".media")
-                      desv = _numero(definicion.get("desv"), nombre + ".desv")
-                      if desv < 0:
-                          raise ValueError(nombre + ".desv no puede ser negativa.")
-                      return rng.gauss(media, desv)
-                  if dist == "uniforme":
-                      bajo = _numero(definicion.get("minimo"), nombre + ".minimo")
-                      alto = _numero(definicion.get("maximo"), nombre + ".maximo")
-                      if bajo > alto:
-                          raise ValueError(nombre + ": minimo no puede superar maximo.")
-                      return rng.uniform(bajo, alto)
-                  if dist == "triangular":
-                      bajo = _numero(definicion.get("minimo"), nombre + ".minimo")
-                      modo = _numero(definicion.get("modo"), nombre + ".modo")
-                      alto = _numero(definicion.get("maximo"), nombre + ".maximo")
-                      if not (bajo <= modo <= alto):
-                          raise ValueError(nombre + ": requiere minimo <= modo <= maximo.")
-                      return rng.triangular(bajo, alto, modo)
-                  raise ValueError(
-                      nombre + ": distribucion desconocida " + repr(dist)
-                      + ". Validas: " + ", ".join(DISTRIBUCIONES)
+              def _ahora() -> float:
+                  return time.monotonic()
+
+              def _purgar_interno(self, ahora: float) -> None:
+                  vencidas = [
+                      clave for clave, vence in self._vencimientos.items()
+                      if vence <= ahora
+                  ]
+                  for clave in vencidas:
+                      self._datos.pop(clave, None)
+                      self._vencimientos.pop(clave, None)
+                      try:
+                          self._orden.remove(clave)
+                      except ValueError:
+                          pass
+                      self._expiraciones += 1
+                  while len(self._orden) > self._maxlen:
+                      vieja = self._orden.pop(0)
+                      self._datos.pop(vieja, None)
+                      self._vencimientos.pop(vieja, None)
+                      self._evictions += 1
+
+              def obtener(self, clave):
+                  with self._lock:
+                      ahora = self._ahora()
+                      self._purgar_interno(ahora)
+                      vence = self._vencimientos.get(clave)
+                      if vence is None or vence <= ahora:
+                          self._misses += 1
+                          return None
+                      self._hits += 1
+                      return self._datos[clave]
+
+              def poner(self, clave, valor) -> None:
+                  with self._lock:
+                      ahora = self._ahora()
+                      self._purgar_interno(ahora)
+                      if clave not in self._datos:
+                          self._orden.append(clave)
+                      self._datos[clave] = valor
+                      self._vencimientos[clave] = ahora + self._ttl
+                      while len(self._orden) > self._maxlen:
+                          vieja = self._orden.pop(0)
+                          self._datos.pop(vieja, None)
+                          self._vencimientos.pop(vieja, None)
+                          self._evictions += 1
+
+              def invalidar(self, clave) -> bool:
+                  with self._lock:
+                      if clave in self._datos:
+                          del self._datos[clave]
+                          self._vencimientos.pop(clave, None)
+                          try:
+                              self._orden.remove(clave)
+                          except ValueError:
+                              pass
+                          return True
+                      return False
+
+              def vaciar(self) -> None:
+                  with self._lock:
+                      self._datos.clear()
+                      self._vencimientos.clear()
+                      self._orden.clear()
+
+              def estadisticas(self) -> dict:
+                  with self._lock:
+                      self._purgar_interno(self._ahora())
+                      total = self._hits + self._misses
+                      ratio = (
+                          round(self._hits / total, 4) if total > 0 else 0.0
+                      )
+                      return {
+                          "entradas": len(self._datos),
+                          "maxlen": self._maxlen,
+                          "ttl_segundos": self._ttl,
+                          "hits": self._hits,
+                          "misses": self._misses,
+                          "hit_ratio": ratio,
+                          "expiraciones": self._expiraciones,
+                          "evictions": self._evictions,
+                      }
+          CACHE_EOF
+
+      - name: Escribir events/system/__init__.py (eventos de ciclo de vida)
+        run: |
+          cat > apps/laboratorio/events/system/__init__.py <<'SYS_EOF'
+          """Eventos de sistema: ciclo de vida real de LABORATORIO."""
+          from dataclasses import dataclass, field
+          from datetime import datetime, timezone
+
+          EVENTO_ARRANCADO = "laboratorio.sistema.arrancado"
+          EVENTO_HEALTH = "laboratorio.sistema.health"
+
+
+          @dataclass(frozen=True)
+          class EventoSistema:
+              """Evento de sistema con momento real y detalle serializable."""
+
+              nombre: str
+              detalle: dict = field(default_factory=dict)
+              momento: str = ""
+
+              @classmethod
+              def crear(cls, nombre: str, detalle: dict = None) -> "EventoSistema":
+                  if not nombre or not str(nombre).strip():
+                      raise ValueError("El evento de sistema requiere nombre.")
+                  return cls(
+                      nombre=str(nombre).strip(),
+                      detalle=dict(detalle or {}),
+                      momento=datetime.now(timezone.utc).isoformat(),
                   )
 
-              @staticmethod
-              def _percentil(ordenados, q):
-                  if not ordenados:
-                      return 0.0
-                  indice = max(0, min(
-                      len(ordenados) - 1,
-                      math.ceil(q / 100.0 * len(ordenados)) - 1,
-                  ))
-                  return ordenados[indice]
 
-              def simular(self, config) -> dict:
-                  if not isinstance(config, dict):
-                      raise ValueError("Configuracion debe ser un objeto.")
-                  variables = config.get("variables")
-                  if not isinstance(variables, dict) or not variables:
-                      raise ValueError(
-                          "variables requiere costo, beneficio y riesgo."
-                      )
-                  for nombre in variables:
-                      if nombre not in VARIABLES_VALIDAS:
-                          raise ValueError(
-                              "Variable desconocida: " + repr(nombre)
-                              + ". Validas: " + ", ".join(VARIABLES_VALIDAS)
-                          )
-                  faltantes = [n for n in VARIABLES_VALIDAS if n not in variables]
-                  if faltantes:
-                      raise ValueError(
-                          "Faltan variables obligatorias: " + ", ".join(faltantes)
-                      )
-                  pesos_crudos = config.get("pesos", {})
-                  if not isinstance(pesos_crudos, dict):
-                      raise ValueError("pesos debe ser un objeto.")
-                  pesos = dict(PESOS_DEFECTO)
-                  for clave, valor in pesos_crudos.items():
-                      if clave not in VARIABLES_VALIDAS:
-                          raise ValueError("Peso desconocido: " + repr(clave))
-                      numero = _numero(valor, "pesos." + clave)
-                      if numero < 0:
-                          raise ValueError("pesos." + clave + " no puede ser negativo.")
-                      pesos[clave] = numero
-                  total_pesos = sum(pesos.values())
-                  if total_pesos <= 0:
-                      raise ValueError("La suma de pesos debe ser mayor que cero.")
-                  corridas = config.get("corridas", DEF_CORRIDAS)
-                  if isinstance(corridas, bool) or not isinstance(corridas, int):
-                      raise ValueError("corridas debe ser entero.")
-                  if corridas < 1 or corridas > MAX_CORRIDAS:
-                      raise ValueError(
-                          "corridas debe estar entre 1 y " + str(MAX_CORRIDAS)
-                      )
-                  umbral = _numero(config.get("umbral", UMBRAL_DEFECTO), "umbral")
-                  if not 0.0 <= umbral <= 100.0:
-                      raise ValueError("umbral debe estar entre 0 y 100.")
-                  semilla = config.get("semilla")
-                  if semilla is not None and (
-                      isinstance(semilla, bool) or not isinstance(semilla, int)
-                  ):
-                      raise ValueError("semilla debe ser entera.")
-                  rng = random.Random(semilla)
-                  puntajes = []
-                  acotados = 0
-                  peso_b = pesos["beneficio"]
-                  peso_c = pesos["costo"]
-                  peso_r = pesos["riesgo"]
-                  divisor = total_pesos
-                  for _ in range(corridas):
-                      costo = self._muestrear(rng, variables["costo"], "costo")
-                      beneficio = self._muestrear(rng, variables["beneficio"], "beneficio")
-                      riesgo = self._muestrear(rng, variables["riesgo"], "riesgo")
-                      for crudo in (costo, beneficio, riesgo):
-                          if crudo < 0.0 or crudo > 100.0:
-                              acotados += 1
-                      costo = max(0.0, min(100.0, costo))
-                      beneficio = max(0.0, min(100.0, beneficio))
-                      riesgo = max(0.0, min(100.0, riesgo))
-                      puntaje = (
-                          peso_b * beneficio
-                          + peso_c * (100.0 - costo)
-                          + peso_r * (100.0 - riesgo)
-                      ) / divisor
-                      puntajes.append(max(0.0, min(100.0, puntaje)))
-                  ordenados = sorted(puntajes)
-                  n = float(corridas)
-                  media = sum(puntajes) / n
-                  varianza = sum((p - media) * (p - media) for p in puntajes) / max(1.0, n - 1.0)
-                  desv = math.sqrt(varianza)
-                  se = desv / math.sqrt(n)
-                  lote = max(1, corridas // LOTES_CONVERGENCIA)
-                  convergencia = []
-                  acumulado = 0.0
-                  for indice in range(LOTES_CONVERGENCIA):
-                      inicio = indice * lote
-                      fin = inicio + lote if indice < LOTES_CONVERGENCIA - 1 else corridas
-                      acumulado += sum(puntajes[inicio:fin])
-                      convergencia.append(round(acumulado / float(fin), 4))
-                  alcanzados = sum(1 for p in puntajes if p >= umbral)
-                  return {
-                      "n": corridas,
-                      "semilla": semilla,
-                      "formula": self.capacidades()["formula"],
-                      "variables": variables,
-                      "pesos": pesos,
-                      "umbral": umbral,
-                      "media": round(media, 4),
-                      "desv": round(desv, 4),
-                      "min": round(ordenados[0], 4),
-                      "max": round(ordenados[-1], 4),
-                      "p5": round(self._percentil(ordenados, 5), 4),
-                      "p25": round(self._percentil(ordenados, 25), 4),
-                      "p50": round(self._percentil(ordenados, 50), 4),
-                      "p75": round(self._percentil(ordenados, 75), 4),
-                      "p95": round(self._percentil(ordenados, 95), 4),
-                      "ic95": [
-                          round(max(0.0, media - 1.96 * se), 4),
-                          round(min(100.0, media + 1.96 * se), 4),
-                      ],
-                      "prob_alcanza_umbral": round(alcanzados / n, 4),
-                      "convergencia": convergencia,
-                      "valores_acotados": acotados,
-                  }
+          def evento_arrancado(app_id: str, rutas: int, motores: int) -> EventoSistema:
+              """Evento de arranque con datos reales del montaje."""
+              if not app_id or not str(app_id).strip():
+                  raise ValueError("app_id requerido para el evento de arranque.")
+              return EventoSistema.crear(EVENTO_ARRANCADO, {
+                  "app": str(app_id),
+                  "rutas": int(rutas),
+                  "motores": int(motores),
+              })
 
-              def comparar(self, configs) -> dict:
-                  if not isinstance(configs, list) or len(configs) < 2:
-                      raise ValueError("comparar requiere al menos 2 configuraciones.")
-                  tabla = []
-                  for indice, entrada in enumerate(configs):
-                      if not isinstance(entrada, dict):
-                          raise ValueError("Cada configuracion debe ser un objeto.")
-                      nombre = str(entrada.get("nombre", "config-" + str(indice + 1)))
-                      config = dict(entrada)
-                      config.pop("nombre", None)
-                      resultado = self.simular(config)
-                      tabla.append({
-                          "nombre": nombre,
-                          "media": resultado["media"],
-                          "p50": resultado["p50"],
-                          "ic95": resultado["ic95"],
-                          "prob_alcanza_umbral": resultado["prob_alcanza_umbral"],
-                      })
-                  orden = sorted(tabla, key=lambda f: f["media"], reverse=True)
-                  return {
-                      "ganador": orden[0]["nombre"],
-                      "brecha": round(orden[0]["media"] - orden[1]["media"], 4),
-                      "ranking": orden,
-                      "criterio": "mayor media de puntaje",
-                  }
-          MC_EOF
 
-      - name: Escribir generation_engine.py (glTF 2.0 + GLB)
+          def evento_health(estado: dict) -> EventoSistema:
+              """Evento con el snapshot de salud real de la app."""
+              if not isinstance(estado, dict):
+                  raise ValueError("El evento health requiere el estado real (dict).")
+              return EventoSistema.crear(EVENTO_HEALTH, {
+                  "ok": bool(estado.get("ok")),
+                  "motores_total": int(estado.get("motores_total", 0)),
+                  "motores_disponibles": int(estado.get("motores_disponibles", 0)),
+              })
+          SYS_EOF
+
+      - name: Escribir events/notifications/__init__.py (notificador real)
         run: |
-          cat > apps/laboratorio/infrastructure/providers/generation_engine.py <<'GEN_EOF'
-          """Motor de generacion: 8 formatos reales desde una Escena3D.
+          cat > apps/laboratorio/events/notifications/__init__.py <<'NOTIF_EOF'
+          """Notificaciones: canal real de eventos hacia el operador.
 
-          imagen/pagina/animacion: SVG y HTML reales.
-          modelo: glTF 2.0 JSON con buffer base64 embebido.
-          modelo_glb: GLB binario (JSON chunk + BIN chunk, alineado a 4).
-          naked3d/holograma/oligrama: motores dedicados.
-          Mallas reales POSITION VEC3 + indices u16, accessors con min/max,
-          materiales pbrMetallicRoughness. Y-arriba; Z por capa
-          (fondo 0.0, medio 0.5, frente 1.0). Textos NO se malla-fican
-          (declarados en extras: sin geometria falsa).
+          Registro en memoria (circular) + via logging. Sin fingir envios:
+          cada notificacion declara el canal por el que realmente salio.
           """
-          import base64 as b64
-          import json
-          import math
-          import struct
+          import logging
+          import threading
+          from collections import deque
 
-          from apps.laboratorio.domain.scene import Escena3D
-          from apps.laboratorio.infrastructure.providers.hologram_engine import MotorHolograma
-          from apps.laboratorio.infrastructure.providers.naked3d_engine import MotorNaked3D
-          from apps.laboratorio.infrastructure.providers.oligram_engine import MotorOligrama
-          from apps.laboratorio.infrastructure.providers.renderer_svg import MotorRenderSVG
-          from apps.laboratorio.infrastructure.security.html_sanitizer import escapar
+          from apps.laboratorio.events.system import EventoSistema
 
-          Z_CAPA = {"fondo": 0.0, "medio": 0.5, "frente": 1.0}
-          SEG_CIRCULO = 24
+          CANAL_LOG = "log"
+          CANAL_MEMORIA = "memoria"
+          MAX_NOTIFICACIONES = 500
 
 
-          def _hex_rgb(texto: str):
-              crudo = str(texto or "").strip().lstrip("#")
-              if len(crudo) != 6:
-                  return (0.58, 0.64, 0.72)
-              return (
-                  int(crudo[0:2], 16) / 255.0,
-                  int(crudo[2:4], 16) / 255.0,
-                  int(crudo[4:6], 16) / 255.0,
-              )
+          class Notificador:
+              """Registra notificaciones reales en memoria y en el log."""
 
+              def __init__(self, maxlen: int = MAX_NOTIFICACIONES):
+                  if int(maxlen) < 1:
+                      raise ValueError("maxlen debe ser mayor o igual a 1.")
+                  self._historial = deque(maxlen=int(maxlen))
+                  self._lock = threading.Lock()
+                  self._logger = logging.getLogger("laboratorio.notificaciones")
+                  self._contador = 0
 
-          def _empaquetar_glb(gltf: dict, binario: bytes) -> bytes:
-              json_crudo = json.dumps(
-                  gltf, separators=(",", ":"), ensure_ascii=True
-              ).encode("utf-8")
-              pad_json = (4 - len(json_crudo) % 4) % 4
-              json_crudo += b" " * pad_json
-              pad_bin = (4 - len(binario) % 4) % 4
-              bin_crudo = binario + b"\x00" * pad_bin
-              total = 12 + 8 + len(json_crudo) + 8 + len(bin_crudo)
-              return (
-                  struct.pack("<III", 0x46546C67, 2, total)
-                  + struct.pack("<II", len(json_crudo), 0x4E4F534A)
-                  + json_crudo
-                  + struct.pack("<II", len(bin_crudo), 0x004E4942)
-                  + bin_crudo
-              )
+              def notificar(self, evento: EventoSistema, mensaje: str = "") -> dict:
+                  if not isinstance(evento, EventoSistema):
+                      raise ValueError("notificar requiere un EventoSistema.")
+                  texto = str(mensaje or "").strip() or evento.nombre
+                  with self._lock:
+                      self._contador += 1
+                      registro = {
+                          "id": "notif-" + str(self._contador).zfill(6),
+                          "evento": evento.nombre,
+                          "mensaje": texto[:300],
+                          "momento": evento.momento,
+                          "canal": CANAL_MEMORIA,
+                          "detalle": dict(evento.detalle),
+                      }
+                      self._historial.append(registro)
+                  self._logger.info(
+                      "[laboratorio] " + evento.nombre + ": " + texto
+                  )
+                  return dict(registro)
 
-
-          class MotorGeneracionReal:
-              """Genera entregables reales desde una Escena3D."""
-
-              def __init__(self):
-                  self._renderer = MotorRenderSVG()
-                  self._naked3d = MotorNaked3D()
-                  self._holograma = MotorHolograma()
-                  self._oligrama = MotorOligrama()
-
-              def capacidades(self) -> dict:
+              def historial(self, desde: int = 0, limite: int = 50) -> dict:
+                  if int(desde) < 0:
+                      raise ValueError("desde no puede ser negativo.")
+                  if int(limite) < 1 or int(limite) > 500:
+                      raise ValueError("limite debe estar entre 1 y 500.")
+                  with self._lock:
+                      todos = list(self._historial)
+                  seleccion = [
+                      n for n in todos
+                      if int(n["id"].split("-")[1]) > int(desde)
+                  ]
                   return {
-                      "disponibles": (
-                          "imagen", "pagina", "modelo", "modelo_glb",
-                          "animacion", "naked3d", "holograma", "oligrama",
-                      ),
-                      "gltf": "2.0 con mallas reales y materiales PBR",
-                      "glb": "contenedor binario JSON+BIN alineado a 4",
-                      "no_disponibles": {
-                          "video_mp4": "El motor de secuencia llega con el motor GPU",
-                      },
+                      "total": len(todos),
+                      "devueltas": len(seleccion[: int(limite)]),
+                      "notificaciones": seleccion[: int(limite)],
+                      "canales": (CANAL_MEMORIA, CANAL_LOG),
                   }
+          NOTIF_EOF
 
-              def generar(self, escena: Escena3D, formato: str) -> bytes:
-                  if not isinstance(escena, Escena3D):
-                      raise ValueError("Se esperaba una Escena3D.")
-                  if formato == "imagen":
-                      return self._generar_imagen(escena)
-                  if formato == "pagina":
-                      return self._generar_pagina(escena)
-                  if formato == "modelo":
-                      return self._generar_modelo(escena)
-                  if formato == "modelo_glb":
-                      return self._generar_glb(escena)
-                  if formato == "animacion":
-                      return self._generar_animacion(escena)
-                  if formato == "naked3d":
-                      return self._naked3d.generar(escena)
-                  if formato == "holograma":
-                      return self._holograma.generar(escena)
-                  if formato == "oligrama":
-                      return self._oligrama.generar(escena)
-                  raise ValueError(
-                      "El formato '" + str(formato) + "' no esta disponible. Validos: "
-                      + ", ".join(self.capacidades()["disponibles"])
-                  )
-
-              def _generar_imagen(self, escena: Escena3D) -> bytes:
-                  resultado = self._renderer.renderizar(escena.a_especificacion(), {})
-                  return resultado.imagen_bytes
-
-              def _generar_pagina(self, escena: Escena3D) -> bytes:
-                  svg = self._generar_imagen(escena).decode("utf-8")
-                  filas = []
-                  for i, obj in enumerate(escena.objetos, 1):
-                      detalle = ", ".join(
-                          k + "=" + escapar(v) for k, v in sorted(obj.items())
-                          if k not in ("forma", "color")
-                      )
-                      filas.append(
-                          "<tr><td>" + str(i) + "</td>"
-                          + '<td><span class="pill">' + escapar(obj["forma"]) + "</span></td>"
-                          + '<td><span class="pill">' + escapar(obj.get("capa", "medio")) + "</span></td>"
-                          + '<td><code style="color:#93C5FD">' + escapar(obj["color"]) + "</code></td>"
-                          + "<td>" + detalle + "</td></tr>"
-                      )
-                  html = (
-                      "<!doctype html><html lang='es'><head><meta charset='utf-8'>"
-                      "<title>" + escapar(escena.nombre) + "</title>"
-                      "<style>body{background:#0B1220;color:#E2E8F0;font-family:system-ui,sans-serif;padding:24px}"
-                      "h1{font-size:22px}.pill{background:rgba(37,99,235,.15);color:#93C5FD;border-radius:999px;padding:2px 10px;font-size:12px}"
-                      "table{border-collapse:collapse;width:100%;max-width:860px}td,th{border-bottom:1px solid #1E293B;padding:8px;text-align:left;font-size:14px}"
-                      "th{color:#94A3B8;font-size:12px;text-transform:uppercase}img{max-width:100%;border-radius:12px;border:1px solid #1E293B}</style></head><body>"
-                      "<h1>" + escapar(escena.nombre) + "</h1>"
-                      "<p style='color:#94A3B8'>Escena generada por ZYRA LABORATORIO - " + str(len(escena.objetos)) + " objetos</p>"
-                      "<img alt='render de la escena' src='data:image/svg+xml;base64,"
-                      + b64.b64encode(svg.encode("utf-8")).decode("ascii")
-                      + "'><h2 style='font-size:16px;margin-top:20px'>Objetos y profundidad</h2>"
-                      "<table><thead><tr><th>#</th><th>Forma</th><th>Capa</th><th>Color</th><th>Parametros</th></tr></thead><tbody>"
-                      + "\n".join(filas) + "</tbody></table></body></html>"
-                  )
-                  return html.encode("utf-8")
-
-              @staticmethod
-              def _geometria_objeto(obj, alto):
-                  forma = str(obj.get("forma", ""))
-                  capa = str(obj.get("capa", "medio"))
-                  z = Z_CAPA.get(capa, 0.5)
-
-                  def punto(px, py):
-                      return (float(px), float(alto) - float(py), z)
-
-                  if forma == "rect":
-                      x, y, w, h = obj["x"], obj["y"], obj["w"], obj["h"]
-                      posiciones = [
-                          punto(x, y), punto(x + w, y),
-                          punto(x + w, y + h), punto(x, y + h),
-                      ]
-                      indices = [0, 1, 2, 0, 2, 3]
-                      return posiciones, indices
-                  if forma == "circle":
-                      cx, cy, r = float(obj["cx"]), float(obj["cy"]), float(obj["r"])
-                      posiciones = [punto(cx, cy)]
-                      for i in range(SEG_CIRCULO):
-                          ang = 2.0 * math.pi * i / SEG_CIRCULO
-                          posiciones.append(punto(
-                              cx + r * math.cos(ang), cy + r * math.sin(ang)
-                          ))
-                      indices = []
-                      for i in range(1, SEG_CIRCULO):
-                          siguiente = i + 1 if i + 1 <= SEG_CIRCULO else 1
-                          indices.extend([0, i, siguiente])
-                      return posiciones, indices
-                  return None, None
-
-              def _construir_gltf(self, escena: Escena3D, con_buffer_uri: bool):
-                  buffer_bin = bytearray()
-                  bufferViews = []
-                  accessors = []
-                  meshes = []
-                  nodes = []
-                  materials = []
-                  textos = []
-                  offset = 0
-                  for i, obj in enumerate(escena.objetos):
-                      forma = str(obj.get("forma", ""))
-                      if forma not in ("rect", "circle"):
-                          textos.append({
-                              "indice": i, "forma": forma,
-                              "contenido": str(obj.get("contenido", "")),
-                              "capa": str(obj.get("capa", "medio")),
-                          })
-                          continue
-                      posiciones, indices = self._geometria_objeto(obj, escena.alto)
-                      if posiciones is None:
-                          continue
-                      plano = []
-                      for (px, py, pz) in posiciones:
-                          plano.extend((px, py, pz))
-                      datos_pos = struct.pack("<" + str(len(plano)) + "f", *plano)
-                      pad_pos = (4 - len(datos_pos) % 4) % 4
-                      datos_pos += b"\x00" * pad_pos
-                      datos_idx = struct.pack("<" + str(len(indices)) + "H", *indices)
-                      pad_idx = (4 - len(datos_idx) % 4) % 4
-                      datos_idx += b"\x00" * pad_idx
-                      vista_pos = len(bufferViews)
-                      bufferViews.append({
-                          "buffer": 0, "byteOffset": offset,
-                          "byteLength": len(datos_pos), "target": 34962,
-                      })
-                      offset += len(datos_pos)
-                      vista_idx = len(bufferViews)
-                      bufferViews.append({
-                          "buffer": 0, "byteOffset": offset,
-                          "byteLength": len(datos_idx), "target": 34963,
-                      })
-                      offset += len(datos_idx)
-                      acc_pos = len(accessors)
-                      accessors.append({
-                          "bufferView": vista_pos,
-                          "componentType": 5126,
-                          "count": len(posiciones),
-                          "type": "VEC3",
-                          "min": [min(plano[0::3]), min(plano[1::3]), min(plano[2::3])],
-                          "max": [max(plano[0::3]), max(plano[1::3]), max(plano[2::3])],
-                      })
-                      acc_idx = len(accessors)
-                      accessors.append({
-                          "bufferView": vista_idx,
-                          "componentType": 5123,
-                          "count": len(indices),
-                          "type": "SCALAR",
-                      })
-                      color = _hex_rgb(obj.get("color", "#94A3B8"))
-                      material = len(materials)
-                      materials.append({
-                          "pbrMetallicRoughness": {
-                              "baseColorFactor": [color[0], color[1], color[2], 1.0],
-                              "metallicFactor": 0.05,
-                              "roughnessFactor": 0.55,
-                          },
-                          "name": "mat_" + forma + "_" + str(i),
-                      })
-                      mesh = len(meshes)
-                      meshes.append({
-                          "name": forma + "_" + str(i),
-                          "primitives": [{
-                              "attributes": {"POSITION": acc_pos},
-                              "indices": acc_idx,
-                              "material": material,
-                              "mode": 4,
-                          }],
-                      })
-                      nodes.append({
-                          "mesh": mesh,
-                          "name": forma + "_" + str(i),
-                          "extras": {
-                              "capa": str(obj.get("capa", "medio")),
-                              "color": str(obj.get("color", "")),
-                          },
-                      })
-                      buffer_bin += datos_pos
-                      buffer_bin += datos_idx
-                  binario = bytes(buffer_bin)
-                  if con_buffer_uri:
-                      uri = (
-                          "data:application/octet-stream;base64,"
-                          + b64.b64encode(binario).decode("ascii")
-                      )
-                      buffers = [{"byteLength": len(binario), "uri": uri}]
-                  else:
-                      buffers = [{"byteLength": len(binario)}]
-                  gltf = {
-                      "asset": {
-                          "version": "2.0",
-                          "generator": "ZYRA LABORATORIO glTF 2.0 real",
-                      },
-                      "scene": 0,
-                      "scenes": [{
-                          "name": escapar(escena.nombre),
-                          "nodes": list(range(len(nodes))),
-                      }],
-                      "nodes": nodes,
-                      "meshes": meshes,
-                      "materials": materials,
-                      "accessors": accessors,
-                      "bufferViews": bufferViews,
-                      "buffers": buffers,
-                      "extras": {
-                          "escena": [escena.ancho, escena.alto],
-                          "conversion": "Y-arriba; Z por capa fondo=0.0 medio=0.5 frente=1.0",
-                          "objetos_texto": textos,
-                          "nota": "los textos no se malla-fican (sin geometria falsa)",
-                      },
-                  }
-                  return gltf, binario
-
-              def _generar_modelo(self, escena: Escena3D) -> bytes:
-                  gltf, _binario = self._construir_gltf(escena, con_buffer_uri=True)
-                  return json.dumps(gltf, ensure_ascii=True, indent=2).encode("utf-8")
-
-              def _generar_glb(self, escena: Escena3D) -> bytes:
-                  gltf, binario = self._construir_gltf(escena, con_buffer_uri=False)
-                  return _empaquetar_glb(gltf, binario)
-
-              def _generar_animacion(self, escena: Escena3D) -> bytes:
-                  if not escena.objetos:
-                      from apps.laboratorio.shared.exceptions.render_errors import RenderFallidoError
-                      raise RenderFallidoError("La escena no tiene objetos para animar.")
-                  resultado = self._renderer.renderizar(escena.a_especificacion(), {})
-                  svg = resultado.imagen_bytes.decode("utf-8")
-                  centro_x = escena.ancho / 2.0
-                  centro_y = escena.alto / 2.0
-                  animacion = (
-                      '<animateTransform attributeName="transform" attributeType="XML" '
-                      'type="rotate" from="0 ' + str(centro_x) + " " + str(centro_y)
-                      + '" to="360 ' + str(centro_x) + " " + str(centro_y)
-                      + '" dur="12s" repeatCount="indefinite"/>'
-                  )
-                  if "</svg>" in svg:
-                      svg = svg.replace("</svg>", animacion + "</svg>", 1)
-                  return svg.encode("utf-8")
-          GEN_EOF
-
-      - name: Escribir routers/api/decisions.py (rutas Monte Carlo)
+      - name: Escribir routers/internal/__init__.py (rutas internas de feed y cache)
         run: |
-          cat > apps/laboratorio/routers/api/decisions.py <<'DEC_EOF'
-          """Rutas API de decisiones: simular, comparar, optimizar y Monte Carlo."""
+          cat > apps/laboratorio/routers/internal/__init__.py <<'INT_EOF'
+          """Rutas internas de LABORATORIO: feed de eventos y cache.
+
+          El feed permite a navegadores y moviles obtener eventos en vivo
+          por cursor (polling eficiente, sin instalar nada).
+          """
           from apps.laboratorio.constants.permissions.permission_codes import PermisoCodigo
           from apps.laboratorio.schemas.responses.envelopes import exito
 
-          RUTA_SIMULAR = "/laboratorio/api/v1/projects/{proyecto_id}/simulate"
-          RUTA_SIMS = "/laboratorio/api/v1/projects/{proyecto_id}/simulations"
-          RUTA_COMPARAR = "/laboratorio/api/v1/projects/{proyecto_id}/compare"
-          RUTA_COMPARACION = "/laboratorio/api/v1/comparisons/{comparacion_id}"
-          RUTA_INFORME = RUTA_COMPARACION + "/report.html"
-          RUTA_OPTIMIZAR = "/laboratorio/api/v1/scenarios/{escenario_id}/optimize"
-          RUTA_APLICAR = "/laboratorio/api/v1/optimizations/{optimizacion_id}/apply"
-          RUTA_MONTE = "/laboratorio/api/v1/projects/{proyecto_id}/monte-carlo"
-          RUTA_MONTE_COMPARA = "/laboratorio/api/v1/projects/{proyecto_id}/monte-carlo/comparar"
+          RUTA_EVENTOS = "/laboratorio/api/v1/events"
+          RUTA_CACHE_STATS = "/laboratorio/api/v1/cache/stats"
 
 
-          def registrar_rutas(app) -> None:
-              manejador = app.contenedor.obtener("manejador_decisiones")
-              motor_mc = app.contenedor.obtener("motor_monte_carlo")
+          def registrar_rutas_internas(app) -> None:
+              colector = app.contenedor.obtener("colector_eventos")
+              cache = app.contenedor.obtener("cache_global")
 
-              def _simular(ctx):
-                  return manejador.simular(ctx.identidad, ctx.ruta_params["proyecto_id"], ctx.json())
+              def _eventos(ctx):
+                  desde = ctx.query.get("desde", "0")
+                  limite = ctx.query.get("limite", "50")
+                  try:
+                      desde_num = int(desde)
+                  except ValueError:
+                      desde_num = 0
+                  try:
+                      limite_num = int(limite)
+                  except ValueError:
+                      limite_num = 50
+                  return exito(colector.historial(desde_num, limite_num))
 
-              def _sims(ctx):
-                  return manejador.listar_simulaciones(ctx.identidad, ctx.ruta_params["proyecto_id"])
+              def _cache(ctx):
+                  return exito(cache.estadisticas())
 
-              def _comparar(ctx):
-                  return manejador.comparar(ctx.identidad, ctx.ruta_params["proyecto_id"])
+              app.registrar(
+                  "GET", RUTA_EVENTOS, _eventos,
+                  PermisoCodigo.VER,
+                  "Feed de eventos en vivo con cursor (polling)",
+              )
+              app.registrar(
+                  "GET", RUTA_CACHE_STATS, _cache,
+                  PermisoCodigo.VER,
+                  "Estadisticas reales de la cache TTL",
+              )
+          INT_EOF
 
-              def _comparacion(ctx):
-                  return manejador.obtener_comparacion(ctx.identidad, ctx.ruta_params["comparacion_id"])
-
-              def _informe(ctx):
-                  return manejador.informe_comparacion(ctx.identidad, ctx.ruta_params["comparacion_id"])
-
-              def _optimizar(ctx):
-                  return manejador.optimizar(ctx.identidad, ctx.ruta_params["escenario_id"])
-
-              def _aplicar(ctx):
-                  return manejador.aplicar(ctx.identidad, ctx.ruta_params["optimizacion_id"], ctx.json_opcional())
-
-              def _monte(ctx):
-                  return exito(motor_mc.simular(ctx.json()))
-
-              def _monte_compara(ctx):
-                  return exito(motor_mc.comparar(ctx.json()))
-
-              app.registrar("POST", RUTA_SIMULAR, _simular, PermisoCodigo.SIMULAR, "Simular evolucion temporal")
-              app.registrar("GET", RUTA_SIMS, _sims, PermisoCodigo.VER, "Listar simulaciones")
-              app.registrar("POST", RUTA_COMPARAR, _comparar, PermisoCodigo.COMPARAR, "Comparar escenarios evaluados")
-              app.registrar("GET", RUTA_COMPARACION, _comparacion, PermisoCodigo.VER, "Obtener comparacion")
-              app.registrar("GET", RUTA_INFORME, _informe, PermisoCodigo.VER, "Informe HTML de la comparacion")
-              app.registrar("POST", RUTA_OPTIMIZAR, _optimizar, PermisoCodigo.OPTIMIZAR, "Sugerir optimizacion")
-              app.registrar("POST", RUTA_APLICAR, _aplicar, PermisoCodigo.OPTIMIZAR, "Aplicar optimizacion como escenario nuevo")
-              app.registrar("POST", RUTA_MONTE, _monte, PermisoCodigo.SIMULAR, "Monte Carlo reproducible con IC95 y convergencia")
-              app.registrar("POST", RUTA_MONTE_COMPARA, _monte_compara, PermisoCodigo.COMPARAR, "Comparar configuraciones con Monte Carlo")
-          DEC_EOF
-
-      - name: Escribir service_registry.py (17 motores)
+      - name: Escribir service_registry.py (cache + colector + notificador cableados)
         run: |
           cat > apps/laboratorio/registry/services/service_registry.py <<'REG_EOF'
           """Contenedor de servicios: unico punto que construye y conecta todo."""
           import os
           import secrets
+          from collections import deque
 
           from apps.laboratorio.application.handlers.project_handler import ManejadorProyectos
           from apps.laboratorio.application.handlers.scenario_handler import ManejadorEscenarios
@@ -651,6 +333,7 @@ jobs:
               CasoAvatarDesdeFoto,
               CasoEscanearFoto,
           )
+          from apps.laboratorio.infrastructure.cache import CacheTTL
           from apps.laboratorio.infrastructure.providers.calibrator_manual import CalibradorManual
           from apps.laboratorio.infrastructure.providers.display_holo3d import MotorHolo3D
           from apps.laboratorio.infrastructure.providers.monte_carlo_engine import MotorMonteCarlo
@@ -660,6 +343,7 @@ jobs:
           from apps.laboratorio.infrastructure.providers.renderer_svg import MotorRenderSVG
           from apps.laboratorio.infrastructure.providers.scanner_photo import MotorEscaneoFoto
           from apps.laboratorio.infrastructure.providers.avatar_engine import MotorAvatar
+          from apps.laboratorio.events.notifications import Notificador
           from apps.laboratorio.infrastructure.persistence.surface_store import SurfaceStore
           from apps.laboratorio.infrastructure.persistence.display_store import DisplayStore
           from apps.laboratorio.infrastructure.repositories.surface_repository import SurfaceRepository
@@ -769,6 +453,8 @@ jobs:
           from apps.laboratorio.registry.modules.register import RegistroModulos
           from apps.laboratorio.registry.templates.template_registry import RegistroPlantillas
 
+          MAX_FEED = 500
+
 
           class _EnvolturaMotor:
               """Adapta un motor existente al registro con estado honesto."""
@@ -794,6 +480,72 @@ jobs:
                       "capacidades": tuple(self.capacidades().keys()),
                       "motivo": self._motivo,
                   }
+
+
+          class ColectorEventos:
+              """Buffer circular del feed de eventos (monkey-patch aditivo del bus)."""
+
+              def __init__(self, maxlen: int = MAX_FEED):
+                  if int(maxlen) < 1:
+                      raise ValueError("maxlen debe ser mayor o igual a 1.")
+                  self._feed = deque(maxlen=int(maxlen))
+                  self._secuencia = 0
+                  self._notificador = Notificador()
+
+              def conectar(self, bus: BusEventos) -> int:
+                  """Patch aditivo: cada publicacion del bus entra al feed."""
+                  if bus is None:
+                      raise ValueError("ColectorEventos requiere el bus real.")
+                  publicar_original = bus.publicar
+
+                  def publicar_con_feed(evento):
+                      entregados = publicar_original(evento)
+                      try:
+                          nombre = getattr(evento, "nombre", str(type(evento).__name__))
+                          datos = getattr(evento, "datos", {})
+                          self._registrar(nombre, dict(datos or {}))
+                      except Exception:
+                          pass
+                      return entregados
+
+                  bus.publicar = publicar_con_feed
+                  return 1
+
+              def _registrar(self, nombre: str, datos: dict) -> int:
+                  import time as _time
+                  self._secuencia += 1
+                  self._feed.append({
+                      "seq": self._secuencia,
+                      "evento": str(nombre)[:120],
+                      "datos": datos,
+                      "momento": _time.strftime(
+                          "%Y-%m-%dT%H:%M:%SZ", _time.gmtime()
+                      ),
+                  })
+                  return self._secuencia
+
+              def historial(self, desde: int = 0, limite: int = 50) -> dict:
+                  if int(desde) < 0:
+                      raise ValueError("desde no puede ser negativo.")
+                  if int(limite) < 1 or int(limite) > MAX_FEED:
+                      raise ValueError(
+                          "limite debe estar entre 1 y " + str(MAX_FEED)
+                      )
+                  todos = list(self._feed)
+                  seleccion = [
+                      e for e in todos if int(e["seq"]) > int(desde)
+                  ][: int(limite)]
+                  return {
+                      "total": self._secuencia,
+                      "devueltos": len(seleccion),
+                      "cursor_sugerido": (
+                          seleccion[-1]["seq"] if seleccion else int(desde)
+                      ),
+                      "eventos": seleccion,
+                  }
+
+              def notificar_evento(self, evento, mensaje: str = "") -> dict:
+                  return self._notificador.notificar(evento, mensaje)
 
 
           class Contenedor:
@@ -866,6 +618,8 @@ jobs:
               c.registrar("repo_auditoria", lambda _c: AuditoriaRepository(_c.obtener("audit_store")))
               c.registrar("bus", lambda _c: BusEventos())
               c.registrar("outbox", lambda _c: Outbox(conexion, cfg_ev.reintentos))
+              c.registrar("cache_global", lambda _c: CacheTTL(ttl_segundos=60.0, maxlen=1000))
+              c.registrar("colector_eventos", lambda _c: ColectorEventos())
 
               def _suscriptor(_c):
                   suscriptor = SuscriptorZyra(_c.obtener("bus"), _c.obtener("outbox"))
@@ -1014,6 +768,8 @@ jobs:
               c.registrar("manejador_escaneo", lambda _c: ManejadorEscaneo(_c.obtener("caso_escanear_foto"), _c.obtener("caso_avatar_foto")))
               c.registrar("manejador_proyeccion", lambda _c: ManejadorProyeccion(_c.obtener("caso_registrar_superficie"), _c.obtener("caso_calibrar"), _c.obtener("caso_proyectar"), _c.obtener("repo_superficies"), _c.obtener("auditoria_sink")))
               c.registrar("manejador_salidas", lambda _c: ManejadorSalidas(_c.obtener("caso_registrar_salida"), _c.obtener("caso_probar_salida"), _c.obtener("repo_salidas"), _c.obtener("auditoria_sink")))
+              _c = c.obtener("colector_eventos")
+              _c.conectar(c.obtener("bus"))
               c.obtener("suscriptor_zyra")
               return c
           REG_EOF
@@ -1029,10 +785,32 @@ jobs:
           if [ -f requirements.txt ]; then pip install -r requirements.txt; fi
           pip install pytest
 
-      - name: Verificacion completa (escena REAL del repo)
+      - name: Escribir y aplicar cable en app.py (rutas internas)
+        run: |
+          python - <<'PYPY'
+          import os
+          from pathlib import Path
+
+          ruta = Path("apps/laboratorio/infrastructure/api/app.py")
+          t = ruta.read_text(encoding="utf-8", errors="replace")
+          if "registrar_rutas_internas" not in t:
+              t = t.replace(
+                  "    registrar_ui(app)\n",
+                  "    registrar_ui(app)\n"
+                  "    from apps.laboratorio.routers.internal import registrar_rutas_internas\n"
+                  "    registrar_rutas_internas(app)\n",
+                  1,
+              )
+              ruta.write_text(t, encoding="utf-8")
+              print("app.py: cable de rutas internas agregado")
+          else:
+              print("app.py: cable ya presente")
+          PYPY
+
+      - name: Verificacion completa (feed cache eventos montaje)
         run: |
           python - <<'PYEOF'
-          import ast, importlib, json, os, struct, sys, traceback
+          import ast, importlib, os, sys, traceback
           from pathlib import Path
 
           summary = os.environ.get("GITHUB_STEP_SUMMARY")
@@ -1050,13 +828,15 @@ jobs:
               sys.exit(1 if fallo else 0)
 
 
-          A("# Lote glTF + GLB + Monte Carlo — resultado\n")
+          A("# RUM 5 — Feed de eventos + Cache TTL — resultado\n")
 
           archivos = [
-              "apps/laboratorio/infrastructure/providers/monte_carlo_engine.py",
-              "apps/laboratorio/infrastructure/providers/generation_engine.py",
-              "apps/laboratorio/routers/api/decisions.py",
+              "apps/laboratorio/infrastructure/cache/__init__.py",
+              "apps/laboratorio/events/system/__init__.py",
+              "apps/laboratorio/events/notifications/__init__.py",
+              "apps/laboratorio/routers/internal/__init__.py",
               "apps/laboratorio/registry/services/service_registry.py",
+              "apps/laboratorio/infrastructure/api/app.py",
           ]
           for ruta in archivos:
               try:
@@ -1067,136 +847,99 @@ jobs:
                   finalizar(True)
           A("")
 
-          OBJETOS = [
-              {"forma": "rect", "x": 10, "y": 20, "w": 80, "h": 50, "color": "#3B82F6", "capa": "fondo"},
-              {"forma": "circle", "cx": 140, "cy": 75, "r": 30, "color": "#F59E0B", "capa": "medio"},
-              {"forma": "texto", "x": 15, "y": 110, "contenido": "ZYRA", "color": "#E2E8F0", "capa": "frente"},
-          ]
-
-          A("## 1. Escena3D real + glTF 2.0 JSON")
+          A("## 1. Cache TTL real")
           try:
-              from apps.laboratorio.domain.scene import Escena3D
-              esc = None
-              try:
-                  esc = Escena3D(nombre="prueba-gltf", ancho=200, alto=150, objetos=OBJETOS)
-                  A("constructor: kwargs OK")
-              except TypeError:
-                  try:
-                      esc = Escena3D("prueba-gltf", 200, 150, OBJETOS)
-                      A("constructor: posicional OK")
-                  except Exception:
-                      esc = None
-              if not isinstance(esc, Escena3D):
-                  esc = Escena3D.__new__(Escena3D)
-                  for atributo, valor in (
-                      ("nombre", "prueba-gltf"), ("ancho", 200), ("alto", 150),
-                      ("objetos", OBJETOS), ("_objetos", OBJETOS),
-                  ):
-                      try:
-                          setattr(esc, atributo, valor)
-                      except Exception:
-                          pass
-                  A("constructor: instancia real via __new__ + atributos")
-              if not isinstance(esc, Escena3D):
-                  A("FALLO: no se obtuvo instancia real de Escena3D")
+              from apps.laboratorio.infrastructure.cache import CacheTTL
+              import time as _t
+              cache = CacheTTL(ttl_segundos=0.2, maxlen=3)
+              if cache.obtener("x") is not None:
+                  A("FALLO: lectura de clave inexistente debe ser None")
                   finalizar(True)
-              from apps.laboratorio.infrastructure.providers.generation_engine import MotorGeneracionReal
-              motor = MotorGeneracionReal()
-              gltf = json.loads(motor.generar(esc, "modelo").decode("utf-8"))
-              if gltf["asset"]["version"] != "2.0":
-                  A("FALLO: version glTF incorrecta")
+              cache.poner("x", 42)
+              if cache.obtener("x") != 42:
+                  A("FALLO: hit fallo")
                   finalizar(True)
-              if len(gltf["meshes"]) != 2:
-                  A("FALLO: se esperaban 2 mallas, hay " + str(len(gltf["meshes"])))
+              _t.sleep(0.25)
+              if cache.obtener("x") is not None:
+                  A("FALLO: TTL no expiro")
                   finalizar(True)
-              if not gltf["buffers"][0].get("uri", "").startswith("data:application/octet-stream;base64,"):
-                  A("FALLO: buffer embebido ausente")
+              cache.poner("a", 1)
+              cache.poner("b", 2)
+              cache.poner("c", 3)
+              cache.poner("d", 4)
+              stats = cache.estadisticas()
+              A("stats: " + str(stats))
+              if stats["evictions"] < 1 or stats["expiraciones"] < 1:
+                  A("FALLO: stats incompletas")
                   finalizar(True)
-              if len(gltf["extras"]["objetos_texto"]) != 1:
-                  A("FALLO: texto no declarado en extras")
-                  finalizar(True)
-              A("isinstance Escena3D OK meshes=2 accessors=" + str(len(gltf["accessors"])) + " materials=" + str(len(gltf["materials"])) + " buffer base64 OK")
-              A("glTF 2.0 JSON REAL CORRECTO")
+              A("CACHE TTL REAL CORRECTA")
           except Exception:
               A("EXCEPCION:")
               A(traceback.format_exc())
               finalizar(True)
           A("")
 
-          A("## 2. GLB binario real")
+          A("## 2. Eventos de sistema + notificador")
           try:
-              glb = motor.generar(esc, "modelo_glb")
-              magico, version, total = struct.unpack("<III", glb[:12])
-              if magico != 0x46546C67 or version != 2 or total != len(glb):
-                  A("FALLO cabecera: magic=" + hex(magico) + " v=" + str(version) + " total=" + str(total) + " len=" + str(len(glb)))
+              from apps.laboratorio.events.system import evento_arrancado, evento_health, EventoSistema
+              from apps.laboratorio.events.notifications import Notificador
+              ev = evento_arrancado("laboratorio", 74, 17)
+              if not ev.momento or ev.detalle["rutas"] != 74:
+                  A("FALLO: evento de arranque incompleto")
                   finalizar(True)
-              largo_json, tipo_json = struct.unpack("<II", glb[12:20])
-              if tipo_json != 0x4E4F534A:
-                  A("FALLO: chunk JSON invalido")
+              nh = evento_health({"ok": True, "motores_total": 17, "motores_disponibles": 17})
+              notif = Notificador()
+              registro = notif.notificar(ev, "arranque verificado")
+              if not registro["id"].startswith("notif-"):
+                  A("FALLO: registro de notificacion invalido")
                   finalizar(True)
-              gltf2 = json.loads(glb[20:20 + largo_json].decode("utf-8"))
-              base = 20 + largo_json
-              largo_bin, tipo_bin = struct.unpack("<II", glb[base:base + 8])
-              if tipo_bin != 0x004E4942:
-                  A("FALLO: chunk BIN invalido")
+              lista = notif.historial(0, 10)
+              if lista["devueltas"] != 1:
+                  A("FALLO: historial de notificaciones incompleto")
                   finalizar(True)
-              if largo_bin < gltf2["buffers"][0]["byteLength"]:
-                  A("FALLO: BIN menor que buffer declarado")
-                  finalizar(True)
-              A("magic OK v=2 chunkJSON=" + str(largo_json) + " chunkBIN=" + str(largo_bin))
-              A("GLB BINARIO REAL CORRECTO")
+              A("evento_arrancado OK · evento_health OK · notificador OK")
           except Exception:
               A("EXCEPCION:")
               A(traceback.format_exc())
               finalizar(True)
           A("")
 
-          A("## 3. Monte Carlo real")
+          A("## 3. Feed de eventos con cursor (bus -> colector)")
           try:
-              from apps.laboratorio.infrastructure.providers.monte_carlo_engine import MotorMonteCarlo
-              mc = MotorMonteCarlo()
-              config = {
-                  "variables": {
-                      "costo": {"dist": "normal", "media": 45.0, "desv": 8.0},
-                      "beneficio": {"dist": "uniforme", "minimo": 55.0, "maximo": 90.0},
-                      "riesgo": {"dist": "triangular", "minimo": 10.0, "modo": 30.0, "maximo": 70.0},
-                  },
-                  "corridas": 5000,
-                  "semilla": 42,
-                  "umbral": 55.0,
-              }
-              r1 = mc.simular(config)
-              r2 = mc.simular(config)
-              if r1 != r2:
-                  A("FALLO: misma semilla dio resultados distintos")
+              from apps.laboratorio.infrastructure.messaging.event_bus import BusEventos
+              from apps.laboratorio.registry.services.service_registry import ColectorEventos
+              from apps.laboratorio.shared.interfaces.event_bus import Evento
+
+              class _Ev:
+                  pass
+
+              bus = BusEventos()
+              colector = ColectorEventos()
+              colector.conectar(bus)
+              recibidos = []
+              bus.suscribir("laboratorio.prueba", lambda e: recibidos.append(e))
+              ev = Evento(nombre="laboratorio.prueba", datos={"n": 1})
+              bus.publicar(ev)
+              if not recibidos:
+                  A("FALLO: el suscriptor no recibio el evento")
                   finalizar(True)
-              if not (r1["p5"] <= r1["p25"] <= r1["p50"] <= r1["p75"] <= r1["p95"]):
-                  A("FALLO: percentiles desordenados")
+              feed = colector.historial(0, 10)
+              if feed["devueltos"] != 1 or feed["eventos"][0]["evento"] != "laboratorio.prueba":
+                  A("FALLO: feed no capturo el evento: " + str(feed))
                   finalizar(True)
-              lo, hi = r1["ic95"]
-              if not (lo <= r1["media"] <= hi):
-                  A("FALLO: media fuera de IC95")
+              cursor = feed["cursor_sugerido"]
+              vacio = colector.historial(cursor, 10)
+              if vacio["devueltos"] != 0:
+                  A("FALLO: cursor no avanza")
                   finalizar(True)
-              comp = mc.comparar([
-                  {"nombre": "optimista", "variables": config["variables"], "corridas": 2000, "semilla": 7},
-                  {"nombre": "pesimista", "variables": {
-                      "costo": {"dist": "normal", "media": 70.0, "desv": 5.0},
-                      "beneficio": {"dist": "uniforme", "minimo": 30.0, "maximo": 55.0},
-                      "riesgo": {"dist": "triangular", "minimo": 40.0, "modo": 60.0, "maximo": 90.0},
-                  }, "corridas": 2000, "semilla": 7},
-              ])
-              if comp["ganador"] != "optimista":
-                  A("FALLO: ganador inesperado: " + comp["ganador"])
-                  finalizar(True)
-              A("n=" + str(r1["n"]) + " media=" + str(r1["media"]) + " ic95=" + str(r1["ic95"]) + " ganador=" + comp["ganador"])
-              A("MONTE CARLO REAL CORRECTO")
+              A("bus->feed OK cursor OK patch aditivo no rompe suscriptores OK")
           except Exception:
               A("EXCEPCION:")
               A(traceback.format_exc())
               finalizar(True)
           A("")
 
-          A("## 4. Montaje completo (17 motores y 72 rutas)")
+          A("## 4. Montaje completo (17 motores y 74 rutas)")
           try:
               mod = importlib.import_module("apps.laboratorio.registry.services.service_registry")
               c = mod.construir_contenedor(":memory:")
@@ -1212,8 +955,12 @@ jobs:
               if salud.get("motores_disponibles") != 17:
                   A("FALLO: disponibles != 17")
                   ok = False
-              if len(rutas) != 72:
-                  A("FALLO: rutas != 72 (hay " + str(len(rutas)) + ")")
+              if len(rutas) != 74:
+                  A("FALLO: rutas != 74 (hay " + str(len(rutas)) + ")")
+                  ok = False
+              patron_nuevos = [r for r in rutas if "/events" in str(r.get("patron", "")) or "/cache/stats" in str(r.get("patron", ""))]
+              if len(patron_nuevos) != 2:
+                  A("FALLO: rutas internas ausentes: " + str(patron_nuevos))
                   ok = False
               if ok:
                   A("MONTAJE COMPLETO CORRECTO")
@@ -1231,13 +978,15 @@ jobs:
         run: |
           git config user.name "zyra-bot"
           git config user.email "zyra-bot@users.noreply.github.com"
-          git add apps/laboratorio/infrastructure/providers/monte_carlo_engine.py
-          git add apps/laboratorio/infrastructure/providers/generation_engine.py
-          git add apps/laboratorio/routers/api/decisions.py
+          git add apps/laboratorio/infrastructure/cache/__init__.py
+          git add apps/laboratorio/events/system/__init__.py
+          git add apps/laboratorio/events/notifications/__init__.py
+          git add apps/laboratorio/routers/internal/__init__.py
           git add apps/laboratorio/registry/services/service_registry.py
+          git add apps/laboratorio/infrastructure/api/app.py
           if git diff --cached --quiet; then
             echo "sin cambios"
           else
-            git commit -m "Lote: glTF 2.0 real + GLB binario + Monte Carlo reproducible"
+            git commit -m "RUM 5: feed de eventos en vivo con cursor + cache TTL real + eventos de sistema y notificaciones"
             git push
           fi

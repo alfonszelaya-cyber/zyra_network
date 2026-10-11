@@ -1,5 +1,6 @@
-"""Rutas de presentaciones + control remoto holografico."""
+"""Rutas de presentaciones + control remoto + MODO CURSO."""
 from apps.laboratorio.constants.permissions.permission_codes import PermisoCodigo
+from apps.laboratorio.schemas.responses.envelopes import exito
 from apps.laboratorio.shared.exceptions.domain_errors import EntidadNoEncontradaError
 
 RUTA_CREAR = "/laboratorio/api/v1/projects/{proyecto_id}/presentations"
@@ -13,17 +14,21 @@ RUTA_TOQUE = RUTA_SESION + "/tocar"
 RUTA_FRAME = RUTA_SESION + "/frame.svg"
 RUTA_VISTA = RUTA_SESION + "/view"
 RUTA_PROYECTAR = RUTA_SESION + "/proyectar"
+RUTA_CURSO_CREAR = "/laboratorio/api/v1/presentations/{presentacion_id}/curso"
+RUTA_CURSO_RESPONDER = "/laboratorio/api/v1/presentations/curso/{curso_id}/responder"
+RUTA_CURSO_CERTIFICAR = "/laboratorio/api/v1/presentations/curso/{curso_id}/certificar"
 
 
 def registrar_rutas(app) -> None:
     manejador = app.contenedor.obtener("manejador_presentaciones")
     remota = app.contenedor.obtener("presentacion_remota")
+    modocurso = app.contenedor.obtener("modocurso")
 
-    def _sesion_o_404(sesion_id):
+    def _sesion_o_404(sid):
         try:
-            return remota.sesion(sesion_id)
+            return remota.sesion(sid)
         except ValueError as exc:
-            raise EntidadNoEncontradaError(str(exc), sesion_id)
+            raise EntidadNoEncontradaError(str(exc), sid)
 
     def _crear(ctx):
         return manejador.crear(ctx.identidad, ctx.ruta_params["proyecto_id"], ctx.json())
@@ -104,16 +109,33 @@ def registrar_rutas(app) -> None:
     def _proyectar(ctx):
         return remota.proyectar_paso_actual(ctx.ruta_params["sesion_id"])
 
-    app.registrar("POST", RUTA_SESIONES, _crear_sesion, PermisoCodigo.PRESENTAR, "Abrir sesion interactiva")
-    app.registrar("GET", RUTA_SESIONES, _listar_sesiones, PermisoCodigo.VER, "Listar sesiones interactivas")
+    def _curso_crear(ctx):
+        datos = ctx.json()
+        return exito(modocurso.crear_curso(
+            ctx.ruta_params["presentacion_id"], datos.get("preguntas", []),
+            datos.get("umbral_aprobacion", 0.7)))
+
+    def _curso_responder(ctx):
+        datos = ctx.json()
+        return exito(modocurso.responder(ctx.ruta_params["curso_id"],
+                                         ctx.identidad.zid, datos.get("respuestas", [])))
+
+    def _curso_certificar(ctx):
+        return exito(modocurso.certificar(ctx.ruta_params["curso_id"], ctx.identidad.zid))
+
     app.registrar("POST", RUTA_CREAR, _crear, PermisoCodigo.PRESENTAR, "Crear presentacion con pasos")
     app.registrar("GET", RUTA_CREAR, _listar, PermisoCodigo.VER, "Listar presentaciones")
     app.registrar("GET", RUTA_ITEM, _obtener, PermisoCodigo.VER, "Obtener presentacion")
     app.registrar("GET", RUTA_PLAY, _reproducir, PermisoCodigo.VER, "Reproducir slideshow real")
     app.registrar("POST", RUTA_SELLAR, _sellar, PermisoCodigo.PRESENTAR, "Sellar en ZYRA via outbox")
+    app.registrar("POST", RUTA_SESIONES, _crear_sesion, PermisoCodigo.PRESENTAR, "Abrir sesion interactiva")
+    app.registrar("GET", RUTA_SESIONES, _listar_sesiones, PermisoCodigo.VER, "Listar sesiones interactivas")
     app.registrar("GET", RUTA_SESION, _estado, PermisoCodigo.VER, "Estado de la sesion interactiva")
     app.registrar("POST", RUTA_ACCION, _accion, PermisoCodigo.PRESENTAR, "Accion de control")
     app.registrar("POST", RUTA_TOQUE, _tocar, PermisoCodigo.PRESENTAR, "Tocar punto a explicar")
     app.registrar("GET", RUTA_FRAME, _frame, PermisoCodigo.VER, "Frame holografico del paso actual")
     app.registrar("GET", RUTA_VISTA, _vista, PermisoCodigo.VER, "Vista de control desde telefono o PC")
     app.registrar("POST", RUTA_PROYECTAR, _proyectar, PermisoCodigo.PRESENTAR, "Proyectar paso actual")
+    app.registrar("POST", RUTA_CURSO_CREAR, _curso_crear, PermisoCodigo.PRESENTAR, "Crear curso de capacitacion")
+    app.registrar("POST", RUTA_CURSO_RESPONDER, _curso_responder, PermisoCodigo.VER, "Responder evaluacion")
+    app.registrar("POST", RUTA_CURSO_CERTIFICAR, _curso_certificar, PermisoCodigo.VER, "Certificado firmado + sellado en la Red")

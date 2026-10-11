@@ -65,6 +65,8 @@ from apps.laboratorio.application.use_cases.decide import (
     CasoAplicarOptimizacion,
 )
 from apps.laboratorio.infrastructure.providers.simulation_engine import MotorEvolucionReal
+from apps.laboratorio.infrastructure.providers.presentation_remote import ModoCurso, PresentacionRemota
+from apps.laboratorio.infrastructure.providers.renderer_3d import MotorRenderOrbital
 from apps.laboratorio.infrastructure.providers.citizens_engine import MotorCiudadanos
 from apps.laboratorio.infrastructure.providers.physics_engine import MotorFisico
 from apps.laboratorio.infrastructure.providers.presentation_remote import PresentacionRemota
@@ -350,6 +352,8 @@ def construir_contenedor(ruta_bd: str = ":memory:") -> Contenedor:
     c.registrar("registro_motores", _motores)
     c.registrar("salidas_universales", lambda _c: _c.obtener("registro_motores").obtener("display_holo3d"))
     c.registrar("motor_monte_carlo", lambda _c: MotorMonteCarlo())
+    c.registrar("motor_orbital", lambda _c: MotorRenderOrbital())
+    c.registrar("modocurso", lambda _c: ModoCurso(_c.obtener("repo_presentaciones"), _c.obtener("outbox"), _c.obtener("firmador"), _c.obtener("cliente_zyra")))
     c.registrar("gemelo_vivo", lambda _c: GemeloVivo())
     c.registrar("motor_ciudadanos", lambda _c: MotorCiudadanos())
     c.registrar("motor_fisico", lambda _c: MotorFisico())

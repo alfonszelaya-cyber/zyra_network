@@ -1,6 +1,7 @@
 """Contenedor de servicios: unico punto que construye y conecta todo."""
 import os
 import secrets
+from collections import deque
 
 from apps.laboratorio.application.handlers.project_handler import ManejadorProyectos
 from apps.laboratorio.application.handlers.scenario_handler import ManejadorEscenarios
@@ -25,6 +26,7 @@ from apps.laboratorio.application.use_cases.scan_photo import (
     CasoAvatarDesdeFoto,
     CasoEscanearFoto,
 )
+from apps.laboratorio.infrastructure.cache import CacheTTL
 from apps.laboratorio.infrastructure.providers.calibrator_manual import CalibradorManual
 from apps.laboratorio.infrastructure.providers.display_holo3d import MotorHolo3D
 from apps.laboratorio.infrastructure.providers.monte_carlo_engine import MotorMonteCarlo
@@ -34,6 +36,7 @@ from apps.laboratorio.infrastructure.providers.renderer_raster import MotorRende
 from apps.laboratorio.infrastructure.providers.renderer_svg import MotorRenderSVG
 from apps.laboratorio.infrastructure.providers.scanner_photo import MotorEscaneoFoto
 from apps.laboratorio.infrastructure.providers.avatar_engine import MotorAvatar
+from apps.laboratorio.events.notifications import Notificador
 from apps.laboratorio.infrastructure.persistence.surface_store import SurfaceStore
 from apps.laboratorio.infrastructure.persistence.display_store import DisplayStore
 from apps.laboratorio.infrastructure.repositories.surface_repository import SurfaceRepository
@@ -143,6 +146,8 @@ from apps.laboratorio.registry.engines.engine_registry import RegistroMotores
 from apps.laboratorio.registry.modules.register import RegistroModulos
 from apps.laboratorio.registry.templates.template_registry import RegistroPlantillas
 
+MAX_FEED = 500
+
 
 class _EnvolturaMotor:
     """Adapta un motor existente al registro con estado honesto."""
@@ -168,6 +173,72 @@ class _EnvolturaMotor:
             "capacidades": tuple(self.capacidades().keys()),
             "motivo": self._motivo,
         }
+
+
+class ColectorEventos:
+    """Buffer circular del feed de eventos (monkey-patch aditivo del bus)."""
+
+    def __init__(self, maxlen: int = MAX_FEED):
+        if int(maxlen) < 1:
+            raise ValueError("maxlen debe ser mayor o igual a 1.")
+        self._feed = deque(maxlen=int(maxlen))
+        self._secuencia = 0
+        self._notificador = Notificador()
+
+    def conectar(self, bus: BusEventos) -> int:
+        """Patch aditivo: cada publicacion del bus entra al feed."""
+        if bus is None:
+            raise ValueError("ColectorEventos requiere el bus real.")
+        publicar_original = bus.publicar
+
+        def publicar_con_feed(evento):
+            entregados = publicar_original(evento)
+            try:
+                nombre = getattr(evento, "nombre", str(type(evento).__name__))
+                datos = getattr(evento, "datos", {})
+                self._registrar(nombre, dict(datos or {}))
+            except Exception:
+                pass
+            return entregados
+
+        bus.publicar = publicar_con_feed
+        return 1
+
+    def _registrar(self, nombre: str, datos: dict) -> int:
+        import time as _time
+        self._secuencia += 1
+        self._feed.append({
+            "seq": self._secuencia,
+            "evento": str(nombre)[:120],
+            "datos": datos,
+            "momento": _time.strftime(
+                "%Y-%m-%dT%H:%M:%SZ", _time.gmtime()
+            ),
+        })
+        return self._secuencia
+
+    def historial(self, desde: int = 0, limite: int = 50) -> dict:
+        if int(desde) < 0:
+            raise ValueError("desde no puede ser negativo.")
+        if int(limite) < 1 or int(limite) > MAX_FEED:
+            raise ValueError(
+                "limite debe estar entre 1 y " + str(MAX_FEED)
+            )
+        todos = list(self._feed)
+        seleccion = [
+            e for e in todos if int(e["seq"]) > int(desde)
+        ][: int(limite)]
+        return {
+            "total": self._secuencia,
+            "devueltos": len(seleccion),
+            "cursor_sugerido": (
+                seleccion[-1]["seq"] if seleccion else int(desde)
+            ),
+            "eventos": seleccion,
+        }
+
+    def notificar_evento(self, evento, mensaje: str = "") -> dict:
+        return self._notificador.notificar(evento, mensaje)
 
 
 class Contenedor:
@@ -240,6 +311,8 @@ def construir_contenedor(ruta_bd: str = ":memory:") -> Contenedor:
     c.registrar("repo_auditoria", lambda _c: AuditoriaRepository(_c.obtener("audit_store")))
     c.registrar("bus", lambda _c: BusEventos())
     c.registrar("outbox", lambda _c: Outbox(conexion, cfg_ev.reintentos))
+    c.registrar("cache_global", lambda _c: CacheTTL(ttl_segundos=60.0, maxlen=1000))
+    c.registrar("colector_eventos", lambda _c: ColectorEventos())
 
     def _suscriptor(_c):
         suscriptor = SuscriptorZyra(_c.obtener("bus"), _c.obtener("outbox"))
@@ -388,5 +461,7 @@ def construir_contenedor(ruta_bd: str = ":memory:") -> Contenedor:
     c.registrar("manejador_escaneo", lambda _c: ManejadorEscaneo(_c.obtener("caso_escanear_foto"), _c.obtener("caso_avatar_foto")))
     c.registrar("manejador_proyeccion", lambda _c: ManejadorProyeccion(_c.obtener("caso_registrar_superficie"), _c.obtener("caso_calibrar"), _c.obtener("caso_proyectar"), _c.obtener("repo_superficies"), _c.obtener("auditoria_sink")))
     c.registrar("manejador_salidas", lambda _c: ManejadorSalidas(_c.obtener("caso_registrar_salida"), _c.obtener("caso_probar_salida"), _c.obtener("repo_salidas"), _c.obtener("auditoria_sink")))
+    _c = c.obtener("colector_eventos")
+    _c.conectar(c.obtener("bus"))
     c.obtener("suscriptor_zyra")
     return c

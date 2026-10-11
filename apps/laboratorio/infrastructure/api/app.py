@@ -180,5 +180,7 @@ def montar_aplicacion(ruta_bd: str = ":memory:") -> AplicacionLab:
     conectar_comprension(app)
     conectar_captura(app)
     registrar_ui(app)
+    from apps.laboratorio.routers.internal import registrar_rutas_internas
+    registrar_rutas_internas(app)
     app.activar_intermediario(contenedor.obtener("auditoria_sink"))
     return app

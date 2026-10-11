@@ -76,7 +76,9 @@ class AplicacionLab:
                 return estado, {"Content-Type": MIME_JSON}, self._json_bytes(sobre)
         ctx = ContextoPeticion(identidad, params, query, cuerpo or b"")
         resultado = handler(ctx)
-        if len(resultado) == 3:
+        if isinstance(resultado, dict):
+            status, carga, headers_extra = 200, resultado, {}
+        elif len(resultado) == 3:
             status, carga, headers_extra = resultado
         else:
             status, carga = resultado[0], resultado[1]
@@ -184,3 +186,16 @@ def montar_aplicacion(ruta_bd: str = ":memory:") -> AplicacionLab:
     registrar_rutas_internas(app)
     app.activar_intermediario(contenedor.obtener("auditoria_sink"))
     return app
+
+
+_instancia_app = None
+
+
+def __getattr__(nombre):
+    """Export perezoso: from ...app import app (PEP 562)."""
+    global _instancia_app
+    if nombre == "app":
+        if _instancia_app is None:
+            _instancia_app = montar_aplicacion()
+        return _instancia_app
+    raise AttributeError("Este modulo no exporta " + repr(nombre))

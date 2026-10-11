@@ -27,6 +27,7 @@ from apps.laboratorio.application.use_cases.scan_photo import (
 )
 from apps.laboratorio.infrastructure.providers.calibrator_manual import CalibradorManual
 from apps.laboratorio.infrastructure.providers.display_holo3d import MotorHolo3D
+from apps.laboratorio.infrastructure.providers.monte_carlo_engine import MotorMonteCarlo
 from apps.laboratorio.infrastructure.providers.renderer_3d import MotorRender3D
 from apps.laboratorio.infrastructure.providers.renderer_photoreal import MotorRenderFotoreal
 from apps.laboratorio.infrastructure.providers.renderer_raster import MotorRenderRaster
@@ -265,11 +266,13 @@ def construir_contenedor(ruta_bd: str = ":memory:") -> Contenedor:
         registro.registrar("evolucion", _EnvolturaMotor("evolucion", MotorEvolucionReal(), True))
         registro.registrar("comparacion", _EnvolturaMotor("comparacion", MotorComparacionReal(), True))
         registro.registrar("optimizacion", _EnvolturaMotor("optimizacion", MotorOptimizacionReal(), True))
+        registro.registrar("monte_carlo", _EnvolturaMotor("monte_carlo", MotorMonteCarlo(), True))
         registro.registrar("display_holo3d", MotorHolo3D())
         return registro
 
     c.registrar("registro_motores", _motores)
     c.registrar("salidas_universales", lambda _c: _c.obtener("registro_motores").obtener("display_holo3d"))
+    c.registrar("motor_monte_carlo", lambda _c: MotorMonteCarlo())
     c.registrar("estado_salud", lambda _c: EstadoSalud(
         conexion, cfg_red, _c.obtener("registro_motores"),
         cliente_zyra=_c.obtener("cliente_zyra"),

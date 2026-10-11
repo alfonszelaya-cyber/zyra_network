@@ -1,11 +1,18 @@
-"""Motor de generacion: 7 formatos reales desde una Escena3D.
+"""Motor de generacion: 8 formatos reales desde una Escena3D.
 
-Fase 4: naked3d (parallax sin lentes), holograma (proyeccion
-estilizada) y oligrama (mapa de red) se suman a imagen, pagina,
-modelo y animacion. Cero duplicacion: reutiliza MotorRenderSVG.
-El video MP4 NO se simula: llega en fase 6.
+imagen/pagina/animacion: SVG y HTML reales.
+modelo: glTF 2.0 JSON con buffer base64 embebido.
+modelo_glb: GLB binario (JSON chunk + BIN chunk, alineado a 4).
+naked3d/holograma/oligrama: motores dedicados.
+Mallas reales POSITION VEC3 + indices u16, accessors con min/max,
+materiales pbrMetallicRoughness. Y-arriba; Z por capa
+(fondo 0.0, medio 0.5, frente 1.0). Textos NO se malla-fican
+(declarados en extras: sin geometria falsa).
 """
+import base64 as b64
 import json
+import math
+import struct
 
 from apps.laboratorio.domain.scene import Escena3D
 from apps.laboratorio.infrastructure.providers.hologram_engine import MotorHolograma
@@ -13,6 +20,38 @@ from apps.laboratorio.infrastructure.providers.naked3d_engine import MotorNaked3
 from apps.laboratorio.infrastructure.providers.oligram_engine import MotorOligrama
 from apps.laboratorio.infrastructure.providers.renderer_svg import MotorRenderSVG
 from apps.laboratorio.infrastructure.security.html_sanitizer import escapar
+
+Z_CAPA = {"fondo": 0.0, "medio": 0.5, "frente": 1.0}
+SEG_CIRCULO = 24
+
+
+def _hex_rgb(texto: str):
+    crudo = str(texto or "").strip().lstrip("#")
+    if len(crudo) != 6:
+        return (0.58, 0.64, 0.72)
+    return (
+        int(crudo[0:2], 16) / 255.0,
+        int(crudo[2:4], 16) / 255.0,
+        int(crudo[4:6], 16) / 255.0,
+    )
+
+
+def _empaquetar_glb(gltf: dict, binario: bytes) -> bytes:
+    json_crudo = json.dumps(
+        gltf, separators=(",", ":"), ensure_ascii=True
+    ).encode("utf-8")
+    pad_json = (4 - len(json_crudo) % 4) % 4
+    json_crudo += b" " * pad_json
+    pad_bin = (4 - len(binario) % 4) % 4
+    bin_crudo = binario + b"\x00" * pad_bin
+    total = 12 + 8 + len(json_crudo) + 8 + len(bin_crudo)
+    return (
+        struct.pack("<III", 0x46546C67, 2, total)
+        + struct.pack("<II", len(json_crudo), 0x4E4F534A)
+        + json_crudo
+        + struct.pack("<II", len(bin_crudo), 0x004E4942)
+        + bin_crudo
+    )
 
 
 class MotorGeneracionReal:
@@ -27,12 +66,13 @@ class MotorGeneracionReal:
     def capacidades(self) -> dict:
         return {
             "disponibles": (
-                "imagen", "pagina", "modelo", "animacion",
-                "naked3d", "holograma", "oligrama",
+                "imagen", "pagina", "modelo", "modelo_glb",
+                "animacion", "naked3d", "holograma", "oligrama",
             ),
+            "gltf": "2.0 con mallas reales y materiales PBR",
+            "glb": "contenedor binario JSON+BIN alineado a 4",
             "no_disponibles": {
-                "video_mp4": "El motor de secuencia llega en fase 6",
-                "modelo_gltf_completo": "Se amplia en fase 6 con mallas reales",
+                "video_mp4": "El motor de secuencia llega con el motor GPU",
             },
         }
 
@@ -45,6 +85,8 @@ class MotorGeneracionReal:
             return self._generar_pagina(escena)
         if formato == "modelo":
             return self._generar_modelo(escena)
+        if formato == "modelo_glb":
+            return self._generar_glb(escena)
         if formato == "animacion":
             return self._generar_animacion(escena)
         if formato == "naked3d":
@@ -54,8 +96,8 @@ class MotorGeneracionReal:
         if formato == "oligrama":
             return self._oligrama.generar(escena)
         raise ValueError(
-            "El formato '" + str(formato)
-            + "' no esta disponible. El video MP4 llega con el motor de secuencia (fase 6)."
+            "El formato '" + str(formato) + "' no esta disponible. Validos: "
+            + ", ".join(self.capacidades()["disponibles"])
         )
 
     def _generar_imagen(self, escena: Escena3D) -> bytes:
@@ -63,7 +105,6 @@ class MotorGeneracionReal:
         return resultado.imagen_bytes
 
     def _generar_pagina(self, escena: Escena3D) -> bytes:
-        import base64 as b64
         svg = self._generar_imagen(escena).decode("utf-8")
         filas = []
         for i, obj in enumerate(escena.objetos, 1):
@@ -95,37 +136,167 @@ class MotorGeneracionReal:
         )
         return html.encode("utf-8")
 
-    def _generar_modelo(self, escena: Escena3D) -> bytes:
-        nodos = []
+    @staticmethod
+    def _geometria_objeto(obj, alto):
+        forma = str(obj.get("forma", ""))
+        capa = str(obj.get("capa", "medio"))
+        z = Z_CAPA.get(capa, 0.5)
+
+        def punto(px, py):
+            return (float(px), float(alto) - float(py), z)
+
+        if forma == "rect":
+            x, y, w, h = obj["x"], obj["y"], obj["w"], obj["h"]
+            posiciones = [
+                punto(x, y), punto(x + w, y),
+                punto(x + w, y + h), punto(x, y + h),
+            ]
+            indices = [0, 1, 2, 0, 2, 3]
+            return posiciones, indices
+        if forma == "circle":
+            cx, cy, r = float(obj["cx"]), float(obj["cy"]), float(obj["r"])
+            posiciones = [punto(cx, cy)]
+            for i in range(SEG_CIRCULO):
+                ang = 2.0 * math.pi * i / SEG_CIRCULO
+                posiciones.append(punto(
+                    cx + r * math.cos(ang), cy + r * math.sin(ang)
+                ))
+            indices = []
+            for i in range(1, SEG_CIRCULO):
+                siguiente = i + 1 if i + 1 <= SEG_CIRCULO else 1
+                indices.extend([0, i, siguiente])
+            return posiciones, indices
+        return None, None
+
+    def _construir_gltf(self, escena: Escena3D, con_buffer_uri: bool):
+        buffer_bin = bytearray()
+        bufferViews = []
+        accessors = []
+        meshes = []
+        nodes = []
+        materials = []
+        textos = []
+        offset = 0
         for i, obj in enumerate(escena.objetos):
-            nodo = {
-                "name": obj["forma"] + "_" + str(i),
-                "extras": {
-                    "color": obj["color"], "forma": obj["forma"],
-                    "capa": obj.get("capa", "medio"),
+            forma = str(obj.get("forma", ""))
+            if forma not in ("rect", "circle"):
+                textos.append({
+                    "indice": i, "forma": forma,
+                    "contenido": str(obj.get("contenido", "")),
+                    "capa": str(obj.get("capa", "medio")),
+                })
+                continue
+            posiciones, indices = self._geometria_objeto(obj, escena.alto)
+            if posiciones is None:
+                continue
+            plano = []
+            for (px, py, pz) in posiciones:
+                plano.extend((px, py, pz))
+            datos_pos = struct.pack("<" + str(len(plano)) + "f", *plano)
+            pad_pos = (4 - len(datos_pos) % 4) % 4
+            datos_pos += b"\x00" * pad_pos
+            datos_idx = struct.pack("<" + str(len(indices)) + "H", *indices)
+            pad_idx = (4 - len(datos_idx) % 4) % 4
+            datos_idx += b"\x00" * pad_idx
+            vista_pos = len(bufferViews)
+            bufferViews.append({
+                "buffer": 0, "byteOffset": offset,
+                "byteLength": len(datos_pos), "target": 34962,
+            })
+            offset += len(datos_pos)
+            vista_idx = len(bufferViews)
+            bufferViews.append({
+                "buffer": 0, "byteOffset": offset,
+                "byteLength": len(datos_idx), "target": 34963,
+            })
+            offset += len(datos_idx)
+            acc_pos = len(accessors)
+            accessors.append({
+                "bufferView": vista_pos,
+                "componentType": 5126,
+                "count": len(posiciones),
+                "type": "VEC3",
+                "min": [min(plano[0::3]), min(plano[1::3]), min(plano[2::3])],
+                "max": [max(plano[0::3]), max(plano[1::3]), max(plano[2::3])],
+            })
+            acc_idx = len(accessors)
+            accessors.append({
+                "bufferView": vista_idx,
+                "componentType": 5123,
+                "count": len(indices),
+                "type": "SCALAR",
+            })
+            color = _hex_rgb(obj.get("color", "#94A3B8"))
+            material = len(materials)
+            materials.append({
+                "pbrMetallicRoughness": {
+                    "baseColorFactor": [color[0], color[1], color[2], 1.0],
+                    "metallicFactor": 0.05,
+                    "roughnessFactor": 0.55,
                 },
-            }
-            if obj["forma"] == "rect":
-                nodo["translation"] = [obj["x"], obj["y"], 0.0]
-                nodo["extras"]["tamano"] = [obj["w"], obj["h"]]
-            elif obj["forma"] == "circle":
-                nodo["translation"] = [obj["cx"], obj["cy"], 0.0]
-                nodo["extras"]["radio"] = obj["r"]
-            else:
-                nodo["translation"] = [obj["x"], obj["y"], 0.0]
-                nodo["extras"]["texto"] = obj["contenido"]
-            nodos.append(nodo)
-        modelo = {
-            "asset": {"version": "2.0", "generator": "ZYRA LABORATORIO glTF-lite"},
+                "name": "mat_" + forma + "_" + str(i),
+            })
+            mesh = len(meshes)
+            meshes.append({
+                "name": forma + "_" + str(i),
+                "primitives": [{
+                    "attributes": {"POSITION": acc_pos},
+                    "indices": acc_idx,
+                    "material": material,
+                    "mode": 4,
+                }],
+            })
+            nodes.append({
+                "mesh": mesh,
+                "name": forma + "_" + str(i),
+                "extras": {
+                    "capa": str(obj.get("capa", "medio")),
+                    "color": str(obj.get("color", "")),
+                },
+            })
+            buffer_bin += datos_pos
+            buffer_bin += datos_idx
+        binario = bytes(buffer_bin)
+        if con_buffer_uri:
+            uri = (
+                "data:application/octet-stream;base64,"
+                + b64.b64encode(binario).decode("ascii")
+            )
+            buffers = [{"byteLength": len(binario), "uri": uri}]
+        else:
+            buffers = [{"byteLength": len(binario)}]
+        gltf = {
+            "asset": {
+                "version": "2.0",
+                "generator": "ZYRA LABORATORIO glTF 2.0 real",
+            },
             "scene": 0,
-            "scenes": [{"name": escapar(escena.nombre), "nodes": list(range(len(nodos)))}],
-            "nodes": nodos,
+            "scenes": [{
+                "name": escapar(escena.nombre),
+                "nodes": list(range(len(nodes))),
+            }],
+            "nodes": nodes,
+            "meshes": meshes,
+            "materials": materials,
+            "accessors": accessors,
+            "bufferViews": bufferViews,
+            "buffers": buffers,
             "extras": {
-                "dimensiones": [escena.ancho, escena.alto],
-                "nota": "glTF-lite exportado por LABORATORIO (fase 4)",
+                "escena": [escena.ancho, escena.alto],
+                "conversion": "Y-arriba; Z por capa fondo=0.0 medio=0.5 frente=1.0",
+                "objetos_texto": textos,
+                "nota": "los textos no se malla-fican (sin geometria falsa)",
             },
         }
-        return json.dumps(modelo, ensure_ascii=True, indent=2).encode("utf-8")
+        return gltf, binario
+
+    def _generar_modelo(self, escena: Escena3D) -> bytes:
+        gltf, _binario = self._construir_gltf(escena, con_buffer_uri=True)
+        return json.dumps(gltf, ensure_ascii=True, indent=2).encode("utf-8")
+
+    def _generar_glb(self, escena: Escena3D) -> bytes:
+        gltf, binario = self._construir_gltf(escena, con_buffer_uri=False)
+        return _empaquetar_glb(gltf, binario)
 
     def _generar_animacion(self, escena: Escena3D) -> bytes:
         if not escena.objetos:

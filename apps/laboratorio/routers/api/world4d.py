@@ -1,4 +1,4 @@
-"""Rutas 4D + ciudadanos + fisica + camara orbital + desastres."""
+"""Rutas 4D + ciudadanos + fisica + camara orbital + desastres + impresion 3D."""
 from apps.laboratorio.constants.permissions.permission_codes import PermisoCodigo
 from apps.laboratorio.infrastructure.providers.renderer_3d import CamaraOrbital
 from apps.laboratorio.permissions.policies.project_policy import PoliticaProyecto
@@ -17,6 +17,9 @@ RUTA_FIS_PASO = "/laboratorio/api/v1/scenes/{escena_id}/physics/step"
 RUTA_FIS_ESTADO = "/laboratorio/api/v1/scenes/{escena_id}/physics"
 RUTA_CAMARA = "/laboratorio/api/v1/scenes/{escena_id}/camara/orbital"
 RUTA_DESASTRE = "/laboratorio/api/v1/scenes/{escena_id}/desastre/simular"
+RUTA_STL = "/laboratorio/api/v1/scenes/{escena_id}/print3d/stl"
+RUTA_GCODE = "/laboratorio/api/v1/scenes/{escena_id}/print3d/gcode"
+RUTA_P3D_FULL = "/laboratorio/api/v1/scenes/{escena_id}/print3d/preparar"
 
 
 def registrar_rutas(app) -> None:
@@ -24,6 +27,7 @@ def registrar_rutas(app) -> None:
     ciudadanos = app.contenedor.obtener("motor_ciudadanos")
     fisica = app.contenedor.obtener("motor_fisico")
     motor_orbital = app.contenedor.obtener("motor_orbital")
+    motor_p3d = app.contenedor.obtener("motor_p3d")
     repo_escenas = app.contenedor.obtener("repo_escenas")
     repo_proyectos = app.contenedor.obtener("repo_proyectos")
 
@@ -32,6 +36,24 @@ def registrar_rutas(app) -> None:
         proyecto = repo_proyectos.obtener_exigir(str(escena.proyecto_id))
         PoliticaProyecto.exigir_ver(proyecto, ctx.identidad)
         return escena
+
+    def _tl_crear(ctx):
+        return manejador.crear_timeline(ctx.identidad, ctx.ruta_params["escena_id"], ctx.json())
+
+    def _tl_obtener(ctx):
+        return manejador.obtener_timeline(ctx.identidad, ctx.ruta_params["escena_id"])
+
+    def _luz_crear(ctx):
+        return manejador.crear_luz(ctx.identidad, ctx.ruta_params["escena_id"], ctx.json())
+
+    def _luz_obtener(ctx):
+        return manejador.obtener_luz(ctx.identidad, ctx.ruta_params["escena_id"])
+
+    def _int_crear(ctx):
+        return manejador.crear_interaccion(ctx.identidad, ctx.ruta_params["escena_id"], ctx.json())
+
+    def _int_listar(ctx):
+        return manejador.listar_interacciones(ctx.identidad, ctx.ruta_params["escena_id"])
 
     def _poblar(ctx):
         datos = ctx.json()
@@ -88,12 +110,33 @@ def registrar_rutas(app) -> None:
         return exito({"plan": plan, "red": {"evento": "laboratorio.desastre.simulado",
                                             "estado": outbox.estadisticas()}})
 
-    app.registrar("POST", RUTA_TIMELINE, lambda c: manejador.crear_timeline(c.identidad, c.ruta_params["escena_id"], c.json()), PermisoCodigo.EDITAR_4D, "Crear linea de tiempo")
-    app.registrar("GET", RUTA_TIMELINE, lambda c: manejador.obtener_timeline(c.identidad, c.ruta_params["escena_id"]), PermisoCodigo.VER, "Obtener linea de tiempo")
-    app.registrar("POST", RUTA_LIGHTING, lambda c: manejador.crear_luz(c.identidad, c.ruta_params["escena_id"], c.json()), PermisoCodigo.EDITAR_4D, "Crear programa de luz")
-    app.registrar("GET", RUTA_LIGHTING, lambda c: manejador.obtener_luz(c.identidad, c.ruta_params["escena_id"]), PermisoCodigo.VER, "Obtener programa de luz")
-    app.registrar("POST", RUTA_INTERACCIONES, lambda c: manejador.crear_interaccion(c.identidad, c.ruta_params["escena_id"], c.json()), PermisoCodigo.EDITAR_4D, "Crear zona de interaccion")
-    app.registrar("GET", RUTA_INTERACCIONES, lambda c: manejador.listar_interacciones(c.identidad, c.ruta_params["escena_id"]), PermisoCodigo.VER, "Listar interacciones")
+    def _stl(ctx):
+        _escena_verificada(ctx)
+        datos = ctx.json()
+        return exito(motor_p3d.generar_stl(datos.get("objetos", [])))
+
+    def _gcode(ctx):
+        _escena_verificada(ctx)
+        datos = ctx.json()
+        return exito(motor_p3d.generar_gcode(
+            datos.get("objetos", []), float(datos.get("altura_capa_mm", 0.2)),
+            float(datos.get("densidad_relleno", 0.3)),
+            float(datos.get("velocidad_mm_s", 1500))))
+
+    def _p3d_full(ctx):
+        _escena_verificada(ctx)
+        datos = ctx.json()
+        return exito(motor_p3d.disenar_y_preparar(
+            datos.get("objetos", []), float(datos.get("altura_capa_mm", 0.2)),
+            float(datos.get("densidad_relleno", 0.3)),
+            float(datos.get("velocidad_mm_s", 1500))))
+
+    app.registrar("POST", RUTA_TIMELINE, _tl_crear, PermisoCodigo.EDITAR_4D, "Crear linea de tiempo")
+    app.registrar("GET", RUTA_TIMELINE, _tl_obtener, PermisoCodigo.VER, "Obtener linea de tiempo")
+    app.registrar("POST", RUTA_LIGHTING, _luz_crear, PermisoCodigo.EDITAR_4D, "Crear programa de luz")
+    app.registrar("GET", RUTA_LIGHTING, _luz_obtener, PermisoCodigo.VER, "Obtener programa de luz")
+    app.registrar("POST", RUTA_INTERACCIONES, _int_crear, PermisoCodigo.EDITAR_4D, "Crear zona de interaccion")
+    app.registrar("GET", RUTA_INTERACCIONES, _int_listar, PermisoCodigo.VER, "Listar interacciones")
     app.registrar("POST", RUTA_CIT_POBLAR, _poblar, PermisoCodigo.EDITAR_4D, "Poblar gemelo con ciudadanos")
     app.registrar("POST", RUTA_CIT_PASO, _paso_cit, PermisoCodigo.EDITAR_4D, "Paso de simulacion social")
     app.registrar("GET", RUTA_CIT_ESTADO, _estado_cit, PermisoCodigo.VER, "Estado de la poblacion")
@@ -103,4 +146,7 @@ def registrar_rutas(app) -> None:
     app.registrar("POST", RUTA_FIS_PASO, _fis_paso, PermisoCodigo.EDITAR_4D, "Paso de fisica")
     app.registrar("GET", RUTA_FIS_ESTADO, _fis_estado, PermisoCodigo.VER, "Estado del mundo fisico")
     app.registrar("POST", RUTA_CAMARA, _camara, PermisoCodigo.VER, "Vista orbital (PNG real)")
-    app.registrar("POST", RUTA_DESASTRE, _desastre, PermisoCodigo.EDITAR_4D, "Simular desastre: zonas seguras + ayuda + evento a la Red")
+    app.registrar("POST", RUTA_DESASTRE, _desastre, PermisoCodigo.EDITAR_4D, "Simular desastre")
+    app.registrar("POST", RUTA_STL, _stl, PermisoCodigo.EDITAR_4D, "Generar STL imprimible")
+    app.registrar("POST", RUTA_GCODE, _gcode, PermisoCodigo.EDITAR_4D, "Generar G-code marlin")
+    app.registrar("POST", RUTA_P3D_FULL, _p3d_full, PermisoCodigo.EDITAR_4D, "Disenar y preparar impresion completa")

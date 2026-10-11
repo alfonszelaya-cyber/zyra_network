@@ -1,8 +1,8 @@
-"""LAB-CORE: cliente de ZYRA Core (registro, sellado, confianza).
+"""LAB-CORE: cliente de ZYRA Network (registro, sellado, confianza).
 
-Ley 1: si la red no esta configurada, lo reporta; nunca simula exito.
-Reintentos reales con espera progresiva sobre fallos de transporte
-(nunca sobre rechazos definitivos de la Red: HTTP 4xx no se reintenta).
+Ley 1: si la Red no esta configurada, lo reporta; nunca simula exito.
+Reintentos reales con espera progresiva solo sobre fallos de
+transporte; los rechazos definitivos (HTTP 4xx) no se reintentan.
 """
 import json as _json
 import time
@@ -20,7 +20,7 @@ ESPERA_BASE = 0.4
 
 
 class ClienteZyra:
-    """Unica puerta HTTP hacia ZYRA Core."""
+    """Unica puerta HTTP hacia ZYRA Network."""
 
     def __init__(self, config_red):
         if config_red is None:
@@ -32,12 +32,12 @@ class ClienteZyra:
         return self._cfg.configurada
 
     def estado_conexion(self) -> dict:
-        """Estado real y honesto del enlace con ZYRA Core."""
+        """Estado real y honesto del enlace con ZYRA Network."""
         if not self.configurado:
             return {
                 "configurada": False,
                 "conectada": False,
-                "motivo": "URL de ZYRA Core no configurada",
+                "motivo": "URL de ZYRA Network no configurada",
             }
         try:
             self._peticion("GET", "/health")
@@ -55,7 +55,9 @@ class ClienteZyra:
 
     def _peticion(self, metodo: str, ruta: str, carga: dict = None) -> dict:
         if not self.configurado:
-            raise RedNoDisponibleError("URL de ZYRA Core no configurada.")
+            raise RedNoDisponibleError(
+                "URL de ZYRA Network no configurada."
+            )
         url = self._cfg.url_zyra_core.rstrip("/") + ruta
         intentos_max = max(1, int(getattr(self._cfg, "reintentos", 1)))
         ultimo_error = ""
@@ -85,19 +87,23 @@ class ClienteZyra:
                 except Exception:
                     pass
                 if exc.code >= 500:
-                    ultimo_error = "ZYRA Core respondio HTTP " + str(exc.code)
+                    ultimo_error = (
+                        "ZYRA Network respondio HTTP " + str(exc.code)
+                    )
                 else:
                     raise RedNoDisponibleError(
-                        "ZYRA Core rechazo la peticion (HTTP "
+                        "ZYRA Network rechazo la peticion (HTTP "
                         + str(exc.code) + "): "
                         + cuerpo.decode("utf-8", "replace")[:200]
                     ) from exc
             except (urllib.error.URLError, TimeoutError, OSError) as exc:
-                ultimo_error = "ZYRA Core inalcanzable: " + str(exc)
+                ultimo_error = "ZYRA Network inalcanzable: " + str(exc)
             if intento < intentos_max:
                 espera = ESPERA_BASE * (2 ** (intento - 1))
                 time.sleep(espera)
-        raise RedNoDisponibleError(ultimo_error or "ZYRA Core inalcanzable.")
+        raise RedNoDisponibleError(
+            ultimo_error or "ZYRA Network inalcanzable."
+        )
 
     @staticmethod
     def _procesar(crudo: bytes) -> dict:
@@ -105,17 +111,20 @@ class ClienteZyra:
             cuerpo = _json.loads(crudo.decode("utf-8"))
         except (ValueError, UnicodeDecodeError) as exc:
             raise RespuestaInvalidaError(
-                "Respuesta de ZYRA Core no es JSON valido."
+                "Respuesta de ZYRA Network no es JSON valido."
             ) from exc
         if not isinstance(cuerpo, dict):
             raise RespuestaInvalidaError(
-                "Respuesta de ZYRA Core debe ser un objeto JSON."
+                "Respuesta de ZYRA Network debe ser un objeto JSON."
             )
         return cuerpo
 
     def registrar_app(self) -> dict:
         if not self.configurado:
-            return {"registrado": False, "motivo": "URL de ZYRA Core no configurada"}
+            return {
+                "registrado": False,
+                "motivo": "URL de ZYRA Network no configurada",
+            }
         return self._peticion(
             "POST",
             "/apps/register",
@@ -128,7 +137,10 @@ class ClienteZyra:
 
     def sellar_documento(self, titulo: str, contenido: str) -> dict:
         if not self.configurado:
-            return {"sellado": False, "motivo": "URL de ZYRA Core no configurada"}
+            return {
+                "sellado": False,
+                "motivo": "URL de ZYRA Network no configurada",
+            }
         return self._peticion(
             "POST", "/documents/seal",
             {"titulo": titulo, "contenido": contenido},
@@ -137,13 +149,20 @@ class ClienteZyra:
     def verificar_documento(self, documento_id: str) -> dict:
         if not documento_id:
             raise ValueError("documento_id requerido.")
-        return self._peticion("GET", "/documents/" + documento_id + "/verify")
+        return self._peticion(
+            "GET", "/documents/" + documento_id + "/verify"
+        )
 
     def entregar(self, destino: str, carga: dict) -> dict:
         if not self.configurado:
-            raise RedNoDisponibleError("URL de ZYRA Core no configurada.")
+            raise RedNoDisponibleError(
+                "URL de ZYRA Network no configurada."
+            )
         if destino == DESTINO_SELLO:
             return self.sellar_documento(
-                str(carga.get("titulo", "")), str(carga.get("contenido", ""))
+                str(carga.get("titulo", "")),
+                str(carga.get("contenido", "")),
             )
-        raise RespuestaInvalidaError("Destino de entrega desconocido: " + destino)
+        raise RespuestaInvalidaError(
+            "Destino de entrega desconocido: " + destino
+        )

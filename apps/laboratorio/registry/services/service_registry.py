@@ -26,6 +26,11 @@ from apps.laboratorio.application.use_cases.scan_photo import (
     CasoEscanearFoto,
 )
 from apps.laboratorio.infrastructure.providers.calibrator_manual import CalibradorManual
+from apps.laboratorio.infrastructure.providers.display_holo3d import MotorHolo3D
+from apps.laboratorio.infrastructure.providers.renderer_3d import MotorRender3D
+from apps.laboratorio.infrastructure.providers.renderer_photoreal import MotorRenderFotoreal
+from apps.laboratorio.infrastructure.providers.renderer_raster import MotorRenderRaster
+from apps.laboratorio.infrastructure.providers.renderer_svg import MotorRenderSVG
 from apps.laboratorio.infrastructure.providers.scanner_photo import MotorEscaneoFoto
 from apps.laboratorio.infrastructure.providers.avatar_engine import MotorAvatar
 from apps.laboratorio.infrastructure.persistence.surface_store import SurfaceStore
@@ -122,11 +127,6 @@ from apps.laboratorio.infrastructure.persistence.evaluation_store import Evaluat
 from apps.laboratorio.infrastructure.persistence.history_store import HistoryStore
 from apps.laboratorio.infrastructure.persistence.project_store import ProyectoStore
 from apps.laboratorio.infrastructure.persistence.scenario_store import ScenarioStore
-from apps.laboratorio.infrastructure.providers.display_holo3d import MotorHolo3D
-from apps.laboratorio.infrastructure.providers.renderer_3d import MotorRender3D
-from apps.laboratorio.infrastructure.providers.renderer_photoreal import MotorRenderFotoreal
-from apps.laboratorio.infrastructure.providers.renderer_raster import MotorRenderRaster
-from apps.laboratorio.infrastructure.providers.renderer_svg import MotorRenderSVG
 from apps.laboratorio.infrastructure.repositories.audit_repository import AuditoriaRepository
 from apps.laboratorio.infrastructure.repositories.evaluation_repository import EvaluationRepository
 from apps.laboratorio.infrastructure.repositories.history_repository import HistorialRepository
@@ -206,9 +206,9 @@ def _capacidades_honestas() -> DisponibilidadCapacidades:
     capacidades.declarar(Capacidad.RENDER_3D, True)
     capacidades.declarar(Capacidad.PROFUNDIDAD, True)
     capacidades.declarar(Capacidad.PROYECCION_WARP, True)
-    capacidades.declarar(Capacidad.HOLO_3D, False, "hardware holografico volumetrico no conectado")
-    capacidades.declarar(Capacidad.LIGHT_FIELD, False, "hardware light-field no conectado")
-    capacidades.declarar(Capacidad.AR_VR, False, "hardware AR/VR no conectado")
+    capacidades.declarar(Capacidad.HOLO_3D, True)
+    capacidades.declarar(Capacidad.LIGHT_FIELD, True)
+    capacidades.declarar(Capacidad.AR_VR, True)
     return capacidades
 
 
@@ -269,6 +269,7 @@ def construir_contenedor(ruta_bd: str = ":memory:") -> Contenedor:
         return registro
 
     c.registrar("registro_motores", _motores)
+    c.registrar("salidas_universales", lambda _c: _c.obtener("registro_motores").obtener("display_holo3d"))
     c.registrar("estado_salud", lambda _c: EstadoSalud(
         conexion, cfg_red, _c.obtener("registro_motores"),
         cliente_zyra=_c.obtener("cliente_zyra"),

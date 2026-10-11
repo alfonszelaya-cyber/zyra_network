@@ -1,4 +1,4 @@
-"""Rutas API de decisiones: simular, comparar, optimizar y Monte Carlo."""
+"""Rutas de decisiones + gemelo digital en vivo."""
 from apps.laboratorio.constants.permissions.permission_codes import PermisoCodigo
 from apps.laboratorio.schemas.responses.envelopes import exito
 
@@ -11,11 +11,16 @@ RUTA_OPTIMIZAR = "/laboratorio/api/v1/scenarios/{escenario_id}/optimize"
 RUTA_APLICAR = "/laboratorio/api/v1/optimizations/{optimizacion_id}/apply"
 RUTA_MONTE = "/laboratorio/api/v1/projects/{proyecto_id}/monte-carlo"
 RUTA_MONTE_COMPARA = "/laboratorio/api/v1/projects/{proyecto_id}/monte-carlo/comparar"
+RUTA_GEMELO_FUENTES = "/laboratorio/api/v1/twin/sources"
+RUTA_GEMELO_FUENTE = "/laboratorio/api/v1/twin/sources/{fuente_id}"
+RUTA_GEMELO_HISTORICO = "/laboratorio/api/v1/twin/sources/{fuente_id}/history"
+RUTA_GEMELO_ESTADO = "/laboratorio/api/v1/twin"
 
 
 def registrar_rutas(app) -> None:
     manejador = app.contenedor.obtener("manejador_decisiones")
     motor_mc = app.contenedor.obtener("motor_monte_carlo")
+    gemelo = app.contenedor.obtener("gemelo_vivo")
 
     def _simular(ctx):
         return manejador.simular(ctx.identidad, ctx.ruta_params["proyecto_id"], ctx.json())
@@ -44,6 +49,23 @@ def registrar_rutas(app) -> None:
     def _monte_compara(ctx):
         return exito(motor_mc.comparar(ctx.json()))
 
+    def _gem_registrar(ctx):
+        datos = ctx.json()
+        return exito(gemelo.registrar_fuente(
+            datos.get("id", ""), str(datos.get("tipo", "sensor")).strip(),
+            datos.get("valor", 0.0), datos.get("umbral_alto"),
+            datos.get("umbral_bajo"), str(datos.get("etiqueta", ""))))
+
+    def _gem_actualizar(ctx):
+        datos = ctx.json()
+        return exito(gemelo.actualizar(ctx.ruta_params["fuente_id"], datos.get("valor")))
+
+    def _gem_historico(ctx):
+        return exito(gemelo.historico(ctx.ruta_params["fuente_id"]))
+
+    def _gem_estado(ctx):
+        return exito(gemelo.estado())
+
     app.registrar("POST", RUTA_SIMULAR, _simular, PermisoCodigo.SIMULAR, "Simular evolucion temporal")
     app.registrar("GET", RUTA_SIMS, _sims, PermisoCodigo.VER, "Listar simulaciones")
     app.registrar("POST", RUTA_COMPARAR, _comparar, PermisoCodigo.COMPARAR, "Comparar escenarios evaluados")
@@ -51,5 +73,9 @@ def registrar_rutas(app) -> None:
     app.registrar("GET", RUTA_INFORME, _informe, PermisoCodigo.VER, "Informe HTML de la comparacion")
     app.registrar("POST", RUTA_OPTIMIZAR, _optimizar, PermisoCodigo.OPTIMIZAR, "Sugerir optimizacion")
     app.registrar("POST", RUTA_APLICAR, _aplicar, PermisoCodigo.OPTIMIZAR, "Aplicar optimizacion como escenario nuevo")
-    app.registrar("POST", RUTA_MONTE, _monte, PermisoCodigo.SIMULAR, "Monte Carlo reproducible con IC95 y convergencia")
-    app.registrar("POST", RUTA_MONTE_COMPARA, _monte_compara, PermisoCodigo.COMPARAR, "Comparar configuraciones con Monte Carlo")
+    app.registrar("POST", RUTA_MONTE, _monte, PermisoCodigo.SIMULAR, "Monte Carlo reproducible")
+    app.registrar("POST", RUTA_MONTE_COMPARA, _monte_compara, PermisoCodigo.COMPARAR, "Comparar con Monte Carlo")
+    app.registrar("POST", RUTA_GEMELO_FUENTES, _gem_registrar, PermisoCodigo.SIMULAR, "Registrar fuente real del gemelo")
+    app.registrar("POST", RUTA_GEMELO_FUENTE, _gem_actualizar, PermisoCodigo.SIMULAR, "Actualizar valor real de una fuente")
+    app.registrar("GET", RUTA_GEMELO_HISTORICO, _gem_historico, PermisoCodigo.VER, "Historico real de una fuente")
+    app.registrar("GET", RUTA_GEMELO_ESTADO, _gem_estado, PermisoCodigo.VER, "Estado del gemelo digital en vivo")

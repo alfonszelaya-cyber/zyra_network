@@ -65,6 +65,10 @@ from apps.laboratorio.application.use_cases.decide import (
     CasoAplicarOptimizacion,
 )
 from apps.laboratorio.infrastructure.providers.simulation_engine import MotorEvolucionReal
+from apps.laboratorio.infrastructure.providers.citizens_engine import MotorCiudadanos
+from apps.laboratorio.infrastructure.providers.physics_engine import MotorFisico
+from apps.laboratorio.infrastructure.providers.presentation_remote import PresentacionRemota
+from apps.laboratorio.infrastructure.providers.simulation_engine import GemeloVivo
 from apps.laboratorio.infrastructure.providers.comparison_engine import MotorComparacionReal
 from apps.laboratorio.infrastructure.providers.optimization_engine import MotorOptimizacionReal
 from apps.laboratorio.infrastructure.persistence.simulation_store import SimulationStore
@@ -346,6 +350,10 @@ def construir_contenedor(ruta_bd: str = ":memory:") -> Contenedor:
     c.registrar("registro_motores", _motores)
     c.registrar("salidas_universales", lambda _c: _c.obtener("registro_motores").obtener("display_holo3d"))
     c.registrar("motor_monte_carlo", lambda _c: MotorMonteCarlo())
+    c.registrar("gemelo_vivo", lambda _c: GemeloVivo())
+    c.registrar("motor_ciudadanos", lambda _c: MotorCiudadanos())
+    c.registrar("motor_fisico", lambda _c: MotorFisico())
+    c.registrar("presentacion_remota", lambda _c: PresentacionRemota(_c.obtener("repo_presentaciones"), _c.obtener("salidas_universales")))
     c.registrar("estado_salud", lambda _c: EstadoSalud(
         conexion, cfg_red, _c.obtener("registro_motores"),
         cliente_zyra=_c.obtener("cliente_zyra"),

@@ -1,18 +1,1060 @@
-name: "ZYRA - AUDITORIA EX-4/EX-3/EX-DES (solo lectura, 2 min)"
+name: "ZYRA EX FINAL 3 puntos - capacitacion+camara+desastres (autocontenido, verde o nada)"
 
 on:
   push:
   workflow_dispatch:
 
 permissions:
-  contents: read
+  contents: write
 
 jobs:
-  auditoria:
+  lote:
     runs-on: ubuntu-latest
     steps:
       - name: Descargar repositorio
         uses: actions/checkout@v4
+
+      - name: renderer_3d.py completo (original + CamaraOrbital + MotorRenderOrbital)
+        run: |
+          cat > apps/laboratorio/infrastructure/providers/renderer_3d.py <<'R3_EOF'
+          """Motor 3D: perspectiva real + CAMARA ORBITAL (nuevo, mismo archivo).
+
+          Original: proyeccion con punto de fuga por capa.
+          Nuevo: CamaraOrbital (azimut/elevacion/distancia) y
+          MotorRenderOrbital (vista 2.5D girada con foreshortening),
+          deterministas y con metadata honesta.
+          """
+          import math
+
+          from apps.laboratorio.domain.scene import Escena3D
+          from apps.laboratorio.infrastructure.providers.renderer_raster import (
+              PROFUNDIDAD_POR_CAPA,
+              MotorRenderRaster,
+              RasterizadorBase,
+              hex_a_rgb,
+          )
+          from apps.laboratorio.shared.adapters.engine_adapter import AdaptadorMotor
+          from apps.laboratorio.shared.exceptions.render_errors import (
+              EscenaVaciaError,
+              RenderFallidoError,
+          )
+          from apps.laboratorio.shared.interfaces.renderer import (
+              Renderer,
+              ResultadoRender,
+          )
+
+          Z_POR_CAPA = {"fondo": 2.0, "medio": 1.0, "frente": 0.2}
+          DISTANCIA_FOCAL = 3.0
+
+
+          class MotorRender3D(AdaptadorMotor, Renderer):
+              """Calidad 3D: perspectiva con punto de fuga + profundidad."""
+
+              def __init__(self):
+                  AdaptadorMotor.__init__(self, "renderer_3d", "renderer", "1.0.0")
+                  self.marcar_disponible()
+
+              def capacidades(self) -> dict:
+                  return {
+                      "calidades": ["3d"],
+                      "profundidad": True,
+                      "proyeccion": "perspectiva con punto de fuga central",
+                      "z_por_capa": Z_POR_CAPA,
+                  }
+
+              @staticmethod
+              def _proyectar(valor, centro, z) -> float:
+                  escala = DISTANCIA_FOCAL / (DISTANCIA_FOCAL + z)
+                  return centro + (valor - centro) * escala
+
+              def renderizar(self, escena, opciones) -> ResultadoRender:
+                  if not isinstance(escena, Escena3D):
+                      raise RenderFallidoError("Se esperaba una Escena3D.")
+                  if not escena.es_renderizable:
+                      raise EscenaVaciaError("La escena no tiene objetos.")
+                  ancho = int(opciones.get("ancho", escena.ancho))
+                  alto = int(opciones.get("alto", escena.alto))
+                  cx, cy = ancho / 2.0, alto / 2.0
+                  lienzo = RasterizadorBase(ancho, alto, (15, 23, 42))
+                  sx = ancho / escena.ancho
+                  sy = alto / escena.alto
+                  escala_texto = max(2, int(round(min(sx, sy) * 2)))
+                  for capa in ("fondo", "medio", "frente"):
+                      z = Z_POR_CAPA[capa]
+                      depth_val = PROFUNDIDAD_POR_CAPA[capa]
+                      for obj in escena.objetos:
+                          if obj.get("capa", "medio") != capa:
+                              continue
+                          color = hex_a_rgb(obj["color"])
+                          if obj["forma"] == "rect":
+                              x1 = self._proyectar(obj["x"] * sx, cx, z)
+                              y1 = self._proyectar(obj["y"] * sy, cy, z)
+                              x2 = self._proyectar((obj["x"] + obj["w"]) * sx, cx, z)
+                              y2 = self._proyectar((obj["y"] + obj["h"]) * sy, cy, z)
+                              lienzo.rect(x1, y1, x2 - x1, y2 - y1, color, depth_val)
+                          elif obj["forma"] == "circle":
+                              cxp = self._proyectar(obj["cx"] * sx, cx, z)
+                              cyp = self._proyectar(obj["cy"] * sy, cy, z)
+                              rp = obj["r"] * min(sx, sy) * (DISTANCIA_FOCAL / (DISTANCIA_FOCAL + z))
+                              lienzo.circle(cxp, cyp, rp, color, depth_val)
+                          else:
+                              lienzo.texto(
+                                  self._proyectar(obj["x"] * sx, cx, z),
+                                  self._proyectar(obj["y"] * sy, cy, z),
+                                  obj["contenido"], color, depth_val, escala_texto,
+                              )
+                  return ResultadoRender(
+                      imagen_bytes=lienzo.imagen_png(),
+                      profundidad_bytes=lienzo.profundidad_png(),
+                      ancho=ancho,
+                      alto=alto,
+                      metadata={
+                          "formato": "png", "motor": "renderer_3d",
+                          "profundidad": True, "proyeccion": "perspectiva",
+                      },
+                  )
+
+
+          class CamaraOrbital:
+              """Camara virtual: azimut, elevacion y distancia con limites reales."""
+
+              def __init__(self, distancia=3.0, azimut=0.0, elevacion=35.0):
+                  d = float(distancia)
+                  if not 1.0 <= d <= 10.0:
+                      raise ValueError("distancia debe estar entre 1 y 10.")
+                  self.distancia = d
+                  self.azimut = float(azimut) % 360.0
+                  e = float(elevacion)
+                  if not 5.0 <= e <= 85.0:
+                      raise ValueError("elevacion debe estar entre 5 y 85 grados.")
+                  self.elevacion = e
+
+              def girar(self, d_azimut, d_elevacion) -> dict:
+                  self.azimut = (self.azimut + float(d_azimut)) % 360.0
+                  self.elevacion = max(5.0, min(85.0, self.elevacion + float(d_elevacion)))
+                  return self.estado()
+
+              def zoom(self, factor) -> dict:
+                  self.distancia = max(1.0, min(10.0, self.distancia * float(factor)))
+                  return self.estado()
+
+              def estado(self) -> dict:
+                  return {"azimut": round(self.azimut, 2), "elevacion": round(self.elevacion, 2),
+                          "distancia": round(self.distancia, 3)}
+
+
+          class MotorRenderOrbital(AdaptadorMotor):
+              """Vista orbital 2.5D determinista sobre el rasterizador real."""
+
+              def __init__(self):
+                  AdaptadorMotor.__init__(self, "renderer_orbital", "renderer", "1.0.0")
+                  self.marcar_disponible()
+
+              def capacidades(self) -> dict:
+                  return {
+                      "proyeccion": "orbital 2.5D (rotacion azimut + foreshortening elevacion)",
+                      "profundidad": True,
+                      "determinista": True,
+                  }
+
+              @staticmethod
+              def _transformar(px, py, cx, cy, cos_a, sin_a, el, escala):
+                  dx = px - cx
+                  dy = py - cy
+                  rx = dx * cos_a - dy * sin_a
+                  ry = (dx * sin_a + dy * cos_a) * el
+                  return cx + rx * escala, cy + ry * escala
+
+              def renderizar_orbital(self, escena, opciones, camara) -> ResultadoRender:
+                  if not isinstance(escena, Escena3D):
+                      raise RenderFallidoError("Se esperaba una Escena3D.")
+                  if not escena.es_renderizable:
+                      raise EscenaVaciaError("La escena no tiene objetos.")
+                  if not isinstance(camara, CamaraOrbital):
+                      raise RenderFallidoError("Se esperaba una CamaraOrbital.")
+                  ancho = int(opciones.get("ancho", escena.ancho))
+                  alto = int(opciones.get("alto", escena.alto))
+                  lienzo = RasterizadorBase(ancho, alto, (15, 23, 42))
+                  sx = ancho / escena.ancho
+                  sy = alto / escena.alto
+                  cx, cy = ancho / 2.0, alto / 2.0
+                  az = math.radians(camara.azimut)
+                  el = math.sin(math.radians(camara.elevacion))
+                  cos_a, sin_a = math.cos(az), math.sin(az)
+                  f = camara.distancia
+                  for capa in ("fondo", "medio", "frente"):
+                      z = Z_POR_CAPA[capa] + (1.0 - el) * 0.5
+                      escala = f / (f + z)
+                      depth_val = PROFUNDIDAD_POR_CAPA[capa]
+                      for obj in escena.objetos:
+                          if obj.get("capa", "medio") != capa:
+                              continue
+                          color = hex_a_rgb(obj["color"])
+                          forma = obj["forma"]
+                          if forma == "rect":
+                              x1, y1 = self._transformar(obj["x"] * sx, obj["y"] * sy, cx, cy, cos_a, sin_a, el, escala)
+                              x2, y2 = self._transformar((obj["x"] + obj["w"]) * sx, (obj["y"] + obj["h"]) * sy, cx, cy, cos_a, sin_a, el, escala)
+                              lienzo.rect(min(x1, x2), min(y1, y2), abs(x2 - x1), abs(y2 - y1), color, depth_val)
+                          elif forma == "circle":
+                              px, py = self._transformar(obj["cx"] * sx, obj["cy"] * sy, cx, cy, cos_a, sin_a, el, escala)
+                              lienzo.circle(px, py, obj["r"] * min(sx, sy) * escala, color, depth_val)
+                          else:
+                              px, py = self._transformar(obj["x"] * sx, obj["y"] * sy, cx, cy, cos_a, sin_a, el, escala)
+                              lienzo.texto(px, py, obj["contenido"], color, depth_val,
+                                           max(2, int(round(min(sx, sy) * 2))))
+                  return ResultadoRender(
+                      imagen_bytes=lienzo.imagen_png(),
+                      profundidad_bytes=lienzo.profundidad_png(),
+                      ancho=ancho,
+                      alto=alto,
+                      metadata={
+                          "formato": "png", "motor": "renderer_orbital",
+                          "proyeccion": "orbital 2.5D",
+                          "azimut": camara.azimut, "elevacion": camara.elevacion,
+                          "distancia": camara.distancia, "profundidad": True,
+                      },
+                  )
+          R3_EOF
+
+      - name: citizens_engine.py completo (original + plan de desastres EX-DES)
+        run: |
+          cat > apps/laboratorio/infrastructure/providers/citizens_engine.py <<'CIT_EOF'
+          """Motor de CIUDADANOS SIMULADOS + SIMULACION DE DESASTRES (EX-DES).
+
+          Ciudadanos: origen descripcion/foto/escaneo, agenda, aglomeraciones,
+          evacuacion. Nuevo: mapa oficial de desastres (terremoto, inundacion,
+          incendio, erupcion) con multiplicador de velocidad, zonas seguras
+          declaradas y AYUDA ESPECIFICA por tipo de desastre. Determinista.
+          """
+          import math
+
+          CELULA = 50.0
+          UMBRAL_AGLO = 6
+          VEL_DEFECTO = 1.4
+          ESTADOS = ("en_ruta", "en_punto", "evacuando")
+
+          DESASTRES = {
+              "terremoto": {"multiplicador": 2.0,
+                            "ayuda": ("rescate urbano", "albergues", "atencion medica de emergencia")},
+              "inundacion": {"multiplicador": 1.3,
+                             "ayuda": ("botes de rescate", "albergues en altura", "agua potable")},
+              "incendio": {"multiplicador": 1.8,
+                           "ayuda": ("bomberos", "rutas libres de humo", "atencion respiratoria")},
+              "erupcion": {"multiplicador": 1.5,
+                           "ayuda": ("mascarillas", "evacuacion de amplio radio", "refugios cerrados")},
+          }
+
+
+          def _num(v, n):
+              if isinstance(v, bool) or not isinstance(v, (int, float)):
+                  raise ValueError(n + " debe ser numerico.")
+              return float(v)
+
+
+          class Ciudadano:
+              __slots__ = ("id", "nombre", "rol", "x", "y", "velocidad", "agenda",
+                           "indice", "estado", "color")
+
+              def __init__(self, id_c, nombre, rol, x, y, velocidad, agenda, color="#38BDF8"):
+                  self.id = str(id_c)
+                  self.nombre = str(nombre)[:80]
+                  self.rol = str(rol)[:40]
+                  self.x = _num(x, "x")
+                  self.y = _num(y, "y")
+                  if velocidad <= 0:
+                      raise ValueError("velocidad debe ser positiva.")
+                  self.velocidad = float(velocidad)
+                  if not agenda:
+                      raise ValueError("agenda requiere al menos un punto.")
+                  self.agenda = [(_num(p[0], "ax"), _num(p[1], "ay")) for p in agenda]
+                  self.indice = 0
+                  self.estado = "en_ruta"
+                  self.color = str(color)[:7]
+
+              def a_dict(self):
+                  return {"id": self.id, "nombre": self.nombre, "rol": self.rol,
+                          "x": round(self.x, 3), "y": round(self.y, 3),
+                          "velocidad": round(self.velocidad, 3), "estado": self.estado,
+                          "destino": list(self.agenda[self.indice]), "color": self.color}
+
+
+          class MotorCiudadanos:
+              def __init__(self):
+                  self._todos = []
+                  self._salidas = []
+                  self._tiempo = 0.0
+
+              def capacidades(self) -> dict:
+                  return {"origenes": ("descripcion", "foto", "escaneo"),
+                          "estados": ESTADOS,
+                          "desastres": sorted(DESASTRES.keys()),
+                          "deteccion": ("aglomeraciones", "evacuacion", "zonas_seguras"),
+                          "uso": "gemelo digital + plan de emergencia por desastre"}
+
+              def poblar(self, ciudadanos, salidas=None) -> dict:
+                  if not isinstance(ciudadanos, list) or not ciudadanos:
+                      raise ValueError("ciudadanos requiere lista con al menos 1.")
+                  self._todos = []
+                  self._salidas = [(_num(s[0], "sx"), _num(s[1], "sy")) for s in (salidas or [])]
+                  self._tiempo = 0.0
+                  for i, esp in enumerate(ciudadanos):
+                      if not isinstance(esp, dict):
+                          raise ValueError("ciudadanos[" + str(i) + "] debe ser objeto.")
+                      origen = str(esp.get("origen", "descripcion")).strip()
+                      if origen == "descripcion":
+                          nombre = str(esp.get("nombre", "")).strip()
+                          if not nombre:
+                              raise ValueError("descripcion requiere nombre.")
+                          rol = str(esp.get("rol", "peaton"))
+                          color = str(esp.get("color", "#38BDF8"))
+                      elif origen == "foto":
+                          nombre = str(esp.get("nombre", "Foto-" + str(i + 1)))
+                          rol = str(esp.get("rol", "peaton"))
+                          color = str(esp.get("color_foto", esp.get("color", "#F59E0B")))
+                      elif origen == "escaneo":
+                          nombre = str(esp.get("nombre", "Escaneado-" + str(i + 1)))
+                          rol = "visitante"
+                          if not esp.get("puntos"):
+                              raise ValueError("escaneo requiere puntos del scan real.")
+                          color = "#EC4899"
+                      else:
+                          raise ValueError("origen desconocido: " + repr(origen))
+                      x = _num(esp.get("x", 0.0), "x")
+                      y = _num(esp.get("y", 0.0), "y")
+                      vel = _num(esp.get("velocidad", VEL_DEFECTO), "velocidad")
+                      agenda = esp.get("agenda") or [[x, y]]
+                      self._todos.append(Ciudadano("cit-" + str(i + 1).zfill(5), nombre, rol, x, y, vel, agenda, color))
+                  return {"poblacion": len(self._todos), "salidas": len(self._salidas)}
+
+              def paso(self, dt=1.0) -> dict:
+                  dt = _num(dt, "dt")
+                  if dt <= 0 or dt > 10.0:
+                      raise ValueError("dt debe estar entre 0 y 10.")
+                  self._tiempo += dt
+                  for c in self._todos:
+                      dx = c.agenda[c.indice][0] - c.x
+                      dy = c.agenda[c.indice][1] - c.y
+                      dist = math.hypot(dx, dy)
+                      if dist < 0.5:
+                          c.indice = (c.indice + 1) % len(c.agenda)
+                      else:
+                          paso = min(c.velocidad * dt, dist)
+                          c.x += dx / dist * paso
+                          c.y += dy / dist * paso
+                      if c.estado != "evacuando":
+                          c.estado = "en_ruta"
+                  return {"tiempo": round(self._tiempo, 3), "poblacion": len(self._todos),
+                          "aglomeraciones": self._aglomeraciones()}
+
+              def _aglomeraciones(self):
+                  celdas = {}
+                  for c in self._todos:
+                      clave = (int(c.x // CELULA), int(c.y // CELULA))
+                      celdas.setdefault(clave, []).append(c.id)
+                  return [{"celda": list(k), "cantidad": len(v), "ciudadanos": v[:20]}
+                          for k, v in sorted(celdas.items()) if len(v) >= UMBRAL_AGLO]
+
+              def evacuar(self) -> dict:
+                  if not self._salidas:
+                      raise ValueError("evacuar requiere salidas definidas en poblar.")
+                  for c in self._todos:
+                      mejor = min(self._salidas, key=lambda s: math.hypot(s[0] - c.x, s[1] - c.y))
+                      c.agenda = [mejor]
+                      c.indice = 0
+                      c.estado = "evacuando"
+                      c.velocidad = c.velocidad * 1.6
+                  return {"evacuando": len(self._todos), "salidas": len(self._salidas)}
+
+              def declarar_zonas_seguras(self, zonas) -> dict:
+                  if not isinstance(zonas, list) or not zonas:
+                      raise ValueError("zonas_seguras requiere al menos 1 zona [x, y, radio].")
+                  limpias = []
+                  for z in zonas:
+                      if not (isinstance(z, (list, tuple)) and len(z) == 3):
+                          raise ValueError("cada zona debe ser [x, y, radio].")
+                      x, y, r = _num(z[0], "zx"), _num(z[1], "zy"), _num(z[2], "zr")
+                      if r <= 0:
+                          raise ValueError("radio de zona segura debe ser positivo.")
+                      limpias.append((x, y, r))
+                  self._zonas = limpias
+                  return {"zonas_seguras": len(limpias)}
+
+              def simular_desastre(self, tipo, epicentro, radio_afectacion, zonas_seguras) -> dict:
+                  spec = DESASTRES.get(str(tipo or "").strip())
+                  if spec is None:
+                      raise ValueError("desastre desconocido: " + repr(tipo)
+                                       + ". Validos: " + ", ".join(sorted(DESASTRES)))
+                  if not (isinstance(epicentro, (list, tuple)) and len(epicentro) == 2):
+                      raise ValueError("epicentro debe ser [x, y].")
+                  ex, ey = _num(epicentro[0], "ex"), _num(epicentro[1], "ey")
+                  radio = _num(radio_afectacion, "radio")
+                  if radio <= 0:
+                      raise ValueError("radio de afectacion debe ser positivo.")
+                  self.declarar_zonas_seguras(zonas_seguras)
+                  afectados = 0
+                  tiempo_max = 0.0
+                  for c in self._todos:
+                      if math.hypot(c.x - ex, c.y - ey) <= radio:
+                          afectados += 1
+                          zx, zy, _zr = min(self._zonas,
+                                            key=lambda s: math.hypot(s[0] - c.x, s[1] - c.y))
+                          c.agenda = [(zx, zy)]
+                          c.indice = 0
+                          c.estado = "evacuando"
+                          c.velocidad = c.velocidad * spec["multiplicador"]
+                          d = math.hypot(zx - c.x, zy - c.y)
+                          if c.velocidad > 0:
+                              tiempo_max = max(tiempo_max, d / c.velocidad)
+                  return {
+                      "tipo": tipo, "epicentro": [ex, ey], "radio_afectacion": radio,
+                      "afectados": afectados, "poblacion": len(self._todos),
+                      "zonas_seguras": [list(z) for z in self._zonas],
+                      "ayuda_necesaria": list(spec["ayuda"]),
+                      "pasos_estimados_evacuacion": round(tiempo_max, 2),
+                  }
+
+              def estado_poblacion(self) -> dict:
+                  return {"tiempo": round(self._tiempo, 3), "poblacion": len(self._todos),
+                          "ciudadanos": [c.a_dict() for c in self._todos[:200]],
+                          "salidas": [list(s) for s in self._salidas]}
+
+              def total(self) -> int:
+                  return len(self._todos)
+          CIT_EOF
+
+      - name: presentation_remote.py completo (original + ModoCurso EX-4)
+        run: |
+          cat > apps/laboratorio/infrastructure/providers/presentation_remote.py <<'PR_EOF'
+          """PRESENTACION HOLOGRAFICA INTERACTIVA + MODO CURSO (EX-4).
+
+          Proyeccion (salida universal) e control (telefono/PC/tablet)
+          independientes. Nuevo: ModoCurso con evaluacion real
+          (preguntas/respuestas/calificacion) y certificado firmado con
+          Firmador + sellado en la Red via outbox (verificable con ZID).
+          """
+          import json
+          import time
+
+          from apps.laboratorio.domain.scene import Escena3D
+          from apps.laboratorio.infrastructure.providers.hologram_engine import MotorHolograma
+          from apps.laboratorio.shared.models.identifiers import nuevo_id
+
+          ACCIONES_VALIDAS = ("avanzar", "retroceder", "ir_a", "tocar_punto", "finalizar")
+
+
+          def _escapar(texto):
+              return str(texto).replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
+
+
+          def _escena_para_holograma(nombre):
+              try:
+                  return Escena3D(nombre=nombre, ancho=900, alto=700, objetos=[])
+              except TypeError:
+                  try:
+                      return Escena3D(nombre, 900, 700, [])
+                  except Exception:
+                      esc = Escena3D.__new__(Escena3D)
+                      for atributo, valor in (("nombre", nombre), ("ancho", 900), ("alto", 700), ("objetos", [])):
+                          setattr(esc, atributo, valor)
+                      return esc
+
+
+          class SesionPresentacion:
+              def __init__(self, id_sesion, presentacion, proyector):
+                  self.id = str(id_sesion)
+                  self._presentacion = presentacion
+                  self._proyector = proyector
+                  self._holograma = MotorHolograma()
+                  self.paso_actual = 0
+                  self.activa = True
+                  self.anotaciones = []
+                  self.historial = []
+                  self.iniciada_en = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+
+              def _pasos(self):
+                  return list(getattr(self._presentacion, "pasos", []) or [])
+
+              def total_pasos(self):
+                  return len(self._pasos())
+
+              def _registrar(self, accion, detalle):
+                  entrada = {"accion": str(accion), "detalle": dict(detalle or {}),
+                             "momento": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())}
+                  self.historial.append(entrada)
+                  return entrada
+
+              def _paso_datos(self):
+                  pasos = self._pasos()
+                  if not pasos:
+                      return {"indice": 0, "total": 0, "titulo": "", "contenido": ""}
+                  paso = pasos[min(self.paso_actual, len(pasos) - 1)]
+                  try:
+                      datos = paso.a_dict() if hasattr(paso, "a_dict") else dict(paso)
+                  except Exception:
+                      datos = {"titulo": str(getattr(paso, "titulo", ""))}
+                  datos["indice"] = self.paso_actual
+                  datos["total"] = len(pasos)
+                  return datos
+
+              def avanzar(self):
+                  total = self.total_pasos()
+                  if self.paso_actual < total - 1:
+                      self.paso_actual += 1
+                  self._registrar("avanzar", {"paso": self.paso_actual})
+                  return {"paso": self.paso_actual, "total": total}
+
+              def retroceder(self):
+                  if self.paso_actual > 0:
+                      self.paso_actual -= 1
+                  self._registrar("retroceder", {"paso": self.paso_actual})
+                  return {"paso": self.paso_actual, "total": self.total_pasos()}
+
+              def ir_a(self, indice):
+                  indice = int(indice)
+                  total = self.total_pasos()
+                  if not 0 <= indice < total:
+                      raise ValueError("indice fuera de rango 0.." + str(total - 1))
+                  self.paso_actual = indice
+                  self._registrar("ir_a", {"paso": indice})
+                  return {"paso": self.paso_actual, "total": total}
+
+              def tocar_punto(self, x, y, etiqueta=""):
+                  xv = float(x)
+                  yv = float(y)
+                  if xv < 0 or yv < 0:
+                      raise ValueError("coordenadas no pueden ser negativas.")
+                  anotacion = {"id": "anot-" + str(len(self.anotaciones) + 1).zfill(4),
+                               "paso": self.paso_actual, "x": round(xv, 2), "y": round(yv, 2),
+                               "etiqueta": str(etiqueta or "")[:200],
+                               "momento": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())}
+                  self.anotaciones.append(anotacion)
+                  self._registrar("tocar_punto", {"paso": self.paso_actual, "x": anotacion["x"], "y": anotacion["y"]})
+                  return dict(anotacion)
+
+              def anotaciones_del_paso(self, indice=None):
+                  indice = self.paso_actual if indice is None else int(indice)
+                  return [dict(a) for a in self.anotaciones if a["paso"] == indice]
+
+              def frame_holograma(self):
+                  paso = self._paso_datos()
+                  titulo = str(paso.get("titulo", "") or ("Paso " + str(paso["indice"] + 1)))
+                  svg = self._holograma.generar(_escena_para_holograma(titulo)).decode("utf-8")
+                  texto = str(paso.get("contenido", "") or paso.get("descripcion", "") or "")
+                  marcas = []
+                  if texto:
+                      y = 60
+                      for i in range(0, min(len(texto), 240), 60):
+                          marcas.append('<text x="24" y="' + str(y) + '" fill="#E2E8F0" font-size="16" font-family="sans-serif">' + _escapar(texto[i:i + 60]) + "</text>")
+                          y += 24
+                  for a in self.anotaciones_del_paso():
+                      marcas.append('<circle cx="' + str(a["x"]) + '" cy="' + str(a["y"]) + '" r="10" fill="none" stroke="#F59E0B" stroke-width="3"><animate attributeName="r" values="6;14;6" dur="1.6s" repeatCount="indefinite"/></circle>')
+                  if marcas and "</svg>" in svg:
+                      svg = svg.replace("</svg>", "".join(marcas) + "</svg>", 1)
+                  return svg.encode("utf-8")
+
+              def estado(self):
+                  return {"sesion": str(self.id), "activa": self.activa, "paso_actual": self.paso_actual,
+                          "total_pasos": self.total_pasos(), "anotaciones_total": len(self.anotaciones),
+                          "anotaciones_paso": self.anotaciones_del_paso(), "iniciada_en": self.iniciada_en,
+                          "paso": self._paso_datos()}
+
+              def finalizar(self):
+                  self.activa = False
+                  self._registrar("finalizar", {"anotaciones": len(self.anotaciones)})
+                  return {"sesion": str(self.id), "duracion_pasos": self.total_pasos(),
+                          "anotaciones": len(self.anotaciones), "historial": list(self.historial)}
+
+
+          class PresentacionRemota:
+              def __init__(self, repo_presentaciones, proyector):
+                  self._repo = repo_presentaciones
+                  self._proyector = proyector
+                  self._sesiones = {}
+
+              def capacidades(self):
+                  return {"control": ("telefono", "pc", "tablet"), "acciones": ACCIONES_VALIDAS,
+                          "proyeccion": "MotorHolo3D salida universal (independiente del control)",
+                          "tactil": "el navegador de control es el tactil"}
+
+              def crear_sesion(self, presentacion_id):
+                  id_limpio = str(presentacion_id or "").strip()
+                  if not id_limpio:
+                      raise ValueError("presentacion_id requerido.")
+                  presentacion = self._repo.obtener_exigir(id_limpio)
+                  id_sesion = str(nuevo_id("ses"))
+                  sesion = SesionPresentacion(id_sesion, presentacion, self._proyector)
+                  self._sesiones[id_sesion] = sesion
+                  return {"sesion": id_sesion, "presentacion": id_limpio,
+                          "total_pasos": sesion.total_pasos(),
+                          "vista_control": "/laboratorio/api/v1/presentations/remote/" + id_sesion + "/view"}
+
+              def sesion(self, id_sesion):
+                  sesion = self._sesiones.get(str(id_sesion or "").strip())
+                  if sesion is None:
+                      raise ValueError("Sesion desconocida: " + str(id_sesion))
+                  return sesion
+
+              def listar_sesiones(self):
+                  return {"activas": [{"sesion": str(sid), "paso": s.paso_actual, "total": s.total_pasos()}
+                                       for sid, s in sorted(self._sesiones.items()) if s.activa],
+                          "total": len(self._sesiones)}
+
+              def proyectar_paso_actual(self, id_sesion):
+                  sesion = self.sesion(id_sesion)
+                  frame = sesion.frame_holograma()
+                  canal = "web-sesion-" + str(sesion.id)
+                  if not any(d.get("nombre") == canal
+                             for d in self._proyector.listar_destinos().get("destinos", [])):
+                      self._proyector.registrar_destino("web", "", canal)
+                  entrega = self._proyector.presentar(frame, {})
+                  return {"sesion": str(sesion.id), "paso": sesion.paso_actual, "proyeccion": entrega}
+
+
+          class ModoCurso:
+              """Capacitacion con evaluacion real + certificado firmado y sellado en la Red."""
+
+              def __init__(self, repo_presentaciones, outbox, firmador, cliente=None):
+                  self._repo = repo_presentaciones
+                  self._outbox = outbox
+                  self._firmador = firmador
+                  self._cliente = cliente
+                  self._cursos = {}
+
+              def capacidades(self):
+                  return {"evaluacion": "preguntas de opcion multiple con calificacion automatica",
+                          "certificado": "firmado (HMAC) + sellado en ZYRA via outbox",
+                          "verificable": "con ZID del alumno"}
+
+              def crear_curso(self, presentacion_id, preguntas, umbral_aprobacion=0.7):
+                  pid = str(presentacion_id or "").strip()
+                  if not pid:
+                      raise ValueError("presentacion_id requerido.")
+                  presentacion = self._repo.obtener_exigir(pid)
+                  if not isinstance(preguntas, list) or not preguntas:
+                      raise ValueError("preguntas requiere al menos 1.")
+                  limpias = []
+                  for i, p in enumerate(preguntas):
+                      if not isinstance(p, dict):
+                          raise ValueError("pregunta " + str(i) + " debe ser objeto.")
+                      texto = str(p.get("texto", "")).strip()
+                      opciones = list(p.get("opciones", []))
+                      correcta = p.get("correcta")
+                      if not texto or len(opciones) < 2 or isinstance(correcta, bool) \
+                              or not isinstance(correcta, int) or not 0 <= correcta < len(opciones):
+                          raise ValueError("pregunta " + str(i) + " invalida: texto + 2+ opciones + indice correcta.")
+                      limpias.append({"texto": texto[:300],
+                                      "opciones": [str(o)[:120] for o in opciones],
+                                      "correcta": correcta})
+                  umbral = float(umbral_aprobacion)
+                  if not 0.0 < umbral <= 1.0:
+                      raise ValueError("umbral_aprobacion debe estar entre 0 y 1.")
+                  curso_id = str(nuevo_id("cur"))
+                  self._cursos[curso_id] = {
+                      "id": curso_id, "presentacion_id": pid,
+                      "titulo": str(getattr(presentacion, "titulo", ""))[:120],
+                      "preguntas": limpias, "umbral": umbral, "resultados": {},
+                  }
+                  return {"curso": curso_id, "presentacion": pid,
+                          "preguntas": len(limpias), "umbral": umbral}
+
+              def _curso(self, curso_id):
+                  curso = self._cursos.get(str(curso_id or "").strip())
+                  if curso is None:
+                      raise ValueError("Curso desconocido: " + str(curso_id))
+                  return curso
+
+              def responder(self, curso_id, zid, respuestas):
+                  curso = self._curso(curso_id)
+                  if not isinstance(respuestas, list) or len(respuestas) != len(curso["preguntas"]):
+                      raise ValueError("respuestas debe tener "
+                                       + str(len(curso["preguntas"])) + " valores.")
+                  detalle = []
+                  aciertos = 0
+                  for i, (preg, resp) in enumerate(zip(curso["preguntas"], respuestas)):
+                      ok = isinstance(resp, int) and not isinstance(resp, bool) and resp == preg["correcta"]
+                      aciertos += 1 if ok else 0
+                      detalle.append({"pregunta": i, "correcta": ok})
+                  puntaje = round(aciertos / len(curso["preguntas"]), 4)
+                  aprobado = puntaje >= curso["umbral"]
+                  curso["resultados"][str(zid)] = {"puntaje": puntaje, "aprobado": aprobado}
+                  return {"curso": str(curso["id"]), "zid": str(zid),
+                          "puntaje": puntaje, "aprobado": aprobado, "detalle": detalle}
+
+              def certificar(self, curso_id, zid):
+                  curso = self._curso(curso_id)
+                  z = str(zid or "").strip()
+                  if not z:
+                      raise ValueError("zid requerido para certificar.")
+                  resultado = curso["resultados"].get(z)
+                  if resultado is None:
+                      raise ValueError("El ZID no ha respondido el curso.")
+                  if not resultado["aprobado"]:
+                      raise ValueError("Curso no aprobado: puntaje " + str(resultado["puntaje"])
+                                       + " < umbral " + str(curso["umbral"]))
+                  contenido = json.dumps(
+                      {"curso": str(curso["id"]), "presentacion": curso["presentacion_id"],
+                       "titulo": curso["titulo"], "zid": z, "puntaje": resultado["puntaje"]},
+                      sort_keys=True)
+                  firma = self._firmador.firmar_documento("cert-" + str(curso["id"]) + "-" + z, contenido)
+                  self._outbox.encolar(
+                      "laboratorio.curso.certificado", "zyra/documents/seal",
+                      {"titulo": "Certificado de curso: " + curso["titulo"],
+                       "contenido": contenido})
+                  if self._cliente is not None:
+                      self._outbox.procesar(self._cliente.entregar)
+                  stats = self._outbox.estadisticas()
+                  if stats.get("enviado", 0) > 0:
+                      estado = "sellado_en_zyra"
+                  elif stats.get("error", 0) > 0:
+                      estado = "error_red"
+                  else:
+                      estado = "pendiente_red"
+                  return {"certificado": firma, "estado_red": estado, "outbox": stats}
+          PR_EOF
+
+      - name: world4d.py + presentations.py con rutas nuevas
+        run: |
+          cat > apps/laboratorio/routers/api/world4d.py <<'W4_EOF'
+          """Rutas 4D: timeline, luz, interacciones, ciudadanos, fisica + camara orbital + desastres."""
+          from apps.laboratorio.constants.permissions.permission_codes import PermisoCodigo
+          from apps.laboratorio.infrastructure.providers.renderer_3d import CamaraOrbital
+          from apps.laboratorio.permissions.policies.project_policy import PoliticaProyecto
+          from apps.laboratorio.schemas.responses.envelopes import exito
+
+          RUTA_TIMELINE = "/laboratorio/api/v1/scenes/{escena_id}/timeline"
+          RUTA_LIGHTING = "/laboratorio/api/v1/scenes/{escena_id}/lighting"
+          RUTA_INTERACCIONES = "/laboratorio/api/v1/scenes/{escena_id}/interactions"
+          RUTA_CIT_POBLAR = "/laboratorio/api/v1/scenes/{escena_id}/citizens/populate"
+          RUTA_CIT_PASO = "/laboratorio/api/v1/scenes/{escena_id}/citizens/step"
+          RUTA_CIT_ESTADO = "/laboratorio/api/v1/scenes/{escena_id}/citizens"
+          RUTA_CIT_EVACUAR = "/laboratorio/api/v1/scenes/{escena_id}/citizens/evacuate"
+          RUTA_FIS_AGREGAR = "/laboratorio/api/v1/scenes/{escena_id}/physics/bodies"
+          RUTA_FIS_IMPULSO = "/laboratorio/api/v1/scenes/{escena_id}/physics/bodies/{cuerpo_id}/impulse"
+          RUTA_FIS_PASO = "/laboratorio/api/v1/scenes/{escena_id}/physics/step"
+          RUTA_FIS_ESTADO = "/laboratorio/api/v1/scenes/{escena_id}/physics"
+          RUTA_CAMARA = "/laboratorio/api/v1/scenes/{escena_id}/camara/orbital"
+          RUTA_DESASTRE = "/laboratorio/api/v1/scenes/{escena_id}/desastre/simular"
+
+
+          def registrar_rutas(app) -> None:
+              manejador = app.contenedor.obtener("manejador_cuatro_d")
+              ciudadanos = app.contenedor.obtener("motor_ciudadanos")
+              fisica = app.contenedor.obtener("motor_fisico")
+              motor_orbital = app.contenedor.obtener("motor_orbital")
+              repo_escenas = app.contenedor.obtener("repo_escenas")
+              repo_proyectos = app.contenedor.obtener("repo_proyectos")
+
+              def _escena_verificada(ctx):
+                  escena = repo_escenas.obtener_exigir(ctx.ruta_params["escena_id"])
+                  proyecto = repo_proyectos.obtener_exigir(str(escena.proyecto_id))
+                  PoliticaProyecto.exigir_ver(proyecto, ctx.identidad)
+                  return escena
+
+              def _crear_timeline(ctx):
+                  return manejador.crear_timeline(ctx.identidad, ctx.ruta_params["escena_id"], ctx.json())
+
+              def _obtener_timeline(ctx):
+                  return manejador.obtener_timeline(ctx.identidad, ctx.ruta_params["escena_id"])
+
+              def _crear_luz(ctx):
+                  return manejador.crear_luz(ctx.identidad, ctx.ruta_params["escena_id"], ctx.json())
+
+              def _obtener_luz(ctx):
+                  return manejador.obtener_luz(ctx.identidad, ctx.ruta_params["escena_id"])
+
+              def _crear_interaccion(ctx):
+                  return manejador.crear_interaccion(ctx.identidad, ctx.ruta_params["escena_id"], ctx.json())
+
+              def _listar_interacciones(ctx):
+                  return manejador.listar_interacciones(ctx.identidad, ctx.ruta_params["escena_id"])
+
+              def _poblar(ctx):
+                  datos = ctx.json()
+                  return exito(ciudadanos.poblar(datos.get("ciudadanos", []), datos.get("salidas", [])))
+
+              def _paso_cit(ctx):
+                  cuerpo = ctx.json_opcional()
+                  return exito(ciudadanos.paso(float((cuerpo or {}).get("dt", 1.0))))
+
+              def _estado_cit(ctx):
+                  return exito(ciudadanos.estado_poblacion())
+
+              def _evacuar(ctx):
+                  return exito(ciudadanos.evacuar())
+
+              def _fis_agregar(ctx):
+                  datos = ctx.json()
+                  return exito(fisica.agregar(
+                      datos.get("id", "cuerpo-1"), datos.get("x", 0.0), datos.get("y", 0.0),
+                      datos.get("w", 10.0), datos.get("h", 10.0),
+                      datos.get("masa", 1.0), datos.get("rebote", 0.5)))
+
+              def _fis_impulso(ctx):
+                  datos = ctx.json()
+                  return exito(fisica.impulso(ctx.ruta_params["cuerpo_id"], datos.get("vx", 0.0), datos.get("vy", 0.0)))
+
+              def _fis_paso(ctx):
+                  cuerpo = ctx.json_opcional()
+                  return exito(fisica.paso(float((cuerpo or {}).get("dt", 0.016))))
+
+              def _fis_estado(ctx):
+                  return exito(fisica.estado())
+
+              def _camara(ctx):
+                  escena = _escena_verificada(ctx)
+                  datos = ctx.json()
+                  camara = CamaraOrbital(distancia=datos.get("distancia", 3.0))
+                  camara.girar(float(datos.get("azimut", 0.0)), float(datos.get("elevacion", 35.0)))
+                  resultado = motor_orbital.renderizar_orbital(
+                      escena,
+                      {"ancho": int(datos.get("ancho", 400)), "alto": int(datos.get("alto", 300))},
+                      camara,
+                  )
+                  return 200, resultado.imagen_bytes, {
+                      "Content-Type": "image/png",
+                      "X-Lab-Metadata": "orbital",
+                      "Cache-Control": "no-store",
+                  }
+
+              def _desastre(ctx):
+                  escena = _escena_verificada(ctx)
+                  datos = ctx.json()
+                  plan = ciudadanos.simular_desastre(
+                      str(datos.get("tipo", "")),
+                      datos.get("epicentro", [0, 0]),
+                      datos.get("radio", 50.0),
+                      datos.get("zonas_seguras", []),
+                  )
+                  outbox = app.contenedor.obtener("outbox")
+                  outbox.encolar(
+                      "laboratorio.desastre.simulado", "zyra/documents/seal",
+                      {"titulo": "Simulacion de desastre: " + str(plan["tipo"]),
+                       "contenido": {"plan": plan, "escena": ctx.ruta_params["escena_id"]}})
+                  stats = outbox.estadisticas()
+                  return exito({"plan": plan,
+                                "red": {"evento": "laboratorio.desastre.simulado", "estado": stats}})
+
+              app.registrar("POST", RUTA_TIMELINE, _crear_timeline, PermisoCodigo.EDITAR_4D, "Crear linea de tiempo")
+              app.registrar("GET", RUTA_TIMELINE, _obtener_timeline, PermisoCodigo.VER, "Obtener linea de tiempo")
+              app.registrar("POST", RUTA_LIGHTING, _crear_luz, PermisoCodigo.EDITAR_4D, "Crear programa de luz")
+              app.registrar("GET", RUTA_LIGHTING, _obtener_luz, PermisoCodigo.VER, "Obtener programa de luz")
+              app.registrar("POST", RUTA_INTERACCIONES, _crear_interaccion, PermisoCodigo.EDITAR_4D, "Crear zona de interaccion")
+              app.registrar("GET", RUTA_INTERACCIONES, _listar_interacciones, PermisoCodigo.VER, "Listar interacciones")
+              app.registrar("POST", RUTA_CIT_POBLAR, _poblar, PermisoCodigo.EDITAR_4D, "Poblar gemelo con ciudadanos")
+              app.registrar("POST", RUTA_CIT_PASO, _paso_cit, PermisoCodigo.EDITAR_4D, "Paso de simulacion social")
+              app.registrar("GET", RUTA_CIT_ESTADO, _estado_cit, PermisoCodigo.VER, "Estado de la poblacion")
+              app.registrar("POST", RUTA_CIT_EVACUAR, _evacuar, PermisoCodigo.EDITAR_4D, "Evacuacion hacia salidas")
+              app.registrar("POST", RUTA_FIS_AGREGAR, _fis_agregar, PermisoCodigo.EDITAR_4D, "Agregar cuerpo fisico")
+              app.registrar("POST", RUTA_FIS_IMPULSO, _fis_impulso, PermisoCodigo.EDITAR_4D, "Impulso a un cuerpo")
+              app.registrar("POST", RUTA_FIS_PASO, _fis_paso, PermisoCodigo.EDITAR_4D, "Paso de fisica")
+              app.registrar("GET", RUTA_FIS_ESTADO, _fis_estado, PermisoCodigo.VER, "Estado del mundo fisico")
+              app.registrar("POST", RUTA_CAMARA, _camara, PermisoCodigo.VER, "Vista orbital de la escena (PNG real)")
+              app.registrar("POST", RUTA_DESASTRE, _desastre, PermisoCodigo.EDITAR_4D, "Simular desastre: zonas seguras + ayuda + evento a la Red")
+          W4_EOF
+          cat > apps/laboratorio/routers/api/presentations.py <<'PRES_EOF'
+          """Rutas de presentaciones + control remoto + MODO CURSO (EX-4)."""
+          from apps.laboratorio.constants.permissions.permission_codes import PermisoCodigo
+          from apps.laboratorio.shared.exceptions.domain_errors import EntidadNoEncontradaError
+
+          RUTA_CREAR = "/laboratorio/api/v1/projects/{proyecto_id}/presentations"
+          RUTA_ITEM = "/laboratorio/api/v1/presentations/{presentacion_id}"
+          RUTA_PLAY = RUTA_ITEM + "/play"
+          RUTA_SELLAR = RUTA_ITEM + "/seal"
+          RUTA_SESIONES = "/laboratorio/api/v1/presentations/remote"
+          RUTA_SESION = RUTA_SESIONES + "/{sesion_id}"
+          RUTA_ACCION = RUTA_SESION + "/accion"
+          RUTA_TOQUE = RUTA_SESION + "/tocar"
+          RUTA_FRAME = RUTA_SESION + "/frame.svg"
+          RUTA_VISTA = RUTA_SESION + "/view"
+          RUTA_PROYECTAR = RUTA_SESION + "/proyectar"
+          RUTA_CURSO_CREAR = "/laboratorio/api/v1/presentations/{presentacion_id}/curso"
+          RUTA_CURSO_RESPONDER = "/laboratorio/api/v1/presentations/curso/{curso_id}/responder"
+          RUTA_CURSO_CERTIFICAR = "/laboratorio/api/v1/presentations/curso/{curso_id}/certificar"
+
+
+          def registrar_rutas(app) -> None:
+              manejador = app.contenedor.obtener("manejador_presentaciones")
+              remota = app.contenedor.obtener("presentacion_remota")
+              modocurso = app.contenedor.obtener("modocurso")
+
+              def _sesion_o_404(sesion_id):
+                  try:
+                      return remota.sesion(sesion_id)
+                  except ValueError as exc:
+                      raise EntidadNoEncontradaError(str(exc), sesion_id)
+
+              def _crear(ctx):
+                  return manejador.crear(ctx.identidad, ctx.ruta_params["proyecto_id"], ctx.json())
+
+              def _listar(ctx):
+                  return manejador.listar(ctx.identidad, ctx.ruta_params["proyecto_id"])
+
+              def _obtener(ctx):
+                  return manejador.obtener(ctx.identidad, ctx.ruta_params["presentacion_id"])
+
+              def _reproducir(ctx):
+                  return manejador.reproducir(ctx.identidad, ctx.ruta_params["presentacion_id"])
+
+              def _sellar(ctx):
+                  return manejador.sellar(ctx.identidad, ctx.ruta_params["presentacion_id"])
+
+              def _crear_sesion(ctx):
+                  datos = ctx.json()
+                  return remota.crear_sesion(datos.get("presentacion_id", ""))
+
+              def _listar_sesiones(ctx):
+                  return remota.listar_sesiones()
+
+              def _estado(ctx):
+                  return _sesion_o_404(ctx.ruta_params["sesion_id"]).estado()
+
+              def _accion(ctx):
+                  datos = ctx.json()
+                  accion = str(datos.get("accion", "")).strip()
+                  sesion = _sesion_o_404(ctx.ruta_params["sesion_id"])
+                  if accion == "avanzar":
+                      return sesion.avanzar()
+                  if accion == "retroceder":
+                      return sesion.retroceder()
+                  if accion == "ir_a":
+                      return sesion.ir_a(datos.get("indice", 0))
+                  if accion == "finalizar":
+                      return sesion.finalizar()
+                  raise ValueError("accion desconocida: " + repr(accion))
+
+              def _tocar(ctx):
+                  datos = ctx.json()
+                  sesion = _sesion_o_404(ctx.ruta_params["sesion_id"])
+                  return sesion.tocar_punto(datos.get("x", 0.0), datos.get("y", 0.0), str(datos.get("etiqueta", "")))
+
+              def _frame(ctx):
+                  sesion = _sesion_o_404(ctx.ruta_params["sesion_id"])
+                  return 200, sesion.frame_holograma(), {"Content-Type": "image/svg+xml", "Cache-Control": "no-store"}
+
+              def _vista(ctx):
+                  sesion_id = ctx.ruta_params["sesion_id"]
+                  _sesion_o_404(sesion_id)
+                  base = "/laboratorio/api/v1/presentations/remote/" + sesion_id
+                  html = ("<!doctype html><html lang='es'><head><meta charset='utf-8'>"
+                          "<meta name='viewport' content='width=device-width, initial-scale=1'>"
+                          "<title>Control</title><style>body{background:#0B1220;color:#E2E8F0;"
+                          "font-family:system-ui,sans-serif;text-align:center;padding:16px}"
+                          "button{font-size:22px;margin:6px;padding:14px 22px;border-radius:12px;"
+                          "border:1px solid #1E293B;background:#111827;color:#93C5FD}"
+                          "img{max-width:100%;border-radius:12px;border:1px solid #1E293B}</style></head><body>"
+                          "<h3>Control de proyeccion</h3>"
+                          "<img id='f' src='" + base + "/frame.svg'>"
+                          "<div><button onclick='acc(\"retroceder\")'>&#9664; Atras</button>"
+                          "<button onclick='acc(\"avanzar\")'>Siguiente &#9654;</button></div>"
+                          "<p style='color:#94A3B8;font-size:13px'>Toca la imagen para marcar el punto a explicar</p>"
+                          "<script>function acc(a){fetch('" + base + "/accion',{method:'POST',"
+                          "headers:{'Content-Type':'application/json'},body:JSON.stringify({accion:a})})"
+                          ".then(r=>r.json()).then(refrescar)}"
+                          "var f=document.getElementById('f');"
+                          "f.addEventListener('click',function(e){var r=f.getBoundingClientRect();"
+                          "var x=(e.clientX-r.left)*900/r.width;var y=(e.clientY-r.top)*700/r.height;"
+                          "fetch('" + base + "/tocar',{method:'POST',headers:{'Content-Type':'application/json'},"
+                          "body:JSON.stringify({x:x,y:y})}).then(()=>refrescar());});"
+                          "function refrescar(){f.src='" + base + "/frame.svg?t='+Date.now();}"
+                          "setInterval(refrescar,3000);</script></body></html>")
+                  return 200, html.encode("utf-8"), {"Content-Type": "text/html; charset=utf-8"}
+
+              def _proyectar(ctx):
+                  return remota.proyectar_paso_actual(ctx.ruta_params["sesion_id"])
+
+              def _curso_crear(ctx):
+                  datos = ctx.json()
+                  return modocurso.crear_curso(
+                      ctx.ruta_params["presentacion_id"],
+                      datos.get("preguntas", []),
+                      datos.get("umbral_aprobacion", 0.7))
+
+              def _curso_responder(ctx):
+                  datos = ctx.json()
+                  return modocurso.responder(
+                      ctx.ruta_params["curso_id"], ctx.identidad.zid,
+                      datos.get("respuestas", []))
+
+              def _curso_certificar(ctx):
+                  return modocurso.certificar(ctx.ruta_params["curso_id"], ctx.identidad.zid)
+
+              app.registrar("POST", RUTA_CREAR, _crear, PermisoCodigo.PRESENTAR, "Crear presentacion con pasos")
+              app.registrar("GET", RUTA_CREAR, _listar, PermisoCodigo.VER, "Listar presentaciones")
+              app.registrar("GET", RUTA_ITEM, _obtener, PermisoCodigo.VER, "Obtener presentacion")
+              app.registrar("GET", RUTA_PLAY, _reproducir, PermisoCodigo.VER, "Reproducir slideshow real")
+              app.registrar("POST", RUTA_SELLAR, _sellar, PermisoCodigo.PRESENTAR, "Sellar en ZYRA via outbox")
+              app.registrar("POST", RUTA_SESIONES, _crear_sesion, PermisoCodigo.PRESENTAR, "Abrir sesion interactiva")
+              app.registrar("GET", RUTA_SESIONES, _listar_sesiones, PermisoCodigo.VER, "Listar sesiones interactivas")
+              app.registrar("GET", RUTA_SESION, _estado, PermisoCodigo.VER, "Estado de la sesion interactiva")
+              app.registrar("POST", RUTA_ACCION, _accion, PermisoCodigo.PRESENTAR, "Accion de control")
+              app.registrar("POST", RUTA_TOQUE, _tocar, PermisoCodigo.PRESENTAR, "Tocar punto a explicar")
+              app.registrar("GET", RUTA_FRAME, _frame, PermisoCodigo.VER, "Frame holografico del paso actual")
+              app.registrar("GET", RUTA_VISTA, _vista, PermisoCodigo.VER, "Vista de control desde telefono o PC")
+              app.registrar("POST", RUTA_PROYECTAR, _proyectar, PermisoCodigo.PRESENTAR, "Proyectar paso actual")
+              app.registrar("POST", RUTA_CURSO_CREAR, _curso_crear, PermisoCodigo.PRESENTAR, "Crear curso de capacitacion con evaluacion")
+              app.registrar("POST", RUTA_CURSO_RESPONDER, _curso_responder, PermisoCodigo.VER, "Responder evaluacion del curso")
+              app.registrar("POST", RUTA_CURSO_CERTIFICAR, _curso_certificar, PermisoCodigo.VER, "Certificado firmado + sellado en la Red")
+          PRES_EOF
+
+      - name: Cablear service_registry (idempotente con asserts duros)
+        run: |
+          python - <<'PYEOF'
+          import ast
+          from pathlib import Path
+
+          ruta = Path("apps/laboratorio/registry/services/service_registry.py")
+          t = ruta.read_text(encoding="utf-8")
+          lineas = t.splitlines(keepends=True)
+          cambios = []
+
+          def indice_de(condicion):
+              for i, l in enumerate(lineas):
+                  if condicion(l):
+                      return i
+              return -1
+
+          if "ModoCurso" not in t:
+              i = indice_de(lambda l: "presentation_remote import" in l and l.strip().startswith("from"))
+              if i < 0:
+                  raise SystemExit("FATAL: sin import ancla de presentation_remote")
+              indent = lineas[i][: len(lineas[i]) - len(lineas[i].lstrip())]
+              lineas.insert(i + 1, indent + "from apps.laboratorio.infrastructure.providers.presentation_remote import ModoCurso\n")
+              cambios.append("import ModoCurso")
+
+          if "MotorRenderOrbital" not in t:
+              i = indice_de(lambda l: "renderer_3d import" in l and l.strip().startswith("from"))
+              if i < 0:
+                  raise SystemExit("FATAL: sin import ancla de renderer_3d")
+              indent = lineas[i][: len(lineas[i]) - len(lineas[i].lstrip())]
+              lineas.insert(i + 1, indent + "from apps.laboratorio.infrastructure.providers.renderer_3d import MotorRenderOrbital\n")
+              cambios.append("import MotorRenderOrbital")
+
+          if '"modocurso"' not in t:
+              i = indice_de(lambda l: 'c.registrar("presentacion_remota"' in l)
+              if i < 0:
+                  raise SystemExit("FATAL: sin ancla presentacion_remota")
+              indent = lineas[i][: len(lineas[i]) - len(lineas[i].lstrip())]
+              lineas.insert(i + 1, indent + 'c.registrar("modocurso", lambda _c: ModoCurso(_c.obtener("repo_presentaciones"), _c.obtener("outbox"), _c.obtener("firmador"), _c.obtener("cliente_zyra")))\n')
+              cambios.append("servicio modocurso")
+
+          if '"motor_orbital"' not in t:
+              i = indice_de(lambda l: 'c.registrar("motor_fisico"' in l)
+              if i < 0:
+                  i = indice_de(lambda l: 'c.registrar("modocurso"' in l)
+              if i < 0:
+                  raise SystemExit("FATAL: sin ancla para motor_orbital")
+              indent = lineas[i][: len(lineas[i]) - len(lineas[i].lstrip())]
+              lineas.insert(i + 1, indent + 'c.registrar("motor_orbital", lambda _c: MotorRenderOrbital())\n')
+              cambios.append("servicio motor_orbital")
+
+          t = "".join(lineas)
+          for requerido in ("ModoCurso", "MotorRenderOrbital", '"modocurso"', '"motor_orbital"'):
+              if requerido not in t:
+                  raise SystemExit("FATAL: falta " + requerido)
+          ast.parse(t)
+          ruta.write_text(t, encoding="utf-8")
+          print("service_registry: " + ("; ".join(cambios) if cambios else "ya al dia") + " - verificado")
+          PYEOF
 
       - name: Configurar Python
         uses: actions/setup-python@v5
@@ -25,110 +1067,320 @@ jobs:
           if [ -f requirements.txt ]; then pip install -r requirements.txt; fi
           pip install pytest
 
-      - name: Auditar los 3 puntos
+      - name: Escribir las 3 pruebas nuevas
         run: |
-          python - <<'PYEOF'
-          import ast, importlib, os, subprocess, sys, traceback
-          from pathlib import Path
+          cat > apps/laboratorio/tests/test_curso_certificado.py <<'TC1_EOF'
+          """EX-4: curso con evaluacion real + certificado firmado y sellado."""
+          import json
 
-          summary = os.environ.get("GITHUB_STEP_SUMMARY")
-          L = []
-          A = L.append
+          import pytest
 
-
-          def finalizar():
-              md = "\n".join(L)
-              if summary:
-                  with open(summary, "a") as fh:
-                      fh.write(md + "\n")
-              sys.exit(0)
+          from apps.laboratorio.infrastructure.providers.presentation_remote import ModoCurso
+          from apps.laboratorio.infrastructure.security.signing import Firmador
+          from apps.laboratorio.tests.conftest import OBJETOS, assert_2xx
 
 
-          A("# 🔍 AUDITORIA EX-4 (capacitacion) · EX-3 (camara) · EX-DES (desastres)\n")
+          class _PresentacionFalsa:
+              id = "pres-x"
+              titulo = "Curso de prueba"
+              pasos = []
 
-          A("## 1. EX-4 Capacitacion — que existe\n")
-          p = Path("apps/laboratorio/application/use_cases/build_presentation.py")
-          A("- build_presentation.py: " + ("existe" if p.is_file() else "NO EXISTE"))
-          if p.is_file():
-              t = p.read_text(errors="replace")
-              for marca in ("class CasoCrearPresentacion", "class CasoReproducirPresentacion",
-                            "class CasoSellarPresentacion", "pasos"):
-                  A("  - " + marca + ": " + ("SI" if marca in t else "NO"))
-          p2 = Path("apps/laboratorio/domain/presentation.py")
-          A("- domain/presentation.py: " + ("existe" if p2.is_file() else "NO EXISTE"))
-          if p2.is_file():
-              t2 = p2.read_text(errors="replace")
-              A("  - estructura de Paso: " + str([n.name for n in ast.parse(t2).body if isinstance(n, ast.ClassDef)]))
-          p3 = Path("apps/laboratorio/infrastructure/providers/presentation_remote.py")
-          A("- presentation_remote.py (control interactivo): " + ("existe" if p3.is_file() else "NO"))
-          A("- evaluacion/certificado: " + ("BUSCAR: no existe ningun archivo de evaluacion"
-            if not list(Path("apps/laboratorio").rglob("*evaluacion*")) and not list(Path("apps/laboratorio").rglob("*certificado*"))
-            else "hay archivos relacionados"))
-          A("")
 
-          A("## 2. EX-3 Camara orbital — que existe\n")
-          for ruta, marcas in (
-              ("apps/laboratorio/domain/scene.py", ["class Escena3D", "objetos"]),
-              ("apps/laboratorio/infrastructure/providers/renderer_3d.py", ["DISTANCIA_FOCAL", "_proyectar", "Z_POR_CAPA"]),
-              ("apps/laboratorio/domain/timeline.py", ["class"]),
-              ("apps/laboratorio/infrastructure/providers/warper.py", ["def warpear", "invertir3x3"]),
-          ):
-              p = Path(ruta)
-              if not p.is_file():
-                  A("- " + ruta + ": NO EXISTE")
-                  continue
-              t = p.read_text(errors="replace")
-              A("- " + ruta + ": existe")
-              for marca in marcas:
-                  A("  - " + marca + ": " + ("SI" if marca in t else "NO"))
-          A("")
+          class _RepoFalso:
+              @staticmethod
+              def obtener_exigir(pid):
+                  return _PresentacionFalsa()
 
-          A("## 3. EX-DES Gemelo-AXIS desastres — que existe\n")
-          axis_p = Path("apps/axis/life_history/emergency_dispatch.py")
-          A("- AXIS emergency_dispatch: " + ("existe" if axis_p.is_file() else "NO EXISTE"))
-          if axis_p.is_file():
-              t = axis_p.read_text(errors="replace")
-              A("  - clases: " + str([n.name for n in ast.parse(t).body if isinstance(n, ast.ClassDef)]))
-          puente = Path("apps/laboratorio/infrastructure/providers/citizens_engine.py")
-          A("- citizens_engine (evacuacion): " + ("existe" if puente.is_file() else "NO"))
-          if puente.is_file():
-              t = puente.read_text(errors="replace")
-              A("  - evacuar: " + ("SI" if "def evacuar" in t else "NO"))
-              A("  - salidas: " + ("SI" if "_salidas" in t else "NO"))
-          A("- EVENTOS de la Red (para conectar AXIS->gemelo):")
-          ev = Path("apps/laboratorio/constants/events/event_names.py")
-          if ev.is_file():
-              A("  - event_names.py existe: " + str([n.value for n in ast.parse(ev.read_text()).body
-                  if isinstance(n, ast.Assign)][:0] or "ver archivo"))
-          outbox = Path("apps/laboratorio/infrastructure/messaging/outbox.py")
-          A("- outbox (entrega a la Red): " + ("existe" if outbox.is_file() else "NO"))
-          A("")
 
-          A("## 4. Montaje real + suite actual\n")
-          try:
-              mod = importlib.import_module("apps.laboratorio.infrastructure.api.app")
-              app = mod.montar_aplicacion(":memory:")
-              A("- montaje OK · rutas: " + str(len(app.listar_rutas())))
-          except Exception:
-              A("- MONTAJE FALLO:")
-              A("```")
-              A(traceback.format_exc()[-900:])
-              A("```")
-          r = subprocess.run([sys.executable, "-m", "pytest", "apps/laboratorio/tests", "-q", "--tb=line"],
-                             capture_output=True, text=True, timeout=600)
-          A("- suite: " + str(r.returncode) + " -> " + ((r.stdout or r.stderr or "").strip().splitlines()[-1] if (r.stdout or r.stderr) else "?"))
-          A("")
+          class _OutboxFalso:
+              def __init__(self):
+                  self.items = []
+                  self.enviadas = []
 
-          A("## 5. LO QUE SE NECESITA\n")
-          A("- EX-4: clase EvaluacionCurso + CasoCertificar (reforzando presentation_remote y sellando via outbox existente)")
-          A("- EX-3: motor camara orbital (posicion/angulo/proyeccion) reforzando renderer_3d + ruta de recorrido en world4d")
-          A("- EX-DES: puente desastres (mapa tipo de desastre -> zonas seguras + ayuda) reforzando citizens_engine.evacuar + evento Red via outbox hacia AXIS")
-          finalizar()
-          PYEOF
+              def encolar(self, ev, dest, carga):
+                  self.items.append((ev, dest, carga))
+                  return len(self.items)
 
-      - name: Publicar artefacto
+              def procesar(self, entregador):
+                  for it in self.items:
+                      self.enviadas.append(it)
+                      entregador(it[1], it[2])
+                  n = len(self.items)
+                  self.items = []
+                  return {"procesados": n, "enviados": n, "reprogramados": 0, "abandonados": 0}
+
+              def estadisticas(self):
+                  return {"pendiente": len(self.items), "enviado": len(self.enviadas), "error": 0}
+
+
+          PREGUNTAS = [
+              {"texto": "Que es ZYRA?", "opciones": ["Una red", "Un coche"], "correcta": 0},
+              {"texto": "2+2?", "opciones": ["3", "4"], "correcta": 1},
+          ]
+
+
+          def _modo():
+              return ModoCurso(_RepoFalso(), _OutboxFalso(),
+                               Firmador("clave-de-test-1234567890abcd"), cliente=None)
+
+
+          def test_crear_curso_valida_preguntas():
+              res = _modo().crear_curso("pres-x", PREGUNTAS, 0.7)
+              assert res["preguntas"] == 2
+              with pytest.raises(ValueError):
+                  _modo().crear_curso("pres-x", [{"texto": "mala", "opciones": ["a"], "correcta": 0}])
+
+
+          def test_responder_califica_automatico():
+              modo = _modo()
+              curso = modo.crear_curso("pres-x", PREGUNTAS)["curso"]
+              res = modo.responder(curso, "alumno-1", [0, 1])
+              assert res["puntaje"] == 1.0 and res["aprobado"] is True
+              res2 = modo.responder(curso, "alumno-2", [1, 0])
+              assert res2["puntaje"] == 0.0 and res2["aprobado"] is False
+
+
+          def test_certificar_exige_aprobado():
+              modo = _modo()
+              curso = modo.crear_curso("pres-x", PREGUNTAS)["curso"]
+              with pytest.raises(ValueError):
+                  modo.certificar(curso, "nadie")
+              modo.responder(curso, "alumno-2", [1, 0])
+              with pytest.raises(ValueError):
+                  modo.certificar(curso, "alumno-2")
+
+
+          def test_certificado_firmado_y_encolado_a_la_red():
+              modo = _modo()
+              curso = modo.crear_curso("pres-x", PREGUNTAS)["curso"]
+              modo.responder(curso, "alumno-1", [0, 1])
+              res = modo.certificar(curso, "alumno-1")
+              assert res["certificado"]["algoritmo"] == "hmac-sha256"
+              assert res["certificado"]["firma"]
+              assert res["estado_red"] == "sellado_en_zyra"
+
+
+          def test_curso_completo_por_http(app, despachar):
+              _s, _h, datos = despachar("POST", "/laboratorio/api/v1/projects", json.dumps({
+                  "titulo": "Proy curso", "tipo": "negocio"}).encode("utf-8"))
+              assert_2xx(_s, datos)
+              proyecto_id = datos["datos"]["proyecto"]["id"]
+              _ss, _hsc, datos_sc = despachar(
+                  "POST", "/laboratorio/api/v1/projects/" + proyecto_id + "/scenes",
+                  json.dumps({"nombre": "S", "objetos": OBJETOS}).encode("utf-8"))
+              assert_2xx(_ss, datos_sc)
+              escena_id = datos_sc["datos"]["escena"]["id"]
+              status, _h2, datos2 = despachar(
+                  "POST", "/laboratorio/api/v1/projects/" + proyecto_id + "/presentations",
+                  json.dumps({"titulo": "Capacitacion", "pasos": [
+                      {"titulo": "P1", "contenido": "c", "duracion_segundos": 10, "escena_id": escena_id},
+                  ]}).encode("utf-8"))
+              assert_2xx(status, datos2)
+              presentacion_id = datos2["datos"]["presentacion"]["id"]
+              status3, _h3, datos3 = despachar(
+                  "POST", "/laboratorio/api/v1/presentations/" + presentacion_id + "/curso",
+                  json.dumps({"preguntas": PREGUNTAS, "umbral_aprobacion": 0.7}).encode("utf-8"))
+              assert_2xx(status3, datos3)
+              curso_id = datos3["datos"]["curso"]
+              status4, _h4, datos4 = despachar(
+                  "POST", "/laboratorio/api/v1/presentations/curso/" + curso_id + "/responder",
+                  json.dumps({"respuestas": [0, 1]}).encode("utf-8"))
+              assert_2xx(status4, datos4)
+              assert datos4["datos"]["aprobado"] is True
+              status5, _h5, datos5 = despachar(
+                  "POST", "/laboratorio/api/v1/presentations/curso/" + curso_id + "/certificar",
+                  b"")
+              assert_2xx(status5, datos5)
+              assert datos5["datos"]["certificado"]["firma"]
+              outbox = app.contenedor.obtener("outbox")
+              assert outbox.estadisticas()["pendiente"] >= 1 or outbox.estadisticas()["error"] >= 1
+          TC1_EOF
+          cat > apps/laboratorio/tests/test_camara_orbital.py <<'TC2_EOF'
+          """EX-3: camara orbital + render 2.5D determinista."""
+          import pytest
+
+          from apps.laboratorio.infrastructure.providers.renderer_3d import (
+              CamaraOrbital,
+              MotorRenderOrbital,
+          )
+          from apps.laboratorio.shared.exceptions.render_errors import EscenaVaciaError
+          from apps.laboratorio.tests.conftest import construir_escena, construir_escena_vacia
+
+
+          def test_girar_con_limites():
+              cam = CamaraOrbital()
+              cam.girar(90, 10)
+              assert cam.estado()["azimut"] == 90.0
+              assert cam.estado()["elevacion"] == 45.0
+              cam.girar(0, 200)
+              assert cam.estado()["elevacion"] == 85.0
+
+
+          def test_distancia_validada():
+              with pytest.raises(ValueError):
+                  CamaraOrbital(distancia=0.5)
+              with pytest.raises(ValueError):
+                  CamaraOrbital(elevacion=120)
+
+
+          def test_render_orbital_png_determinista():
+              motor = MotorRenderOrbital()
+              cam = CamaraOrbital()
+              cam.girar(45, 40)
+              r1 = motor.renderizar_orbital(construir_escena(), {"ancho": 200, "alto": 150}, cam)
+              r2 = motor.renderizar_orbital(construir_escena(), {"ancho": 200, "alto": 150}, cam)
+              assert bytes(r1.imagen_bytes[:8]) == b"\x89PNG\r\n\x1a\n"
+              assert r1.imagen_bytes == r2.imagen_bytes
+              assert "orbital" in r1.metadata["proyeccion"]
+              assert bytes(r1.profundidad_bytes[:8]) == b"\x89PNG\r\n\x1a\n"
+
+
+          def test_render_orbital_rechaza_escena_vacia():
+              motor = MotorRenderOrbital()
+              cam = CamaraOrbital()
+              with pytest.raises(EscenaVaciaError):
+                  motor.renderizar_orbital(construir_escena_vacia(), {}, cam)
+
+
+          def test_camara_por_http(despachar):
+              _s, _h, datos = despachar("POST", "/laboratorio/api/v1/projects", json.dumps({
+                  "titulo": "Proy camara", "tipo": "negocio"}).encode("utf-8"))
+              assert_2xx = None
+              from apps.laboratorio.tests.conftest import assert_2xx as a2, OBJETOS
+              a2(_s, datos)
+              proyecto_id = datos["datos"]["proyecto"]["id"]
+              status, _h2, datos2 = despachar(
+                  "POST", "/laboratorio/api/v1/projects/" + proyecto_id + "/scenes",
+                  json.dumps({"nombre": "S cam", "objetos": OBJETOS}).encode("utf-8"))
+              a2(status, datos2)
+              escena_id = datos2["datos"]["escena"]["id"]
+              status3, headers3, payload3 = despachar(
+                  "POST", "/laboratorio/api/v1/scenes/" + escena_id + "/camara/orbital",
+                  json.dumps({"azimut": 45, "elevacion": 40, "ancho": 200, "alto": 150}).encode("utf-8"))
+              a2(status3, headers3)
+              assert headers3.get("Content-Type") == "image/png"
+          TC2_EOF
+          cat > apps/laboratorio/tests/test_desastres.py <<'TC3_EOF'
+          """EX-DES: desastre -> zonas seguras + ayuda especifica + evento a la Red."""
+          import json
+
+          import pytest
+
+          from apps.laboratorio.infrastructure.providers.citizens_engine import MotorCiudadanos
+          from apps.laboratorio.tests.conftest import OBJETOS, assert_2xx
+
+
+          def _motor():
+              motor = MotorCiudadanos()
+              motor.poblar(
+                  [{"origen": "descripcion", "nombre": "P" + str(i),
+                    "x": 10 + i, "y": 10, "velocidad": 1.0, "agenda": [[60, 60]]}
+                   for i in range(5)]
+                  + [{"origen": "descripcion", "nombre": "Lejos",
+                      "x": 500, "y": 500, "velocidad": 1.0, "agenda": [[510, 510]]}],
+                  salidas=[[0, 0]],
+              )
+              return motor
+
+
+          def test_desastre_desconocido_rechaza():
+              motor = _motor()
+              with pytest.raises(ValueError):
+                  motor.simular_desastre("meteorito", [10, 10], 50, [[200, 200, 30]])
+
+
+          def test_terremoto_afecta_solo_zona_y_genera_plan():
+              motor = _motor()
+              plan = motor.simular_desastre(
+                  "terremoto", [12, 10], 30, [[300, 300, 40]])
+              assert plan["afectados"] == 5
+              assert plan["poblacion"] == 6
+              assert "rescate urbano" in plan["ayuda_necesaria"]
+              assert plan["pasos_estimados_evacuacion"] > 0
+              for c in motor.estado_poblacion()["ciudadanos"]:
+                  if c["nombre"] != "Lejos":
+                      assert c["estado"] == "evacuando"
+                  else:
+                      assert c["estado"] == "en_ruta"
+
+
+          def test_cada_desastre_tiene_ayuda_propia():
+              motor = MotorCiudadanos()
+              motor.poblar([{"origen": "descripcion", "nombre": "A", "x": 0, "y": 0}])
+              plan_i = motor.simular_desastre("inundacion", [0, 0], 100, [[50, 50, 20]])
+              assert "botes de rescate" in plan_i["ayuda_necesaria"]
+              plan_e = motor.simular_desastre("erupcion", [0, 0], 100, [[80, 80, 20]])
+              assert "mascarillas" in plan_e["ayuda_necesaria"]
+
+
+          def test_zonas_seguras_requieren_radio():
+              motor = _motor()
+              with pytest.raises(ValueError):
+                  motor.simular_desastre("incendio", [10, 10], 30, [[200, 200]])
+
+
+          def test_desastre_por_http_deja_evento_en_outbox(app, despachar):
+              _s, _h, datos = despachar("POST", "/laboratorio/api/v1/projects", json.dumps({
+                  "titulo": "Proy desastre", "tipo": "negocio"}).encode("utf-8"))
+              assert_2xx(_s, datos)
+              proyecto_id = datos["datos"]["proyecto"]["id"]
+              status, _h2, datos2 = despachar(
+                  "POST", "/laboratorio/api/v1/projects/" + proyecto_id + "/scenes",
+                  json.dumps({"nombre": "S", "objetos": OBJETOS}).encode("utf-8"))
+              assert_2xx(status, datos2)
+              escena_id = datos2["datos"]["escena"]["id"]
+              status3, _h3, datos3 = despachar(
+                  "POST", "/laboratorio/api/v1/scenes/" + escena_id + "/citizens/populate",
+                  json.dumps({"ciudadanos": [
+                      {"origen": "descripcion", "nombre": "C1", "x": 10, "y": 10},
+                      {"origen": "descripcion", "nombre": "C2", "x": 12, "y": 11},
+                  ], "salidas": [[0, 0]]}).encode("utf-8"))
+              assert_2xx(status3, datos3)
+              status4, _h4, datos4 = despachar(
+                  "POST", "/laboratorio/api/v1/scenes/" + escena_id + "/desastre/simular",
+                  json.dumps({"tipo": "terremoto", "epicentro": [11, 10], "radio": 50,
+                              "zonas_seguras": [[200, 200, 40]]}).encode("utf-8"))
+              assert_2xx(status4, datos4)
+              plan = datos4["datos"]["plan"]
+              assert plan["afectados"] == 2
+              assert plan["ayuda_necesaria"]
+              outbox = app.contenedor.obtener("outbox")
+              stats = outbox.estadisticas()
+              assert stats["pendiente"] >= 1
+          TC3_EOF
+
+      - name: Correr la suite completa
+        run: |
+          python -m pytest apps/laboratorio/tests -v --tb=short 2>&1 | tee pytest_salida.txt
+          echo "${PIPESTATUS[0]}" > pytest_codigo.txt
+
+      - name: Log completo al Summary
         if: always()
-        uses: actions/upload-artifact@v4
-        with:
-          name: auditoria-ex3
-          path: auditoria_ex3.md
+        run: |
+          touch pytest_salida.txt pytest_codigo.txt
+          {
+            echo "## Resultado - EX FINAL (3 puntos)"
+            echo ""
+            echo "Codigo de salida de pytest: $(cat pytest_codigo.txt)"
+            echo ""
+            echo '```'
+            cat pytest_salida.txt
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Commit solo con codigo de salida 0 real
+        run: |
+          CODIGO=$(cat pytest_codigo.txt)
+          if [ "$CODIGO" != "0" ]; then
+            echo "PYTEST SALIO CON CODIGO $CODIGO - no se commitea."
+            exit 1
+          fi
+          git config user.name "zyra-bot"
+          git config user.email "zyra-bot@users.noreply.github.com"
+          git add apps/laboratorio
+          if git diff --cached --quiet; then
+            echo "sin cambios"
+          else
+            git commit -m "EX FINAL: capacitacion con certificado ZYRA + camara orbital + simulacion de desastres conectada a la Red"
+            git push
+          fi

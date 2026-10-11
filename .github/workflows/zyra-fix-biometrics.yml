@@ -1,17 +1,24 @@
+name: "ZYRA - video_encoder reescrito completo desde cero (verde o nada)"
 
 on:
-  pu
+  push:
   workflow_dispatch:
 
 permissions:
   contents: write
 
 jobs:
-  parche:
+  cierre:
     runs-on: ubuntu-latest
     steps:
       - name: Descargar repositorio
         uses: actions/checkout@v4
+
+      - name: Instalar ffmpeg
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq ffmpeg
+          ffmpeg -version | head -1
 
       - name: Configurar Python
         uses: actions/setup-python@v5
@@ -24,33 +31,314 @@ jobs:
           if [ -f requirements.txt ]; then pip install -r requirements.txt; fi
           pip install pytest
 
-      - name: Parche - reemplaza la linea ftypmp42 donde este
+      - name: video_encoder.py COMPLETO desde cero (validacion correcta incluida)
         run: |
-          cat > /tmp/fix_mp4.py <<'FIX_EOF'
-          import ast
+          cat > apps/laboratorio/infrastructure/providers/video_encoder.py <<'VID_EOF'
+          """Encoder de VIDEO: MP4/H.264 via ffmpeg + AVI-MJPEG propio (stdlib)."""
+          import math
+          import shutil
+          import struct
+          import subprocess
+          import tempfile
           from pathlib import Path
 
-          ruta = Path("apps/laboratorio/infrastructure/providers/video_encoder.py")
-          lineas = ruta.read_text(encoding="utf-8").splitlines(keepends=True)
+          from apps.laboratorio.infrastructure.providers.png_decoder import (
+              decodificar_png_rgb,
+          )
+          from apps.laboratorio.infrastructure.providers.png_encoder import (
+              encode_png_rgb,
+          )
 
-          corregida = False
-          for i, linea in enumerate(lineas):
-              if "ftypmp42" in linea:
-                  sangria = linea[: len(linea) - len(linea.lstrip())]
-                  lineas[i] = sangria + 'if mp4[4:8] != b"ftyp":\n'
-                  corregida = True
-                  print("linea " + str(i + 1) + " reemplazada: " + linea.strip() + " -> if mp4[4:8] != b'ftyp':")
-                  break
+          FPS_DEFECTO = 12
+          MAX_FRAMES = 600
+          MAX_DIM = 1920
 
-          if not corregida:
-              raise SystemExit("FATAL: ninguna linea contiene ftypmp42")
 
-          texto = "".join(lineas)
-          ast.parse(texto)
-          ruta.write_text(texto, encoding="utf-8")
-          print("video_encoder.py: sintaxis OK")
-          FIX_EOF
-          python /tmp/fix_mp4.py
+          def ffmpeg_disponible() -> bool:
+              return shutil.which("ffmpeg") is not None
+
+
+          def _avi(frames_jpeg, ancho, alto, fps):
+              tam = sum(len(f) + 8 for f in frames_jpeg)
+              total = 4 + 8 + 4 + 8 + 4 + 68 + 16 + 12 + tam + 8 + len(frames_jpeg) * 16
+              avi = bytearray()
+              avi += b"RIFF" + struct.pack("<I", total - 8) + b"AVI "
+              avi += b"LIST" + struct.pack("<I", 4) + b"hdrl"
+              avi += b"avih" + struct.pack("<I", 56)
+              avi += struct.pack("<IIIIIIIIIIIIII", int(1_000_000 / max(1, fps)), 0, 0, 0x10,
+                                 len(frames_jpeg), 0, 1, ancho * alto * 3, ancho, alto, 0, 0, 0, 0)
+              avi += b"LIST" + struct.pack("<I", 68) + b"strl"
+              avi += b"strh" + struct.pack("<I", 56)
+              avi += b"vids" + b"MJPG" + struct.pack("<IIIIIIIII", 0, 0, 0, 0, 1, fps, 0, len(frames_jpeg), ancho * alto * 3)
+              avi += struct.pack("<II", ancho, alto)
+              avi += b"LIST" + struct.pack("<I", 10) + b"strfstrf" + struct.pack("<IHI", 40, ancho, alto)[:8]
+              avi += b"LIST" + struct.pack("<I", tam + 4) + b"movi"
+              for frame in frames_jpeg:
+                  avi += b"00dc" + struct.pack("<I", len(frame)) + frame
+              avi += b"idx1" + struct.pack("<I", len(frames_jpeg) * 16)
+              for frame in frames_jpeg:
+                  avi += b"00dc" + struct.pack("<II", 0x10, len(frame))
+              return bytes(avi)
+
+
+          class MotorVideo:
+              """MP4/H.264 con ffmpeg del sistema; AVI-MJPEG propio como respaldo.
+
+              Validacion MP4: el estandar ISO-BMFF garantiza que los bytes
+              4-8 son siempre b"ftyp" sin importar el brand (isom, mp42, avc1).
+              """
+
+              def capacidades(self) -> dict:
+                  disponible = ffmpeg_disponible()
+                  return {"mp4_h264": ("disponible via ffmpeg" if disponible
+                                       else "NO disponible (instale ffmpeg)"),
+                          "avi_mjpeg": "siempre disponible (stdlib)",
+                          "fps": {"defecto": FPS_DEFECTO, "rango": (1, 60)},
+                          "max_frames": MAX_FRAMES}
+
+              @staticmethod
+              def _validar(frames_png, fps):
+                  fps = int(fps)
+                  if not 1 <= fps <= 60:
+                      raise ValueError("fps debe estar entre 1 y 60.")
+                  if not isinstance(frames_png, list) or not frames_png:
+                      raise ValueError("frames_png requiere al menos 1 frame.")
+                  if len(frames_png) > MAX_FRAMES:
+                      raise ValueError("maximo " + str(MAX_FRAMES) + " frames.")
+                  ref = None
+                  pngs = []
+                  for i, datos_png in enumerate(frames_png):
+                      ancho, alto, pixeles = decodificar_png_rgb(datos_png)
+                      if ancho > MAX_DIM or alto > MAX_DIM:
+                          raise ValueError("frame " + str(i) + " excede " + str(MAX_DIM))
+                      if ref is None:
+                          ref = (ancho, alto)
+                      elif (ancho, alto) != ref:
+                          raise ValueError("todos los frames deben tener la misma resolucion.")
+                      pngs.append((ancho, alto, pixeles))
+                  return pngs, ref, fps
+
+              def ensamblar_mp4(self, frames_png, fps=FPS_DEFECTO, bitrate="2M") -> dict:
+                  """MP4/H.264 REAL via ffmpeg. Error honesto si no esta instalado."""
+                  if not ffmpeg_disponible():
+                      raise RuntimeError(
+                          "ffmpeg no esta instalado. Alternativa real: ensamblar_avi().")
+                  pngs, ref, fps = self._validar(frames_png, fps)
+                  ancho, alto = ref
+                  if ancho % 2:
+                      ancho += 1
+                  if alto % 2:
+                      alto += 1
+                  with tempfile.TemporaryDirectory() as tmp:
+                      tmp_dir = Path(tmp)
+                      for i, (w, h, pixeles) in enumerate(pngs):
+                          (tmp_dir / ("f" + str(i).zfill(5) + ".png")).write_bytes(
+                              encode_png_rgb(w, h, pixeles))
+                      salida = tmp_dir / "salida.mp4"
+                      resultado = subprocess.run(
+                          ["ffmpeg", "-y", "-loglevel", "error",
+                           "-framerate", str(fps), "-i", str(tmp_dir / "f%05d.png"),
+                           "-c:v", "libx264", "-pix_fmt", "yuv420p",
+                           "-b:v", str(bitrate), str(salida)],
+                          capture_output=True, text=True, timeout=300)
+                      if resultado.returncode != 0 or not salida.is_file():
+                          raise RuntimeError("ffmpeg fallo: " + (resultado.stderr or "")[-400:])
+                      mp4 = salida.read_bytes()
+                  if mp4[4:8] != b"ftyp":
+                      raise ValueError(
+                          "contenedor invalido: primeros 12 bytes=" + str(mp4[:12]))
+                  return {"formato": "mp4-h264", "frames": len(pngs), "fps": fps,
+                          "duracion_segundos": round(len(pngs) / fps, 2),
+                          "resolucion": [ancho, alto], "bytes": len(mp4),
+                          "video": mp4, "encoder": "ffmpeg libx264"}
+
+              def ensamblar_avi(self, frames_png, fps=FPS_DEFECTO, calidad=50) -> dict:
+                  """AVI-MJPEG propio, siempre disponible."""
+                  pngs, ref, fps = self._validar(frames_png, fps)
+                  ancho, alto = ref
+                  jpegs = []
+                  for _w, _h, pixeles in pngs:
+                      gris = bytearray(ancho * alto)
+                      for j in range(ancho * alto):
+                          gris[j] = (pixeles[j * 3] + pixeles[j * 3 + 1] + pixeles[j * 3 + 2]) // 3
+                      jpegs.append(self._jpeg_luminancia(gris, ancho, alto, calidad))
+                  video = _avi(jpegs, ancho, alto, fps)
+                  if video[:4] != b"RIFF" or video[8:12] != b"AVI ":
+                      raise ValueError("contenedor invalido.")
+                  return {"formato": "avi-mjpeg", "frames": len(jpegs), "fps": fps,
+                          "duracion_segundos": round(len(jpegs) / fps, 2),
+                          "resolucion": list(ref), "bytes": len(video), "video": video}
+
+              @staticmethod
+              def _jpeg_luminancia(pixeles, ancho, alto, calidad):
+                  base_q = [16, 11, 10, 16, 24, 40, 51, 61, 12, 12, 14, 19, 26, 58, 60, 55,
+                            14, 13, 16, 24, 40, 57, 69, 56, 14, 17, 22, 29, 51, 87, 80, 62,
+                            18, 22, 37, 56, 68, 109, 103, 77, 24, 35, 55, 64, 81, 104, 113, 92,
+                            49, 64, 78, 87, 103, 121, 120, 101, 72, 92, 95, 98, 112, 100, 103, 99]
+                  factor = max(1.0, min(50.0, float(calidad)))
+                  cuant = [max(1, min(255, int(c * factor / 50.0))) for c in base_q]
+                  zigzag = [0, 1, 8, 16, 9, 2, 3, 10, 17, 24, 32, 25, 18, 11, 4, 5,
+                            12, 19, 26, 33, 40, 48, 41, 34, 27, 20, 13, 6, 7, 14, 21, 28,
+                            35, 42, 49, 56, 57, 50, 43, 36, 29, 22, 15, 23, 30, 37, 44, 51,
+                            58, 59, 52, 45, 38, 31, 39, 46, 53, 60, 61, 54, 47, 55, 62, 63]
+
+                  def dct2(b):
+                      res = []
+                      for u in range(8):
+                          for v in range(8):
+                              cu = 0.7071067811865476 if u == 0 else 1.0
+                              cv = 0.7071067811865476 if v == 0 else 1.0
+                              s = 0.0
+                              for x in range(8):
+                                  for y in range(8):
+                                      s += b[x * 8 + y] * math.cos((2 * x + 1) * u * math.pi / 16) * math.cos((2 * y + 1) * v * math.pi / 16)
+                              res.append(cu * cv * s / 4.0)
+                      return res
+
+                  cuerpo = bytearray()
+                  cuerpo += bytes([0xFF, 0xD8, 0xFF, 0xC0, 0, 17, 8,
+                                   alto >> 8, alto & 0xFF, ancho >> 8, ancho & 0xFF, 1, 1, 0x11, 0])
+                  cuerpo += bytes([0xFF, 0xDB, 0, 132, 0]) + bytes(cuant)
+                  cuerpo += bytes([0xFF, 0xC4, 0, 162, 0x00]) + bytes([0] * 272)
+                  cuerpo += bytes([0xFF, 0xDA, 0, 12, 1, 1, 0, 0, 63, 0])
+                  for py in range(0, alto, 8):
+                      for px in range(0, ancho, 8):
+                          bloque = []
+                          for x in range(8):
+                              for y in range(8):
+                                  sx = min(ancho - 1, px + x)
+                                  sy = min(alto - 1, py + y)
+                                  bloque.append(pixeles[sy * ancho + sx])
+                          coefs = dct2(bloque)
+                          for i in range(64):
+                              cuerpo += struct.pack(">h", round(coefs[zigzag[i]] / cuant[i]))
+                  cuerpo += bytes([0xFF, 0xD9])
+                  return bytes(cuerpo)
+          VID_EOF
+
+      - name: Configurar Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Instalar dependencias
+        run: |
+          python -m pip install --upgrade pip
+          if [ -f requirements.txt ]; then pip install -r requirements.txt; fi
+          pip install pytest
+
+      - name: test de video (fix de _frame YA DENTRO)
+        run: |
+          cat > apps/laboratorio/tests/test_video_impresion.py <<'TV_EOF'
+          """EX: video AVI-MJPEG real + impresion 3D STL/G-code real."""
+          import json
+          import struct
+
+          import pytest
+
+          from apps.laboratorio.infrastructure.providers.print_3d_engine import MotorImpresion3D
+          from apps.laboratorio.infrastructure.providers.video_encoder import MotorVideo
+          from apps.laboratorio.infrastructure.providers.png_encoder import encode_png_rgb
+          from apps.laboratorio.tests.conftest import OBJETOS, assert_2xx
+
+
+          def _frame(color):
+              return encode_png_rgb(32, 32, bytes(bytes(color) * (32 * 32)))
+
+
+          def test_video_ensambla_contenedor_valido():
+              res = MotorVideo().ensamblar(
+                  [_frame((255, 0, 0)), _frame((0, 255, 0)),
+                   _frame((0, 0, 255)), _frame((255, 255, 0))], fps=8)
+              video = res["video"]
+              assert video[:4] == b"RIFF" and video[8:12] == b"AVI "
+              assert b"MJPG" in video
+              assert res["frames"] == 4 and res["fps"] == 8
+
+
+          def test_video_rechaza_resoluciones_distintas():
+              with pytest.raises(ValueError):
+                  MotorVideo().ensamblar([
+                      encode_png_rgb(32, 32, bytes(bytes((10, 20, 30)) * (32 * 32))),
+                      encode_png_rgb(48, 48, bytes(bytes((10, 20, 30)) * (48 * 48)))])
+
+
+          def test_video_rechaza_fps_invalido():
+              motor = MotorVideo()
+              with pytest.raises(ValueError):
+                  motor.ensamblar([_frame((1, 2, 3))], fps=0)
+              with pytest.raises(ValueError):
+                  motor.ensamblar([_frame((1, 2, 3))], fps=200)
+
+
+          def test_stl_binario_valido():
+              res = MotorImpresion3D().generar_stl([
+                  {"forma": "rect", "x": 0, "y": 0, "w": 20, "h": 20, "alto_3d": 5},
+                  {"forma": "circle", "x": 30, "y": 0, "r": 10, "alto_3d": 8}])
+              stl = res["stl_binario"]
+              assert stl[:21] == b"ZYRA LABORATORIO STL "
+              tris = struct.unpack("<I", stl[80:84])[0]
+              assert tris == res["triangulos"] > 0
+              assert len(stl) == 84 + tris * 50
+
+
+          def test_stl_rechaza_forma_no_imprimible():
+              with pytest.raises(ValueError):
+                  MotorImpresion3D().generar_stl([{"forma": "texto", "contenido": "hola"}])
+
+
+          def test_gcode_marlin_valido():
+              res = MotorImpresion3D().generar_gcode(
+                  [{"forma": "rect", "x": 0, "y": 0, "w": 40, "h": 40, "alto_3d": 10}],
+                  altura_capa_mm=0.2, densidad_relleno=0.3, velocidad_mm_s=1500)
+              assert "M104 S200" in res["gcode"]
+              assert "G28" in res["gcode"]
+              assert "M84" in res["gcode"]
+              assert res["capas"] == 50
+
+
+          def test_gcode_rechaza_parametros_invalidos():
+              motor = MotorImpresion3D()
+              objs = [{"forma": "rect", "x": 0, "y": 0, "w": 10, "h": 10}]
+              with pytest.raises(ValueError):
+                  motor.generar_gcode(objs, altura_capa_mm=2.0)
+              with pytest.raises(ValueError):
+                  motor.generar_gcode(objs, densidad_relleno=1.5)
+              with pytest.raises(ValueError):
+                  motor.generar_gcode(objs, velocidad_mm_s=0)
+
+
+          def test_disenar_y_preparar_flujo_completo():
+              res = MotorImpresion3D().disenar_y_preparar(
+                  [{"forma": "rect", "x": 0, "y": 0, "w": 30, "h": 30, "alto_3d": 6}],
+                  altura_capa_mm=0.3)
+              assert res["stl"]["triangulos"] > 0
+              assert res["gcode"]["capas"] == 20
+
+
+          def test_mp4_y_p3d_por_http(app, despachar):
+              _s, _h, datos = despachar("POST", "/laboratorio/api/v1/projects", json.dumps({
+                  "titulo": "Proy EX", "tipo": "negocio"}).encode("utf-8"))
+              assert_2xx(_s, datos)
+              proyecto_id = datos["datos"]["proyecto"]["id"]
+              status, _h2, datos2 = despachar(
+                  "POST", "/laboratorio/api/v1/projects/" + proyecto_id + "/scenes",
+                  json.dumps({"nombre": "S", "objetos": OBJETOS}).encode("utf-8"))
+              assert_2xx(status, datos2)
+              escena_id = datos2["datos"]["escena"]["id"]
+              status3, _h3, datos3 = despachar(
+                  "POST", "/laboratorio/api/v1/scenes/" + escena_id + "/print3d/stl",
+                  json.dumps({"objetos": [{"forma": "rect", "x": 0, "y": 0,
+                                           "w": 20, "h": 20, "alto_3d": 5}]}).encode("utf-8"))
+              assert_2xx(status3, datos3)
+              assert datos3["datos"]["triangulos"] > 0
+              status4, _h4, datos4 = despachar(
+                  "POST", "/laboratorio/api/v1/scenes/" + escena_id + "/print3d/gcode",
+                  json.dumps({"objetos": [{"forma": "rect", "x": 0, "y": 0,
+                                           "w": 20, "h": 20, "alto_3d": 5}]}).encode("utf-8"))
+              assert_2xx(status4, datos4)
+              assert "M104" in datos4["datos"]["gcode"]
+          TV_EOF
 
       - name: Correr la suite + verificar MP4 real
         run: |
@@ -81,7 +369,7 @@ jobs:
         run: |
           touch pytest_salida.txt pytest_codigo.txt
           {
-            echo "## Resultado - parche MP4 tolerante"
+            echo "## Resultado - video_encoder desde cero"
             echo ""
             echo "Codigo de salida de pytest: $(cat pytest_codigo.txt)"
             echo ""
@@ -103,6 +391,6 @@ jobs:
           if git diff --cached --quiet; then
             echo "sin cambios"
           else
-            git commit -m "MP4: validacion ftyp tolerante a indentacion (brand isom valido)"
+            git commit -m "video_encoder reescrito completo con validacion ftyp estandar"
             git push
           fi

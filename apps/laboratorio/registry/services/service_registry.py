@@ -123,6 +123,9 @@ from apps.laboratorio.infrastructure.persistence.history_store import HistorySto
 from apps.laboratorio.infrastructure.persistence.project_store import ProyectoStore
 from apps.laboratorio.infrastructure.persistence.scenario_store import ScenarioStore
 from apps.laboratorio.infrastructure.providers.display_holo3d import MotorHolo3D
+from apps.laboratorio.infrastructure.providers.renderer_3d import MotorRender3D
+from apps.laboratorio.infrastructure.providers.renderer_photoreal import MotorRenderFotoreal
+from apps.laboratorio.infrastructure.providers.renderer_raster import MotorRenderRaster
 from apps.laboratorio.infrastructure.providers.renderer_svg import MotorRenderSVG
 from apps.laboratorio.infrastructure.repositories.audit_repository import AuditoriaRepository
 from apps.laboratorio.infrastructure.repositories.evaluation_repository import EvaluationRepository
@@ -138,6 +141,32 @@ from apps.laboratorio.registry.engines.capabilities import (
 from apps.laboratorio.registry.engines.engine_registry import RegistroMotores
 from apps.laboratorio.registry.modules.register import RegistroModulos
 from apps.laboratorio.registry.templates.template_registry import RegistroPlantillas
+
+
+class _EnvolturaMotor:
+    """Adapta un motor existente al registro con estado honesto."""
+
+    def __init__(self, nombre, motor, disponible, motivo="", tipo="motor"):
+        self.nombre = str(nombre)
+        self._motor = motor
+        self._disponible = bool(disponible)
+        self._motivo = "" if disponible else str(motivo)
+        self._tipo = str(tipo)
+
+    def capacidades(self) -> dict:
+        if hasattr(self._motor, "capacidades"):
+            return self._motor.capacidades()
+        return {}
+
+    def reporte(self) -> dict:
+        return {
+            "nombre": self.nombre,
+            "tipo": self._tipo,
+            "estado": "disponible" if self._disponible else "no_disponible",
+            "version": "1.0.0",
+            "capacidades": tuple(self.capacidades().keys()),
+            "motivo": self._motivo,
+        }
 
 
 class Contenedor:
@@ -173,11 +202,11 @@ class Contenedor:
 def _capacidades_honestas() -> DisponibilidadCapacidades:
     capacidades = DisponibilidadCapacidades()
     capacidades.declarar(Capacidad.RENDER_SVG, True)
-    capacidades.declarar(Capacidad.RENDER_RASTER, False, "motor raster llega en fase 6")
+    capacidades.declarar(Capacidad.RENDER_RASTER, True)
     capacidades.declarar(Capacidad.RENDER_3D, True)
     capacidades.declarar(Capacidad.PROFUNDIDAD, True)
     capacidades.declarar(Capacidad.PROYECCION_WARP, True)
-    capacidades.declarar(Capacidad.HOLO_3D, False, "hardware holografico no conectado")
+    capacidades.declarar(Capacidad.HOLO_3D, False, "hardware holografico volumetrico no conectado")
     capacidades.declarar(Capacidad.LIGHT_FIELD, False, "hardware light-field no conectado")
     capacidades.declarar(Capacidad.AR_VR, False, "hardware AR/VR no conectado")
     return capacidades
@@ -222,6 +251,20 @@ def construir_contenedor(ruta_bd: str = ":memory:") -> Contenedor:
     def _motores(_c):
         registro = RegistroMotores()
         registro.registrar("renderer_svg", MotorRenderSVG())
+        registro.registrar("renderer_raster", _EnvolturaMotor("renderer_raster", MotorRenderRaster(), True, tipo="renderer"))
+        registro.registrar("renderer_3d", MotorRender3D())
+        registro.registrar("renderer_photoreal", MotorRenderFotoreal())
+        registro.registrar("naked3d", _EnvolturaMotor("naked3d", MotorNaked3D(), True))
+        registro.registrar("holograma", _EnvolturaMotor("holograma", MotorHolograma(), True))
+        registro.registrar("oligrama", _EnvolturaMotor("oligrama", MotorOligrama(), True))
+        registro.registrar("avatar", _EnvolturaMotor("avatar", MotorAvatar(), True))
+        registro.registrar("escaneo_foto", _EnvolturaMotor("escaneo_foto", MotorEscaneoFoto(), True))
+        registro.registrar("calibrador", _EnvolturaMotor("calibrador", CalibradorManual(), True))
+        registro.registrar("comprension_textual", _EnvolturaMotor("comprension_textual", MotorComprensionTextual(), True))
+        registro.registrar("generacion", _EnvolturaMotor("generacion", MotorGeneracionReal(), True))
+        registro.registrar("evolucion", _EnvolturaMotor("evolucion", MotorEvolucionReal(), True))
+        registro.registrar("comparacion", _EnvolturaMotor("comparacion", MotorComparacionReal(), True))
+        registro.registrar("optimizacion", _EnvolturaMotor("optimizacion", MotorOptimizacionReal(), True))
         registro.registrar("display_holo3d", MotorHolo3D())
         return registro
 

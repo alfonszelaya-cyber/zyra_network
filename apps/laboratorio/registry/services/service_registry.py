@@ -269,7 +269,10 @@ def construir_contenedor(ruta_bd: str = ":memory:") -> Contenedor:
         return registro
 
     c.registrar("registro_motores", _motores)
-    c.registrar("estado_salud", lambda _c: EstadoSalud(conexion, cfg_red, _c.obtener("registro_motores")))
+    c.registrar("estado_salud", lambda _c: EstadoSalud(
+        conexion, cfg_red, _c.obtener("registro_motores"),
+        cliente_zyra=_c.obtener("cliente_zyra"),
+    ))
     clave = os.environ.get("LAB_SIGNING_KEY") or secrets.token_hex(32)
     c.registrar("firmador", lambda _c: Firmador(clave))
     c.registrar("auditoria_sink", lambda _c: AuditoriaSink(_c.obtener("repo_auditoria")))

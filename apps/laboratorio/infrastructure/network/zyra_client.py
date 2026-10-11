@@ -1,8 +1,11 @@
 """LAB-CORE: cliente de ZYRA Core (registro, sellado, confianza).
 
 Ley 1: si la red no esta configurada, lo reporta; nunca simula exito.
+Reintentos reales con espera progresiva sobre fallos de transporte
+(nunca sobre rechazos definitivos de la Red: HTTP 4xx no se reintenta).
 """
 import json as _json
+import time
 import urllib.error
 import urllib.request
 
@@ -13,6 +16,7 @@ from apps.laboratorio.shared.exceptions.network_errors import (
 )
 
 DESTINO_SELLO = "zyra/documents/seal"
+ESPERA_BASE = 0.4
 
 
 class ClienteZyra:
@@ -27,31 +31,76 @@ class ClienteZyra:
     def configurado(self) -> bool:
         return self._cfg.configurada
 
+    def estado_conexion(self) -> dict:
+        """Estado real y honesto del enlace con ZYRA Core."""
+        if not self.configurado:
+            return {
+                "configurada": False,
+                "conectada": False,
+                "motivo": "URL de ZYRA Core no configurada",
+            }
+        try:
+            self._peticion("GET", "/health")
+            return {
+                "configurada": True,
+                "conectada": True,
+                "motivo": "",
+            }
+        except RedNoDisponibleError as exc:
+            return {
+                "configurada": True,
+                "conectada": False,
+                "motivo": str(exc)[:300],
+            }
+
     def _peticion(self, metodo: str, ruta: str, carga: dict = None) -> dict:
         if not self.configurado:
             raise RedNoDisponibleError("URL de ZYRA Core no configurada.")
         url = self._cfg.url_zyra_core.rstrip("/") + ruta
-        datos = _json.dumps(carga or {}).encode("utf-8")
-        peticion = urllib.request.Request(
-            url, data=datos if metodo != "GET" else None, method=metodo
-        )
-        peticion.add_header("Content-Type", "application/json")
-        peticion.add_header("X-ZYRA-APP", self._cfg.app_id)
-        if self._cfg.api_token:
-            peticion.add_header("Authorization", "Bearer " + self._cfg.api_token)
-        try:
-            with urllib.request.urlopen(
-                peticion, timeout=self._cfg.timeout_segundos
-            ) as respuesta:
-                crudo = respuesta.read()
-        except urllib.error.HTTPError as exc:
-            raise RedNoDisponibleError(
-                "ZYRA Core respondio HTTP " + str(exc.code)
-            ) from exc
-        except (urllib.error.URLError, TimeoutError, OSError) as exc:
-            raise RedNoDisponibleError(
-                "ZYRA Core inalcanzable: " + str(exc)
-            ) from exc
+        intentos_max = max(1, int(getattr(self._cfg, "reintentos", 1)))
+        ultimo_error = ""
+        for intento in range(1, intentos_max + 1):
+            datos = _json.dumps(carga or {}).encode("utf-8")
+            peticion = urllib.request.Request(
+                url,
+                data=datos if metodo != "GET" else None,
+                method=metodo,
+            )
+            peticion.add_header("Content-Type", "application/json")
+            peticion.add_header("X-ZYRA-APP", self._cfg.app_id)
+            if self._cfg.api_token:
+                peticion.add_header(
+                    "Authorization", "Bearer " + self._cfg.api_token
+                )
+            try:
+                with urllib.request.urlopen(
+                    peticion, timeout=self._cfg.timeout_segundos
+                ) as respuesta:
+                    crudo = respuesta.read()
+                return self._procesar(crudo)
+            except urllib.error.HTTPError as exc:
+                cuerpo = b""
+                try:
+                    cuerpo = exc.read()
+                except Exception:
+                    pass
+                if exc.code >= 500:
+                    ultimo_error = "ZYRA Core respondio HTTP " + str(exc.code)
+                else:
+                    raise RedNoDisponibleError(
+                        "ZYRA Core rechazo la peticion (HTTP "
+                        + str(exc.code) + "): "
+                        + cuerpo.decode("utf-8", "replace")[:200]
+                    ) from exc
+            except (urllib.error.URLError, TimeoutError, OSError) as exc:
+                ultimo_error = "ZYRA Core inalcanzable: " + str(exc)
+            if intento < intentos_max:
+                espera = ESPERA_BASE * (2 ** (intento - 1))
+                time.sleep(espera)
+        raise RedNoDisponibleError(ultimo_error or "ZYRA Core inalcanzable.")
+
+    @staticmethod
+    def _procesar(crudo: bytes) -> dict:
         try:
             cuerpo = _json.loads(crudo.decode("utf-8"))
         except (ValueError, UnicodeDecodeError) as exc:
@@ -81,7 +130,8 @@ class ClienteZyra:
         if not self.configurado:
             return {"sellado": False, "motivo": "URL de ZYRA Core no configurada"}
         return self._peticion(
-            "POST", "/documents/seal", {"titulo": titulo, "contenido": contenido}
+            "POST", "/documents/seal",
+            {"titulo": titulo, "contenido": contenido},
         )
 
     def verificar_documento(self, documento_id: str) -> dict:

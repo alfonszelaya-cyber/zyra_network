@@ -1,4 +1,4 @@
-name: ZYRA Fase 8 suite CI permanente
+name: ZYRA Fase 9 auditoria de interfaces de las 8 apps
 
 on:
   push:
@@ -6,12 +6,12 @@ on:
   workflow_dispatch:
 
 permissions:
-  contents: write
+  contents: read
 
 jobs:
-  fase8:
+  fase9:
     runs-on: ubuntu-latest
-    timeout-minutes: 25
+    timeout-minutes: 30
     steps:
       - name: Descargar repositorio
         uses: actions/checkout@v4
@@ -21,21 +21,29 @@ jobs:
         with:
           python-version: "3.11"
 
-      - name: Dependencias
+      - name: Dependencias minimas
         run: |
           python -m pip install --upgrade pip
-          python -m pip install --quiet cryptography pytest pyyaml
+          python -m pip install --quiet cryptography
 
-      - name: Crear suite CI y auto-probarla
+      - name: Mapa de interfaces de las apps
         run: |
           python3 - <<'PYEOF'
-          import json, os, py_compile, subprocess, sys, traceback
+          import json, os, re, secrets, subprocess, sys, time, traceback
+          import urllib.request, urllib.error
           from pathlib import Path
 
           ROOT = Path.cwd()
           OUT = []
           DATA = {}
           GATES = []
+          NP, SP = 8765, 8766
+          BASE = 'http://127.0.0.1:%d' % NP
+          BSP = 'http://127.0.0.1:%d' % SP
+          TOKEN = 'e2e-token-' + secrets.token_hex(16)
+          ROOTKEY = secrets.token_hex(32)
+          APPS = ['/mpe', '/agro', '/axis', '/semilla', '/nexo',
+                  '/subastas', '/ciclo', '/laboratorio']
 
           def add(s=''):
               OUT.append(str(s))
@@ -45,7 +53,7 @@ jobs:
               if out:
                   Path(out).write_text('\n'.join(OUT), encoding='utf-8')
               else:
-                  Path('fase8.md').write_text('\n'.join(OUT), encoding='utf-8')
+                  Path('fase9.md').write_text('\n'.join(OUT), encoding='utf-8')
 
           def _manejador(tipo, valor, tb):
               add('')
@@ -63,235 +71,170 @@ jobs:
               add('- gate %s: %s' % (n, 'OK' if ok else 'FALLO'))
               return bool(ok)
 
-          def contar():
-              nf = 0
-              npy = 0
-              for p in ROOT.rglob('*'):
-                  if not p.is_file() or '.git' in p.parts or '__pycache__' in p.parts:
+          def pedir(url):
+              try:
+                  with urllib.request.urlopen(url, timeout=8) as r:
+                      ct = r.headers.get('Content-Type', '')
+                      cuerpo = r.read().decode('utf-8', errors='replace')
+                      return r.status, ct, cuerpo
+              except urllib.error.HTTPError as e:
+                  return e.code, '', e.read().decode('utf-8', errors='replace')[:500]
+              except Exception as e:
+                  return None, '', str(e)
+
+          add('# FASE 9 - AUDITORIA DE INTERFACES (app normal vs API cruda)')
+          add('')
+          add('Regla nivel pro: backend JSON = motor (correcto). Frontend HTML = lo que')
+          add('el usuario necesita. Se mapea que sirve cada app en su raiz y donde')
+          add('esta la UI del laboratorio que su propio catalogo menciona.')
+          add('')
+
+          env = dict(os.environ)
+          env.update({'ZYRA_ROOT_KEY': ROOTKEY, 'ZYRA_API_TOKEN': TOKEN,
+                      'ZYRA_REQUIRE_TOKEN': '1', 'ZYRA_DATA_DIR': '/tmp/zyra-9',
+                      'ZYRA_PORT': str(NP), 'SUPERAPP_DATA_DIR': '/tmp/super-9',
+                      'PORT': str(SP), 'PYTHONUNBUFFERED': '1'})
+          proc = subprocess.Popen([sys.executable, 'main.py'], cwd=str(ROOT), env=env,
+                                  stdout=subprocess.DEVNULL,
+                                  stderr=subprocess.STDOUT)
+          sproc = None
+          vivo = False
+          t0 = time.time()
+          while time.time() - t0 < 30:
+              if proc.poll() is not None:
+                  break
+              st, _ct, _b = pedir(BASE + '/health')
+              if st is not None:
+                  vivo = True
+                  break
+              time.sleep(1.0)
+          add('## I1. Sistema arriba')
+          add('')
+          add('- red: %s' % vivo)
+          sproc = subprocess.Popen([sys.executable, 'superapp.py'], cwd=str(ROOT),
+                                   env=env, stdout=subprocess.DEVNULL,
+                                   stderr=subprocess.STDOUT)
+          sp_vivo = False
+          t0 = time.time()
+          while time.time() - t0 < 70:
+              if sproc.poll() is not None:
+                  break
+              st, _ct, _b = pedir(BSP + '/health')
+              if st == 200:
+                  sp_vivo = True
+                  break
+              time.sleep(1.5)
+          add('- superapp: %s' % sp_vivo)
+          gate('sistema_arriba', vivo and sp_vivo)
+          add('')
+
+          add('## I2. Que sirve cada app en su raiz')
+          add('')
+          add('| App | HTTP | Content-Type | Tipo | Titulo o primera señal |')
+          add('|---|---|---|---|---|')
+          tipos = {}
+          for a in APPS:
+              st, ct, cuerpo = pedir(BSP + a + '/')
+              es_html = 'text/html' in ct.lower()
+              es_json = 'json' in ct.lower() or cuerpo.strip().startswith('{')
+              tipo = 'HTML' if es_html else ('JSON' if es_json else 'OTRO')
+              tipos[a] = tipo
+              titulo = ''
+              if es_html:
+                  m = re.search(r'<title>([^<]{1,60})</title>', cuerpo)
+                  if m:
+                      titulo = m.group(1)
+                  else:
+                      mh = re.search(r'<h1[^>]*>([^<]{1,60})</h1>', cuerpo)
+                      if mh:
+                          titulo = mh.group(1)
+              elif es_json:
+                  n = len(re.findall(r'"patron"', cuerpo))
+                  titulo = 'JSON (%d entradas de catalogo)' % n if n else 'JSON'
+              add('| %s | %s | %s | **%s** | %s |' % (a, st, ct[:30], tipo, titulo[:50]))
+          DATA['tipos_raiz'] = tipos
+          html_en_raiz = [a for a, t in tipos.items() if t == 'HTML']
+          add('')
+          add('- Apps con HTML en raiz: %d de 8 (%s)' % (len(html_en_raiz), html_en_raiz))
+          add('- Apps con JSON crudo en raiz: %s' % [a for a, t in tipos.items() if t == 'JSON'])
+          add('')
+          add('> Nota: JSON en raiz NO es defecto del motor. Es que la puerta de entrada')
+          add('> para humanos no esta definida en esa app. El motor sigue siendo usable por API.')
+          add('')
+
+          add('## I3. Donde esta la UI del laboratorio (su catalogo la menciona)')
+          add('')
+          uis = []
+          for ruta in ('/laboratorio/ui', '/laboratorio/ui/menu',
+                       '/laboratorio/panel', '/laboratorio/index.html',
+                       '/laboratorio/api/v1/ui/menu'):
+              st, ct, cuerpo = pedir(BSP + ruta)
+              tipo = 'HTML' if 'text/html' in ct.lower() else (
+                  'JSON' if 'json' in ct.lower() or cuerpo.strip().startswith('{') else '?')
+              uis.append((ruta, st, tipo))
+              add('- GET %s -> %s (%s) %s' % (ruta, st, tipo, cuerpo[:80].replace('\n', ' ')))
+          add('')
+          ui_ok = any(st == 200 and t == 'HTML' for _r, st, t in uis)
+          gate('ui_laboratorio_localizada', ui_ok)
+          if not ui_ok:
+              add('')
+              add('Buscando en el codigo del laboratorio donde define su UI...')
+              src = ROOT / 'apps' / 'laboratorio'
+              hits = []
+              for p in src.rglob('*.py'):
+                  try:
+                      if p.stat().st_size == 0:
+                          continue
+                      t = p.read_text(encoding='utf-8', errors='replace')
+                  except OSError:
                       continue
-                  nf += 1
-                  if p.suffix == '.py':
-                      npy += 1
-              return nf, npy
-
-          SINTAXIS = [
-          'import ast, sys',
-          'from pathlib import Path',
-          '',
-          'ROOT = Path(__file__).resolve().parents[1]',
-          'SKIP = {".git", "__pycache__"}',
-          'errores = []',
-          'total = 0',
-          'for p in ROOT.rglob("*.py"):',
-          '    if SKIP & set(p.parts):',
-          '        continue',
-          '    total += 1',
-          '    try:',
-          '        ast.parse(p.read_bytes())',
-          '    except SyntaxError as e:',
-          '        errores.append("%s linea %s: %s" % (p.relative_to(ROOT), e.lineno, e.msg))',
-          'print("python revisados: %d | errores de sintaxis: %d" % (total, len(errores)))',
-          'for e in errores[:20]:',
-          '    print("  " + e)',
-          'sys.exit(1 if errores else 0)',
-          ]
-
-          BOOT = [
-          'import json, os, secrets, subprocess, sys, time',
-          'import urllib.request, urllib.error',
-          'from pathlib import Path',
-          '',
-          'ROOT = Path(__file__).resolve().parents[1]',
-          "TOKEN = 'ci-token-' + secrets.token_hex(16)",
-          'KEY = secrets.token_hex(32)',
-          'NP, SP = 8765, 8766',
-          "BASE = 'http://127.0.0.1:%d' % NP",
-          "BSP = 'http://127.0.0.1:%d' % SP",
-          'ENV = dict(os.environ)',
-          "ENV.update({'ZYRA_ROOT_KEY': KEY, 'ZYRA_API_TOKEN': TOKEN,",
-          "            'ZYRA_REQUIRE_TOKEN': '1', 'ZYRA_DATA_DIR': '/tmp/ci-zyra',",
-          "            'ZYRA_PORT': str(NP), 'SUPERAPP_DATA_DIR': '/tmp/ci-super',",
-          "            'PORT': str(SP), 'PYTHONUNBUFFERED': '1'})",
-          '',
-          'def espera(url, segundos):',
-          '    t0 = time.time()',
-          '    while time.time() - t0 < segundos:',
-          '        try:',
-          '            with urllib.request.urlopen(url, timeout=3) as r:',
-          "                return r.status, r.read().decode('utf-8', errors='replace')",
-          '        except urllib.error.HTTPError as e:',
-          '            return e.code, ""',
-          '        except Exception:',
-          '            time.sleep(1.2)',
-          '    return None, ""',
-          '',
-          'procs = []',
-          'ok = True',
-          'try:',
-          "    p1 = subprocess.Popen([sys.executable, 'main.py'], cwd=str(ROOT), env=ENV,",
-          '                          stdout=subprocess.DEVNULL, stderr=subprocess.STDOUT)',
-          '    procs.append(p1)',
-          "    st, _ = espera(BASE + '/health', 40)",
-          "    print('red health: %s' % st)",
-          '    if st is None:',
-          '        ok = False',
-          "    p2 = subprocess.Popen([sys.executable, 'superapp.py'], cwd=str(ROOT), env=ENV,",
-          '                          stdout=subprocess.DEVNULL, stderr=subprocess.STDOUT)',
-          '    procs.append(p2)',
-          "    st2, cuerpo = espera(BSP + '/health', 70)",
-          "    print('superapp health: %s' % st2)",
-          '    apps = []',
-          '    if st2 == 200:',
-          '        try:',
-          "            apps = list(json.loads(cuerpo).get('apps', {}).keys())",
-          '        except Exception:',
-          '            apps = []',
-          "    print('apps vivas: %s' % apps)",
-          '    if st2 != 200 or len(apps) != 8:',
-          '        ok = False',
-          'finally:',
-          '    for p in procs:',
-          '        try:',
-          '            if p.poll() is None:',
-          '                p.terminate()',
-          '                p.wait(timeout=10)',
-          '        except Exception:',
-          '            try:',
-          '                p.kill()',
-          '            except Exception:',
-          '                pass',
-          "print('CI BOOT: %s' % ('OK' if ok else 'FALLO'))",
-          'sys.exit(0 if ok else 1)',
-          ]
-
-          CIYML = [
-          'name: ZYRA CI',
-          '',
-          'on:',
-          '  push:',
-          '    branches: [main]',
-          '  workflow_dispatch:',
-          '',
-          'permissions:',
-          '  contents: read',
-          '',
-          'jobs:',
-          '  ci:',
-          '    runs-on: ubuntu-latest',
-          '    timeout-minutes: 25',
-          '    steps:',
-          '      - name: Descargar repositorio',
-          '        uses: actions/checkout@v4',
-          '',
-          '      - name: Configurar Python',
-          '        uses: actions/setup-python@v5',
-          '        with:',
-          '          python-version: "3.11"',
-          '',
-          '      - name: Instalar minimo',
-          '        run: |',
-          '          python -m pip install --upgrade pip',
-          '          python -m pip install --quiet cryptography pytest',
-          '',
-          '      - name: Sintaxis de todo el repositorio',
-          '        run: python3 tools/ci_sintaxis.py',
-          '',
-          '      - name: Tests de invariantes',
-          '        run: python3 -m pytest tests/test_portal_js_sync.py tests/test_namespace_manifest.py -q',
-          '',
-          '      - name: Tests de AXIS (suite conocida buena)',
-          '        run: python3 -m pytest apps/axis -q --tb=short -p no:cacheprovider',
-          '        env:',
-          '          PYTHONPATH: ${{ github.workspace }}',
-          '',
-          '      - name: Arranque real de red y superapp',
-          '        run: python3 tools/ci_boot.py',
-          '        env:',
-          '          PYTHONPATH: ${{ github.workspace }}',
-          ]
-
-          nf0, np0 = contar()
-          add('# FASE 8 - SUITE CI PERMANENTE')
-          add('')
-          add('Crea la CI que corre SIEMPRE en cada push: sintaxis total, invariantes,')
-          add('tests de AXIS y arranque real de red+superapp. Auto-probada aqui antes de commitear.')
-          add('')
-          add('## B1. Creacion de archivos')
-          add('')
-          td = ROOT / 'tools'
-          td.mkdir(exist_ok=True)
-          f1 = td / 'ci_sintaxis.py'
-          f2 = td / 'ci_boot.py'
-          f3 = ROOT / '.github' / 'workflows' / 'ci.yml'
-          f1.write_text('\n'.join(SINTAXIS) + '\n', encoding='utf-8')
-          f2.write_text('\n'.join(BOOT) + '\n', encoding='utf-8')
-          f3.write_text('\n'.join(CIYML) + '\n', encoding='utf-8')
-          add('- creado tools/ci_sintaxis.py')
-          add('- creado tools/ci_boot.py')
-          add('- creado .github/workflows/ci.yml')
-          add('')
-
-          add('## B2. Auto-prueba: compilacion de herramientas')
-          add('')
-          comp = True
-          try:
-              py_compile.compile(str(f1), doraise=True)
-              py_compile.compile(str(f2), doraise=True)
-              add('- py_compile herramientas: OK')
-          except Exception as e:
-              comp = False
-              add('- FALLO: %s' % e)
-          gate('herramientas_compilan', comp)
-          add('')
-
-          add('## B3. Auto-prueba: ci_sintaxis.py sobre el repo real')
-          add('')
-          envx = dict(os.environ)
-          envx['PYTHONPATH'] = str(ROOT)
-          r1 = subprocess.run([sys.executable, str(f1)], cwd=str(ROOT),
-                              capture_output=True, text=True, timeout=300)
-          add('```')
-          for l in (r1.stdout or '').splitlines()[:8]:
-              add(l)
-          add('```')
-          gate('sintaxis_selftest', r1.returncode == 0)
-          add('')
-
-          add('## B4. Auto-prueba: ci_boot.py (arranque real de red + superapp)')
-          add('')
-          try:
-              r2 = subprocess.run([sys.executable, str(f2)], cwd=str(ROOT), env=envx,
-                                  capture_output=True, text=True, timeout=240)
+                  for i, ln in enumerate(t.splitlines()):
+                      if re.search(r'(?i)(text/html|<html|<h1|ui/menu|index\.html)', ln):
+                          hits.append('%s:%d: %s' % (p.relative_to(ROOT), i + 1, ln.strip()[:120]))
+                          if len(hits) >= 12:
+                              break
+                  if len(hits) >= 12:
+                      break
+              add('')
+              add('```python')
+              for h in hits:
+                  add(h)
               add('```')
-              for l in (r2.stdout or '').splitlines()[:12]:
-                  add(l)
-              add('```')
-              gate('boot_selftest', r2.returncode == 0)
-          except Exception as e:
-              add('- FALLO: %s' % e)
-              gate('boot_selftest', False)
           add('')
 
-          add('## B5. Validacion del YAML de la CI')
+          add('## I4. Elementos interactivos en las interfaces HTML encontradas')
           add('')
-          yaml_ok = False
-          try:
-              import yaml
-              doc = yaml.safe_load(f3.read_text(encoding='utf-8'))
-              yaml_ok = isinstance(doc, dict) and 'jobs' in doc and 'ci' in doc.get('jobs', {})
-              add('- ci.yml parsea correctamente y tiene el job ci: %s' % yaml_ok)
-          except Exception as e:
-              add('- FALLO parseando ci.yml: %s' % e)
-          gate('ci_yaml_valido', yaml_ok)
+          for a in html_en_raiz[:8]:
+              st, ct, cuerpo = pedir(BSP + a + '/')
+              if st != 200 or 'text/html' not in ct.lower():
+                  continue
+              forms = len(re.findall(r'<form', cuerpo))
+              inputs = len(re.findall(r'<input', cuerpo))
+              botones = len(re.findall(r'<button', cuerpo))
+              enlaces = len(re.findall(r'<a\s', cuerpo))
+              add('- %s: %d forms, %d inputs, %d botones, %d enlaces' % (a, forms, inputs, botones, enlaces))
           add('')
 
-          add('## B6. Conteo dinamico')
+          add('## I5. El portal de la superapp: la entrada unica de la vision')
           add('')
-          nf1, np1 = contar()
-          add('- python: %d (esperado %d = %d + 2 herramientas)' % (np1, np0 + 2, np0))
-          add('- archivos: %d (esperado %d = %d + 3)' % (nf1, nf0 + 3, nf0))
-          gate('conteo_dinamico', np1 == np0 + 2 and nf1 == nf0 + 3)
+          st, ct, cuerpo = pedir(BSP + '/')
+          es_html = 'text/html' in ct.lower()
+          tarjetas = len(re.findall(r'class="card', cuerpo)) if es_html else 0
+          soon = len(re.findall(r'soon', cuerpo)) if es_html else 0
+          add('- GET / -> %s (%s) | tarjetas=%d | marcadas soon=%d' % (st, 'HTML' if es_html else '?', tarjetas, soon))
+          gate('portal_html', es_html and tarjetas >= 8)
           add('')
+
+          for p in (sproc, proc):
+              try:
+                  if p and p.poll() is None:
+                      p.terminate()
+                      p.wait(timeout=10)
+              except Exception:
+                  try:
+                      p.kill()
+                  except Exception:
+                      pass
 
           fallos = [n for n, ok in GATES if not ok]
           add('## Resultado de gates')
@@ -300,39 +243,33 @@ jobs:
               add('- %s: %s' % (n, 'OK' if ok else 'FALLO'))
           add('')
           if fallos:
-              add('**GATES FALLIDOS: %s. Sin commit.**' % ', '.join(fallos))
+              add('**GATES FALLIDOS: %s.**' % ', '.join(fallos))
           else:
-              add('**Suite CI auto-probada. Commit aplicado. Desde ahora cada push ejecuta ZYRA CI.**')
+              add('**Mapa completo. Con estos datos se disenian las interfaces que faltan (9b).**')
+          add('')
+          add('## Plan 9b segun estos datos')
+          add('')
+          add('1. Para apps con JSON en raiz: crear puerta HTML (panel) que consuma su propia API.')
+          add('2. Laboratorio: conectar su UI existente a la raiz o enlazarla desde el portal.')
+          add('3. Portal de la superapp: enlaces directos a los paneles HTML de cada app.')
           add('')
 
           DATA['gates'] = {n: ok for n, ok in GATES}
-          Path('fase8.json').write_text(
+          DATA['tipos'] = tipos
+          Path('fase9.json').write_text(
               json.dumps(DATA, indent=2, ensure_ascii=False, default=str),
               encoding='utf-8')
           escribe()
-          print('Fase 8 terminada. Gates fallidos:', fallos)
+          print('Fase 9 terminada. Gates fallidos:', fallos)
           if fallos:
               raise SystemExit('GATES FALLARON')
           print('Gates OK')
           PYEOF
 
-      - name: Commit si hay cambios
-        run: |
-          git config user.name "zyra-cleanup-bot"
-          git config user.email "actions@users.noreply.github.com"
-          git add .github/workflows/ci.yml tools
-          if [ -n "$(git status --porcelain)" ]; then
-            git commit -m "ci: suite permanente (sintaxis total, invariantes, axis, arranque real)"
-            git push
-            echo "## Commit aplicado - el push dispara ZYRA CI por primera vez" >> "$GITHUB_STEP_SUMMARY"
-          else
-            echo "## Sin cambios (CI ya existe)" >> "$GITHUB_STEP_SUMMARY"
-          fi
-
       - name: Subir artefacto
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: fase8-zyra
-          path: fase8.json
+          name: fase9-zyra
+          path: fase9.json
           if-no-files-found: ignore

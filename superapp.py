@@ -370,20 +370,22 @@ class PortalHandler(BaseHTTPRequestHandler):
         if path in ("/", "/index.html"):
             base = self._read_portal("index.html").decode("utf-8")
             zid_s = self._sesion()
-            par_viejo = (
-                '<a href="/entrar" style="color:#58a6ff">Entrar</a>'
-                + "\n"
-                + '<a href="/salir" style="color:#8b949e">Salir</a>')
             if zid_s:
                 estado = (
-                    '<span style="color:#3fb950;font-weight:700">Conectado: '
-                    + zid_s + '</span>'
-                    + ' <a href="/salir" style="color:#f85149">Salir</a>')
+                    '<p class="estado ok">Conectado: ' + zid_s + '</p>')
             else:
-                estado = '<a href="/entrar" style="color:#58a6ff">Entrar</a>'
-            base = base.replace(par_viejo, estado, 1)
+                estado = (
+                    '<p class="estado">Sin sesion. Entra para acceder a las apps.</p>')
+            base = base.replace("__ESTADO__", estado, 1)
             self._send_html(200, base)
             return
+        if path == "/inicio":
+            self._send_html(200, self._read_portal("inicio.html").decode("utf-8"))
+            return
+        if path == "/registro":
+            self._send_html(200, self._read_portal("registro.html").decode("utf-8"))
+            return
+
         if path == "/health":
             apps = {
                 p: {"label": v["label"], "port": v["port"]}

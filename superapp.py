@@ -368,10 +368,21 @@ class PortalHandler(BaseHTTPRequestHandler):
     def do_GET(self):
         path = self.path.split("?", 1)[0]
         if path in ("/", "/index.html"):
-            self._send_html(
-                200,
-                self._read_portal("index.html").decode("utf-8"),
-            )
+            base = self._read_portal("index.html").decode("utf-8")
+            zid_s = self._sesion()
+            par_viejo = (
+                '<a href="/entrar" style="color:#58a6ff">Entrar</a>'
+                + "\n"
+                + '<a href="/salir" style="color:#8b949e">Salir</a>')
+            if zid_s:
+                estado = (
+                    '<span style="color:#3fb950;font-weight:700">Conectado: '
+                    + zid_s + '</span>'
+                    + ' <a href="/salir" style="color:#f85149">Salir</a>')
+            else:
+                estado = '<a href="/entrar" style="color:#58a6ff">Entrar</a>'
+            base = base.replace(par_viejo, estado, 1)
+            self._send_html(200, base)
             return
         if path == "/health":
             apps = {
@@ -392,8 +403,9 @@ class PortalHandler(BaseHTTPRequestHandler):
             return
         if path == "/salir":
             self.send_response(303)
-            self.send_header("Set-Cookie", "zyra_zid=; Max-Age=0; Path=/")
-            self.send_header("Location", "/")
+            self.send_header("Set-Cookie", "zyra_zid=; Max-Age=0; Path=/; HttpOnly")
+            self.send_header("Cache-Control", "no-store")
+            self.send_header("Location", "/entrar")
             self.end_headers()
             return
         if path == "/verificar":
@@ -436,25 +448,31 @@ class PortalHandler(BaseHTTPRequestHandler):
         if path == "/entrar":
             largo = int(self.headers.get("Content-Length", 0) or 0)
             crudo = self.rfile.read(largo).decode("utf-8") if largo else ""
-            import re as _re
             from urllib.parse import unquote_plus as _uq
-            campos = {}
+            zid = ""
+            clave = ""
             for par in crudo.split("&"):
                 if "=" in par:
                     k, v = par.split("=", 1)
-                    campos[k] = _uq(v)
-            zid = (campos.get("zid") or "").strip()
-            clave = (campos.get("clave") or "").strip()
-            if not _re.match(r"^[A-Za-z0-9][A-Za-z0-9_.-]{2,63}$", zid or ""):
-                self._send_html(400, self._pagina_entrar("ZID invalido o vacio."))
-                return
-            es_dueno = (zid == os.environ.get("ZYRA_OWNER_ZID", "Z-OWNER-ALFONSZELAYA"))
+                    if k == "zid":
+                        zid = _uq(v).strip()
+                    elif k == "clave":
+                        clave = _uq(v).strip()
+            owner = os.environ.get("ZYRA_OWNER_ZID", "")
             clave_req = os.environ.get("ZYRA_CLAVE_DUENO", "")
-            if es_dueno and clave_req and clave != clave_req:
-                self._send_html(403, self._pagina_entrar("Clave de dueno incorrecta."))
+            if not owner or not clave_req:
+                self._send_html(503, self._pagina_entrar(
+                    "Acceso no configurado en el servidor."))
+                return
+            if zid != owner:
+                self._send_html(403, self._pagina_entrar(
+                    "SOLO_EL_PROPIETARIO_PUEDE_ENTRAR. El registro publico llegara con la Red."))
+                return
+            if clave != clave_req:
+                self._send_html(403, self._pagina_entrar("Clave incorrecta."))
                 return
             self.send_response(303)
-            self.send_header("Set-Cookie", "zyra_zid=" + zid + "; Path=/; Max-Age=604800")
+            self.send_header("Set-Cookie", "zyra_zid=" + zid + "; Path=/; Max-Age=604800; HttpOnly")
             self.send_header("Location", "/")
             self.end_headers()
             return

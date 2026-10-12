@@ -3,6 +3,11 @@
 Resilience contract: failures are returned as
 (ok=False, data=None, error=...), never raised -
 the app keeps working when the Network is down.
+
+Auth contract: when ZYRA_API_TOKEN is set (or an
+explicit api_token is passed) every request carries
+an Authorization Bearer token. Without a token the
+client behaves exactly as before (backwards compatible).
 """
 from __future__ import annotations
 
@@ -12,12 +17,13 @@ import urllib.request
 
 
 class NetworkClient:
-    """HTTP client for ZYRA Network (retries)."""
+    """HTTP client for ZYRA Network (retries + auth)."""
 
     def __init__(
         self,
         base_url: str | None = None,
         *,
+        api_token: str | None = None,
         timeout_seconds: float = 5.0,
         max_retries: int = 2,
     ) -> None:
@@ -25,6 +31,11 @@ class NetworkClient:
             base_url
             or os.environ.get("ZYRA_URL", "")
         ).rstrip("/")
+        self._token = (
+            api_token
+            or os.environ.get("ZYRA_API_TOKEN", "")
+            or ""
+        ).strip()
         self._timeout = timeout_seconds
         self._retries = max(0, max_retries)
 
@@ -32,15 +43,21 @@ class NetworkClient:
     def base_url(self) -> str:
         return self._base
 
-    def get(self, path: str) -> tuple[
-        bool, dict | None, str | None
-    ]:
+    @property
+    def api_token(self) -> str:
+        return self._token
+
+    def get(self, path: str) -> tuple[bool, dict | None, str | None]:
         return self._call("GET", path)
 
-    def post(
-        self, path: str, payload: dict
-    ) -> tuple[bool, dict | None, str | None]:
+    def post(self, path: str, payload: dict) -> tuple[bool, dict | None, str | None]:
         return self._call("POST", path, payload)
+
+    def _headers(self) -> dict:
+        headers = {"Content-Type": "application/json"}
+        if self._token:
+            headers["Authorization"] = "Bearer " + self._token
+        return headers
 
     def _call(
         self,
@@ -69,10 +86,7 @@ class NetworkClient:
                     url,
                     data=data,
                     method=method,
-                    headers={
-                        "Content-Type":
-                        "application/json"
-                    },
+                    headers=self._headers(),
                 )
                 with urllib.request.urlopen(
                     request,

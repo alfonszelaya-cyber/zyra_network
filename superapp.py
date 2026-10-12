@@ -402,6 +402,19 @@ class PortalHandler(BaseHTTPRequestHandler):
                 self._read_portal("verificar.html").decode("utf-8"),
             )
             return
+        if path == "/manifest.json":
+            self._send(200, "application/manifest+json", self._read_portal("manifest.json"))
+            return
+        if path == "/sw.js":
+            self._send(200, "application/javascript; charset=utf-8", self._read_portal("sw.js"))
+            return
+        if path == "/icon-192.png":
+            self._send(200, "image/png", self._read_portal("icon-192.png"))
+            return
+        if path == "/icon-512.png":
+            self._send(200, "image/png", self._read_portal("icon-512.png"))
+            return
+
         if path == "/verificar.js":
             self._send(
                 200,

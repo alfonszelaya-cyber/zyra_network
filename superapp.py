@@ -48,6 +48,9 @@ class _SimpleClient:
 
     def __init__(self, base_url: str) -> None:
         self._base = base_url.rstrip("/")
+        self._token = (
+            os.environ.get("ZYRA_API_TOKEN", "") or ""
+        ).strip()
 
     def get(self, path: str):
         return self._call("GET", path)
@@ -64,11 +67,14 @@ class _SimpleClient:
             else None
         )
         try:
+            headers = {"Content-Type": "application/json"}
+            if self._token:
+                headers["Authorization"] = "Bearer " + self._token
             request = urllib.request.Request(
                 self._base + path,
                 data=data,
                 method=method,
-                headers={"Content-Type": "application/json"},
+                headers=headers,
             )
             with urllib.request.urlopen(request, timeout=15) as resp:
                 body = json.loads(resp.read().decode("utf-8"))

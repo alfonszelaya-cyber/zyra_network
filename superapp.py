@@ -273,12 +273,57 @@ class PortalHandler(BaseHTTPRequestHandler):
     def _read_portal(self, name):
         return (ROOT / "portal" / name).read_bytes()
 
+    def _sesion(self):
+        cruda = self.headers.get("Cookie", "") or ""
+        for parte in cruda.split(";"):
+            if "=" in parte:
+                k, v = parte.split("=", 1)
+                if k.strip() == "zyra_zid":
+                    return v.strip()
+        return None
+
+    def _pagina_entrar(self, mensaje):
+        aviso = ""
+        if mensaje:
+            aviso = "<p style='color:#f85149'>" + mensaje + "</p>"
+        html = (
+            "<!doctype html><html lang='es'><head><meta charset='utf-8'>"
+            "<meta name='viewport' content='width=device-width, initial-scale=1'>"
+            "<title>Entrar a ZYRA</title>"
+            "<style>body{font-family:system-ui,sans-serif;background:#0d1117;"
+            "color:#e6edf3;max-width:520px;margin:0 auto;padding:32px 16px}"
+            "input,button{width:100%;padding:12px;margin:6px 0;border-radius:8px;"
+            "border:1px solid #30363d;background:#161b22;color:#e6edf3;"
+            "box-sizing:border-box;font-size:16px}"
+            "button{background:#238636;border:none;font-weight:700}"
+            "</style></head><body>"
+            "<h1>Entrar a ZYRA</h1>"
+            + aviso +
+            "<form method='POST' action='/entrar'>"
+            "<input name='zid' placeholder='Tu ZID' required>"
+            "<input name='clave' type='password' placeholder='Clave de dueno (solo propietario)'>"
+            "<button>Entrar</button></form>"
+            "<p><a href='/' style='color:#8b949e'>Volver al portal</a></p>"
+            "</body></html>"
+        )
+        return html
+
     def _proxy(self, target):
         length = int(
             self.headers.get("Content-Length", 0) or 0
         )
         body = self.rfile.read(length) if length > 0 else None
         headers = {}
+        zid_s = self._sesion()
+        if zid_s:
+            headers["x-zyra-zid"] = zid_s
+            ruta_obj = (self.path or "").split("?", 1)[0]
+            if ruta_obj.startswith("/laboratorio"):
+                if zid_s == os.environ.get("ZYRA_OWNER_ZID", "Z-OWNER-ALFONSZELAYA"):
+                    headers["x-zyra-roles"] = os.environ.get(
+                        "ZYRA_ROLES_DUENO", "LAB_GOBERNADOR")
+                else:
+                    headers["x-zyra-roles"] = "LAB_ESPECTADOR"
         ct = self.headers.get("Content-Type")
         if ct:
             headers["Content-Type"] = ct
@@ -342,6 +387,15 @@ class PortalHandler(BaseHTTPRequestHandler):
             ).encode("utf-8")
             self._send(200, "application/json", payload)
             return
+        if path == "/entrar":
+            self._send_html(200, self._pagina_entrar(""))
+            return
+        if path == "/salir":
+            self.send_response(303)
+            self.send_header("Set-Cookie", "zyra_zid=; Max-Age=0; Path=/")
+            self.send_header("Location", "/")
+            self.end_headers()
+            return
         if path == "/verificar":
             self._send_html(
                 200,
@@ -366,6 +420,31 @@ class PortalHandler(BaseHTTPRequestHandler):
 
     def do_POST(self):
         path = self.path.split("?", 1)[0]
+        if path == "/entrar":
+            largo = int(self.headers.get("Content-Length", 0) or 0)
+            crudo = self.rfile.read(largo).decode("utf-8") if largo else ""
+            import re as _re
+            from urllib.parse import unquote_plus as _uq
+            campos = {}
+            for par in crudo.split("&"):
+                if "=" in par:
+                    k, v = par.split("=", 1)
+                    campos[k] = _uq(v)
+            zid = (campos.get("zid") or "").strip()
+            clave = (campos.get("clave") or "").strip()
+            if not _re.match(r"^[A-Za-z0-9][A-Za-z0-9_.-]{2,63}$", zid or ""):
+                self._send_html(400, self._pagina_entrar("ZID invalido o vacio."))
+                return
+            es_dueno = (zid == os.environ.get("ZYRA_OWNER_ZID", "Z-OWNER-ALFONSZELAYA"))
+            clave_req = os.environ.get("ZYRA_CLAVE_DUENO", "")
+            if es_dueno and clave_req and clave != clave_req:
+                self._send_html(403, self._pagina_entrar("Clave de dueno incorrecta."))
+                return
+            self.send_response(303)
+            self.send_header("Set-Cookie", "zyra_zid=" + zid + "; Path=/; Max-Age=604800")
+            self.send_header("Location", "/")
+            self.end_headers()
+            return
         if path == "/verify":
             if not ZYRA_URL:
                 self._send_html(

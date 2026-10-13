@@ -229,7 +229,10 @@ class SubastasApiHandler(BaseHTTPRequestHandler):
         path = self.path.split("?")[0]
         try:
             if path in ("/", "/subastas", "/subastas/"):
-                self._send_html(200, self._home())
+                try:
+                    self._send_html(200, self._home())
+                except Exception as exc:
+                    self._send_html(500, "<pre>ERR home: " + repr(exc)[:400] + "</pre>")
                 return
             if path in ("/subastas/api/health", "/subastas/health"):
                 self._send_json(200, {"ok": True, "app": "subastas"})
@@ -355,6 +358,33 @@ class SubastasApiHandler(BaseHTTPRequestHandler):
             self._send_json(500, {"ok": False, "error": "server error"})
 
     def do_POST(self) -> None:
+        if path == "/subastas/permiso":
+            try:
+                zid_h = (self.headers.get("x-zyra-zid") or "").strip()
+                aprobado = bool(zid_h)
+                motivo = ""
+                if not aprobado:
+                    try:
+                        dd = self._read_json() or {}
+                    except Exception:
+                        dd = {}
+                    z = str(dd.get("zid", "")).strip()
+                    c = str(dd.get("clave", ""))
+                    owner = os.environ.get("ZYRA_OWNER_ZID", "")
+                    clave_o = os.environ.get("ZYRA_CLAVE_DUENO", "")
+                    if owner and z == owner and clave_o and c == clave_o:
+                        aprobado = True
+                    elif not owner or not clave_o:
+                        motivo = "Servidor sin credenciales de propietario configuradas"
+                    else:
+                        motivo = "ZID o clave no autorizados. Inicia sesion en la SuperApp."
+                if aprobado:
+                    self._send_json(200, {"aprobado": True, "rol": "comprador"})
+                else:
+                    self._send_json(200, {"aprobado": False, "error": motivo})
+            except Exception as exc:
+                self._send_json(200, {"aprobado": False, "error": "ERR: " + repr(exc)[:200]})
+            return
         path = self.path.split("?")[0]
         try:
             if path == "/subastas/api/cartera":

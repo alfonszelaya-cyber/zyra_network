@@ -514,9 +514,52 @@ class PortalHandler(BaseHTTPRequestHandler):
             if len(nombre) < 3 or len(clave) < 8 or not db64 or not sb64:
                 self._send(400, "application/json", json.dumps({"ok": False, "error": "Falta nombre, clave (min 8), documento o selfie"}).encode())
                 return
-            ok_r, dr, er = _SimpleClient(ZYRA_URL).post("/identity/enroll", {"kind": "person", "name": nombre, "display_name": nombre, "actor": os.environ.get("ZYRA_ENROLL_ACTOR", "superapp"), "doc_image_b64": db64, "selfie_image_b64": sb64})
-            if not ok_r:
-                self._send(502, "application/json", json.dumps({"ok": False, "error": "La Red responde: " + str(er)[:250]}).encode())
+            payload_e = json.dumps({"kind": "person", "name": nombre, "display_name": nombre, "actor": os.environ.get("ZYRA_ENROLL_ACTOR", "superapp"), "doc_image_b64": db64, "selfie_image_b64": sb64}).encode("utf-8")
+            q_e = urllib.request.Request(ZYRA_URL + "/identity/enroll", data=payload_e, method="POST")
+            q_e.add_header("Content-Type", "application/json")
+            q_e.add_header("Authorization", "Bearer " + os.environ.get("ZYRA_API_TOKEN", ""))
+            cuerpo_e = ""
+            status_e = None
+            try:
+                with urllib.request.urlopen(q_e, timeout=60) as re_:
+                    status_e = re_.status
+                    cuerpo_e = re_.read().decode("utf-8", "replace")
+            except urllib.error.HTTPError as he_:
+                status_e = he_.code
+                try:
+                    cuerpo_e = he_.read().decode("utf-8", "replace")
+                except Exception:
+                    cuerpo_e = ""
+            except Exception as ex_:
+                self._send(502, "application/json", json.dumps({"ok": False, "error": "Sin conexion con la Red: " + str(ex_)[:180]}).encode())
+                return
+            try:
+                je_ = json.loads(cuerpo_e or "{}")
+            except Exception:
+                je_ = {}
+            if status_e in (200, 201) and je_.get("ok") is True:
+                dx_ = je_.get("data") or je_
+                if isinstance(dx_, dict):
+                    zid = str(dx_.get("zid") or dx_.get("identity_id") or dx_.get("id") or "")
+            elif "biometrics_unavailable" in cuerpo_e or "face engine not installed" in cuerpo_e:
+                try:
+                    import sqlite3 as _sq2
+                    con2 = _sq2.connect(str(DATA_DIR / "credenciales.db"))
+                    con2.execute("CREATE TABLE IF NOT EXISTS pendientes (nombre TEXT, doc_b64 TEXT, selfie_b64 TEXT, fecha TEXT)")
+                    con2.execute("INSERT INTO pendientes VALUES (?, ?, ?, datetime('now'))", (nombre, db64, sb64))
+                    con2.commit()
+                    con2.close()
+                except Exception:
+                    pass
+                self._send(200, "application/json", json.dumps({"ok": False, "codigo": "mantenimiento", "error": "Biometria en mantenimiento. Tu solicitud quedo guardada."}).encode())
+                return
+            else:
+                emsg = ""
+                if isinstance(je_.get("error"), dict):
+                    emsg = str(je_["error"].get("message", ""))
+                if not emsg:
+                    emsg = cuerpo_e[:250] or ("HTTP " + str(status_e))
+                self._send(502, "application/json", json.dumps({"ok": False, "error": emsg}).encode())
                 return
             zid = ""
             if isinstance(dr, dict):

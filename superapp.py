@@ -412,6 +412,39 @@ class PortalHandler(BaseHTTPRequestHandler):
             base = base.replace("__ESTADO__", estado, 1)
             self._send_html(200, base)
             return
+
+        if path == "/inicio":
+            try:
+                d_i = self._read_portal("inicio.html")
+            except Exception:
+                d_i = b"<html><body></body></html>"
+            self._send(200, "text/html; charset=utf-8", d_i)
+            return
+
+        if path == "/registro":
+            try:
+                d_r = self._read_portal("registro.html")
+            except Exception:
+                d_r = b"<html><body></body></html>"
+            self._send(200, "text/html; charset=utf-8", d_r)
+            return
+
+        if path == "/version":
+            try:
+                d_v = self._read_portal("version.txt")
+            except Exception:
+                d_v = b"0"
+            self._send(200, "text/plain; charset=utf-8", d_v)
+            return
+
+        if path.startswith("/icon-") and path.endswith(".png"):
+            try:
+                datos_i = self._read_portal(path[1:])
+            except Exception:
+                self._send_html(404, NOT_FOUND_PAGE)
+                return
+            self._send(200, "image/png", datos_i)
+            return
         if path == "/health":
             apps = {
                 p: {"label": v["label"], "port": v["port"]}

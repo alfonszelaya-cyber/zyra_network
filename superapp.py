@@ -374,16 +374,25 @@ class PortalHandler(BaseHTTPRequestHandler):
                 estado = (
                     '<p class="estado ok">Conectado: ' + zid_s
                     + ' &middot; <a href="/salir" style="color:#f85149">Salir</a></p>')
+                tarjetas = ""
+                for _pref, _inf in APPS.items():
+                    tarjetas += (
+                        '<a class="opcion" href="' + _pref + '/"><b>' + _inf["label"]
+                        + '</b><span>Abrir aplicacion</span></a>')
+                seccion = (
+                    '<div class="menu">' + tarjetas + '</div>'
+                    + '<p class="tag" style="margin-top:20px;margin-bottom:8px">Verificador publico</p>'
+                    + '<div class="menu">'
+                    + '<a class="opcion" href="/verificar"><b>Verificar</b>'
+                    + '<span>Confirma la autenticidad de un documento</span></a>'
+                    + '</div>')
+                i1 = base.find('<div class="menu">')
+                i2 = base.find('</div>', i1) + len('</div>')
+                base = base[:i1] + seccion + base[i2:]
             else:
-                estado = ''
+                estado = ""
             base = base.replace("__ESTADO__", estado, 1)
             self._send_html(200, base)
-            return
-        if path == "/inicio":
-            self._send_html(200, self._read_portal("inicio.html").decode("utf-8"))
-            return
-        if path == "/registro":
-            self._send_html(200, self._read_portal("registro.html").decode("utf-8"))
             return
 
         if path == "/health":

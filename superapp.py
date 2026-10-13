@@ -301,7 +301,7 @@ class PortalHandler(BaseHTTPRequestHandler):
             + aviso +
             "<form method='POST' action='/entrar'>"
             "<input name='zid' placeholder='Tu ZID' required>"
-            "<input name='clave' type='password' placeholder='Clave de dueno (solo propietario)'>"
+            "<input name='clave' type='password' placeholder='Tu clave'>"
             "<button>Entrar</button></form>"
             "<p><a href='/' style='color:#8b949e'>Volver al portal</a></p>"
             "</body></html>"

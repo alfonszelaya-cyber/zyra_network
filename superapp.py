@@ -372,10 +372,10 @@ class PortalHandler(BaseHTTPRequestHandler):
             zid_s = self._sesion()
             if zid_s:
                 estado = (
-                    '<p class="estado ok">Conectado: ' + zid_s + '</p>')
+                    '<p class="estado ok">Conectado: ' + zid_s
+                    + ' &middot; <a href="/salir" style="color:#f85149">Salir</a></p>')
             else:
-                estado = (
-                    '<p class="estado">Sin sesion. Entra para acceder a las apps.</p>')
+                estado = ''
             base = base.replace("__ESTADO__", estado, 1)
             self._send_html(200, base)
             return
@@ -410,6 +410,13 @@ class PortalHandler(BaseHTTPRequestHandler):
             self.send_header("Location", "/entrar")
             self.end_headers()
             return
+        if path == "/version":
+            try:
+                dv = self._read_portal("version.txt")
+            except Exception:
+                dv = b"0"
+            self._send(200, "text/plain; charset=utf-8", dv)
+            return
         if path == "/verificar":
             self._send_html(
                 200,
@@ -435,6 +442,9 @@ class PortalHandler(BaseHTTPRequestHandler):
                 "application/javascript; charset=utf-8",
                 self._read_portal("verificar.js"),
             )
+            return
+        if path == "/mpe/register":
+            self._send_html(200, "<!doctype html><html lang='es'><head><meta charset='utf-8'><meta http-equiv='refresh' content='0;url=/registro'><title>ZYRA</title></head><body></body></html>")
             return
         for prefix, info in APPS.items():
             if path == prefix or path.startswith(prefix + "/"):
@@ -462,21 +472,69 @@ class PortalHandler(BaseHTTPRequestHandler):
                         clave = _uq(v).strip()
             owner = os.environ.get("ZYRA_OWNER_ZID", "")
             clave_req = os.environ.get("ZYRA_CLAVE_DUENO", "")
-            if not owner or not clave_req:
-                self._send_html(503, self._pagina_entrar(
-                    "Acceso no configurado en el servidor."))
+            if zid == owner and clave_req and clave == clave_req:
+                self.send_response(303)
+                self.send_header("Set-Cookie", "zyra_zid=" + zid + "; Path=/; Max-Age=604800; HttpOnly")
+                self.send_header("Location", "/")
+                self.end_headers()
                 return
-            if zid != owner:
-                self._send_html(403, self._pagina_entrar(
-                    "SOLO_EL_PROPIETARIO_PUEDE_ENTRAR. El registro publico llegara con la Red."))
+            cred_ok = False
+            try:
+                import sqlite3 as _sq, hashlib as _hs
+                con = _sq.connect(str(DATA_DIR / "credenciales.db"))
+                fila = con.execute("SELECT sal, hash FROM credenciales WHERE zid = ?", (zid,)).fetchone()
+                con.close()
+                if fila:
+                    cred_ok = (_hs.sha256((fila[0] + clave).encode()).hexdigest() == fila[1])
+            except Exception:
+                cred_ok = False
+            if cred_ok:
+                self.send_response(303)
+                self.send_header("Set-Cookie", "zyra_zid=" + zid + "; Path=/; Max-Age=604800; HttpOnly")
+                self.send_header("Location", "/")
+                self.end_headers()
                 return
-            if clave != clave_req:
-                self._send_html(403, self._pagina_entrar("Clave incorrecta."))
+            self._send_html(403, self._pagina_entrar(
+                "ZID o clave incorrectos. Si no tienes ZID, registrate en Registro."))
+            return
+        if path == "/registro/nuevo":
+            if not ZYRA_URL:
+                self._send(503, "application/json", json.dumps({"ok": False, "error": "Red no configurada"}).encode())
                 return
-            self.send_response(303)
-            self.send_header("Set-Cookie", "zyra_zid=" + zid + "; Path=/; Max-Age=604800; HttpOnly")
-            self.send_header("Location", "/")
-            self.end_headers()
+            largo = int(self.headers.get("Content-Length", 0) or 0)
+            crudo = self.rfile.read(largo).decode("utf-8") if largo else ""
+            try:
+                dd = json.loads(crudo or "{}")
+            except Exception:
+                dd = {}
+            nombre = str(dd.get("nombre", "")).strip()
+            clave = str(dd.get("clave", ""))
+            db64 = str(dd.get("doc_image_b64", ""))
+            sb64 = str(dd.get("selfie_image_b64", ""))
+            if len(nombre) < 3 or len(clave) < 8 or not db64 or not sb64:
+                self._send(400, "application/json", json.dumps({"ok": False, "error": "Falta nombre, clave (min 8), documento o selfie"}).encode())
+                return
+            ok_r, dr, er = _SimpleClient(ZYRA_URL).post("/identity/enroll", {"kind": "person", "name": nombre, "display_name": nombre, "actor": os.environ.get("ZYRA_ENROLL_ACTOR", "superapp"), "doc_image_b64": db64, "selfie_image_b64": sb64})
+            if not ok_r:
+                self._send(502, "application/json", json.dumps({"ok": False, "error": "La Red responde: " + str(er)[:250]}).encode())
+                return
+            zid = ""
+            if isinstance(dr, dict):
+                dx = dr.get("data") or dr
+                if isinstance(dx, dict):
+                    zid = str(dx.get("zid") or dx.get("identity_id") or dx.get("id") or "")
+            if not zid:
+                self._send(500, "application/json", json.dumps({"ok": False, "error": "La Red no devolvio ZID"}).encode())
+                return
+            import secrets as _sc, hashlib as _hs, sqlite3 as _sq
+            sal = _sc.token_hex(16)
+            hc = _hs.sha256((sal + clave).encode()).hexdigest()
+            con = _sq.connect(str(DATA_DIR / "credenciales.db"))
+            con.execute("CREATE TABLE IF NOT EXISTS credenciales (zid TEXT PRIMARY KEY, sal TEXT, hash TEXT)")
+            con.execute("INSERT OR REPLACE INTO credenciales VALUES (?, ?, ?)", (zid, sal, hc))
+            con.commit()
+            con.close()
+            self._send(200, "application/json", json.dumps({"ok": True, "zid": zid}).encode())
             return
         if path == "/verify":
             if not ZYRA_URL:

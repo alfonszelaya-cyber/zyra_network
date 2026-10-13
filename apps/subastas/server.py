@@ -1097,44 +1097,44 @@ class SubastasApiHandler(BaseHTTPRequestHandler):
         ])
 
     def _home(self) -> str:
-        return "".join([
-            "<html><head><meta charset='utf-8'>",
-            "<title>ZYRA MARKET</title>",
-            self._style(),
-            "</head><body><div class='wrap'>",
-            "<h1>ZYRA MARKET</h1>",
-            self._nav_html(),
-            "<div class='card'><h2>Registrarme con biometria (por ley)</h2>",
-            "<form id='bioReg' method='POST' action='/subastas/register'>",
-            "<p>Nombre completo: <input name='name' required></p>",
-            "<fieldset><legend>1) Foto del documento</legend>",
-            "<input type='file' id='bioDoc' accept='image/*' capture='environment'></fieldset>",
-            "<fieldset><legend>2) Selfie en vivo</legend>",
-            "<input type='file' id='bioSlf' accept='image/*' capture='user'></fieldset>",
-            "<input type='hidden' name='doc_image_b64' id='bioDocB64'>",
-            "<input type='hidden' name='selfie_image_b64' id='bioSlfB64'>",
-            "<p id='bioSt'>Estado: pendiente</p>",
-            "<button type='submit'>Registrarme</button>",
-            "</form>",
-            "<canvas id='bioCv' style='display:none'></canvas>",
-            "<script>",
-            "(function(){",
-            "var d=document.getElementById('bioDoc'),s=document.getElementById('bioSlf'),st=document.getElementById('bioSt'),hd=document.getElementById('bioDocB64'),hs=document.getElementById('bioSlfB64'),cv=document.getElementById('bioCv'),cx=cv.getContext('2d');",
-            "function p(f,h){if(!f){return;}var r=new FileReader();r.onload=function(){var i=new Image();i.onload=function(){var k=Math.min(1,800/Math.max(i.width,i.height));cv.width=Math.round(i.width*k);cv.height=Math.round(i.height*k);cx.drawImage(i,0,0,cv.width,cv.height);h.value=cv.toDataURL('image/jpeg',0.72).split(',')[1];u();};i.src=r.result;};r.readAsDataURL(f);}",
-            "function u(){st.textContent='Doc: '+(hd.value?'OK':'falta')+' | Selfie: '+(hs.value?'OK':'falta');}",
-            "d.addEventListener('change',function(){p(d.files[0],hd);});",
-            "s.addEventListener('change',function(){p(s.files[0],hs);});",
-            "document.getElementById('bioReg').addEventListener('submit',function(e){if(!hd.value||!hs.value){e.preventDefault();st.textContent='Falta foto del documento o selfie.';}});",
-            "})();",
-            "</script>",
-            "</div>",
-            "<div class='card'><h2>ZYRA MARKET</h2>",
-            "<p>El super mercado de la Red ZYRA.</p>",
-            "<p>Roles: vendedor | comprador | gobierno</p>",
-            "<a href='/subastas/menu'><button>Ir al Menu</button></a>",
-            "</div>",
-            "</div></body></html>",
-        ])
+        P = []
+        P.append("<html><head><meta charset='utf-8'>")
+        P.append("<meta name='viewport' content='width=device-width, initial-scale=1'>")
+        P.append("<title>ZYRA MARKET</title>")
+        P.append("<style>body{font-family:system-ui,sans-serif;background:#0d1117;color:#e6edf3;margin:0;padding:24px 16px;box-sizing:border-box}")
+        P.append(".caja{max-width:520px;background:#11162b;border:1px solid #242c4f;border-radius:14px;padding:18px;margin:0 auto 14px}")
+        P.append("h1{margin:0 0 14px;font-size:26px}input{width:100%;padding:12px;margin:6px 0 12px;border-radius:10px;border:1px solid #30363d;background:#0d1117;color:#e6edf3;box-sizing:border-box;font-size:15px}")
+        P.append("button{padding:13px 22px;border-radius:10px;border:none;background:#238636;color:#fff;font-size:15px;font-weight:700}")
+        P.append(".aprobado{color:#3fb950;font-weight:800;font-size:18px;margin:10px 0}#menu{display:none;margin-top:14px}a.item{display:block;color:#e6edf3;text-decoration:none;padding:10px 12px;background:#0d1117;border:1px solid #30363d;border-radius:8px;margin:6px 0;font-weight:700}</style></head><body>")
+        P.append("<h1>ZYRA MARKET</h1>")
+        P.append("<div class='caja' id='cajaAcceso'>")
+        P.append("<h2 style='margin:0 0 10px;font-size:17px'>Acceso con tu identidad ZYRA</h2>")
+        P.append("<input id='zid' placeholder='Tu ZID'>")
+        P.append("<input id='clave' type='password' placeholder='Tu clave'>")
+        P.append("<button onclick='pedirPermiso()'>Solicitar permiso</button>")
+        P.append("<div id='estado' style='margin-top:12px;font-size:14px'></div>")
+        P.append("</div>")
+        P.append("<div id='menu'><div class='caja'>")
+        P.append("<h2 style='margin:0 0 10px;font-size:17px'>ZYRA MARKET</h2>")
+        P.append("<p style='color:#8b949e;font-size:14px'>El super mercado de la Red ZYRA. Roles: vendedor | comprador | gobierno</p>")
+        P.append("<a class='item' href='/subastas/menu'>IR AL MENU</a>")
+        P.append("</div></div>")
+        P.append("<script>")
+        P.append("async function pedirPermiso(){")
+        P.append("var E=document.getElementById('estado');")
+        P.append("var z=document.getElementById('zid').value.trim();")
+        P.append("var c=document.getElementById('clave').value.trim();")
+        P.append("if(!z||!c){E.innerHTML='<p style=color:#f0b429>Escribe tu ZID y clave.</p>';return;}")
+        P.append("E.innerHTML='<p style=color:#8b949e>Solicitando permiso a la Red...</p>';")
+        P.append("try{var r=await fetch('/subastas/permiso',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({zid:z,clave:c})});")
+        P.append("var j=await r.json();")
+        P.append("if(j.aprobado){E.innerHTML='<p class=aprobado>APROBADO - acceso concedido</p>';")
+        P.append("document.getElementById('menu').style.display='block';")
+        P.append("document.getElementById('cajaAcceso').style.display='none';}")
+        P.append("else{E.innerHTML='<p style=color:#f85149>'+(j.error||'Acceso denegado')+'</p>';}}")
+        P.append("catch(e){E.innerHTML='<p style=color:#f85149>Sin conexion con la Red.</p>';}}")
+        P.append("</script></body></html>")
+        return "".join(P)
 
     def _listings_html(self) -> str:
         rows_data = self.store.list_open()

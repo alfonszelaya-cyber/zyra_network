@@ -374,27 +374,44 @@ class PortalHandler(BaseHTTPRequestHandler):
                 estado = (
                     '<p class="estado ok">Conectado: ' + zid_s
                     + ' &middot; <a href="/salir" style="color:#f85149">Salir</a></p>')
+                DESCRIPCIONES = {
+                    "/mpe": "Empleos, propuestas y credenciales laborales",
+                    "/agro": "Productores, ayudas y precios justos",
+                    "/axis": "Salud, justicia y seguridad",
+                    "/semilla": "Educacion con historial verificado",
+                    "/nexo": "Nucleo contable y fiscal",
+                    "/subastas": "Marketplace con confianza",
+                    "/ciclo": "Reciclaje y arqueologia",
+                    "/laboratorio": "Experimentos, simulaciones y proyecciones",
+                }
                 tarjetas = ""
                 for _pref, _inf in APPS.items():
+                    _ic = "/icon-app" + _pref.replace("/", "-") + ".png"
+                    _desc = DESCRIPCIONES.get(_pref, "Abrir aplicacion")
                     tarjetas += (
-                        '<a class="opcion" href="' + _pref + '/"><b>' + _inf["label"]
-                        + '</b><span>Abrir aplicacion</span></a>')
+                        '<a class="opcion" href="' + _pref + '/">'
+                        + '<div style="display:flex;align-items:center;gap:16px">'
+                        + '<img src="' + _ic + '" alt="" style="width:60px;height:60px;border-radius:16px;flex-shrink:0">'
+                        + '<div><b style="font-size:20px">' + _inf["label"] + '</b>'
+                        + '<span style="display:block;font-size:13px;color:#8b949e;margin-top:3px">' + _desc + '</span></div>'
+                        + '</div></a>')
                 seccion = (
                     '<div class="menu">' + tarjetas + '</div>'
-                    + '<p class="tag" style="margin-top:20px;margin-bottom:8px">Verificador publico</p>'
+                    + '<p class="tag" style="margin-top:22px;margin-bottom:8px">Verificador publico</p>'
                     + '<div class="menu">'
-                    + '<a class="opcion" href="/verificar"><b>Verificar</b>'
+                    + '<a class="opcion" href="/verificar"><b style="font-size:19px">Verificar</b>'
                     + '<span>Confirma la autenticidad de un documento</span></a>'
                     + '</div>')
                 i1 = base.find('<div class="menu">')
                 i2 = base.find('</div>', i1) + len('</div>')
                 base = base[:i1] + seccion + base[i2:]
+                base = base.replace('.opcion{display:flex;flex-direction:column;gap:2px;text-decoration:none;background:#11162b;',
+                    '.opcion{display:block;text-decoration:none;background:#11162b;')
             else:
                 estado = ""
             base = base.replace("__ESTADO__", estado, 1)
             self._send_html(200, base)
             return
-
         if path == "/health":
             apps = {
                 p: {"label": v["label"], "port": v["port"]}
@@ -454,6 +471,14 @@ class PortalHandler(BaseHTTPRequestHandler):
             return
         if path == "/mpe/register":
             self._send_html(200, "<!doctype html><html lang='es'><head><meta charset='utf-8'><meta http-equiv='refresh' content='0;url=/registro'><title>ZYRA</title></head><body></body></html>")
+            return
+        if path.startswith("/icon-") and path.endswith(".png"):
+            try:
+                datos_i = self._read_portal(path[1:])
+            except Exception:
+                self._send_html(404, NOT_FOUND_PAGE)
+                return
+            self._send(200, "image/png", datos_i)
             return
         for prefix, info in APPS.items():
             if path == prefix or path.startswith(prefix + "/"):

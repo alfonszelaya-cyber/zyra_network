@@ -482,8 +482,8 @@ a{color:#a78bfa}
 <label>1) Documento: lado FRONTAL</label>
 <input type="file" id="fileF" accept="image/*" capture="environment" style="display:none" onchange="cargarDoc(this,'F')">
 <input type="file" id="galF" accept="image/*" style="display:none" onchange="cargarDoc(this,'F')">
-<button type="button" class="big" onclick="R('fileF').click()">TOMAR FOTO</button>
-<button type="button" class="mini" onclick="R('galF').click()">o elegir archivo existente</button>
+<button type="button" class="big" id="btF" onclick="tomarFoto('F')">TOMAR FOTO FRONTAL</button>
+<button type="button" class="mini" onclick="elegirArchivo('F')">o elegir archivo existente</button>
 <div class="estado" id="stF"></div>
 <img class="preview" id="pF" alt="" onclick="reeditar('F')">
 <button type="button" class="mini" onclick="irAPaso(1)">Volver</button>
@@ -492,8 +492,8 @@ a{color:#a78bfa}
 <label>2) Documento: lado de ATRAS (reverso)</label>
 <input type="file" id="fileA" accept="image/*" capture="environment" style="display:none" onchange="cargarDoc(this,'A')">
 <input type="file" id="galA" accept="image/*" style="display:none" onchange="cargarDoc(this,'A')">
-<button type="button" class="big" onclick="R('fileA').click()">TOMAR FOTO</button>
-<button type="button" class="mini" onclick="R('galA').click()">o elegir archivo existente</button>
+<button type="button" class="big" id="btA" onclick="tomarFoto('A')">TOMAR FOTO REVERSO</button>
+<button type="button" class="mini" onclick="elegirArchivo('A')">o elegir archivo existente</button>
 <div class="estado" id="stA"></div>
 <img class="preview" id="pA" alt="" onclick="reeditar('A')">
 <div class="estado" id="notaRev"></div>
@@ -502,7 +502,7 @@ a{color:#a78bfa}
 <button type="button" class="mini" onclick="irAPaso(2)">Volver</button>
 </div>
 <div class="paso" id="ps4">
-<label>3) Selfie en vivo (con luz buena y tu rostro visible)</label>
+<label>3) Selfie en vivo (buenav luz y rostro centrado en el ovalo)</label>
 <div id="videozona"><video id="v" autoplay playsinline muted></video><canvas class="ov" id="ov"></canvas></div>
 <div class="estado" id="stProv">Motor de deteccion: preparando...</div>
 <div class="estado" id="stV">Pulsa ABRIR CAMARA para comenzar</div>
@@ -531,17 +531,16 @@ a{color:#a78bfa}
 </form>
 <div id="resp"></div>
 <p style="text-align:center;margin-top:14px"><a href="/">Volver</a> | <a href="/entrar">Ya tengo ZID</a></p>
-<p style="text-align:center;color:#4a4f7a;font-size:11px;margin-top:10px">ZYRA registro v17 - escaner universal</p>
+<p style="text-align:center;color:#4a4f7a;font-size:11px;margin-top:10px">ZYRA registro v18 - escaner universal</p>
 <script>
 var DF="",DA="",DS="";
 var docImg=null,docLado="",docCrudoF="",docCrudoA="",editListo=false;
-var quad=null;
-var cam=null,cara=null,detTipo="",apiCara=null,mpDetector=null,capturando=false;
+var quad=null,procesandoDoc=false;
+var cam=null,cara=null,alineado=false,detTipo="",apiCara=null,mpDetector=null,capturando=false;
 var promesaCara=null;
 function R(id){return document.getElementById(id)}
 function kb(s){return Math.round(s.length*3/4/1024)}
 function dormir(ms){return new Promise(function(res){setTimeout(res,ms)})}
-function esTarjeta(){return R("tipoDoc").value!="pasaporte"}
 function propIdeal(){return R("tipoDoc").value=="pasaporte"?1.41:1.586}
 function zyComprimir(dataUrl,maxLado,calidad){return new Promise(function(res){var im=new Image();im.onload=function(){var w=im.width,h=im.height,e=Math.min(1,maxLado/Math.max(w,h)),c=document.createElement("canvas");c.width=Math.round(w*e);c.height=Math.round(h*e);c.getContext("2d").drawImage(im,0,0,c.width,c.height);res(c.toDataURL("image/jpeg",calidad).split(",").pop())};im.onerror=function(){res(dataUrl.split(",").pop())};im.src=dataUrl})}
 function luma(dataUrl){return new Promise(function(res){var im=new Image();im.onload=function(){var c=document.createElement("canvas");c.width=40;c.height=40;c.getContext("2d").drawImage(im,0,0,40,40);var d=c.getContext("2d").getImageData(0,0,40,40).data,t=0;for(var i=0;i<d.length;i+=4){t+=0.299*d[i]+0.587*d[i+1]+0.114*d[i+2]}res(t/(d.length/4))};im.onerror=function(){res(99)};im.src=dataUrl})}
@@ -600,24 +599,6 @@ if(t=="nativo"){var fs2=await apiCara.detect(v);if(fs2.length){var b4=fs2[0].bou
 }catch(e){}
 return null;
 }
-async function cajaEnEscalada(im){
-var t=await ensureCara();if(!t)return null;
-var MAXD=640;
-var sc=Math.min(1,MAXD/Math.max(im.width,im.height));
-var c=document.createElement("canvas");
-c.width=Math.round(im.width*sc);c.height=Math.round(im.height*sc);
-c.getContext("2d").drawImage(im,0,0,c.width,c.height);
-var b=null;
-if(t=="mediapipe"){b=cajaMP(c)}
-else if(t=="faceapi"){
-try{var r=await faceapi.detectSingleFace(c,new faceapi.TinyFaceDetectorOptions({inputSize:416,scoreThreshold:0.25}));if(r){b={x:r.box.x,y:r.box.y,w:r.box.width,h:r.box.height}}}catch(e){}
-}
-else if(t=="nativo"){
-try{var fs3=await apiCara.detect(c);if(fs3.length){var b5=fs3[0].boundingBox;b={x:b5.x,y:b5.y,w:b5.width,h:b5.height}}}catch(e){}
-}
-if(b){return {x:b.x/sc,y:b.y/sc,w:b.w/sc,h:b.h/sc}}
-return null;
-}
 function irAPaso(n){
 var i;
 for(i=1;i<=5;i++){var e=R("ps"+i);if(e)e.className="paso"+(i==n?" act":"")}
@@ -626,7 +607,7 @@ if(n!=4){stopCam()}
 if(n==3){
 var t=R("tipoDoc").value;
 if(t=="pasaporte"){R("notaRev").innerHTML="Pasaporte: no tiene reverso. Continua.";R("notaRev").className="estado chk";R("bIr4").disabled=false}
-else if(t=="permiso"){R("notaRev").innerHTML="Si tu permiso tiene reverso, tomale foto. Si no, usa el boton de abajo.";R("notaRev").className="estado"}
+else if(t=="permiso"){R("notaRev").innerHTML="Si tu permiso tiene reverso, tomale foto. Si no, usa el boton de abajo.";R("notaRev").className="estado";R("bIr4").disabled=!DA}
 else{R("notaRev").innerHTML="Este documento SI requiere reverso.";R("notaRev").className="estado";R("bIr4").disabled=!DA}
 }
 window.scrollTo(0,0);
@@ -640,6 +621,18 @@ var nm=R("nombre").value.trim();
 if(nm.length<3){R("resp").innerHTML="<p style='color:#f85149'>Escribe tu nombre completo para continuar.</p>";window.scrollTo(0,document.body.scrollHeight);return}
 irAPaso(2);
 }
+function tomarFoto(lado){
+if(procesandoDoc){R("st"+lado).innerHTML="Espera: se esta procesando la foto anterior...";return}
+var inp=R(lado=="F"?"fileF":"fileA");
+inp.value="";
+inp.click();
+}
+function elegirArchivo(lado){
+if(procesandoDoc){R("st"+lado).innerHTML="Espera: se esta procesando la foto anterior...";return}
+var inp=R(lado=="F"?"galF":"galA");
+inp.value="";
+inp.click();
+}
 function quadInicial(im){
 var pr=propIdeal();
 var fw=im.width*0.8,fh=fw/pr;
@@ -649,7 +642,7 @@ return {tl:{x:x,y:y},tr:{x:x+fw,y:y},br:{x:x+fw,y:y+fh},bl:{x:x,y:y+fh}};
 }
 function detectarEsquinas(im){
 try{
-var W=600;
+var W=460;
 var sc=Math.min(1,W/im.width);
 var cw=Math.max(80,Math.round(im.width*sc)),ch=Math.max(60,Math.round(im.height*sc));
 var c=document.createElement("canvas");c.width=cw;c.height=ch;
@@ -666,12 +659,10 @@ var best=null,bestScore=0;
 var pasadas=[1,-1];
 for(var pi=0;pi<2;pi++){
 var sg=pasadas[pi];
-var um=mu+sg*0.32*de;
 for(i=0;i<N;i++)vis[i]=0;
 for(i=0;i<N;i++){
 if(vis[i])continue;
-var val=(lum[i]-mu)*sg;
-if(val<=0.32*de)continue;
+if((lum[i]-mu)*sg<=0.32*de)continue;
 vis[i]=1;
 var qh=0,qt=0;cola[qt++]=i;
 var minx=1e9,maxx=-1,miny=1e9,maxy=-1,cnt=0;
@@ -717,15 +708,33 @@ return {tl:{x:gx,y:gy},tr:{x:gx+gw,y:gy},br:{x:gx+gw,y:gy+ghe},bl:{x:gx,y:gy+ghe
 }
 async function cargarDoc(inp,lado){
 var f=inp.files&&inp.files[0];if(!f)return;
+if(procesandoDoc)return;
+procesandoDoc=true;
+var st=R("st"+lado);
+st.innerHTML="PROCESANDO FOTO... espera unos segundos, no toques nada";
+st.className="estado";st.style.color="#f0b429";
+window.setTimeout(function(){window.scrollTo(0,document.body.scrollHeight)},50);
+try{
 var fr2=new FileReader();
 fr2.onload=async function(){
+try{
 var crudo=fr2.result;
-var L=await luma(crudo);
-if(L<40){R("st"+lado).innerHTML="Foto muy oscura (luz "+Math.round(L)+"/100). Tomala con buena luz.";R("st"+lado).className="estado mal";return}
 var comp=await zyComprimir(crudo,1200,0.78);
+var L=await luma(comp);
+if(L<40){st.innerHTML="Foto muy oscura (luz "+Math.round(L)+"/100). Tomala con buena luz.";st.className="estado mal";procesandoDoc=false;return}
 abrirEditor(lado,comp);
+procesandoDoc=false;
+}catch(e3){
+st.innerHTML="Error procesando la foto: "+e3;st.className="estado mal";
+procesandoDoc=false;
+}
 };
+fr2.onerror=function(){st.innerHTML="No se pudo leer la foto. Intenta de nuevo.";st.className="estado mal";procesandoDoc=false};
 fr2.readAsDataURL(f);
+}catch(e2){
+st.innerHTML="Error: "+e2;st.className="estado mal";
+procesandoDoc=false;
+}
 }
 function abrirEditor(lado,comp){
 docLado=lado;
@@ -740,6 +749,7 @@ R("zonaEdit").style.display="block";
 pintarEditor();
 if(!editListo){iniciarEdit();editListo=true}
 st.innerHTML="Buscando las esquinas del documento...";
+window.setTimeout(function(){window.scrollTo(0,document.body.scrollHeight)},50);
 autoEsquinas();
 };
 im.src="data:image/jpeg;base64,"+comp;
@@ -990,7 +1000,7 @@ R("bRepSelfie").style.display="none";
 cam=await navigator.mediaDevices.getUserMedia({video:{facingMode:"user",width:{ideal:640},height:{ideal:480}}});
 var v=R("v");v.srcObject=cam;
 R("bSelfie").style.display="block";
-st.innerHTML="Camara abierta. Espera el ovalo verde y pulsa CAPTURAR.";
+st.innerHTML="Centra tu rostro DENTRO del ovalo con buena luz.";
 ensureCara();loop();
 }catch(e){
 st.innerHTML="No se pudo abrir la camara: "+e;st.className="estado mal";
@@ -1010,18 +1020,30 @@ if(!cam||v.readyState<2)return;
 var vw=v.videoWidth,vh=v.videoHeight;if(!vw)return;
 if(ov.width!=vw){ov.width=vw;ov.height=vh}
 var g=ov.getContext("2d");g.clearRect(0,0,ov.width,ov.height);
+var o={cx:vw/2,cy:vh*0.46,rx:vw*0.22,ry:vh*0.31};
 try{
 var caja=await cajaEnVideo(v);
 cara=caja;
+alineado=false;
 if(caja){
-var grande=(caja.w/vw)>0.12;
-var cx=caja.x+caja.w/2,cy=caja.y+caja.h/2,rx=caja.w*0.62,ry=caja.h*0.74;
-g.strokeStyle=grande?"#3fb950":"#f0b429";g.lineWidth=4;
-g.beginPath();g.ellipse(cx,cy,rx,ry,0,0,6.3);g.stroke();
-if(!capturando){R("stV").innerHTML=grande?"Rostro detectado: pulsa CAPTURAR":"Acerca tu rostro";R("stV").className="estado";R("stV").style.color=grande?"#3fb950":"#f0b429"}
+var fcx=caja.x+caja.w/2,fcy=caja.y+caja.h/2;
+var nx=(fcx-o.cx)/(o.rx*0.55),ny=(fcy-o.cy)/(o.ry*0.55);
+var wr=caja.w/vw;
+alineado=((nx*nx+ny*ny)<=1&&wr>0.16&&wr<0.60);
+g.strokeStyle=alineado?"#3fb950":"#f0b429";g.lineWidth=4;
+g.beginPath();g.ellipse(o.cx,o.cy,o.rx,o.ry,0,0,6.3);g.stroke();
+if(alineado){
+g.strokeStyle="#3fb950";g.lineWidth=3;
+g.strokeRect(caja.x,caja.y,caja.w,caja.h);
+}
+if(!capturando){
+if(alineado){R("stV").innerHTML="Encuadre perfecto: pulsa CAPTURAR";R("stV").className="estado";R("stV").style.color="#3fb950"}
+else{R("stV").innerHTML="Centra tu rostro dentro del ovalo (entero, no a medias)";R("stV").className="estado";R("stV").style.color="#f0b429"}
+}
 }else{
-g.strokeStyle="#f85149";g.lineWidth=3;g.beginPath();g.ellipse(ov.width/2,ov.height/2,ov.width*0.22,ov.height*0.32,0,0,6.3);g.stroke();
-if(!capturando){R("stV").innerHTML="Buscando tu rostro...";R("stV").style.color="#9aa0c3"}
+g.strokeStyle="#f85149";g.lineWidth=3;
+g.beginPath();g.ellipse(o.cx,o.cy,o.rx,o.ry,0,0,6.3);g.stroke();
+if(!capturando){R("stV").innerHTML="No veo tu rostro. Busca buena luz frente a la camara.";R("stV").style.color="#9aa0c3"}
 }
 }catch(e){}
 },250);
@@ -1031,7 +1053,7 @@ if(capturando)return false;
 var st=R("stV"),v=R("v");
 if(!cam||!v.videoWidth){st.innerHTML="Abre la camara primero.";st.className="estado mal";return false}
 capturando=true;R("bSelfie").disabled=true;
-st.innerHTML="Verificando luz y rostro...";st.className="estado";
+st.innerHTML="Verificando luz, rostro y encuadre...";st.className="estado";
 st.style.color="#f0b429";
 var i=0;while(!cara&&i<10){await dormir(300);i++}
 var c=document.createElement("canvas");c.width=v.videoWidth;c.height=v.videoHeight;
@@ -1045,7 +1067,13 @@ capturando=false;R("bSelfie").disabled=false;
 return false;
 }
 if(detTipo!=""&&!cara){
-st.innerHTML="NO VEO TU ROSTRO con claridad. Colocate frente a la camara con buena luz. NO se guardo.";
+st.innerHTML="NO VEO TU ROSTRO. Colocate frente a la camara con buena luz. NO se guardo.";
+st.className="estado mal";
+capturando=false;R("bSelfie").disabled=false;
+return false;
+}
+if(detTipo!=""&&!alineado){
+st.innerHTML="ENCUADRE INCOMPLETO: tu rostro debe estar ENTERO dentro del ovalo. NO se guardo.";
 st.className="estado mal";
 capturando=false;R("bSelfie").disabled=false;
 return false;
@@ -1057,7 +1085,7 @@ R("bAbrirCam").style.display="none";
 R("bRepSelfie").style.display="block";
 R("bIr5").style.display="block";
 R("pS").src="data:image/jpeg;base64,"+comp;R("pS").style.display="block";
-st.innerHTML="SELFIE GUARDADA: "+kb(comp)+" KB (luz "+Math.round(L)+"/100, rostro verificado)";st.className="estado chk";
+st.innerHTML="SELFIE GUARDADA: "+kb(comp)+" KB (luz "+Math.round(L)+"/100, encuadre verificado)";st.className="estado chk";
 capturando=false;R("bSelfie").disabled=false;
 setTimeout(function(){irAPaso(5)},900);
 return true;
@@ -1078,7 +1106,7 @@ try{var r=await fetch("/registro/nuevo",{method:"POST",headers:{"Content-Type":"
 body:JSON.stringify({nombre:R("nombre").value.trim(),clave:c1,doc_image_b64:DF,doc_back_b64:DA,selfie_image_b64:DS,doc_type:tipo})});
 var j=await r.json();
 if(j.ok&&j.zid){Rr.innerHTML="<div style='background:#0f2a1a;border:1px solid #238636;border-radius:12px;padding:14px'><p style='color:#3fb950;font-weight:800;font-size:17px'>REGISTRO EXITOSO</p><p>Tu ZID unico fue creado:</p><p class='zid'>"+j.zid+"</p><p>Guarda tu ZID y tu clave. Nadie mas puede crearlo.</p><p><a href='/entrar'>ENTRAR AHORA</a></p></div>";}
-else if(j.codigo==="mantenimiento"){Rr.innerHTML="<div style='background:#2a2410;border:1px solid #f0b429;border-radius:12px;padding:14px'><p style='color:#f0b429;font-weight:800'>BIOMETRIA EN MANTENIMIENTO (motor de la Red sin activar)</p><p>"+(j.error||"")+"</p><p>Tu solicitud quedo guardada con tu nombre y fecha. Se procesara cuando el dueño active el motor biométrico de la Red (plan 2GB+ y variable ZYRA_BIOMETRICS_PROVIDER=real en Render). El registro del celular funciono completo: los datos llegaron a la Red.</p><p><a href='/registro'>Volver a intentar</a></p></div>";}
+else if(j.codigo==="mantenimiento"){Rr.innerHTML="<div style='background:#2a2410;border:1px solid #f0b429;border-radius:12px;padding:14px'><p style='color:#f0b429;font-weight:800'>BIOMETRIA EN MANTENIMIENTO (motor de la Red sin activar)</p><p>"+(j.error||"")+"</p><p>Tu solicitud quedo guardada con tu nombre y fecha. El registro del celular funciono completo: los datos llegaron a la Red.</p><p><a href='/registro'>Volver a intentar</a></p></div>";}
 else{Rr.innerHTML="<p style='color:#f85149;font-weight:700'>NO SE PUDO CREAR EL ZID</p><p>"+(j.error||"Motivo desconocido")+"</p>";}}
 catch(e){Rr.innerHTML="<div style='background:#2a1414;border:1px solid #f85149;border-radius:12px;padding:14px'><p style='color:#f85149;font-weight:700'>La Red no respondio</p><p>Detalle tecnico: "+e+"</p><p style='color:#8b949e'>Envia este detalle para corregirlo.</p></div>";}
 window.scrollTo(0,document.body.scrollHeight);

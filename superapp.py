@@ -444,7 +444,10 @@ input[type=file]{padding:9px;font-size:13px}
 .videozona{position:relative;border-radius:12px;overflow:hidden;margin-top:6px;background:#000}
 video{width:100%;display:block;transform:scaleX(-1)}
 .ov{position:absolute;left:0;top:0;width:100%;height:100%;pointer-events:none}
+#zonaEdit{display:none;margin-top:8px;background:#0d1126;border:1px solid #2a2f55;border-radius:12px;padding:10px}
+#cvEdit{width:100%;touch-action:none;border-radius:8px;display:block}
 button{width:100%;margin-top:8px;padding:12px;border:0;border-radius:10px;font-size:15px;font-weight:700;color:#fff;background:#262b52}
+button.ok{background:#1f6f43}
 button.big{margin-top:18px;padding:14px;font-size:17px;font-weight:800;background:linear-gradient(90deg,#7c5cff,#ff5c8a)}
 a{color:#a78bfa}
 #resp{margin-top:14px}
@@ -465,12 +468,17 @@ a{color:#a78bfa}
 <label>1) Documento: lado frontal</label>
 <input type="file" accept="image/*" capture="environment" onchange="cargarDoc(this,'F')">
 <div class="estado" id="stF"></div>
-<canvas class="preview" id="pF"></canvas>
+<img class="preview" id="pF" alt="">
 <label id="lbA">2) Documento: lado de atras (solo DUI)</label>
 <input type="file" accept="image/*" capture="environment" onchange="cargarDoc(this,'A')">
 <div class="estado" id="stA"></div>
-<canvas class="preview" id="pA"></canvas>
-<label>3) Selfie en vivo</label>
+<img class="preview" id="pA" alt="">
+<div id="zonaEdit">
+<p style="color:#9aa0c3;font-size:13px;text-align:center">Arrastra el recuadro verde hasta cubrir el documento COMPLETO. La bola verde de la esquina lo agranda. Proporcion real de tarjeta.</p>
+<canvas id="cvEdit"></canvas>
+<button type="button" class="ok" onclick="recortarDoc()">Recortar y GUARDAR documento</button>
+</div>
+<label>3) Selfie en vivo con prueba de vida</label>
 <div class="videozona"><video id="v" autoplay playsinline muted></video><canvas class="ov" id="ov"></canvas></div>
 <div class="estado" id="stV">Abriendo camara...</div>
 <button type="button" onclick="capturarSelfie()">Capturar selfie</button>
@@ -485,127 +493,227 @@ a{color:#a78bfa}
 <p style="text-align:center;margin-top:14px"><a href="/">Volver</a> | <a href="/entrar">Ya tengo ZID</a></p>
 <script>
 var DF="",DA="",DS="";
+var docImg=null,docLado="",fr={x:0,y:0,w:0,h:0},editListo=false;
+var cam=null,cara=null,ultimoEAR=null,hayLandmarks=false,detTipo="",apiCara=null;
 function R(id){return document.getElementById(id)}
 function kb(s){return Math.round(s.length*3/4/1024)}
+function dormir(ms){return new Promise(function(res){setTimeout(res,ms)})}
 function zyComprimir(dataUrl,maxLado,calidad){return new Promise(function(res){var im=new Image();im.onload=function(){var w=im.width,h=im.height,e=Math.min(1,maxLado/Math.max(w,h)),c=document.createElement("canvas");c.width=Math.round(w*e);c.height=Math.round(h*e);c.getContext("2d").drawImage(im,0,0,c.width,c.height);res(c.toDataURL("image/jpeg",calidad).split(",").pop())};im.onerror=function(){res(dataUrl.split(",").pop())};im.src=dataUrl})}
 function luma(dataUrl){return new Promise(function(res){var im=new Image();im.onload=function(){var c=document.createElement("canvas");c.width=40;c.height=40;c.getContext("2d").drawImage(im,0,0,40,40);var d=c.getContext("2d").getImageData(0,0,40,40).data,t=0;for(var i=0;i<d.length;i+=4){t+=0.299*d[i]+0.587*d[i+1]+0.114*d[i+2]}res(t/(d.length/4))};im.onerror=function(){res(99)};im.src=dataUrl})}
-var detTipo="",apiCara=null,faceapiLista=false;
 function cargarScript(s){return new Promise(function(res,rej){var e=document.createElement("script");e.src=s;e.onload=res;e.onerror=rej;document.head.appendChild(e)})}
 async function ensureCara(){
-  if(detTipo){return detTipo}
-  try{if(window.FaceDetector){apiCara=new FaceDetector({fastMode:true,maxDetectedFaces:1});detTipo="nativo";return detTipo}}catch(e){}
-  try{
-    await cargarScript("https://cdn.jsdelivr.net/npm/face-api.js@0.22.2/dist/face-api.min.js");
-    await faceapi.nets.tinyFaceDetector.loadFromUri("https://cdn.jsdelivr.net/gh/justadudewhohacks/face-api.js@0.22.2/weights");
-    detTipo="faceapi";faceapiLista=true;return detTipo;
-  }catch(e){}
-  return "";
+if(detTipo){return detTipo}
+try{
+await cargarScript("https://cdn.jsdelivr.net/npm/face-api.js@0.22.2/dist/face-api.min.js");
+await faceapi.nets.tinyFaceDetector.loadFromUri("https://cdn.jsdelivr.net/gh/justadudewhohacks/face-api.js@0.22.2/weights");
+detTipo="faceapi";
+try{await faceapi.nets.faceLandmark68TinyNet.loadFromUri("https://cdn.jsdelivr.net/gh/justadudewhohacks/face-api.js@0.22.2/weights");hayLandmarks=true}catch(e2){hayLandmarks=false}
+return detTipo;
+}catch(e){}
+try{if(window.FaceDetector){apiCara=new FaceDetector({fastMode:true,maxDetectedFaces:1});detTipo="nativo";return detTipo}}catch(e2){}
+return "";
 }
+function ear6(p){var d=function(a,b){return Math.hypot(a.x-b.x,a.y-b.y)};return (d(p[1],p[5])+d(p[2],p[4]))/(2*d(p[0],p[3]))}
 async function cajaEn(fuente){
-  var t=await ensureCara();if(!t){return null}
-  try{
-    if(t=="nativo"){var fs=await apiCara.detect(fuente);if(fs.length){var b=fs[0].boundingBox;return {x:b.x,y:b.y,w:b.width,h:b.height}}}
-    if(t=="faceapi"){var r2=await faceapi.detectSingleFace(fuente,new faceapi.TinyFaceDetectorOptions({inputSize:320,scoreThreshold:0.3}));if(r2){return {x:r2.box.x,y:r2.box.y,w:r2.box.width,h:r2.box.height}}}
-  }catch(e){}
-  return null;
+var t=await ensureCara();if(!t){return null}
+try{
+if(t=="faceapi"){
+var op=new faceapi.TinyFaceDetectorOptions({inputSize:320,scoreThreshold:0.3});
+if(hayLandmarks){
+var r2=await faceapi.detectSingleFace(fuente,op).withFaceLandmarks(true);
+if(r2){try{ultimoEAR=(ear6(r2.landmarks.getLeftEye())+ear6(r2.landmarks.getRightEye()))/2}catch(e3){ultimoEAR=null}var b=r2.detection.box;return {x:b.x,y:b.y,w:b.width,h:b.height}}
+ultimoEAR=null;return null;
 }
-function pintarDoc(cv,dataUrl,caja){
-  var im=new Image();
-  im.onload=function(){
-    cv.width=im.width;cv.height=im.height;
-    var g=cv.getContext("2d");g.drawImage(im,0,0);
-    if(caja){
-      var cardW=Math.min(im.width*0.92,Math.max(caja.w*4.6,im.width*0.35));
-      var cardH=cardW/1.586;
-      var fcx=caja.x+caja.w/2,fcy=caja.y+caja.h/2;
-      var cx=fcx-cardW*0.24,cy=fcy-cardH*0.5;
-      if(cx<8){cx=8}
-      if(cy<8){cy=8}
-      if(cx+cardW>im.width-8){cx=im.width-8-cardW}
-      if(cy+cardH>im.height-8){cy=im.height-8-cardH}
-      g.strokeStyle="#3fb950";g.lineWidth=Math.max(3,cv.width/220);g.strokeRect(cx,cy,cardW,cardH);
-    }
-    cv.style.display="block";
-  };
-  im.src="data:image/jpeg;base64,"+dataUrl;
+ultimoEAR=null;
+var r3=await faceapi.detectSingleFace(fuente,op);
+if(r3){var b3=r3.box;return {x:b3.x,y:b3.y,w:b3.width,h:b3.height}}
+return null;
 }
-async function cargarDoc(inp,lado){
-  var f=inp.files&&inp.files[0];if(!f){return}
-  var fr=new FileReader();
-  fr.onload=async function(){
-    var crudo=fr.result;
-    var L=await luma(crudo);
-    if(L<45){R("st"+lado).innerHTML="Foto muy oscura (luz "+Math.round(L)+"/100). Repitela con buena luz.";R("st"+lado).style.color="#f85149";inp.value="";return}
-    var comp=await zyComprimir(crudo,1100,0.72);
-    if(lado=="F"){DF=comp}else{DA=comp}
-    var st=R("st"+lado);
-    st.innerHTML="OK: "+kb(crudo)+" KB -> "+kb(comp)+" KB comprimida";st.style.color="#3fb950";
-    if(lado=="F"){
-      var caja=await cajaEn(await imgDe(comp));
-      pintarDoc(R("pF"),comp,caja);
-      if(caja){st.innerHTML+=" | Tarjeta enmarcada (rostro del documento visto)";st.style.color="#3fb950"}
-      else{st.innerHTML+=" | No se vio el rostro EN la tarjeta: revisa que salga completa y nitida";st.style.color="#f0b429"}
-    }else{
-      pintarDoc(R("pA"),comp,null);
-    }
-  };
-  fr.readAsDataURL(f);
-}
-function imgDe(dataUrl){var im=new Image();im.src="data:image/jpeg;base64,"+dataUrl;return im}
-function cambioTipo(){var d=R("tipoDoc").value=="dui";R("lbA").style.display=d?"block":"none";if(!d){DA="";R("stA").innerHTML="";R("pA").style.display="none"}}
-var cam=null,cara=null;
-async function abrirCam(){
-  try{
-    cam=await navigator.mediaDevices.getUserMedia({video:{facingMode:"user",width:{ideal:640},height:{ideal:480}}});
-    var v=R("v");v.srcObject=cam;
-    R("stV").innerHTML="Camara activa. Espera el ovalo verde sobre tu rostro.";
-    loop();
-  }catch(e){R("stV").innerHTML="No se pudo abrir la camara: "+e}
+if(t=="nativo"){var fs=await apiCara.detect(fuente);if(fs.length){var b=fs[0].boundingBox;return {x:b.x,y:b.y,w:b.width,h:b.height}}}
+}catch(e){}
+return null;
 }
 async function loop(){
-  var v=R("v"),ov=R("ov");
-  setInterval(async function(){
-    if(v.readyState<2){return}
-    var vw=v.videoWidth,vh=v.videoHeight;if(!vw){return}
-    if(ov.width!=vw){ov.width=vw;ov.height=vh}
-    var g=ov.getContext("2d");g.clearRect(0,0,ov.width,ov.height);
-    try{
-      var caja=await cajaEn(v);
-      cara=caja;
-      if(caja){
-        var grande=(caja.w/vw)>0.12;
-        var cx=caja.x+caja.w/2,cy=caja.y+caja.h/2,rx=caja.w*0.62,ry=caja.h*0.74;
-        g.strokeStyle=grande?"#3fb950":"#f0b429";g.lineWidth=4;
-        g.beginPath();g.ellipse(cx,cy,rx,ry,0,0,6.3);g.stroke();
-        R("stV").innerHTML=grande?"Rostro detectado: puedes capturar":"Acerca tu rostro";R("stV").style.color=grande?"#3fb950":"#f0b429";
-      }else{
-        g.strokeStyle="#f85149";g.lineWidth=3;g.beginPath();g.ellipse(ov.width/2,ov.height/2,ov.width*0.22,ov.height*0.32,0,0,6.3);g.stroke();
-        R("stV").innerHTML="Buscando tu rostro...";R("stV").style.color="#9aa0c3";
-      }
-    }catch(e){}
-  },350);
+var v=R("v"),ov=R("ov");
+setInterval(async function(){
+if(v.readyState<2){return}
+var vw=v.videoWidth,vh=v.videoHeight;if(!vw){return}
+if(ov.width!=vw){ov.width=vw;ov.height=vh}
+var g=ov.getContext("2d");g.clearRect(0,0,ov.width,ov.height);
+try{
+var caja=await cajaEn(v);
+cara=caja;
+if(caja){
+var grande=(caja.w/vw)>0.12;
+var cx=caja.x+caja.w/2,cy=caja.y+caja.h/2,rx=caja.w*0.62,ry=caja.h*0.74;
+g.strokeStyle=grande?"#3fb950":"#f0b429";g.lineWidth=4;
+g.beginPath();g.ellipse(cx,cy,rx,ry,0,0,6.3);g.stroke();
+R("stV").innerHTML=grande?"Rostro detectado: puedes capturar":"Acerca tu rostro";R("stV").style.color=grande?"#3fb950":"#f0b429";
+}else{
+ultimoEAR=null;
+g.strokeStyle="#f85149";g.lineWidth=3;g.beginPath();g.ellipse(ov.width/2,ov.height/2,ov.width*0.22,ov.height*0.32,0,0,6.3);g.stroke();
+R("stV").innerHTML="Buscando tu rostro...";R("stV").style.color="#9aa0c3";
+}
+}catch(e){}
+},200);
+}
+async function abrirCam(){
+try{
+cam=await navigator.mediaDevices.getUserMedia({video:{facingMode:"user",width:{ideal:640},height:{ideal:480}}});
+var v=R("v");v.srcObject=cam;
+R("stV").innerHTML="Camara activa. Espera el ovalo verde sobre tu rostro.";
+loop();
+}catch(e){R("stV").innerHTML="No se pudo abrir la camara: "+e}
+}
+function esperarParpadeo(){
+return new Promise(function(res){
+var t0=Date.now(),cerrado=false;
+var iv=setInterval(function(){
+var e=ultimoEAR;
+if(e!=null){
+if(e<0.19){cerrado=true}
+if(cerrado&&e>0.23){clearInterval(iv);res(true)}
+}
+if(Date.now()-t0>8000){clearInterval(iv);res(false)}
+},100);
+});
 }
 async function capturarSelfie(){
-  var Rr=R("resp"),v=R("v");
-  if(!cam){Rr.innerHTML="<p style='color:#f85149'>La camara no esta activa.</p>";return false}
-  if(detTipo&&cara==null){Rr.innerHTML="<p style='color:#f0b429'>El ovalo aun no ve tu rostro. Espera el ovalo verde.</p>";return false}
-  var c=document.createElement("canvas");c.width=v.videoWidth;c.height=v.videoHeight;
-  var g=c.getContext("2d");g.translate(c.width,0);g.scale(-1,1);g.drawImage(v,0,0);
-  var crudo=c.toDataURL("image/jpeg",0.85);
-  var comp=await zyComprimir(crudo,640,0.6);
-  DS=comp;var pv=R("pS");pv.src="data:image/jpeg;base64,"+comp;pv.style.display="block";
-  R("stV").innerHTML="Selfie capturada: "+kb(crudo)+" KB -> "+kb(comp)+" KB";
-  return true;
+var Rr=R("resp"),v=R("v");
+if(!cam){Rr.innerHTML="<p style='color:#f85149'>La camara no esta activa.</p>";return false}
+if(detTipo&&cara==null){Rr.innerHTML="<p style='color:#f0b429'>El ovalo aun no ve tu rostro. Espera el ovalo verde.</p>";return false}
+if(cara&&(cara.w/v.videoWidth)<=0.12){R("stV").innerHTML="Acerca tu rostro al ovalo";R("stV").style.color="#f0b429";return false}
+if(hayLandmarks){
+R("stV").innerHTML="PRUEBA DE VIDA: parpadea ahora";R("stV").style.color="#f0b429";
+var ok=await esperarParpadeo();
+if(!ok){R("stV").innerHTML="No detecte el parpadeo. Intenta de nuevo.";R("stV").style.color="#f85149";return false}
+}else{
+R("stV").innerHTML="Mantente quieto un momento...";
+await dormir(1600);
+if(!cara){R("stV").innerHTML="Perdi tu rostro. Intenta de nuevo.";R("stV").style.color="#f85149";return false}
 }
+var c=document.createElement("canvas");c.width=v.videoWidth;c.height=v.videoHeight;
+var g=c.getContext("2d");g.translate(c.width,0);g.scale(-1,1);g.drawImage(v,0,0);
+var crudo=c.toDataURL("image/jpeg",0.85);
+var comp=await zyComprimir(crudo,720,0.65);
+DS=comp;var pv=R("pS");pv.src="data:image/jpeg;base64,"+comp;pv.style.display="block";
+R("stV").innerHTML="Selfie con vida confirmada: "+kb(crudo)+" KB -> "+kb(comp)+" KB";R("stV").style.color="#3fb950";
+return true;
+}
+async function cargarDoc(inp,lado){
+var f=inp.files&&inp.files[0];if(!f){return}
+var fr2=new FileReader();
+fr2.onload=async function(){
+var crudo=fr2.result;
+var L=await luma(crudo);
+if(L<45){R("st"+lado).innerHTML="Foto muy oscura (luz "+Math.round(L)+"/100). Repitela con buena luz.";R("st"+lado).style.color="#f85149";inp.value="";return}
+var comp=await zyComprimir(crudo,1200,0.78);
+abrirEditor(lado,comp);
+};
+fr2.readAsDataURL(f);
+}
+function abrirEditor(lado,comp){
+docLado=lado;
+var im=new Image();
+R("st"+lado).innerHTML="Abriendo editor para enmarcar el documento...";
+im.onload=async function(){
+docImg=im;
+var fw=im.width*0.8,fh=fw/1.586;
+if(fh>im.height*0.92){fh=im.height*0.92;fw=fh*1.586}
+fr={x:(im.width-fw)/2,y:(im.height-fh)/2,w:fw,h:fh};
+R("st"+lado).innerHTML="Analizando documento...";
+try{
+var caja=await cajaEn(im);
+if(caja){
+var fw2=Math.max(im.width*0.45,Math.min(im.width*0.95,caja.w*5));
+var fh2=fw2/1.586;
+var nx=(caja.x+caja.w/2)-fw2*0.27;
+var ny=(caja.y+caja.h/2)-(fh2*0.46);
+if(nx<4){nx=4}
+if(ny<4){ny=4}
+if(nx+fw2>im.width-4){nx=im.width-4-fw2}
+if(ny+fh2>im.height-4){ny=im.height-4-fh2}
+fr={x:nx,y:ny,w:fw2,h:fh2};
+R("st"+lado).innerHTML="Rostro del documento visto. AJUSTA el recuadro si no cubre la tarjeta completa.";
+}else{
+R("st"+lado).innerHTML="Coloca el recuadro sobre la tarjeta completa.";
+}
+}catch(e){}
+pintarEditor();
+R("zonaEdit").style.display="block";
+if(!editListo){iniciarEdit();editListo=true}
+};
+im.src="data:image/jpeg;base64,"+comp;
+}
+function pintarEditor(){
+var cv=R("cvEdit"),g=cv.getContext("2d"),im=docImg;
+if(!im){return}
+var maxW=Math.min(480,im.width);
+cv.width=maxW;cv.height=Math.round(maxW*im.height/im.width);
+var e=cv.width/im.width;
+g.clearRect(0,0,cv.width,cv.height);
+g.drawImage(im,0,0,cv.width,cv.height);
+g.fillStyle="rgba(0,0,0,0.45)";
+g.fillRect(0,0,cv.width,fr.y*e);
+g.fillRect(0,(fr.y+fr.h)*e,cv.width,cv.height-(fr.y+fr.h)*e);
+g.fillRect(0,fr.y*e,fr.x*e,fr.h*e);
+g.fillRect((fr.x+fr.w)*e,fr.y*e,cv.width-(fr.x+fr.w)*e,fr.h*e);
+g.strokeStyle="#3fb950";g.lineWidth=3;
+g.strokeRect(fr.x*e,fr.y*e,fr.w*e,fr.h*e);
+g.fillStyle="#3fb950";
+g.beginPath();g.arc((fr.x+fr.w)*e,(fr.y+fr.h)*e,12,0,6.3);g.fill();
+}
+function iniciarEdit(){
+var cv=R("cvEdit");
+var arr=null,base=null;
+function pos(ev){var r=cv.getBoundingClientRect();var t=(ev.touches&&ev.touches[0])||ev;return {x:(t.clientX-r.left)*cv.width/r.width,y:(t.clientY-r.top)*cv.height/r.height}}
+function abajo(ev){
+if(!docImg){return}
+var p=pos(ev);var e=cv.width/docImg.width;
+var hx=(fr.x+fr.w)*e,hy=(fr.y+fr.h)*e;
+arr=(Math.hypot(p.x-hx,p.y-hy)<30)?"s":"m";
+base={px:p.x,py:p.y,fx:fr.x,fy:fr.y,fw:fr.w};
+ev.preventDefault();
+}
+function mover(ev){
+if(!arr||!docImg){return}
+var p=pos(ev);var dx=p.x-base.px,dy=p.y-base.py;
+if(arr=="m"){fr.x=base.fx+dx;fr.y=base.fy+dy}
+else{var w=Math.max(60,base.fw+dx);fr.w=w;fr.h=w/1.586}
+if(fr.x<0){fr.x=0}
+if(fr.y<0){fr.y=0}
+if(fr.x+fr.w>docImg.width){fr.x=docImg.width-fr.w}
+if(fr.y+fr.h>docImg.height){fr.y=docImg.height-fr.h}
+pintarEditor();ev.preventDefault();
+}
+cv.addEventListener("pointerdown",abajo,false);
+cv.addEventListener("pointermove",mover,false);
+["pointerup","pointercancel","pointerleave"].forEach(function(t){cv.addEventListener(t,function(){arr=null},false)});
+}
+function recortarDoc(){
+if(!docImg){return}
+var c=document.createElement("canvas");
+c.width=Math.round(fr.w);c.height=Math.round(fr.h);
+c.getContext("2d").drawImage(docImg,fr.x,fr.y,fr.w,fr.h,0,0,c.width,c.height);
+var comp=c.toDataURL("image/jpeg",0.8).split(",").pop();
+if(docLado=="F"){DF=comp}else{DA=comp}
+var pv=R(docLado=="F"?"pF":"pA");
+pv.src="data:image/jpeg;base64,"+comp;pv.style.display="block";
+var st=R("st"+docLado);
+st.innerHTML="GUARDADO: "+kb(comp)+" KB (documento completo)";st.style.color="#3fb950";
+R("zonaEdit").style.display="none";
+docImg=null;
+}
+function cambioTipo(){var d=R("tipoDoc").value=="dui";R("lbA").style.display=d?"block":"none";if(!d){DA="";R("stA").innerHTML="";R("pA").style.display="none"}}
 async function enviar(ev){ev.preventDefault();var Rr=R("resp");
 var c1=R("clave").value,c2=R("clave2").value;
 if(c1!==c2){Rr.innerHTML="<p style='color:#f85149'>Las claves no coinciden.</p>";return false}
 if(R("nombre").value.trim().length<3){Rr.innerHTML="<p style='color:#f85149'>Falta tu nombre completo.</p>";return false}
 if(c1.length<8){Rr.innerHTML="<p style='color:#f85149'>La clave necesita minimo 8 caracteres.</p>";return false}
-if(!DF){Rr.innerHTML="<p style='color:#f85149'>Falta la foto del documento (lado frontal).</p>";return false}
-if(R("tipoDoc").value=="dui"&&!DA){Rr.innerHTML="<p style='color:#f85149'>Falta el lado de atras del DUI.</p>";return false}
-if(!DS){Rr.innerHTML="<p style='color:#f85149'>Falta la selfie en vivo.</p>";return false}
-Rr.innerHTML="<p style='color:#8b949e'>Enviando a la Red ("+kb(DF)+" y "+kb(DS)+" KB comprimidos) y verificando biometria...</p>";
+if(!DF){Rr.innerHTML="<p style='color:#f85149'>Falta GUARDAR la foto del documento frontal (usa Recortar y GUARDAR).</p>";return false}
+if(R("tipoDoc").value=="dui"&&!DA){Rr.innerHTML="<p style='color:#f85149'>Falta GUARDAR el lado de atras del DUI.</p>";return false}
+if(!DS){Rr.innerHTML="<p style='color:#f85149'>Falta la selfie con prueba de vida.</p>";return false}
+Rr.innerHTML="<p style='color:#8b949e'>Enviando a la Red ("+kb(DF)+" y "+kb(DS)+" KB) y verificando biometria...</p>";
 try{var r=await fetch("/registro/nuevo",{method:"POST",headers:{"Content-Type":"application/json"},
 body:JSON.stringify({nombre:R("nombre").value.trim(),clave:c1,doc_image_b64:DF,doc_back_b64:DA,selfie_image_b64:DS,doc_type:R("tipoDoc").value})});
 var j=await r.json();

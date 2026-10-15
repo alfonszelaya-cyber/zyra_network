@@ -529,15 +529,27 @@ a{color:#a78bfa}
 <button type="button" onclick="usarFotoCompleta()">Usar foto completa sin recortar</button>
 </div>
 </form>
-<div id="resp"></div>
+<div id="desglose"></div>
+          <div id="resp"></div>
 <p style="text-align:center;margin-top:14px"><a href="/">Volver</a> | <a href="/entrar">Ya tengo ZID</a></p>
-<p style="text-align:center;color:#4a4f7a;font-size:11px;margin-top:10px">ZYRA registro v18 - escaner universal</p>
+<p style="text-align:center;color:#4a4f7a;font-size:11px;margin-top:10px">ZYRA registro v20 - escaner + desglose</p>
 <script>
 var DF="",DA="",DS="";
 var docImg=null,docLado="",docCrudoF="",docCrudoA="",editListo=false;
 var quad=null,procesandoDoc=false;
 var cam=null,cara=null,alineado=false,detTipo="",apiCara=null,mpDetector=null,capturando=false;
 var promesaCara=null;
+var datosDocF=null,datosDocA=null,minorBloqueado=false;
+function edadDe(iso){try{var f=new Date(iso+"T00:00:00");if(isNaN(f))return -1;var h=new Date();var e=h.getFullYear()-f.getFullYear();var m=h.getMonth()-f.getMonth();if(m<0||(m===0&&h.getDate()<f.getDate()))e--;return e}catch(e){return -1}}
+function nombresCoinciden(a,b){try{a=(a||"").toLowerCase().replace(/[^a-z ]/g,"").split(/\s+/).filter(function(x){return x.length>2});b=(b||"").toLowerCase().replace(/[^a-z ]/g,"").split(/\s+/).filter(function(x){return x.length>2});if(!a.length||!b.length)return true;var hit=0;for(var i=0;i<a.length;i++){if(b.indexOf(a[i])>=0)hit++}return hit>0}catch(e){return true}}
+function parseAAMVA(raw){try{var claves=["DAB","DAC","DAD","DBB","DAQ","DAG","DAI","DAJ","DAK","DCF"];var fnd=[];for(var c=0;c<claves.length;c++){var ix=raw.indexOf(claves[c]);while(ix>=0){fnd.push([ix,claves[c]]);ix=raw.indexOf(claves[c],ix+1)}}fnd.sort(function(a,b){return a[0]-b[0]});if(fnd.length<3)return null;var res={};for(var i=0;i<fnd.length;i++){var fin=(i+1<fnd.length)?fnd[i+1][0]:Math.min(fnd[i][0]+70,raw.length);res[fnd[i][1]]=raw.slice(fnd[i][0]+3,fin).replace(/[\r\n]+$/,"").trim()}if(!res.DBB||res.DBB.length<8)return null;var iso=res.DBB.slice(4,8)+"-"+res.DBB.slice(0,2)+"-"+res.DBB.slice(2,4);return {nombre:((res.DAC||"")+" "+(res.DAD||"")+" "+(res.DAB||"")).trim(),nacimiento:iso,edad:edadDe(iso),numero:(res.DAQ||res.DCF||""),direccion:((res.DAI||"")+" "+(res.DAG||"")+" "+(res.DAJ||"")+" "+(res.DAK||"")).trim()}}catch(e){return null}}
+async function leerCodigo(cv){try{if(!window.BarcodeDetector)return null;var bd=new BarcodeDetector({formats:["pdf417","qr_code","code_128","code_39"]});var fs=await bd.detect(cv);if(fs&&fs.length){var rv=fs[0].rawValue||"";if(rv.length>20)return parseAAMVA(rv)}}catch(e){}return null}
+function mostrarDesglose(){var d=document.getElementById("desglose");if(!d)return;var h="";var fuente=null,nom=document.getElementById("nombre").value.trim();
+if(datosDocF){fuente=datosDocF;h+="<p style='color:#3fb950'>FRONTAL leido: "+(fuente.nombre||"(sin nombre)")+" | Nac: "+(fuente.nacimiento||"?")+" | Edad: "+fuente.edad+"</p>"}
+if(datosDocA){fuente=datosDocA;h+="<p style='color:#3fb950'>REVERSO leido: "+(fuente.nombre||"(sin nombre)")+" | Nac: "+(fuente.nacimiento||"?")+" | Edad: "+fuente.edad+" | No.: "+(fuente.numero||"(no leido)")+((fuente.direccion)?" | Dir: "+fuente.direccion:"")+"</p>"}
+if(!datosDocF&&!datosDocA){h="<p style='color:#9aa0c3'>Desglose: no se leyo codigo (no todo documento lo trae). El registro sigue normal.</p>";minorBloqueado=false}
+if(fuente){if(fuente.edad>=0&&fuente.edad<18){minorBloqueado=true;h+="<p style='color:#f85149;font-weight:700'>MENOR DE EDAD ("+fuente.edad+"): registro de adultos bloqueado. Los menores se registran con tutor.</p>"}else{minorBloqueado=false;if(fuente.edad>=0){h+="<p style='color:#3fb950'>Mayoria de edad por documento: "+fuente.edad+" anos</p>"}}if(fuente.nombre&&nom&&nombresCoinciden(fuente.nombre,nom)){h+="<p style='color:#3fb950'>Cruce de nombre: coincide</p>"}else if(fuente.nombre&&nom){h+="<p style='color:#f0b429'>Aviso: el nombre escrito no coincide con el del documento</p>"}if(fuente.nombre&&nom.length<3){document.getElementById("nombre").value=fuente.nombre}}
+d.innerHTML=h}
 function R(id){return document.getElementById(id)}
 function kb(s){return Math.round(s.length*3/4/1024)}
 function dormir(ms){return new Promise(function(res){setTimeout(res,ms)})}
@@ -720,6 +732,7 @@ fr2.onload=async function(){
 try{
 var crudo=fr2.result;
 var comp=await zyComprimir(crudo,1200,0.78);
+try{var _imL=new Image();_imL.onload=async function(){try{var _cvL=document.createElement("canvas");_cvL.width=_imL.width;_cvL.height=_imL.height;_cvL.getContext("2d").drawImage(_imL,0,0);var _leido=await leerCodigo(_cvL);if(_leido){if(lado=="A"){datosDocA=_leido}else{datosDocF=_leido}mostrarDesglose()}}catch(_eL){}};_imL.onerror=function(){};_imL.src="data:image/jpeg;base64,"+comp;}catch(_eL2){}
 var L=await luma(comp);
 if(L<40){st.innerHTML="Foto muy oscura (luz "+Math.round(L)+"/100). Tomala con buena luz.";st.className="estado mal";procesandoDoc=false;return}
 abrirEditor(lado,comp);
@@ -959,6 +972,7 @@ pv.src="data:image/jpeg;base64,"+comp;pv.style.display="block";
 var st=R("st"+l);
 st.innerHTML=txt;st.className="estado chk";
 R("zonaEdit").style.display="none";docImg=null;
+          mostrarDesglose();
 if(l=="F"){irAPaso(3)}else{R("bIr4").disabled=false;irAPaso(4)}
 }
 async function recortarDoc(){
@@ -1094,6 +1108,7 @@ async function enviar(ev){ev.preventDefault();var Rr=R("resp");
 var c1=R("clave").value,c2=R("clave2").value;
 var tipo=R("tipoDoc").value;
 var reqRev=(tipo=="dui"||tipo=="licencia"||tipo=="id_usa");
+          if(minorBloqueado){Rr.innerHTML="<p style='color:#f85149'>El documento indica MENOR de edad: los menores se registran con tutor. NO se crea ZID de adulto.</p>";return false}
 if(c1!==c2){Rr.innerHTML="<p style='color:#f85149'>Las claves no coinciden.</p>";return false}
 if(R("nombre").value.trim().length<3){Rr.innerHTML="<p style='color:#f85149'>Falta tu nombre completo.</p>";return false}
 if(c1.length<8){Rr.innerHTML="<p style='color:#f85149'>La clave necesita minimo 8 caracteres.</p>";return false}
@@ -1103,7 +1118,7 @@ if(!DS){Rr.innerHTML="<p style='color:#f85149'>Falta la selfie (paso 4: ABRIR CA
 Rr.innerHTML="<p style='color:#8b949e'>Enviando a la Red ("+kb(DF)+" y "+kb(DS)+" KB) y verificando biometria...</p>";
 window.scrollTo(0,document.body.scrollHeight);
 try{var r=await fetch("/registro/nuevo",{method:"POST",headers:{"Content-Type":"application/json"},
-body:JSON.stringify({nombre:R("nombre").value.trim(),clave:c1,doc_image_b64:DF,doc_back_b64:DA,selfie_image_b64:DS,doc_type:tipo})});
+body:JSON.stringify({nombre:R("nombre").value.trim(),clave:c1,doc_image_b64:DF,doc_back_b64:DA,selfie_image_b64:DS,doc_type:tipo,doc_number:((datosDocA&&datosDocA.numero)||(datosDocF&&datosDocF.numero)||"")})});
 var j=await r.json();
 if(j.ok&&j.zid){Rr.innerHTML="<div style='background:#0f2a1a;border:1px solid #238636;border-radius:12px;padding:14px'><p style='color:#3fb950;font-weight:800;font-size:17px'>REGISTRO EXITOSO</p><p>Tu ZID unico fue creado:</p><p class='zid'>"+j.zid+"</p><p>Guarda tu ZID y tu clave. Nadie mas puede crearlo.</p><p><a href='/entrar'>ENTRAR AHORA</a></p></div>";}
 else if(j.codigo==="mantenimiento"){Rr.innerHTML="<div style='background:#2a2410;border:1px solid #f0b429;border-radius:12px;padding:14px'><p style='color:#f0b429;font-weight:800'>BIOMETRIA EN MANTENIMIENTO (motor de la Red sin activar)</p><p>"+(j.error||"")+"</p><p>Tu solicitud quedo guardada con tu nombre y fecha. El registro del celular funciono completo: los datos llegaron a la Red.</p><p><a href='/registro'>Volver a intentar</a></p></div>";}
@@ -1271,17 +1286,17 @@ setTimeout(function(){ensureCara()},1200);
                 self._send(400, "application/json", json.dumps({"ok": False, "error": "Falta nombre, clave (min 8), documento o selfie"}).encode())
                 return
             _pe = {"kind": "person", "name": nombre, "display_name": nombre, "actor": os.environ.get("ZYRA_ENROLL_ACTOR", "superapp"), "doc_image_b64": db64, "selfie_image_b64": sb64}
-_tdoc = str(dd.get("doc_type", "")).strip()
-if _tdoc:
-    _pe["doc_kind"] = _tdoc
-    if _tdoc == "dui":
-        _pe["doc_country"] = "SV"
-    elif _tdoc in ("licencia", "id_usa"):
-        _pe["doc_country"] = "US"
-_ndoc = str(dd.get("doc_number", "")).strip()
-if _ndoc:
-    _pe["doc_number"] = _ndoc
-payload_e = json.dumps(_pe).encode("utf-8")
+            _tdoc = str(dd.get("doc_type", "")).strip()
+            if _tdoc:
+                _pe["doc_kind"] = _tdoc
+                if _tdoc == "dui":
+                    _pe["doc_country"] = "SV"
+                elif _tdoc in ("licencia", "id_usa"):
+                    _pe["doc_country"] = "US"
+            _ndoc = str(dd.get("doc_number", "")).strip()
+            if _ndoc:
+                _pe["doc_number"] = _ndoc
+            payload_e = json.dumps(_pe).encode("utf-8")
             q_e = urllib.request.Request(ZYRA_URL + "/identity/enroll", data=payload_e, method="POST")
             q_e.add_header("Content-Type", "application/json")
             q_e.add_header("Authorization", "Bearer " + os.environ.get("ZYRA_API_TOKEN", ""))

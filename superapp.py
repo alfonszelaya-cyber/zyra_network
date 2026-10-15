@@ -37,7 +37,10 @@ PORT = int(
 if os.environ.get("ZYRA_URL"):
     ZYRA_URL = os.environ["ZYRA_URL"].strip().strip('"\'()').rstrip("/")
 elif os.environ.get("ZYRA_HOST"):
-    ZYRA_URL = ("https://" + os.environ["ZYRA_HOST"].strip().strip('"\'()').rstrip("/")).rstrip("/")
+    _h = os.environ["ZYRA_HOST"].strip().strip('"\'()').rstrip("/")
+    if _h and "." not in _h:
+        _h = _h + ".onrender.com"
+    ZYRA_URL = ("https://" + _h).rstrip("/")
 else:
     ZYRA_URL = ""
 
@@ -462,11 +465,11 @@ a{color:#a78bfa}
 <label>1) Documento: lado frontal</label>
 <input type="file" accept="image/*" capture="environment" onchange="cargarDoc(this,'F')">
 <div class="estado" id="stF"></div>
-<img class="preview" id="pF" alt="">
+<canvas class="preview" id="pF"></canvas>
 <label id="lbA">2) Documento: lado de atras (solo DUI)</label>
 <input type="file" accept="image/*" capture="environment" onchange="cargarDoc(this,'A')">
 <div class="estado" id="stA"></div>
-<img class="preview" id="pA" alt="">
+<canvas class="preview" id="pA"></canvas>
 <label>3) Selfie en vivo</label>
 <div class="videozona"><video id="v" autoplay playsinline muted></video><canvas class="ov" id="ov"></canvas></div>
 <div class="estado" id="stV">Abriendo camara...</div>
@@ -486,6 +489,46 @@ function R(id){return document.getElementById(id)}
 function kb(s){return Math.round(s.length*3/4/1024)}
 function zyComprimir(dataUrl,maxLado,calidad){return new Promise(function(res){var im=new Image();im.onload=function(){var w=im.width,h=im.height,e=Math.min(1,maxLado/Math.max(w,h)),c=document.createElement("canvas");c.width=Math.round(w*e);c.height=Math.round(h*e);c.getContext("2d").drawImage(im,0,0,c.width,c.height);res(c.toDataURL("image/jpeg",calidad).split(",").pop())};im.onerror=function(){res(dataUrl.split(",").pop())};im.src=dataUrl})}
 function luma(dataUrl){return new Promise(function(res){var im=new Image();im.onload=function(){var c=document.createElement("canvas");c.width=40;c.height=40;c.getContext("2d").drawImage(im,0,0,40,40);var d=c.getContext("2d").getImageData(0,0,40,40).data,t=0;for(var i=0;i<d.length;i+=4){t+=0.299*d[i]+0.587*d[i+1]+0.114*d[i+2]}res(t/(d.length/4))};im.onerror=function(){res(99)};im.src=dataUrl})}
+var detTipo="",apiCara=null,faceapiLista=false;
+function cargarScript(s){return new Promise(function(res,rej){var e=document.createElement("script");e.src=s;e.onload=res;e.onerror=rej;document.head.appendChild(e)})}
+async function ensureCara(){
+  if(detTipo){return detTipo}
+  try{if(window.FaceDetector){apiCara=new FaceDetector({fastMode:true,maxDetectedFaces:1});detTipo="nativo";return detTipo}}catch(e){}
+  try{
+    await cargarScript("https://cdn.jsdelivr.net/npm/face-api.js@0.22.2/dist/face-api.min.js");
+    await faceapi.nets.tinyFaceDetector.loadFromUri("https://cdn.jsdelivr.net/gh/justadudewhohacks/face-api.js@0.22.2/weights");
+    detTipo="faceapi";faceapiLista=true;return detTipo;
+  }catch(e){}
+  return "";
+}
+async function cajaEn(fuente){
+  var t=await ensureCara();if(!t){return null}
+  try{
+    if(t=="nativo"){var fs=await apiCara.detect(fuente);if(fs.length){var b=fs[0].boundingBox;return {x:b.x,y:b.y,w:b.width,h:b.height}}}
+    if(t=="faceapi"){var r2=await faceapi.detectSingleFace(fuente,new faceapi.TinyFaceDetectorOptions({inputSize:320,scoreThreshold:0.3}));if(r2){return {x:r2.box.x,y:r2.box.y,w:r2.box.width,h:r2.box.height}}}
+  }catch(e){}
+  return null;
+}
+function pintarDoc(cv,dataUrl,caja){
+  var im=new Image();
+  im.onload=function(){
+    cv.width=im.width;cv.height=im.height;
+    var g=cv.getContext("2d");g.drawImage(im,0,0);
+    if(caja){
+      var cardW=Math.min(im.width*0.92,Math.max(caja.w*4.6,im.width*0.35));
+      var cardH=cardW/1.586;
+      var fcx=caja.x+caja.w/2,fcy=caja.y+caja.h/2;
+      var cx=fcx-cardW*0.24,cy=fcy-cardH*0.5;
+      if(cx<8){cx=8}
+      if(cy<8){cy=8}
+      if(cx+cardW>im.width-8){cx=im.width-8-cardW}
+      if(cy+cardH>im.height-8){cy=im.height-8-cardH}
+      g.strokeStyle="#3fb950";g.lineWidth=Math.max(3,cv.width/220);g.strokeRect(cx,cy,cardW,cardH);
+    }
+    cv.style.display="block";
+  };
+  im.src="data:image/jpeg;base64,"+dataUrl;
+}
 async function cargarDoc(inp,lado){
   var f=inp.files&&inp.files[0];if(!f){return}
   var fr=new FileReader();
@@ -495,33 +538,29 @@ async function cargarDoc(inp,lado){
     if(L<45){R("st"+lado).innerHTML="Foto muy oscura (luz "+Math.round(L)+"/100). Repitela con buena luz.";R("st"+lado).style.color="#f85149";inp.value="";return}
     var comp=await zyComprimir(crudo,1100,0.72);
     if(lado=="F"){DF=comp}else{DA=comp}
-    var pv=R(lado=="F"?"pF":"pA");pv.src="data:image/jpeg;base64,"+comp;pv.style.display="block";
-    var st=R("st"+lado);st.innerHTML="OK: "+kb(crudo)+" KB -> "+kb(comp)+" KB comprimida";st.style.color="#3fb950";
+    var st=R("st"+lado);
+    st.innerHTML="OK: "+kb(crudo)+" KB -> "+kb(comp)+" KB comprimida";st.style.color="#3fb950";
+    if(lado=="F"){
+      var caja=await cajaEn(await imgDe(comp));
+      pintarDoc(R("pF"),comp,caja);
+      if(caja){st.innerHTML+=" | Tarjeta enmarcada (rostro del documento visto)";st.style.color="#3fb950"}
+      else{st.innerHTML+=" | No se vio el rostro EN la tarjeta: revisa que salga completa y nitida";st.style.color="#f0b429"}
+    }else{
+      pintarDoc(R("pA"),comp,null);
+    }
   };
   fr.readAsDataURL(f);
 }
+function imgDe(dataUrl){var im=new Image();im.src="data:image/jpeg;base64,"+dataUrl;return im}
 function cambioTipo(){var d=R("tipoDoc").value=="dui";R("lbA").style.display=d?"block":"none";if(!d){DA="";R("stA").innerHTML="";R("pA").style.display="none"}}
-var cam=null,cara=null,detTipo="",apiCara=null;
-function cargarScript(s){return new Promise(function(res,rej){var e=document.createElement("script");e.src=s;e.onload=res;e.onerror=rej;document.head.appendChild(e)})}
+var cam=null,cara=null;
 async function abrirCam(){
   try{
     cam=await navigator.mediaDevices.getUserMedia({video:{facingMode:"user",width:{ideal:640},height:{ideal:480}}});
     var v=R("v");v.srcObject=cam;
-    R("stV").innerHTML="Camara activa. Espera el recuadro verde sobre tu rostro.";
-    iniciarDetector();
+    R("stV").innerHTML="Camara activa. Espera el ovalo verde sobre tu rostro.";
+    loop();
   }catch(e){R("stV").innerHTML="No se pudo abrir la camara: "+e}
-}
-async function iniciarDetector(){
-  var v=R("v");
-  try{
-    if(window.FaceDetector){apiCara=new FaceDetector({fastMode:true,maxDetectedFaces:1});await apiCara.detect(v);detTipo="nativo";loop();return}
-  }catch(e){}
-  try{
-    await cargarScript("https://cdn.jsdelivr.net/npm/face-api.js@0.22.2/dist/face-api.min.js");
-    await faceapi.nets.tinyFaceDetector.loadFromUri("https://cdn.jsdelivr.net/gh/justadudewhohacks/face-api.js@0.22.2/weights");
-    detTipo="faceapi";loop();return;
-  }catch(e){}
-  detTipo="";R("stV").innerHTML="Camara activa. Detector no disponible: usa el ovalo como guia.";
 }
 async function loop(){
   var v=R("v"),ov=R("ov");
@@ -531,13 +570,13 @@ async function loop(){
     if(ov.width!=vw){ov.width=vw;ov.height=vh}
     var g=ov.getContext("2d");g.clearRect(0,0,ov.width,ov.height);
     try{
-      var caja=null;
-      if(detTipo=="nativo"){var fs=await apiCara.detect(v);if(fs.length){var b=fs[0].boundingBox;caja={x:b.x,y:b.y,w:b.width,h:b.height}}}
-      else if(detTipo=="faceapi"){var r2=await faceapi.detectSingleFace(v,new faceapi.TinyFaceDetectorOptions({inputSize:224,scoreThreshold:0.4}));if(r2){var b2=r2.box;caja={x:b2.x,y:b2.y,w:b2.width,h:b2.height}}}
+      var caja=await cajaEn(v);
       cara=caja;
       if(caja){
         var grande=(caja.w/vw)>0.12;
-        g.strokeStyle=grande?"#3fb950":"#f0b429";g.lineWidth=4;g.strokeRect(caja.x,caja.y,caja.w,caja.h);
+        var cx=caja.x+caja.w/2,cy=caja.y+caja.h/2,rx=caja.w*0.62,ry=caja.h*0.74;
+        g.strokeStyle=grande?"#3fb950":"#f0b429";g.lineWidth=4;
+        g.beginPath();g.ellipse(cx,cy,rx,ry,0,0,6.3);g.stroke();
         R("stV").innerHTML=grande?"Rostro detectado: puedes capturar":"Acerca tu rostro";R("stV").style.color=grande?"#3fb950":"#f0b429";
       }else{
         g.strokeStyle="#f85149";g.lineWidth=3;g.beginPath();g.ellipse(ov.width/2,ov.height/2,ov.width*0.22,ov.height*0.32,0,0,6.3);g.stroke();
@@ -549,7 +588,7 @@ async function loop(){
 async function capturarSelfie(){
   var Rr=R("resp"),v=R("v");
   if(!cam){Rr.innerHTML="<p style='color:#f85149'>La camara no esta activa.</p>";return false}
-  if(detTipo&&cara==null){Rr.innerHTML="<p style='color:#f0b429'>El detector aun no ve tu rostro. Espera el recuadro verde.</p>";return false}
+  if(detTipo&&cara==null){Rr.innerHTML="<p style='color:#f0b429'>El ovalo aun no ve tu rostro. Espera el ovalo verde.</p>";return false}
   var c=document.createElement("canvas");c.width=v.videoWidth;c.height=v.videoHeight;
   var g=c.getContext("2d");g.translate(c.width,0);g.scale(-1,1);g.drawImage(v,0,0);
   var crudo=c.toDataURL("image/jpeg",0.85);

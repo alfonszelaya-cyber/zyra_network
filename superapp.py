@@ -1270,7 +1270,18 @@ setTimeout(function(){ensureCara()},1200);
             if len(nombre) < 3 or len(clave) < 8 or not db64 or not sb64:
                 self._send(400, "application/json", json.dumps({"ok": False, "error": "Falta nombre, clave (min 8), documento o selfie"}).encode())
                 return
-            payload_e = json.dumps({"kind": "person", "name": nombre, "display_name": nombre, "actor": os.environ.get("ZYRA_ENROLL_ACTOR", "superapp"), "doc_image_b64": db64, "selfie_image_b64": sb64}).encode("utf-8")
+            _pe = {"kind": "person", "name": nombre, "display_name": nombre, "actor": os.environ.get("ZYRA_ENROLL_ACTOR", "superapp"), "doc_image_b64": db64, "selfie_image_b64": sb64}
+_tdoc = str(dd.get("doc_type", "")).strip()
+if _tdoc:
+    _pe["doc_kind"] = _tdoc
+    if _tdoc == "dui":
+        _pe["doc_country"] = "SV"
+    elif _tdoc in ("licencia", "id_usa"):
+        _pe["doc_country"] = "US"
+_ndoc = str(dd.get("doc_number", "")).strip()
+if _ndoc:
+    _pe["doc_number"] = _ndoc
+payload_e = json.dumps(_pe).encode("utf-8")
             q_e = urllib.request.Request(ZYRA_URL + "/identity/enroll", data=payload_e, method="POST")
             q_e.add_header("Content-Type", "application/json")
             q_e.add_header("Authorization", "Bearer " + os.environ.get("ZYRA_API_TOKEN", ""))

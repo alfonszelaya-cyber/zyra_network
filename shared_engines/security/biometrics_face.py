@@ -457,6 +457,7 @@ class ZyraVisionProvider:
             "https://raw.githubusercontent.com/opencv/opencv_zoo/refs/heads/main/models/face_detection_yunet/face_detection_yunet_2023mar.onnx",
         ],
         "sface_2021dec.onnx": [
+            "https://media.githubusercontent.com/media/opencv/opencv_zoo/main/models/face_recognition_sface/face_recognition_sface_2021dec.onnx",
             "https://huggingface.co/opencv/face_recognition_sface/resolve/main/sface_2021dec.onnx",
             "https://media.githubusercontent.com/media/opencv/opencv_zoo/main/models/face_recognition_sface/sface_2021dec.onnx",
             "https://raw.githubusercontent.com/opencv/opencv_zoo/refs/heads/main/models/face_recognition_sface/sface_2021dec.onnx",
@@ -476,6 +477,13 @@ class ZyraVisionProvider:
         _os.makedirs(self._dir, exist_ok=True)
         yunet = _os.path.join(self._dir, "face_detection_yunet_2023mar.onnx")
         sface = _os.path.join(self._dir, "sface_2021dec.onnx")
+        _bund = _os.path.join(_os.path.dirname(_os.path.abspath(__file__)), "models")
+        for _nb in ("face_detection_yunet_2023mar.onnx", "sface_2021dec.onnx"):
+            _bpu = _os.path.join(_bund, _nb)
+            _ppu = _os.path.join(self._dir, _nb)
+            if _os.path.exists(_bpu) and _os.path.getsize(_bpu) > 10000 and (not _os.path.exists(_ppu) or _os.path.getsize(_ppu) < 10000):
+                import shutil as _shutil
+                _shutil.copyfile(_bpu, _ppu)
         for path in (yunet, sface):
             if (not _os.path.exists(path)) or _os.path.getsize(path) < 10000:
                 nombre = _os.path.basename(path)

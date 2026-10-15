@@ -450,16 +450,18 @@ class ZyraVisionProvider:
     modality = "face"
     liveness_supported = True
 
-    _YUNET_URL = (
-        "https://github.com/opencv/opencv_zoo/raw/main/"
-        "models/face_detection_yunet/"
-        "face_detection_yunet_2023mar.onnx"
-    )
-    _SFACE_URL = (
-        "https://github.com/opencv/opencv_zoo/raw/main/"
-        "models/face_recognition_sface/"
-        "sface_2021dec.onnx"
-    )
+    _MIRRORS = {
+        "face_detection_yunet_2023mar.onnx": [
+            "https://media.githubusercontent.com/media/opencv/opencv_zoo/main/models/face_detection_yunet/face_detection_yunet_2023mar.onnx",
+            "https://huggingface.co/opencv/face_detection_yunet/resolve/main/face_detection_yunet_2023mar.onnx",
+            "https://raw.githubusercontent.com/opencv/opencv_zoo/refs/heads/main/models/face_detection_yunet/face_detection_yunet_2023mar.onnx",
+        ],
+        "sface_2021dec.onnx": [
+            "https://huggingface.co/opencv/face_recognition_sface/resolve/main/sface_2021dec.onnx",
+            "https://media.githubusercontent.com/media/opencv/opencv_zoo/main/models/face_recognition_sface/sface_2021dec.onnx",
+            "https://raw.githubusercontent.com/opencv/opencv_zoo/refs/heads/main/models/face_recognition_sface/sface_2021dec.onnx",
+        ],
+    }
 
     def __init__(self, model_dir=""):
         self._dir = (
@@ -472,22 +474,39 @@ class ZyraVisionProvider:
 
     def _ensure_models(self):
         _os.makedirs(self._dir, exist_ok=True)
-        yunet = _os.path.join(
-            self._dir, "face_detection_yunet_2023mar.onnx")
+        yunet = _os.path.join(self._dir, "face_detection_yunet_2023mar.onnx")
         sface = _os.path.join(self._dir, "sface_2021dec.onnx")
-        for path, url in (
-            (yunet, self._YUNET_URL),
-            (sface, self._SFACE_URL),
-        ):
+        for path in (yunet, sface):
             if (not _os.path.exists(path)) or _os.path.getsize(path) < 10000:
-                tmp = path + ".tmp"
-                with _urlreq.urlopen(url, timeout=180) as r:
-                    data = r.read()
-                with open(tmp, "wb") as f:
-                    f.write(data)
-                _os.replace(tmp, path)
+                nombre = _os.path.basename(path)
+                ultimo = None
+                for url in self._MIRRORS.get(nombre, []):
+                    try:
+                        req = _urlreq.Request(
+                            url,
+                            headers={"User-Agent": "zyra-vision/1.0"},
+                        )
+                        with _urlreq.urlopen(req, timeout=180) as r:
+                            data = r.read()
+                        if data and len(data) > 10000:
+                            tmp = path + ".tmp"
+                            with open(tmp, "wb") as f:
+                                f.write(data)
+                            _os.replace(tmp, path)
+                            ultimo = None
+                            break
+                        ultimo = RuntimeError("archivo corto: %d" % len(data))
+                    except Exception as exc:
+                        ultimo = exc
+                if ultimo is not None:
+                    from shared_engines.security.biometrics import (
+                        ProviderError,
+                    )
+                    raise ProviderError(
+                        "no se pudo descargar " + nombre
+                        + " desde ningun espejo: " + repr(ultimo)
+                    )
         return yunet, sface
-
     def _engines(self):
         if self._det is None or self._rec is None:
             import cv2

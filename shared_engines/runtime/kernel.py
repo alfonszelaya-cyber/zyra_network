@@ -173,6 +173,11 @@ def _make_biometric_provider() -> object:
         .strip()
         .lower()
     )
+    if choice == "zyra":
+        from shared_engines.security.biometrics_face import (
+            ZyraVisionProvider,
+        )
+        return ZyraVisionProvider()
     if choice == "insightface":
         try:
             from shared_engines.security.biometrics_face import (  # noqa: F401

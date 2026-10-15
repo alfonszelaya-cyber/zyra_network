@@ -486,9 +486,10 @@ a{color:#a78bfa}
 <button type="button" class="ok" onclick="recortarDoc()">Recortar y GUARDAR documento</button>
 <button type="button" onclick="usarFotoCompleta()">Usar foto completa sin recortar</button>
 </div>
-<label>3) Selfie en vivo con prueba de vida</label>
+<label>3) Selfie en vivo</label>
 <div class="videozona"><video id="v" autoplay playsinline muted></video><canvas class="ov" id="ov"></canvas></div>
-<div class="estado" id="stV">Abriendo camara y preparando detector...</div>
+<div class="estado" id="stProv" style="min-height:14px">Motor de deteccion: cargando...</div>
+<div class="estado" id="stV">Abriendo camara...</div>
 <button type="button" id="bSelfie" onclick="capturarSelfie()">Capturar selfie</button>
 <img class="preview" id="pS" alt="">
 <label>4) Crea tu clave de acceso (min 8)</label>
@@ -499,32 +500,61 @@ a{color:#a78bfa}
 </form>
 <div id="resp"></div>
 <p style="text-align:center;margin-top:14px"><a href="/">Volver</a> | <a href="/entrar">Ya tengo ZID</a></p>
+<p style="text-align:center;color:#4a4f7a;font-size:11px;margin-top:10px">ZYRA registro v14</p>
 <script>
 var DF="",DA="",DS="";
 var docImg=null,docLado="",docCrudoF="",docCrudoA="";
 var fr={x:0,y:0,w:0,h:0},editListo=false;
 var cam=null,cara=null,ultimoEAR=null,hayLandmarks=false,detTipo="",apiCara=null,capturando=false;
+var mpDetector=null,mpIntentado=false;
 function R(id){return document.getElementById(id)}
 function kb(s){return Math.round(s.length*3/4/1024)}
 function dormir(ms){return new Promise(function(res){setTimeout(res,ms)})}
 function zyComprimir(dataUrl,maxLado,calidad){return new Promise(function(res){var im=new Image();im.onload=function(){var w=im.width,h=im.height,e=Math.min(1,maxLado/Math.max(w,h)),c=document.createElement("canvas");c.width=Math.round(w*e);c.height=Math.round(h*e);c.getContext("2d").drawImage(im,0,0,c.width,c.height);res(c.toDataURL("image/jpeg",calidad).split(",").pop())};im.onerror=function(){res(dataUrl.split(",").pop())};im.src=dataUrl})}
 function luma(dataUrl){return new Promise(function(res){var im=new Image();im.onload=function(){var c=document.createElement("canvas");c.width=40;c.height=40;c.getContext("2d").drawImage(im,0,0,40,40);var d=c.getContext("2d").getImageData(0,0,40,40).data,t=0;for(var i=0;i<d.length;i+=4){t+=0.299*d[i]+0.587*d[i+1]+0.114*d[i+2]}res(t/(d.length/4))};im.onerror=function(){res(99)};im.src=dataUrl})}
 function cargarScript(s){return new Promise(function(res,rej){var e=document.createElement("script");e.src=s;e.onload=res;e.onerror=rej;document.head.appendChild(e)})}
+async function initMP(){
+if(mpIntentado){return mpDetector!=null}
+mpIntentado=true;
+try{
+var m=await import("https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@0.10.14/vision_bundle.mjs");
+var fs=await m.FilesetResolver.forVisionTasks("https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@0.10.14/wasm");
+mpDetector=await m.FaceDetector.createFromOptions(fs,{
+baseOptions:{modelAssetPath:"https://storage.googleapis.com/mediapipe-models/face_detector/blaze_face_short_range/float16/1/blaze_face_short_range.tflite",delegate:"GPU"},
+runningMode:"IMAGE",minDetectionConfidence:0.3
+});
+return true;
+}catch(e){return false}
+}
 async function ensureCara(){
 if(detTipo){return detTipo}
+if(await initMP()){detTipo="mediapipe";R("stProv").innerHTML="Motor de deteccion: MediaPipe (Google)";return detTipo}
 try{
 await cargarScript("https://cdn.jsdelivr.net/npm/face-api.js@0.22.2/dist/face-api.min.js");
 await faceapi.nets.tinyFaceDetector.loadFromUri("https://cdn.jsdelivr.net/gh/justadudewhohacks/face-api.js@0.22.2/weights");
 detTipo="faceapi";
+R("stProv").innerHTML="Motor de deteccion: face-api.js (respaldo)";
 try{await faceapi.nets.faceLandmark68TinyNet.loadFromUri("https://cdn.jsdelivr.net/gh/justadudewhohacks/face-api.js@0.22.2/weights");hayLandmarks=true}catch(e2){hayLandmarks=false}
 return detTipo;
 }catch(e){}
-try{if(window.FaceDetector){apiCara=new FaceDetector({fastMode:true,maxDetectedFaces:1});detTipo="nativo";return detTipo}}catch(e2){}
+try{if(window.FaceDetector){apiCara=new FaceDetector({fastMode:true,maxDetectedFaces:1});detTipo="nativo";R("stProv").innerHTML="Motor de deteccion: nativo del navegador";return detTipo}}catch(e2){}
+R("stProv").innerHTML="Motor de deteccion: NO disponible";
 return "";
+}
+function cajaMP(fuente){
+try{
+var res=mpDetector.detect(fuente);
+if(res&&res.detections&&res.detections.length){
+var b=res.detections[0].boundingBox;
+return {x:b.originX,y:b.originY,w:b.width,h:b.height};
+}
+}catch(e){}
+return null;
 }
 function ear6(p){var d=function(a,b){return Math.hypot(a.x-b.x,a.y-b.y)};return (d(p[1],p[5])+d(p[2],p[4]))/(2*d(p[0],p[3]))}
 async function cajaEnVideo(v){
 var t=await ensureCara();if(!t){return null}
+if(t=="mediapipe"){return cajaMP(v)}
 try{
 if(t=="faceapi"){
 var op=new faceapi.TinyFaceDetectorOptions({inputSize:320,scoreThreshold:0.3});
@@ -538,7 +568,7 @@ var r3=await faceapi.detectSingleFace(v,op);
 if(r3){var b3=r3.box;return {x:b3.x,y:b3.y,w:b3.width,h:b3.height}}
 return null;
 }
-if(t=="nativo"){var fs=await apiCara.detect(v);if(fs.length){var b=fs[0].boundingBox;return {x:b.x,y:b.y,w:b.width,h:b.height}}}
+if(t=="nativo"){var fs2=await apiCara.detect(v);if(fs2.length){var b4=fs2[0].boundingBox;return {x:b4.x,y:b4.y,w:b4.width,h:b4.height}}}
 }catch(e){}
 return null;
 }
@@ -549,13 +579,18 @@ var sc=Math.min(1,MAXD/Math.max(im.width,im.height));
 var c=document.createElement("canvas");
 c.width=Math.round(im.width*sc);c.height=Math.round(im.height*sc);
 c.getContext("2d").drawImage(im,0,0,c.width,c.height);
+if(t=="mediapipe"){
+var b=cajaMP(c);
+if(b){return {x:b.x/sc,y:b.y/sc,w:b.w/sc,h:b.h/sc}}
+return null;
+}
 try{
 if(t=="faceapi"){
 var r=await faceapi.detectSingleFace(c,new faceapi.TinyFaceDetectorOptions({inputSize:416,scoreThreshold:0.25}));
-if(r){var b=r.box;return {x:b.x/sc,y:b.y/sc,w:b.width/sc,h:b.height/sc}}
+if(r){var b2=r.box;return {x:b2.x/sc,y:b2.y/sc,w:b2.width/sc,h:b2.height/sc}}
 }else if(t=="nativo"){
-var fs=await apiCara.detect(c);
-if(fs.length){var b2=fs[0].boundingBox;return {x:b2.x/sc,y:b2.y/sc,w:b2.width/sc,h:b2.height/sc}}
+var fs3=await apiCara.detect(c);
+if(fs3.length){var b5=fs3[0].boundingBox;return {x:b5.x/sc,y:b5.y/sc,w:b5.width/sc,h:b5.height/sc}}
 }
 }catch(e){}
 return null;
@@ -621,10 +656,10 @@ for(var i=0;i<10&&!cara;i++){await dormir(300)}
 }
 if(cara==null){st.innerHTML="No veo tu rostro: colocate frente a la camara con buena luz.";st.style.color="#f85149";capturando=false;R("bSelfie").disabled=false;return false}
 if((cara.w/v.videoWidth)<=0.12){st.innerHTML="Acerca tu rostro al ovalo.";st.style.color="#f0b429";capturando=false;R("bSelfie").disabled=false;return false}
-var vida="sin confirmar";
-if(hayLandmarks){
+var vida="captura lista";
+if(detTipo=="faceapi"&&hayLandmarks){
 var ok=await esperarParpadeo(5000);
-if(ok){vida="parpadeo confirmado"}else{vida="capturada sin parpadeo visible"}
+vida=ok?"parpadeo confirmado":"sin parpadeo visible";
 }else{
 st.innerHTML="Mantente quieto...";st.style.color="#f0b429";
 await dormir(800);
@@ -787,7 +822,7 @@ if(R("nombre").value.trim().length<3){Rr.innerHTML="<p style='color:#f85149'>Fal
 if(c1.length<8){Rr.innerHTML="<p style='color:#f85149'>La clave necesita minimo 8 caracteres.</p>";return false}
 if(!DF){Rr.innerHTML="<p style='color:#f85149'>Falta GUARDAR el documento frontal (Recortar y GUARDAR, o Usar foto completa).</p>";return false}
 if(R("tipoDoc").value=="dui"&&!DA){Rr.innerHTML="<p style='color:#f85149'>Falta GUARDAR el lado de atras del DUI.</p>";return false}
-if(!DS){Rr.innerHTML="<p style='color:#f85149'>Falta la selfie: pulsa Capturar selfie (guarada SIEMPRE que vea tu rostro).</p>";return false}
+if(!DS){Rr.innerHTML="<p style='color:#f85149'>Falta la selfie: pulsa Capturar selfie (guarda SIEMPRE que vea tu rostro).</p>";return false}
 Rr.innerHTML="<p style='color:#8b949e'>Enviando a la Red ("+kb(DF)+" y "+kb(DS)+" KB) y verificando biometria...</p>";
 try{var r=await fetch("/registro/nuevo",{method:"POST",headers:{"Content-Type":"application/json"},
 body:JSON.stringify({nombre:R("nombre").value.trim(),clave:c1,doc_image_b64:DF,doc_back_b64:DA,selfie_image_b64:DS,doc_type:R("tipoDoc").value})});

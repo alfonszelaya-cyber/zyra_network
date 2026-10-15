@@ -449,6 +449,8 @@ video{width:100%;display:block;transform:scaleX(-1)}
 button{width:100%;margin-top:8px;padding:12px;border:0;border-radius:10px;font-size:15px;font-weight:700;color:#fff;background:#262b52}
 button.ok{background:#1f6f43}
 button.big{margin-top:18px;padding:14px;font-size:17px;font-weight:800;background:linear-gradient(90deg,#7c5cff,#ff5c8a)}
+.fila{display:flex;gap:8px}
+.fila button{flex:1;margin-top:8px;font-size:13px;padding:10px}
 a{color:#a78bfa}
 #resp{margin-top:14px}
 .zid{font-size:20px;font-weight:800;color:#3fb950;letter-spacing:1px}
@@ -468,20 +470,26 @@ a{color:#a78bfa}
 <label>1) Documento: lado frontal</label>
 <input type="file" accept="image/*" capture="environment" onchange="cargarDoc(this,'F')">
 <div class="estado" id="stF"></div>
-<img class="preview" id="pF" alt="">
+<img class="preview" id="pF" alt="" onclick="reeditar('F')">
 <label id="lbA">2) Documento: lado de atras (solo DUI)</label>
 <input type="file" accept="image/*" capture="environment" onchange="cargarDoc(this,'A')">
 <div class="estado" id="stA"></div>
-<img class="preview" id="pA" alt="">
+<img class="preview" id="pA" alt="" onclick="reeditar('A')">
 <div id="zonaEdit">
-<p style="color:#9aa0c3;font-size:13px;text-align:center">Arrastra el recuadro verde hasta cubrir el documento COMPLETO. La bola verde de la esquina lo agranda. Proporcion real de tarjeta.</p>
+<p style="color:#9aa0c3;font-size:13px;text-align:center">Ajusta el recuadro verde hasta cubrir TODA la tarjeta. Arrastralo con el dedo. La bola verde lo agranda.</p>
 <canvas id="cvEdit"></canvas>
+<div class="fila">
+<button type="button" onclick="masGrande(1.18)">+ Grande</button>
+<button type="button" onclick="masGrande(0.85)">- Chico</button>
+<button type="button" onclick="centrarFrame()">Centrar</button>
+</div>
 <button type="button" class="ok" onclick="recortarDoc()">Recortar y GUARDAR documento</button>
+<button type="button" onclick="usarFotoCompleta()">Usar foto completa sin recortar</button>
 </div>
 <label>3) Selfie en vivo con prueba de vida</label>
 <div class="videozona"><video id="v" autoplay playsinline muted></video><canvas class="ov" id="ov"></canvas></div>
-<div class="estado" id="stV">Abriendo camara...</div>
-<button type="button" onclick="capturarSelfie()">Capturar selfie</button>
+<div class="estado" id="stV">Abriendo camara y preparando detector...</div>
+<button type="button" id="bSelfie" onclick="capturarSelfie()">Capturar selfie</button>
 <img class="preview" id="pS" alt="">
 <label>4) Crea tu clave de acceso (min 8)</label>
 <input type="password" id="clave">
@@ -493,8 +501,9 @@ a{color:#a78bfa}
 <p style="text-align:center;margin-top:14px"><a href="/">Volver</a> | <a href="/entrar">Ya tengo ZID</a></p>
 <script>
 var DF="",DA="",DS="";
-var docImg=null,docLado="",fr={x:0,y:0,w:0,h:0},editListo=false;
-var cam=null,cara=null,ultimoEAR=null,hayLandmarks=false,detTipo="",apiCara=null;
+var docImg=null,docLado="",docCrudoF="",docCrudoA="";
+var fr={x:0,y:0,w:0,h:0},editListo=false;
+var cam=null,cara=null,ultimoEAR=null,hayLandmarks=false,detTipo="",apiCara=null,capturando=false;
 function R(id){return document.getElementById(id)}
 function kb(s){return Math.round(s.length*3/4/1024)}
 function dormir(ms){return new Promise(function(res){setTimeout(res,ms)})}
@@ -514,22 +523,40 @@ try{if(window.FaceDetector){apiCara=new FaceDetector({fastMode:true,maxDetectedF
 return "";
 }
 function ear6(p){var d=function(a,b){return Math.hypot(a.x-b.x,a.y-b.y)};return (d(p[1],p[5])+d(p[2],p[4]))/(2*d(p[0],p[3]))}
-async function cajaEn(fuente){
+async function cajaEnVideo(v){
 var t=await ensureCara();if(!t){return null}
 try{
 if(t=="faceapi"){
 var op=new faceapi.TinyFaceDetectorOptions({inputSize:320,scoreThreshold:0.3});
 if(hayLandmarks){
-var r2=await faceapi.detectSingleFace(fuente,op).withFaceLandmarks(true);
+var r2=await faceapi.detectSingleFace(v,op).withFaceLandmarks(true);
 if(r2){try{ultimoEAR=(ear6(r2.landmarks.getLeftEye())+ear6(r2.landmarks.getRightEye()))/2}catch(e3){ultimoEAR=null}var b=r2.detection.box;return {x:b.x,y:b.y,w:b.width,h:b.height}}
 ultimoEAR=null;return null;
 }
 ultimoEAR=null;
-var r3=await faceapi.detectSingleFace(fuente,op);
+var r3=await faceapi.detectSingleFace(v,op);
 if(r3){var b3=r3.box;return {x:b3.x,y:b3.y,w:b3.width,h:b3.height}}
 return null;
 }
-if(t=="nativo"){var fs=await apiCara.detect(fuente);if(fs.length){var b=fs[0].boundingBox;return {x:b.x,y:b.y,w:b.width,h:b.height}}}
+if(t=="nativo"){var fs=await apiCara.detect(v);if(fs.length){var b=fs[0].boundingBox;return {x:b.x,y:b.y,w:b.width,h:b.height}}}
+}catch(e){}
+return null;
+}
+async function cajaEnEscalada(im){
+var t=await ensureCara();if(!t){return null}
+var MAXD=640;
+var sc=Math.min(1,MAXD/Math.max(im.width,im.height));
+var c=document.createElement("canvas");
+c.width=Math.round(im.width*sc);c.height=Math.round(im.height*sc);
+c.getContext("2d").drawImage(im,0,0,c.width,c.height);
+try{
+if(t=="faceapi"){
+var r=await faceapi.detectSingleFace(c,new faceapi.TinyFaceDetectorOptions({inputSize:416,scoreThreshold:0.25}));
+if(r){var b=r.box;return {x:b.x/sc,y:b.y/sc,w:b.width/sc,h:b.height/sc}}
+}else if(t=="nativo"){
+var fs=await apiCara.detect(c);
+if(fs.length){var b2=fs[0].boundingBox;return {x:b2.x/sc,y:b2.y/sc,w:b2.width/sc,h:b2.height/sc}}
+}
 }catch(e){}
 return null;
 }
@@ -541,18 +568,18 @@ var vw=v.videoWidth,vh=v.videoHeight;if(!vw){return}
 if(ov.width!=vw){ov.width=vw;ov.height=vh}
 var g=ov.getContext("2d");g.clearRect(0,0,ov.width,ov.height);
 try{
-var caja=await cajaEn(v);
+var caja=await cajaEnVideo(v);
 cara=caja;
 if(caja){
 var grande=(caja.w/vw)>0.12;
 var cx=caja.x+caja.w/2,cy=caja.y+caja.h/2,rx=caja.w*0.62,ry=caja.h*0.74;
 g.strokeStyle=grande?"#3fb950":"#f0b429";g.lineWidth=4;
 g.beginPath();g.ellipse(cx,cy,rx,ry,0,0,6.3);g.stroke();
-R("stV").innerHTML=grande?"Rostro detectado: puedes capturar":"Acerca tu rostro";R("stV").style.color=grande?"#3fb950":"#f0b429";
+if(!capturando){R("stV").innerHTML=grande?"Rostro detectado: pulsa Capturar selfie":"Acerca tu rostro";R("stV").style.color=grande?"#3fb950":"#f0b429"}
 }else{
 ultimoEAR=null;
 g.strokeStyle="#f85149";g.lineWidth=3;g.beginPath();g.ellipse(ov.width/2,ov.height/2,ov.width*0.22,ov.height*0.32,0,0,6.3);g.stroke();
-R("stV").innerHTML="Buscando tu rostro...";R("stV").style.color="#9aa0c3";
+if(!capturando){R("stV").innerHTML="Buscando tu rostro...";R("stV").style.color="#9aa0c3"}
 }
 }catch(e){}
 },200);
@@ -561,43 +588,57 @@ async function abrirCam(){
 try{
 cam=await navigator.mediaDevices.getUserMedia({video:{facingMode:"user",width:{ideal:640},height:{ideal:480}}});
 var v=R("v");v.srcObject=cam;
-R("stV").innerHTML="Camara activa. Espera el ovalo verde sobre tu rostro.";
+R("stV").innerHTML="Camara activa. Espera el ovalo verde.";
 loop();
 }catch(e){R("stV").innerHTML="No se pudo abrir la camara: "+e}
 }
-function esperarParpadeo(){
+function esperarParpadeo(ms){
 return new Promise(function(res){
 var t0=Date.now(),cerrado=false;
 var iv=setInterval(function(){
 var e=ultimoEAR;
+var quedan=Math.ceil((ms-(Date.now()-t0))/1000);
 if(e!=null){
 if(e<0.19){cerrado=true}
-if(cerrado&&e>0.23){clearInterval(iv);res(true)}
+if(cerrado&&e>0.23){clearInterval(iv);res(true);return}
 }
-if(Date.now()-t0>8000){clearInterval(iv);res(false)}
-},100);
+if(Date.now()-t0>ms){clearInterval(iv);res(false);return}
+R("stV").innerHTML=(cerrado?"Abre los ojos...":"PARPADEA AHORA... ")+quedan+"s";
+R("stV").style.color="#f0b429";
+},150);
 });
 }
 async function capturarSelfie(){
-var Rr=R("resp"),v=R("v");
-if(!cam){Rr.innerHTML="<p style='color:#f85149'>La camara no esta activa.</p>";return false}
-if(detTipo&&cara==null){Rr.innerHTML="<p style='color:#f0b429'>El ovalo aun no ve tu rostro. Espera el ovalo verde.</p>";return false}
-if(cara&&(cara.w/v.videoWidth)<=0.12){R("stV").innerHTML="Acerca tu rostro al ovalo";R("stV").style.color="#f0b429";return false}
+var st=R("stV"),v=R("v");
+if(capturando){return false}
+if(!cam){R("resp").innerHTML="<p style='color:#f85149'>La camara no esta activa.</p>";return false}
+if(v.videoWidth<=0){st.innerHTML="La camara aun esta abriendo, espera 2 segundos.";st.style.color="#f0b429";return false}
+capturando=true;R("bSelfie").disabled=true;
+try{
+if(cara==null){
+st.innerHTML="Buscando tu rostro...";st.style.color="#f0b429";
+for(var i=0;i<10&&!cara;i++){await dormir(300)}
+}
+if(cara==null){st.innerHTML="No veo tu rostro: colocate frente a la camara con buena luz.";st.style.color="#f85149";capturando=false;R("bSelfie").disabled=false;return false}
+if((cara.w/v.videoWidth)<=0.12){st.innerHTML="Acerca tu rostro al ovalo.";st.style.color="#f0b429";capturando=false;R("bSelfie").disabled=false;return false}
+var vida="sin confirmar";
 if(hayLandmarks){
-R("stV").innerHTML="PRUEBA DE VIDA: parpadea ahora";R("stV").style.color="#f0b429";
-var ok=await esperarParpadeo();
-if(!ok){R("stV").innerHTML="No detecte el parpadeo. Intenta de nuevo.";R("stV").style.color="#f85149";return false}
+var ok=await esperarParpadeo(5000);
+if(ok){vida="parpadeo confirmado"}else{vida="capturada sin parpadeo visible"}
 }else{
-R("stV").innerHTML="Mantente quieto un momento...";
-await dormir(1600);
-if(!cara){R("stV").innerHTML="Perdi tu rostro. Intenta de nuevo.";R("stV").style.color="#f85149";return false}
+st.innerHTML="Mantente quieto...";st.style.color="#f0b429";
+await dormir(800);
 }
 var c=document.createElement("canvas");c.width=v.videoWidth;c.height=v.videoHeight;
 var g=c.getContext("2d");g.translate(c.width,0);g.scale(-1,1);g.drawImage(v,0,0);
 var crudo=c.toDataURL("image/jpeg",0.85);
 var comp=await zyComprimir(crudo,720,0.65);
 DS=comp;var pv=R("pS");pv.src="data:image/jpeg;base64,"+comp;pv.style.display="block";
-R("stV").innerHTML="Selfie con vida confirmada: "+kb(crudo)+" KB -> "+kb(comp)+" KB";R("stV").style.color="#3fb950";
+st.innerHTML="SELFIE GUARDADA: "+kb(comp)+" KB ("+vida+")";st.style.color="#3fb950";
+}catch(e){
+st.innerHTML="Error al capturar: "+e;st.style.color="#f85149";
+}
+capturando=false;R("bSelfie").disabled=false;
 return true;
 }
 async function cargarDoc(inp,lado){
@@ -614,31 +655,34 @@ fr2.readAsDataURL(f);
 }
 function abrirEditor(lado,comp){
 docLado=lado;
+if(lado=="F"){docCrudoF=comp}else{docCrudoA=comp}
 var im=new Image();
-R("st"+lado).innerHTML="Abriendo editor para enmarcar el documento...";
+R("st"+lado).innerHTML="Abriendo editor...";
 im.onload=async function(){
 docImg=im;
-var fw=im.width*0.8,fh=fw/1.586;
-if(fh>im.height*0.92){fh=im.height*0.92;fw=fh*1.586}
+var fw=im.width*0.78,fh=fw/1.586;
+if(fh>im.height*0.9){fh=im.height*0.9;fw=fh*1.586}
 fr={x:(im.width-fw)/2,y:(im.height-fh)/2,w:fw,h:fh};
 R("st"+lado).innerHTML="Analizando documento...";
 try{
-var caja=await cajaEn(im);
+var caja=await cajaEnEscalada(im);
 if(caja){
-var fw2=Math.max(im.width*0.45,Math.min(im.width*0.95,caja.w*5));
+var fw2=Math.max(im.width*0.5,Math.min(im.width*0.96,caja.w*3.9));
 var fh2=fw2/1.586;
-var nx=(caja.x+caja.w/2)-fw2*0.27;
-var ny=(caja.y+caja.h/2)-(fh2*0.46);
+if(fh2>im.height*0.95){fh2=im.height*0.95;fw2=fh2*1.586}
+var nx=(caja.x+caja.w/2)-fw2*0.26;
+var ny=(caja.y+caja.h/2)-fh2*0.45;
 if(nx<4){nx=4}
 if(ny<4){ny=4}
 if(nx+fw2>im.width-4){nx=im.width-4-fw2}
 if(ny+fh2>im.height-4){ny=im.height-4-fh2}
 fr={x:nx,y:ny,w:fw2,h:fh2};
-R("st"+lado).innerHTML="Rostro del documento visto. AJUSTA el recuadro si no cubre la tarjeta completa.";
+R("st"+lado).innerHTML="Rostro de la tarjeta visto. AJUSTA el recuadro si no cubre la tarjeta COMPLETA.";
 }else{
-R("st"+lado).innerHTML="Coloca el recuadro sobre la tarjeta completa.";
+R("st"+lado).innerHTML="Coloca el recuadro sobre la tarjeta completa (arrastra, o usa + Grande).";
 }
 }catch(e){}
+clampFrame();
 pintarEditor();
 R("zonaEdit").style.display="block";
 if(!editListo){iniciarEdit();editListo=true}
@@ -661,7 +705,31 @@ g.fillRect((fr.x+fr.w)*e,fr.y*e,cv.width-(fr.x+fr.w)*e,fr.h*e);
 g.strokeStyle="#3fb950";g.lineWidth=3;
 g.strokeRect(fr.x*e,fr.y*e,fr.w*e,fr.h*e);
 g.fillStyle="#3fb950";
-g.beginPath();g.arc((fr.x+fr.w)*e,(fr.y+fr.h)*e,12,0,6.3);g.fill();
+g.beginPath();g.arc((fr.x+fr.w)*e,(fr.y+fr.h)*e,14,0,6.3);g.fill();
+}
+function clampFrame(){
+if(!docImg){return}
+if(fr.w>docImg.width){fr.w=docImg.width;fr.h=fr.w/1.586}
+if(fr.h>docImg.height){fr.h=docImg.height;fr.w=fr.h*1.586}
+if(fr.x<0){fr.x=0}
+if(fr.y<0){fr.y=0}
+if(fr.x+fr.w>docImg.width){fr.x=docImg.width-fr.w}
+if(fr.y+fr.h>docImg.height){fr.y=docImg.height-fr.h}
+}
+function masGrande(f){
+if(!docImg){return}
+var cx=fr.x+fr.w/2,cy=fr.y+fr.h/2;
+var nw=Math.max(80,Math.min(docImg.width,fr.w*f));
+fr.w=nw;fr.h=nw/1.586;
+fr.x=cx-nw/2;fr.y=cy-fr.h/2;
+clampFrame();pintarEditor();
+}
+function centrarFrame(){
+if(!docImg){return}
+var fw=docImg.width*0.78,fh=fw/1.586;
+if(fh>docImg.height*0.9){fh=docImg.height*0.9;fw=fh*1.586}
+fr={x:(docImg.width-fw)/2,y:(docImg.height-fh)/2,w:fw,h:fh};
+clampFrame();pintarEditor();
 }
 function iniciarEdit(){
 var cv=R("cvEdit");
@@ -671,7 +739,7 @@ function abajo(ev){
 if(!docImg){return}
 var p=pos(ev);var e=cv.width/docImg.width;
 var hx=(fr.x+fr.w)*e,hy=(fr.y+fr.h)*e;
-arr=(Math.hypot(p.x-hx,p.y-hy)<30)?"s":"m";
+arr=(Math.hypot(p.x-hx,p.y-hy)<48)?"s":"m";
 base={px:p.x,py:p.y,fx:fr.x,fy:fr.y,fw:fr.w};
 ev.preventDefault();
 }
@@ -679,16 +747,20 @@ function mover(ev){
 if(!arr||!docImg){return}
 var p=pos(ev);var dx=p.x-base.px,dy=p.y-base.py;
 if(arr=="m"){fr.x=base.fx+dx;fr.y=base.fy+dy}
-else{var w=Math.max(60,base.fw+dx);fr.w=w;fr.h=w/1.586}
-if(fr.x<0){fr.x=0}
-if(fr.y<0){fr.y=0}
-if(fr.x+fr.w>docImg.width){fr.x=docImg.width-fr.w}
-if(fr.y+fr.h>docImg.height){fr.y=docImg.height-fr.h}
-pintarEditor();ev.preventDefault();
+else{var w=Math.max(80,base.fw+dx);fr.w=w;fr.h=w/1.586}
+clampFrame();pintarEditor();ev.preventDefault();
 }
 cv.addEventListener("pointerdown",abajo,false);
 cv.addEventListener("pointermove",mover,false);
 ["pointerup","pointercancel","pointerleave"].forEach(function(t){cv.addEventListener(t,function(){arr=null},false)});
+}
+function guardarEn(docLadoSel,comp,txt){
+if(docLadoSel=="F"){DF=comp}else{DA=comp}
+var pv=R(docLadoSel=="F"?"pF":"pA");
+pv.src="data:image/jpeg;base64,"+comp;pv.style.display="block";
+var st=R("st"+docLadoSel);
+st.innerHTML=txt+" — toca la foto para corregir el marco";st.style.color="#3fb950";
+R("zonaEdit").style.display="none";docImg=null;
 }
 function recortarDoc(){
 if(!docImg){return}
@@ -696,23 +768,26 @@ var c=document.createElement("canvas");
 c.width=Math.round(fr.w);c.height=Math.round(fr.h);
 c.getContext("2d").drawImage(docImg,fr.x,fr.y,fr.w,fr.h,0,0,c.width,c.height);
 var comp=c.toDataURL("image/jpeg",0.8).split(",").pop();
-if(docLado=="F"){DF=comp}else{DA=comp}
-var pv=R(docLado=="F"?"pF":"pA");
-pv.src="data:image/jpeg;base64,"+comp;pv.style.display="block";
-var st=R("st"+docLado);
-st.innerHTML="GUARDADO: "+kb(comp)+" KB (documento completo)";st.style.color="#3fb950";
-R("zonaEdit").style.display="none";
-docImg=null;
+guardarEn(docLado,comp,"GUARDADO: "+kb(comp)+" KB (documento completo)");
 }
-function cambioTipo(){var d=R("tipoDoc").value=="dui";R("lbA").style.display=d?"block":"none";if(!d){DA="";R("stA").innerHTML="";R("pA").style.display="none"}}
+function usarFotoCompleta(){
+var comp=docLado=="F"?docCrudoF:docCrudoA;
+if(!comp){return}
+guardarEn(docLado,comp,"GUARDADO COMPLETO: "+kb(comp)+" KB (sin recortar)");
+}
+function reeditar(lado){
+var comp=lado=="F"?docCrudoF:docCrudoA;
+if(comp){abrirEditor(lado,comp)}
+}
+function cambioTipo(){var d=R("tipoDoc").value=="dui";R("lbA").style.display=d?"block":"none";if(!d){DA="";docCrudoA="";R("stA").innerHTML="";R("pA").style.display="none"}}
 async function enviar(ev){ev.preventDefault();var Rr=R("resp");
 var c1=R("clave").value,c2=R("clave2").value;
 if(c1!==c2){Rr.innerHTML="<p style='color:#f85149'>Las claves no coinciden.</p>";return false}
 if(R("nombre").value.trim().length<3){Rr.innerHTML="<p style='color:#f85149'>Falta tu nombre completo.</p>";return false}
 if(c1.length<8){Rr.innerHTML="<p style='color:#f85149'>La clave necesita minimo 8 caracteres.</p>";return false}
-if(!DF){Rr.innerHTML="<p style='color:#f85149'>Falta GUARDAR la foto del documento frontal (usa Recortar y GUARDAR).</p>";return false}
+if(!DF){Rr.innerHTML="<p style='color:#f85149'>Falta GUARDAR el documento frontal (Recortar y GUARDAR, o Usar foto completa).</p>";return false}
 if(R("tipoDoc").value=="dui"&&!DA){Rr.innerHTML="<p style='color:#f85149'>Falta GUARDAR el lado de atras del DUI.</p>";return false}
-if(!DS){Rr.innerHTML="<p style='color:#f85149'>Falta la selfie con prueba de vida.</p>";return false}
+if(!DS){Rr.innerHTML="<p style='color:#f85149'>Falta la selfie: pulsa Capturar selfie (guarada SIEMPRE que vea tu rostro).</p>";return false}
 Rr.innerHTML="<p style='color:#8b949e'>Enviando a la Red ("+kb(DF)+" y "+kb(DS)+" KB) y verificando biometria...</p>";
 try{var r=await fetch("/registro/nuevo",{method:"POST",headers:{"Content-Type":"application/json"},
 body:JSON.stringify({nombre:R("nombre").value.trim(),clave:c1,doc_image_b64:DF,doc_back_b64:DA,selfie_image_b64:DS,doc_type:R("tipoDoc").value})});

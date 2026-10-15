@@ -628,11 +628,13 @@ class PortalHandler(BaseHTTPRequestHandler):
                     emsg = cuerpo_e[:250] or ("HTTP " + str(status_e))
                 self._send(502, "application/json", json.dumps({"ok": False, "error": emsg}).encode())
                 return
-            zid = ""
-            if isinstance(dr, dict):
-                dx = dr.get("data") or dr
-                if isinstance(dx, dict):
-                    zid = str(dx.get("zid") or dx.get("identity_id") or dx.get("id") or "")
+            zid = locals().get("zid", "")
+            if not zid and status_e in (200, 201) and isinstance(je_, dict):
+                dx2 = je_.get("data") or je_
+                if isinstance(dx2, dict):
+                    zid = str(dx2.get("zid") or dx2.get("identity_id") or dx2.get("id") or "")
+                    if not zid and isinstance(dx2.get("identity"), dict):
+                        zid = str(dx2["identity"].get("zid") or "")
             if not zid:
                 self._send(500, "application/json", json.dumps({"ok": False, "error": "La Red no devolvio ZID"}).encode())
                 return

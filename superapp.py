@@ -35,9 +35,9 @@ PORT = int(
 )
 
 if os.environ.get("ZYRA_URL"):
-    ZYRA_URL = os.environ["ZYRA_URL"].rstrip("/")
+    ZYRA_URL = os.environ["ZYRA_URL"].strip().strip('"\'()').rstrip("/")
 elif os.environ.get("ZYRA_HOST"):
-    ZYRA_URL = ("https://" + os.environ["ZYRA_HOST"]).rstrip("/")
+    ZYRA_URL = ("https://" + os.environ["ZYRA_HOST"].strip().strip('"\'()').rstrip("/")).rstrip("/")
 else:
     ZYRA_URL = ""
 
@@ -422,13 +422,166 @@ class PortalHandler(BaseHTTPRequestHandler):
             return
 
         if path == "/registro":
-            try:
-                d_r = self._read_portal("registro.html")
-            except Exception:
-                d_r = b"<html><body></body></html>"
-            self._send(200, "text/html; charset=utf-8", d_r)
+            _reg_html = '''<!DOCTYPE html>
+<html lang="es">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>ZYRA - Crear mi ZID</title>
+<style>
+*{box-sizing:border-box;margin:0;padding:0}
+body{font-family:system-ui,Arial;background:#12162e;color:#e8eaf6;padding:16px;max-width:520px;margin:0 auto}
+h1{font-size:22px;text-align:center;margin:8px 0 4px;color:#fff}
+.sub{text-align:center;color:#9aa0c3;font-size:13px;margin-bottom:14px}
+label{display:block;color:#9aa0c3;font-size:14px;margin:14px 0 6px}
+input,select{width:100%;padding:12px;border-radius:10px;border:1px solid #2a2f55;background:#0d1126;color:#fff;font-size:16px}
+input[type=file]{padding:9px;font-size:13px}
+.estado{text-align:center;font-size:13px;color:#9aa0c3;padding:6px;min-height:20px}
+.preview{display:none;width:100%;border-radius:10px;margin-top:6px}
+.videozona{position:relative;border-radius:12px;overflow:hidden;margin-top:6px;background:#000}
+video{width:100%;display:block;transform:scaleX(-1)}
+.ov{position:absolute;left:0;top:0;width:100%;height:100%;pointer-events:none}
+button{width:100%;margin-top:8px;padding:12px;border:0;border-radius:10px;font-size:15px;font-weight:700;color:#fff;background:#262b52}
+button.big{margin-top:18px;padding:14px;font-size:17px;font-weight:800;background:linear-gradient(90deg,#7c5cff,#ff5c8a)}
+a{color:#a78bfa}
+#resp{margin-top:14px}
+.zid{font-size:20px;font-weight:800;color:#3fb950;letter-spacing:1px}
+</style>
+</head>
+<body>
+<h1>Crear mi ZID</h1>
+<p class="sub">Red de confianza digital</p>
+<form onsubmit="return enviar(event)">
+<label>Nombre completo</label>
+<input id="nombre" required>
+<label>Tipo de documento</label>
+<select id="tipoDoc" onchange="cambioTipo()">
+<option value="dui">DUI (2 lados)</option>
+<option value="pasaporte">Pasaporte (1 cara)</option>
+</select>
+<label>1) Documento: lado frontal</label>
+<input type="file" accept="image/*" capture="environment" onchange="cargarDoc(this,'F')">
+<div class="estado" id="stF"></div>
+<img class="preview" id="pF" alt="">
+<label id="lbA">2) Documento: lado de atras (solo DUI)</label>
+<input type="file" accept="image/*" capture="environment" onchange="cargarDoc(this,'A')">
+<div class="estado" id="stA"></div>
+<img class="preview" id="pA" alt="">
+<label>3) Selfie en vivo</label>
+<div class="videozona"><video id="v" autoplay playsinline muted></video><canvas class="ov" id="ov"></canvas></div>
+<div class="estado" id="stV">Abriendo camara...</div>
+<button type="button" onclick="capturarSelfie()">Capturar selfie</button>
+<img class="preview" id="pS" alt="">
+<label>4) Crea tu clave de acceso (min 8)</label>
+<input type="password" id="clave">
+<label>Repite la clave</label>
+<input type="password" id="clave2">
+<button class="big" type="submit">Crear mi ZID</button>
+</form>
+<div id="resp"></div>
+<p style="text-align:center;margin-top:14px"><a href="/">Volver</a> | <a href="/entrar">Ya tengo ZID</a></p>
+<script>
+var DF="",DA="",DS="";
+function R(id){return document.getElementById(id)}
+function kb(s){return Math.round(s.length*3/4/1024)}
+function zyComprimir(dataUrl,maxLado,calidad){return new Promise(function(res){var im=new Image();im.onload=function(){var w=im.width,h=im.height,e=Math.min(1,maxLado/Math.max(w,h)),c=document.createElement("canvas");c.width=Math.round(w*e);c.height=Math.round(h*e);c.getContext("2d").drawImage(im,0,0,c.width,c.height);res(c.toDataURL("image/jpeg",calidad).split(",").pop())};im.onerror=function(){res(dataUrl.split(",").pop())};im.src=dataUrl})}
+function luma(dataUrl){return new Promise(function(res){var im=new Image();im.onload=function(){var c=document.createElement("canvas");c.width=40;c.height=40;c.getContext("2d").drawImage(im,0,0,40,40);var d=c.getContext("2d").getImageData(0,0,40,40).data,t=0;for(var i=0;i<d.length;i+=4){t+=0.299*d[i]+0.587*d[i+1]+0.114*d[i+2]}res(t/(d.length/4))};im.onerror=function(){res(99)};im.src=dataUrl})}
+async function cargarDoc(inp,lado){
+  var f=inp.files&&inp.files[0];if(!f){return}
+  var fr=new FileReader();
+  fr.onload=async function(){
+    var crudo=fr.result;
+    var L=await luma(crudo);
+    if(L<45){R("st"+lado).innerHTML="Foto muy oscura (luz "+Math.round(L)+"/100). Repitela con buena luz.";R("st"+lado).style.color="#f85149";inp.value="";return}
+    var comp=await zyComprimir(crudo,1100,0.72);
+    if(lado=="F"){DF=comp}else{DA=comp}
+    var pv=R(lado=="F"?"pF":"pA");pv.src="data:image/jpeg;base64,"+comp;pv.style.display="block";
+    var st=R("st"+lado);st.innerHTML="OK: "+kb(crudo)+" KB -> "+kb(comp)+" KB comprimida";st.style.color="#3fb950";
+  };
+  fr.readAsDataURL(f);
+}
+function cambioTipo(){var d=R("tipoDoc").value=="dui";R("lbA").style.display=d?"block":"none";if(!d){DA="";R("stA").innerHTML="";R("pA").style.display="none"}}
+var cam=null,cara=null,detTipo="",apiCara=null;
+function cargarScript(s){return new Promise(function(res,rej){var e=document.createElement("script");e.src=s;e.onload=res;e.onerror=rej;document.head.appendChild(e)})}
+async function abrirCam(){
+  try{
+    cam=await navigator.mediaDevices.getUserMedia({video:{facingMode:"user",width:{ideal:640},height:{ideal:480}}});
+    var v=R("v");v.srcObject=cam;
+    R("stV").innerHTML="Camara activa. Espera el recuadro verde sobre tu rostro.";
+    iniciarDetector();
+  }catch(e){R("stV").innerHTML="No se pudo abrir la camara: "+e}
+}
+async function iniciarDetector(){
+  var v=R("v");
+  try{
+    if(window.FaceDetector){apiCara=new FaceDetector({fastMode:true,maxDetectedFaces:1});await apiCara.detect(v);detTipo="nativo";loop();return}
+  }catch(e){}
+  try{
+    await cargarScript("https://cdn.jsdelivr.net/npm/face-api.js@0.22.2/dist/face-api.min.js");
+    await faceapi.nets.tinyFaceDetector.loadFromUri("https://cdn.jsdelivr.net/gh/justadudewhohacks/face-api.js@0.22.2/weights");
+    detTipo="faceapi";loop();return;
+  }catch(e){}
+  detTipo="";R("stV").innerHTML="Camara activa. Detector no disponible: usa el ovalo como guia.";
+}
+async function loop(){
+  var v=R("v"),ov=R("ov");
+  setInterval(async function(){
+    if(v.readyState<2){return}
+    var vw=v.videoWidth,vh=v.videoHeight;if(!vw){return}
+    if(ov.width!=vw){ov.width=vw;ov.height=vh}
+    var g=ov.getContext("2d");g.clearRect(0,0,ov.width,ov.height);
+    try{
+      var caja=null;
+      if(detTipo=="nativo"){var fs=await apiCara.detect(v);if(fs.length){var b=fs[0].boundingBox;caja={x:b.x,y:b.y,w:b.width,h:b.height}}}
+      else if(detTipo=="faceapi"){var r2=await faceapi.detectSingleFace(v,new faceapi.TinyFaceDetectorOptions({inputSize:224,scoreThreshold:0.4}));if(r2){var b2=r2.box;caja={x:b2.x,y:b2.y,w:b2.width,h:b2.height}}}
+      cara=caja;
+      if(caja){
+        var grande=(caja.w/vw)>0.12;
+        g.strokeStyle=grande?"#3fb950":"#f0b429";g.lineWidth=4;g.strokeRect(caja.x,caja.y,caja.w,caja.h);
+        R("stV").innerHTML=grande?"Rostro detectado: puedes capturar":"Acerca tu rostro";R("stV").style.color=grande?"#3fb950":"#f0b429";
+      }else{
+        g.strokeStyle="#f85149";g.lineWidth=3;g.beginPath();g.ellipse(ov.width/2,ov.height/2,ov.width*0.22,ov.height*0.32,0,0,6.3);g.stroke();
+        R("stV").innerHTML="Buscando tu rostro...";R("stV").style.color="#9aa0c3";
+      }
+    }catch(e){}
+  },350);
+}
+async function capturarSelfie(){
+  var Rr=R("resp"),v=R("v");
+  if(!cam){Rr.innerHTML="<p style='color:#f85149'>La camara no esta activa.</p>";return false}
+  if(detTipo&&cara==null){Rr.innerHTML="<p style='color:#f0b429'>El detector aun no ve tu rostro. Espera el recuadro verde.</p>";return false}
+  var c=document.createElement("canvas");c.width=v.videoWidth;c.height=v.videoHeight;
+  var g=c.getContext("2d");g.translate(c.width,0);g.scale(-1,1);g.drawImage(v,0,0);
+  var crudo=c.toDataURL("image/jpeg",0.85);
+  var comp=await zyComprimir(crudo,640,0.6);
+  DS=comp;var pv=R("pS");pv.src="data:image/jpeg;base64,"+comp;pv.style.display="block";
+  R("stV").innerHTML="Selfie capturada: "+kb(crudo)+" KB -> "+kb(comp)+" KB";
+  return true;
+}
+async function enviar(ev){ev.preventDefault();var Rr=R("resp");
+var c1=R("clave").value,c2=R("clave2").value;
+if(c1!==c2){Rr.innerHTML="<p style='color:#f85149'>Las claves no coinciden.</p>";return false}
+if(R("nombre").value.trim().length<3){Rr.innerHTML="<p style='color:#f85149'>Falta tu nombre completo.</p>";return false}
+if(c1.length<8){Rr.innerHTML="<p style='color:#f85149'>La clave necesita minimo 8 caracteres.</p>";return false}
+if(!DF){Rr.innerHTML="<p style='color:#f85149'>Falta la foto del documento (lado frontal).</p>";return false}
+if(R("tipoDoc").value=="dui"&&!DA){Rr.innerHTML="<p style='color:#f85149'>Falta el lado de atras del DUI.</p>";return false}
+if(!DS){Rr.innerHTML="<p style='color:#f85149'>Falta la selfie en vivo.</p>";return false}
+Rr.innerHTML="<p style='color:#8b949e'>Enviando a la Red ("+kb(DF)+" y "+kb(DS)+" KB comprimidos) y verificando biometria...</p>";
+try{var r=await fetch("/registro/nuevo",{method:"POST",headers:{"Content-Type":"application/json"},
+body:JSON.stringify({nombre:R("nombre").value.trim(),clave:c1,doc_image_b64:DF,doc_back_b64:DA,selfie_image_b64:DS,doc_type:R("tipoDoc").value})});
+var j=await r.json();
+if(j.ok&&j.zid){Rr.innerHTML="<div style='background:#0f2a1a;border:1px solid #238636;border-radius:12px;padding:14px'><p style='color:#3fb950;font-weight:800;font-size:17px'>REGISTRO EXITOSO</p><p>Tu ZID unico fue creado:</p><p class='zid'>"+j.zid+"</p><p>Guarda tu ZID y tu clave. Nadie mas puede crearlo.</p><p><a href='/entrar'>ENTRAR AHORA</a></p></div>";}
+else if(j.codigo==="mantenimiento"){Rr.innerHTML="<div style='background:#2a2410;border:1px solid #f0b429;border-radius:12px;padding:14px'><p style='color:#f0b429;font-weight:800'>BIOMETRIA EN MANTENIMIENTO</p><p>"+(j.error||"")+"</p><p>Tu solicitud quedo guardada.</p><p><a href='/registro'>Volver a intentar</a></p></div>";}
+else{Rr.innerHTML="<p style='color:#f85149;font-weight:700'>NO SE PUDO CREAR EL ZID</p><p>"+(j.error||"Motivo desconocido")+"</p>";}}
+catch(e){Rr.innerHTML="<div style='background:#2a1414;border:1px solid #f85149;border-radius:12px;padding:14px'><p style='color:#f85149;font-weight:700'>La Red no respondio</p><p>Detalle tecnico: "+e+"</p><p style='color:#8b949e'>Envia este detalle para corregirlo.</p></div>";}
+return false}
+abrirCam();
+</script>
+</body>
+</html>
+'''
+            self._send(200, "text/html; charset=utf-8", _reg_html.encode("utf-8"))
             return
-
         if path == "/version":
             try:
                 d_v = self._read_portal("version.txt")
@@ -598,7 +751,7 @@ class PortalHandler(BaseHTTPRequestHandler):
                 except Exception:
                     cuerpo_e = ""
             except Exception as ex_:
-                self._send(502, "application/json", json.dumps({"ok": False, "error": "Sin conexion con la Red: " + str(ex_)[:180]}).encode())
+                self._send(502, "application/json", json.dumps({"ok": False, "error": "Sin conexion con la Red (host configurado: " + (ZYRA_URL.split("//")[-1].split("/")[0] if ZYRA_URL else "(vacio)") + "): " + str(ex_)[:180]}).encode())
                 return
             try:
                 je_ = json.loads(cuerpo_e or "{}")

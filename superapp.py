@@ -527,6 +527,7 @@ a{color:#a78bfa}
 <button type="button" class="mini" onclick="irAPaso(4)">Volver</button>
 </div>
 <div id="zonaEdit">
+          <div id="titLado" style="text-align:center;color:#7c8cf8;font-weight:800;font-size:15px;padding:4px"></div>
 <p style="color:#9aa0c3;font-size:13px;text-align:center">Mueve las 4 bolas verdes a las ESQUINAS del documento.</p>
 <canvas id="cvEdit"></canvas>
 <button type="button" class="mini" onclick="autoEsquinas()">Reintentar deteccion automatica</button>
@@ -828,38 +829,38 @@ return r2;
 }
 function mostrarDesglose(){
 var d=R("desglose");if(!d)return;
-var h="";var fuente=null,nom=R("nombre").value.trim();
-if(datosDocF){fuente=datosDocF;
-if(fuente.confiable&&fuente.nombre){
-h+="<p style='color:#3fb950'>FRONTAL (codigo del documento): "+fuente.nombre+" | Nac: "+(fuente.nacimiento||"?")+" | Edad: "+fuente.edad+"</p>";
-var nomE=R("nombre").value.trim();
-if(nomE.length>=3&&!nombresCoinciden(fuente.nombre,nomE)){nombreNoCoincide=true;h+="<p style='color:#f85149;font-weight:700'>NO COINCIDE: el nombre escrito y el del documento difieren. Corrige tu nombre o usa el documento correcto.</p>"}
-else{h+="<p style='color:#3fb950'>Cruce de nombre: coincide</p>"}}
-else{h+="<p style='color:#9aa0c3'>FRONTAL: sin datos automaticos legibles (el DUI no trae codigo). La foto queda guardada y el motor verificara tu rostro.</p>"}}
-if(datosDocA){fuente=datosDocA;
-var partes=[];
-if(fuente.numero)partes.push("No.: "+fuente.numero);
-if(fuente.direccion)partes.push("Dir: "+fuente.direccion);
-if(fuente.confiable&&fuente.nombre)partes.push("Nombre: "+fuente.nombre);
-h+="<p style='color:#3fb950'>REVERSO: "+(partes.length?partes.join(" | "):"sin datos automaticos legibles — foto guardada")+"</p>";
-if(fuente.vencimiento){var hoy=new Date();hoy.setHours(0,0,0,0);var fvd=new Date(fuente.vencimiento+"T00:00:00");
-if(fvd&&fvd<hoy){docVencido=true;h+="<p style='color:#f85149;font-weight:700'>DOCUMENTO VENCIDO ("+fuente.vencimiento+"): leido automaticamente. NO SE ACEPTA.</p>"}
-else{h+="<p style='color:#3fb950'>Vencimiento leido: "+fuente.vencimiento+" — valido</p>"}}
-if(fuente.nacimiento){var ed2=edadDe(fuente.nacimiento);if(ed2>=0&&ed2<18){minorBloqueado=true;h+="<p style='color:#f85149;font-weight:700'>MENOR DE EDAD ("+ed2+"): se registra con tutor.</p>"}}
-}}
-if(!datosDocF&&!datosDocA){h="<p style='color:#9aa0c3'>Desglose: este documento no trae codigo legible. El motor verificara tu rostro contra el documento.</p>";minorBloqueado=false;docVencido=false;nombreNoCoincide=false}
-if(fuente){
-if(fuente.edad>=0&&fuente.edad<18){minorBloqueado=true;h+="<p style='color:#f85149;font-weight:700'>MENOR DE EDAD ("+fuente.edad+"): registro de adultos bloqueado. Los menores se registran con tutor.</p>"}
-else{minorBloqueado=false;if(fuente.edad>=0){h+="<p style='color:#3fb950'>Mayoria de edad por documento: "+fuente.edad+" anos</p>"}}
-if(fuente.nombre&&nom&&nombresCoinciden(fuente.nombre,nom)){h+="<p style='color:#3fb950'>Cruce de nombre: coincide</p>"}
-else if(fuente.nombre&&nom){h+="<p style='color:#f0b429'>Aviso: el nombre escrito no coincide con el del documento</p>"}
-if(fuente.nombre&&nom.length<3){R("nombre").value=fuente.nombre}
+var h="";var nom=R("nombre").value.trim();
+var fuenteF=datosDocF,fuenteA=datosDocA;
+minorBloqueado=false;docVencido=false;nombreNoCoincide=false;
+if(!fuenteF&&!fuenteA){
+h="<p style='color:#9aa0c3'>Desglose: este documento no trae datos leibles automaticamente. El motor verificara tu rostro contra el documento.</p>";
+d.innerHTML=h;return;
 }
-if(fuente&&fuente.nacimiento&&fuente.edad>=0){}
-if(fuente&&fuente.vencimiento){var hoy=new Date();hoy.setHours(0,0,0,0);var fvd=new Date(fuente.vencimiento+"T00:00:00");
-if(fvd&&fvd<hoy){h+="<p style='color:#f85149;font-weight:700'>DOCUMENTO VENCIDO ("+fuente.vencimiento+"): leido automaticamente. No se acepta.</p>";minorBloqueado=true}
-else{h+="<p style='color:#3fb950'>Vencimiento leido automaticamente: "+fuente.vencimiento+" — valido</p>"}}
-if(fuente&&fuente.texto){h+="<p style='color:#7c8cf8'>Texto leido por OCR del documento (revisalo y corrige si algo salio mal): "+fuente.texto.split("<").join("&lt;")+"</p>"}
+if(fuenteF){
+if(fuenteF.confiable&&fuenteF.nombre){
+h+="<p style='color:#3fb950'>FRONTAL (codigo del documento): "+fuenteF.nombre+" | Nac: "+(fuenteF.nacimiento||"?")+" | Edad: "+fuenteF.edad+"</p>";
+if(nom.length>=3&&!nombresCoinciden(fuenteF.nombre,nom)){nombreNoCoincide=true;h+="<p style='color:#f85149;font-weight:700'>NO COINCIDE: el nombre escrito difiere del documento. Corrigelo antes de crear el ZID.</p>";}
+else{h+="<p style='color:#3fb950'>Cruce de nombre: coincide</p>";}
+}else{
+h+="<p style='color:#9aa0c3'>FRONTAL: sin datos automaticos legibles — foto guardada, el motor verificara tu rostro.</p>";
+}
+}
+if(fuenteA){
+var pa=[];
+if(fuenteA.numero)pa.push("No.: "+fuenteA.numero);
+if(fuenteA.direccion)pa.push("Dir: "+fuenteA.direccion);
+h+="<p style='color:#3fb950'>REVERSO: "+(pa.length?pa.join(" | "):"sin datos automaticos legibles — foto guardada")+"</p>";
+if(fuenteA.vencimiento){
+var hoy=new Date();hoy.setHours(0,0,0,0);
+var fvd=new Date(fuenteA.vencimiento+"T00:00:00");
+if(fvd&&fvd<hoy){docVencido=true;h+="<p style='color:#f85149;font-weight:700'>DOCUMENTO VENCIDO ("+fuenteA.vencimiento+"): NO SE ACEPTA.</p>";}
+else{h+="<p style='color:#3fb950'>Vencimiento leido: "+fuenteA.vencimiento+" — valido</p>";}
+}
+if(fuenteA.nacimiento){
+var ed2=edadDe(fuenteA.nacimiento);
+if(ed2>=0&&ed2<18){minorBloqueado=true;h+="<p style='color:#f85149;font-weight:700'>MENOR DE EDAD ("+ed2+"): se registra con tutor.</p>";}
+}
+}
 d.innerHTML=h;
 }
 async function cargarDoc(inp,lado){
@@ -894,7 +895,8 @@ docLado=lado;
 if(lado=="F"){docCrudoF=comp}else{docCrudoA=comp}
 var st=R("st"+lado);st.className="estado";st.style.color="#9aa0c3";
 var im=new Image();
-st.innerHTML="Abriendo editor...";
+R("titLado").innerHTML="ESTAS ENMARCANDO EL LADO "+(lado=="F"?"FRONTAL (la cara con tu foto)":"REVERSO (la parte de atras)");
+          st.innerHTML="Abriendo editor...";
 im.onload=function(){
 docImg=im;
 quad=quadInicial(im);

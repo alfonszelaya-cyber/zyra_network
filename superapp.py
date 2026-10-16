@@ -481,8 +481,6 @@ a{color:#a78bfa}
 <option value="id_usa">ID de estado / EAD USA (2 lados)</option>
 <option value="permiso">Permiso legal / otro documento</option>
 </select>
-<label>Fecha de vencimiento del documento (si aparece en el)</label>
-<input type="date" id="vencimiento">
 <button type="button" class="big" onclick="irDe1()">Continuar</button>
 </div>
 <div class="paso" id="ps2">
@@ -540,7 +538,7 @@ a{color:#a78bfa}
 <div id="resp"></div>
 </form>
 <p style="text-align:center;margin-top:14px"><a href="/">Volver</a> | <a href="/entrar">Ya tengo ZID</a></p>
-<p style="text-align:center;color:#4a4f7a;font-size:11px;margin-top:10px">ZYRA registro v23 - OCR automatico</p>
+<p style="text-align:center;color:#4a4f7a;font-size:11px;margin-top:10px">ZYRA registro v24 - todo leido automatico</p>
 <script>
 window.onerror=function(m,u,l){try{var b=document.getElementById("jserr");if(b){b.style.display="block";b.innerHTML="Error interno (linea "+l+"): "+m}}catch(e){}};
 var DF="",DA="",DS="";
@@ -743,7 +741,11 @@ res[fnd[i][1]]=raw.slice(fnd[i][0]+3,fin).trim();
 }
 if(!res.DBB||res.DBB.length<8)return null;
 var iso=res.DBB.slice(4,8)+"-"+res.DBB.slice(0,2)+"-"+res.DBB.slice(2,4);
-return {nombre:((res.DAC||"")+" "+(res.DAD||"")+" "+(res.DAB||"")).trim(),nacimiento:iso,edad:edadDe(iso),numero:(res.DAQ||res.DCF||""),direccion:((res.DAI||"")+" "+(res.DAG||"")+" "+(res.DAJ||"")+" "+(res.DAK||"")).trim()};
+var venc="";
+var clv=["DBA","DBD"];
+for(var v2=0;v2<clv.length;v2++){var rv=res[clv[v2]];if(rv&&rv.length===8){var fv2b=rv.slice(4,8)+"-"+rv.slice(0,2)+"-"+rv.slice(2,4);if(!venc)venc=fv2b}}
+if(!venc&&res.DBB){var maxd=res.DBB;var mx2=(maxd.slice(4,8)+"-"+maxd.slice(0,2)+"-"+maxd.slice(2,4));venc=mx2}
+return {nombre:((res.DAC||"")+" "+(res.DAD||"")+" "+(res.DAB||"")).trim(),nacimiento:iso,edad:edadDe(iso),numero:(res.DAQ||res.DCF||""),direccion:((res.DAI||"")+" "+(res.DAG||"")+" "+(res.DAJ||"")+" "+(res.DAK||"")).trim(),vencimiento:venc};
 }catch(e){return null}
 }
 async function leerCodigoDeCanvas(cv){
@@ -800,7 +802,15 @@ var buf="";
 for(var j=0;j<pedazos.length;j++){
 if(pedazos[j].length>0){buf+=pedazos[j];if(buf.length===8){fechas.push(buf);buf=""}}else{if(buf.length===8)fechas.push(buf);buf=""}}
 if(buf.length===8)fechas.push(buf);
-return {nombre:nombre,texto:t.trim().substring(0,400),fechas:fechas};
+var venc2="";
+var hoyS=new Date().toISOString().substring(0,10);
+var mejor=-1;
+for(var f2=0;f2<fechas.length;f2++){
+var fs=fechas[f2];var fs2=fs.substring(4,8)+"-"+fs.substring(0,2)+"-"+fs.substring(2,4);
+var fd=new Date(fs2+"T00:00:00");
+if(!isNaN(fd)){var dd2=Math.abs(fd-new Date(hoyS+"T00:00:00"));if(dd2>mejor){mejor=dd2;venc2=fs2}}
+}
+return {nombre:nombre,texto:t.trim().substring(0,400),fechas:fechas,vencimiento:venc2};
 }catch(e){return null}
 }
 async function leerTodo(comp){
@@ -823,8 +833,10 @@ if(fuente.nombre&&nom&&nombresCoinciden(fuente.nombre,nom)){h+="<p style='color:
 else if(fuente.nombre&&nom){h+="<p style='color:#f0b429'>Aviso: el nombre escrito no coincide con el del documento</p>"}
 if(fuente.nombre&&nom.length<3){R("nombre").value=fuente.nombre}
 }
-var fv=R("vencimiento")?R("vencimiento").value:"";
-if(fv){var hoy=new Date();hoy.setHours(0,0,0,0);var fvd=new Date(fv+"T00:00:00");if(fvd&&fvd<hoy){h+="<p style='color:#f85149;font-weight:700'>Documento VENCIDO ("+fv+"): no se acepta.</p>"}else{h+="<p style='color:#3fb950'>Vencimiento del documento: "+fv+"</p>"}}
+if(fuente&&fuente.nacimiento&&fuente.edad>=0){}
+if(fuente&&fuente.vencimiento){var hoy=new Date();hoy.setHours(0,0,0,0);var fvd=new Date(fuente.vencimiento+"T00:00:00");
+if(fvd&&fvd<hoy){h+="<p style='color:#f85149;font-weight:700'>DOCUMENTO VENCIDO ("+fuente.vencimiento+"): leido automaticamente. No se acepta.</p>";minorBloqueado=true}
+else{h+="<p style='color:#3fb950'>Vencimiento leido automaticamente: "+fuente.vencimiento+" — valido</p>"}}
 if(fuente&&fuente.texto){h+="<p style='color:#7c8cf8'>Texto leido por OCR del documento (revisalo y corrige si algo salio mal): "+fuente.texto.split("<").join("&lt;")+"</p>"}
 d.innerHTML=h;
 }
@@ -1220,8 +1232,7 @@ if(c1.length<8){Rr.innerHTML="<p style='color:#f85149'>La clave necesita minimo 
 if(!DF){Rr.innerHTML="<p style='color:#f85149'>Falta el documento frontal (paso 2).</p>";return false}
 if(reqRev&&!DA){Rr.innerHTML="<p style='color:#f85149'>Este documento requiere el reverso (paso 3).</p>";return false}
 if(!DS){Rr.innerHTML="<p style='color:#f85149'>Falta la selfie (paso 4).</p>";return false}
-          var fv2=R("vencimiento")?R("vencimiento").value:"";
-          if(fv2){var hoy2=new Date();hoy2.setHours(0,0,0,0);var fvd2=new Date(fv2+"T00:00:00");if(fvd2&&fvd2<hoy2){Rr.innerHTML="<p style='color:#f85149;font-weight:700'>DOCUMENTO VENCIDO ("+fv2+"): un documento vencido no es prueba de identidad legal. NO se crea el ZID.</p>";window.scrollTo(0,document.body.scrollHeight);return false}}
+          if(minorBloqueado){Rr.innerHTML="<p style='color:#f85149'>Registro bloqueado: documento vencido o menor detectado por la lectura automatica.</p>";window.scrollTo(0,document.body.scrollHeight);return false}
 Rr.innerHTML="<p style='color:#8b949e'>Enviando a la Red ("+kb(DF)+" y "+kb(DS)+" KB)...</p>";
 window.scrollTo(0,document.body.scrollHeight);
 try{var r=await fetch("/registro/nuevo",{method:"POST",headers:{"Content-Type":"application/json"},

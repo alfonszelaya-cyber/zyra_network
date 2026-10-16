@@ -538,11 +538,11 @@ a{color:#a78bfa}
 <div id="resp"></div>
 </form>
 <p style="text-align:center;margin-top:14px"><a href="/">Volver</a> | <a href="/entrar">Ya tengo ZID</a></p>
-<p style="text-align:center;color:#4a4f7a;font-size:11px;margin-top:10px">ZYRA registro v24 - todo leido automatico</p>
+<p style="text-align:center;color:#4a4f7a;font-size:11px;margin-top:10px">ZYRA registro v25 - bloqueos reales</p>
 <script>
 window.onerror=function(m,u,l){try{var b=document.getElementById("jserr");if(b){b.style.display="block";b.innerHTML="Error interno (linea "+l+"): "+m}}catch(e){}};
 var DF="",DA="",DS="";
-var datosDocF=null,datosDocA=null,minorBloqueado=false;
+var datosDocF=null,datosDocA=null,minorBloqueado=false,docVencido=false,nombreNoCoincide=false;
 var docImg=null,docLado="",docCrudoF="",docCrudoA="",editListo=false;
 var quad=null,procesandoDoc=false;
 var cam=null,cara=null,alineado=false,detTipo="",apiCara=null,mpDetector=null,capturando=false;
@@ -742,10 +742,10 @@ res[fnd[i][1]]=raw.slice(fnd[i][0]+3,fin).trim();
 if(!res.DBB||res.DBB.length<8)return null;
 var iso=res.DBB.slice(4,8)+"-"+res.DBB.slice(0,2)+"-"+res.DBB.slice(2,4);
 var venc="";
-var clv=["DBA","DBD"];
+var clv=["DBA"];
 for(var v2=0;v2<clv.length;v2++){var rv=res[clv[v2]];if(rv&&rv.length===8){var fv2b=rv.slice(4,8)+"-"+rv.slice(0,2)+"-"+rv.slice(2,4);if(!venc)venc=fv2b}}
-if(!venc&&res.DBB){var maxd=res.DBB;var mx2=(maxd.slice(4,8)+"-"+maxd.slice(0,2)+"-"+maxd.slice(2,4));venc=mx2}
-return {nombre:((res.DAC||"")+" "+(res.DAD||"")+" "+(res.DAB||"")).trim(),nacimiento:iso,edad:edadDe(iso),numero:(res.DAQ||res.DCF||""),direccion:((res.DAI||"")+" "+(res.DAG||"")+" "+(res.DAJ||"")+" "+(res.DAK||"")).trim(),vencimiento:venc};
+
+return {nombre:((res.DAC||"")+" "+(res.DAD||"")+" "+(res.DAB||"")).trim(),nacimiento:iso,edad:edadDe(iso),numero:(res.DAQ||res.DCF||""),direccion:((res.DAI||"")+" "+(res.DAG||"")+" "+(res.DAJ||"")+" "+(res.DAK||"")).trim(),vencimiento:venc,confiable:true};
 }catch(e){return null}
 }
 async function leerCodigoDeCanvas(cv){
@@ -794,7 +794,7 @@ var nombre="";
 for(var i=0;i<lineas.length;i++){
 var ln=sinRaros(lineas[i]).trim();
 var partes=ln.split(" ").filter(function(x){return x.length>2});
-if(partes.length>=2&&!nombre){nombre=partes.join(" ")}
+
 }
 var fechas=[];
 var pedazos=t.split(/[^0-9]/);
@@ -803,29 +803,51 @@ for(var j=0;j<pedazos.length;j++){
 if(pedazos[j].length>0){buf+=pedazos[j];if(buf.length===8){fechas.push(buf);buf=""}}else{if(buf.length===8)fechas.push(buf);buf=""}}
 if(buf.length===8)fechas.push(buf);
 var venc2="";
-var hoyS=new Date().toISOString().substring(0,10);
-var mejor=-1;
-for(var f2=0;f2<fechas.length;f2++){
-var fs=fechas[f2];var fs2=fs.substring(4,8)+"-"+fs.substring(0,2)+"-"+fs.substring(2,4);
-var fd=new Date(fs2+"T00:00:00");
-if(!isNaN(fd)){var dd2=Math.abs(fd-new Date(hoyS+"T00:00:00"));if(dd2>mejor){mejor=dd2;venc2=fs2}}
+var t2=t.toUpperCase();
+var lineas2=t2.split(String.fromCharCode(10));
+for(var li=0;li<lineas2.length;li++){
+var LN=lineas2[li];
+var nums=LN.replace(/[^0-9]/g," ").split(" ").filter(function(x){return x.length===8});
+if(!nums.length)continue;
+var f0=nums[0];
+var fiso=f0.substring(4,8)+"-"+f0.substring(0,2)+"-"+f0.substring(2,4);
+var fd=new Date(fiso+"T00:00:00");
+if(isNaN(fd))continue;
+var esVenc=(LN.indexOf("EXP")>=0||LN.indexOf("VENC")>=0||LN.indexOf("CADU")>=0);
+if(esVenc&&!venc2)venc2=fiso;
 }
-return {nombre:nombre,texto:t.trim().substring(0,400),fechas:fechas,vencimiento:venc2};
+return {nombre:null,texto:t.trim().substring(0,400),fechas:fechas,vencimiento:venc2,confiable:false};
 }catch(e){return null}
 }
 async function leerTodo(comp){
 var r1=await leerCodigo(comp);
 if(r1)return r1;
 var r2=await ocrDoc(comp);
-if(r2){try{var nm=R("nombre").value.trim();if(r2.nombre&&nm.length<3){R("nombre").value=r2.nombre}}catch(e){}}
+
 return r2;
 }
 function mostrarDesglose(){
 var d=R("desglose");if(!d)return;
 var h="";var fuente=null,nom=R("nombre").value.trim();
-if(datosDocF){fuente=datosDocF;h+="<p style='color:#3fb950'>FRONTAL leido: "+(fuente.nombre||"(sin nombre)")+" | Nac: "+(fuente.nacimiento||"?")+" | Edad: "+fuente.edad+"</p>"}
-if(datosDocA){fuente=datosDocA;h+="<p style='color:#3fb950'>REVERSO leido: "+(fuente.nombre||"(sin nombre)")+" | Nac: "+(fuente.nacimiento||"?")+" | Edad: "+fuente.edad+" | No.: "+(fuente.numero||"(no leido)")+((fuente.direccion)?" | Dir: "+fuente.direccion:"")+"</p>"}
-if(!datosDocF&&!datosDocA){h="<p style='color:#9aa0c3'>Desglose: este documento no trae codigo legible (o no se detecto). El registro sigue normal.</p>";minorBloqueado=false}
+if(datosDocF){fuente=datosDocF;
+if(fuente.confiable&&fuente.nombre){
+h+="<p style='color:#3fb950'>FRONTAL (codigo del documento): "+fuente.nombre+" | Nac: "+(fuente.nacimiento||"?")+" | Edad: "+fuente.edad+"</p>";
+var nomE=R("nombre").value.trim();
+if(nomE.length>=3&&!nombresCoinciden(fuente.nombre,nomE)){nombreNoCoincide=true;h+="<p style='color:#f85149;font-weight:700'>NO COINCIDE: el nombre escrito y el del documento difieren. Corrige tu nombre o usa el documento correcto.</p>"}
+else{h+="<p style='color:#3fb950'>Cruce de nombre: coincide</p>"}}
+else{h+="<p style='color:#9aa0c3'>FRONTAL: sin datos automaticos legibles (el DUI no trae codigo). La foto queda guardada y el motor verificara tu rostro.</p>"}}
+if(datosDocA){fuente=datosDocA;
+var partes=[];
+if(fuente.numero)partes.push("No.: "+fuente.numero);
+if(fuente.direccion)partes.push("Dir: "+fuente.direccion);
+if(fuente.confiable&&fuente.nombre)partes.push("Nombre: "+fuente.nombre);
+h+="<p style='color:#3fb950'>REVERSO: "+(partes.length?partes.join(" | "):"sin datos automaticos legibles — foto guardada")+"</p>";
+if(fuente.vencimiento){var hoy=new Date();hoy.setHours(0,0,0,0);var fvd=new Date(fuente.vencimiento+"T00:00:00");
+if(fvd&&fvd<hoy){docVencido=true;h+="<p style='color:#f85149;font-weight:700'>DOCUMENTO VENCIDO ("+fuente.vencimiento+"): leido automaticamente. NO SE ACEPTA.</p>"}
+else{h+="<p style='color:#3fb950'>Vencimiento leido: "+fuente.vencimiento+" — valido</p>"}}
+if(fuente.nacimiento){var ed2=edadDe(fuente.nacimiento);if(ed2>=0&&ed2<18){minorBloqueado=true;h+="<p style='color:#f85149;font-weight:700'>MENOR DE EDAD ("+ed2+"): se registra con tutor.</p>"}}
+}}
+if(!datosDocF&&!datosDocA){h="<p style='color:#9aa0c3'>Desglose: este documento no trae codigo legible. El motor verificara tu rostro contra el documento.</p>";minorBloqueado=false;docVencido=false;nombreNoCoincide=false}
 if(fuente){
 if(fuente.edad>=0&&fuente.edad<18){minorBloqueado=true;h+="<p style='color:#f85149;font-weight:700'>MENOR DE EDAD ("+fuente.edad+"): registro de adultos bloqueado. Los menores se registran con tutor.</p>"}
 else{minorBloqueado=false;if(fuente.edad>=0){h+="<p style='color:#3fb950'>Mayoria de edad por documento: "+fuente.edad+" anos</p>"}}
@@ -1083,7 +1105,7 @@ if(l=="F"){DF=comp}else{DA=comp}
 var pv=R(l=="F"?"pF":"pA");
 pv.src="data:image/jpeg;base64,"+comp;pv.style.display="block";
 var st=R("st"+l);
-st.innerHTML=txt;st.className="estado chk";
+st.innerHTML=(l=="F"?"LADO FRONTAL guardado — ":"LADO REVERSO guardado — ")+txt;st.className="estado chk";
 R("zonaEdit").style.display="none";docImg=null;
 mostrarDesglose();
 if(l=="F"){irAPaso(3)}else{R("bIr4").disabled=false;irAPaso(4)}
@@ -1232,7 +1254,9 @@ if(c1.length<8){Rr.innerHTML="<p style='color:#f85149'>La clave necesita minimo 
 if(!DF){Rr.innerHTML="<p style='color:#f85149'>Falta el documento frontal (paso 2).</p>";return false}
 if(reqRev&&!DA){Rr.innerHTML="<p style='color:#f85149'>Este documento requiere el reverso (paso 3).</p>";return false}
 if(!DS){Rr.innerHTML="<p style='color:#f85149'>Falta la selfie (paso 4).</p>";return false}
-          if(minorBloqueado){Rr.innerHTML="<p style='color:#f85149'>Registro bloqueado: documento vencido o menor detectado por la lectura automatica.</p>";window.scrollTo(0,document.body.scrollHeight);return false}
+          if(docVencido){Rr.innerHTML="<p style='color:#f85149;font-weight:700'>DOCUMENTO VENCIDO: no es prueba de identidad legal. NO se crea el ZID.</p>";window.scrollTo(0,document.body.scrollHeight);return false}
+if(minorBloqueado){Rr.innerHTML="<p style='color:#f85149;font-weight:700'>MENOR DE EDAD detectado: los menores se registran con tutor. NO se crea ZID de adulto.</p>";window.scrollTo(0,document.body.scrollHeight);return false}
+if(nombreNoCoincide){Rr.innerHTML="<p style='color:#f85149;font-weight:700'>El nombre escrito NO coincide con el del documento. Corrigelo para crear tu ZID.</p>";window.scrollTo(0,document.body.scrollHeight);return false}
 Rr.innerHTML="<p style='color:#8b949e'>Enviando a la Red ("+kb(DF)+" y "+kb(DS)+" KB)...</p>";
 window.scrollTo(0,document.body.scrollHeight);
 try{var r=await fetch("/registro/nuevo",{method:"POST",headers:{"Content-Type":"application/json"},
@@ -1457,6 +1481,10 @@ setTimeout(function(){ensureCara()},800);
                 emsg = ""
                 if isinstance(je_.get("error"), dict):
                     emsg = str(je_["error"].get("message", ""))
+            if je_["error"].get("reason"):
+                emsg += " | razon: " + str(je_["error"].get("reason"))[:220]
+            if je_["error"].get("case_status"):
+                emsg += " | estado: " + str(je_["error"].get("case_status"))
                 if not emsg:
                     emsg = cuerpo_e[:250] or ("HTTP " + str(status_e))
                 self._send(502, "application/json", json.dumps({"ok": False, "error": emsg}).encode())

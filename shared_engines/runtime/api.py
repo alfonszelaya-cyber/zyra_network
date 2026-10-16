@@ -103,6 +103,19 @@ class ZyraApiHandler(BaseHTTPRequestHandler):
         if segments == ["health"] and method == "GET":
             self._handle_health()
             return
+        if segments == ["provider"] and method == "GET":
+            _bio = getattr(type(self).kernel, "_biometrics", None)
+            _prov = getattr(_bio, "_provider", None)
+            self._send_json(
+                200,
+                {
+                    "ok": True,
+                    "data": {
+                        "provider": str(getattr(_prov, "name", "unknown")),
+                    },
+                },
+            )
+            return
         if (
             len(segments) == 2
             and segments[0] == "verify-existence"

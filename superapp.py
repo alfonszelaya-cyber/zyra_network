@@ -539,7 +539,7 @@ a{color:#a78bfa}
 <div id="resp"></div>
 </form>
 <p style="text-align:center;margin-top:14px"><a href="/">Volver</a> | <a href="/entrar">Ya tengo ZID</a></p>
-<p style="text-align:center;color:#4a4f7a;font-size:11px;margin-top:10px">ZYRA registro v25 - bloqueos reales</p>
+<p style="text-align:center;color:#4a4f7a;font-size:11px;margin-top:10px">ZYRA registro v26 - fotos que no se pierden</p>
 <script>
 window.onerror=function(m,u,l){try{var b=document.getElementById("jserr");if(b){b.style.display="block";b.innerHTML="Error interno (linea "+l+"): "+m}}catch(e){}};
 var DF="",DA="",DS="";
@@ -548,6 +548,8 @@ var docImg=null,docLado="",docCrudoF="",docCrudoA="",editListo=false;
 var quad=null,procesandoDoc=false;
 var cam=null,cara=null,alineado=false,detTipo="",apiCara=null,mpDetector=null,capturando=false;
 var promesaCara=null;
+function saveSes(){try{sessionStorage.setItem("zyraReg",JSON.stringify({DF:DF,DA:DA,DS:DS,nm:R("nombre").value,td:R("tipoDoc").value,paso:(document.querySelector(".paso.act")||{}).id}))}catch(e){}}
+function loadSes(){try{var s=sessionStorage.getItem("zyraReg");if(!s)return null;return JSON.parse(s)}catch(e){return null}}
 var ZX=null,zxListo=false;
 function R(id){return document.getElementById(id)}
 function kb(s){return Math.round(s.length*3/4/1024)}
@@ -617,6 +619,7 @@ function irAPaso(n){
 var i;
 for(i=1;i<=5;i++){var e=R("ps"+i);if(e)e.className="paso"+(i==n?" act":"")}
 R("prog").innerHTML="PASO "+n+" DE 5";
+          saveSes();
 if(n!=4){stopCam()}
 if(n==2){R("stF").innerHTML=DF?("FRONTAL guardado: "+kb(DF)+" KB — toca la foto para rehacer"):"Este paso guarda el lado FRONTAL (la cara con tu foto).";}
 if(n==3){
@@ -1109,6 +1112,7 @@ pv.src="data:image/jpeg;base64,"+comp;pv.style.display="block";
 var st=R("st"+l);
 st.innerHTML=(l=="F"?"LADO FRONTAL guardado — ":"LADO REVERSO guardado — ")+txt;st.className="estado chk";
 R("zonaEdit").style.display="none";docImg=null;
+          saveSes();
 mostrarDesglose();
 if(l=="F"){irAPaso(3)}else{R("bIr4").disabled=false;irAPaso(4)}
 }
@@ -1238,6 +1242,7 @@ stopCam();
 R("bAbrirCam").style.display="none";
 R("bRepSelfie").style.display="block";
 R("bIr5").style.display="block";
+          saveSes();
 R("pS").src="data:image/jpeg;base64,"+comp;R("pS").style.display="block";
 st.innerHTML="SELFIE GUARDADA: "+kb(comp)+" KB (luz "+Math.round(L)+"/100, encuadre verificado)";st.className="estado chk";
 capturando=false;R("bSelfie").disabled=false;
@@ -1270,6 +1275,20 @@ else{Rr.innerHTML="<p style='color:#f85149;font-weight:700'>NO SE PUDO CREAR EL 
 catch(e){Rr.innerHTML="<div style='background:#2a1414;border:1px solid #f85149;border-radius:12px;padding:14px'><p style='color:#f85149;font-weight:700'>La Red no respondio</p><p>Detalle tecnico: "+e+"</p></div>";}
 window.scrollTo(0,document.body.scrollHeight);
 return false}
+(function(){var s=loadSes();if(s&&(s.DF||s.DA||s.DS)){
+DF=s.DF||"";DA=s.DA||"";DS=s.DS||"";
+if(s.nm)R("nombre").value=s.nm;
+if(s.td)R("tipoDoc").value=s.td;
+var dest=2;
+if(DS){dest=5}else if(DA){dest=4}else if(DF){dest=3}
+irAPaso(dest);
+if(DF){var pF2=R("pF");pF2.src="data:image/jpeg;base64,"+DF;pF2.style.display="block"}
+if(DA){var pA2=R("pA");pA2.src="data:image/jpeg;base64,"+DA;pA2.style.display="block"}
+if(DS){var pS2=R("pS");pS2.src="data:image/jpeg;base64,"+DS;pS2.style.display="block";R("bIr5").style.display="block"}
+if(DA&&R("tipoDoc").value!="pasaporte"){R("bIr4").disabled=false}
+mostrarDesglose();
+var rst=R("resp");if(rst)rst.innerHTML="<p style='color:#7c8cf8'>Sesion restaurada: tus fotos siguen aqui. Continua donde ibas.</p>";
+}})();
 setTimeout(function(){ensureCara()},800);
 </script>
 </body>

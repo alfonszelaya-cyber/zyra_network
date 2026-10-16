@@ -789,7 +789,7 @@ if(!window.Tesseract)return null;
 var ret=await Tesseract.recognize("data:image/jpeg;base64,"+dataUrl,"eng");
 var t=(ret&&ret.data&&ret.data.text)?ret.data.text:"";
 if(t.trim().length<20)return null;
-var lineas=t.split("\n");
+var lineas=t.split(String.fromCharCode(10));
 var nombre="";
 for(var i=0;i<lineas.length;i++){
 var ln=sinRaros(lineas[i]).trim();

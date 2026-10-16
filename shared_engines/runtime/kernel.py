@@ -173,6 +173,7 @@ def _make_biometric_provider() -> object:
         .strip()
         .lower()
     )
+    print("ZYRA provider seleccionado: " + choice, flush=True)
     if choice == "zyra":
         try:
             from shared_engines.security.biometrics_face import (
@@ -301,8 +302,12 @@ class ZyraKernel:
                 )
                 self._log.info(
                     "biometrics engine wired"
-                    " (fail-closed provider"
-                    " until face model installed)"
+                    " (provider: %s)",
+                    getattr(
+                        getattr(self._biometrics, "_provider", None),
+                        "name",
+                        "unknown",
+                    ),
                 )
             except Exception as exc:
                 self._log.error(

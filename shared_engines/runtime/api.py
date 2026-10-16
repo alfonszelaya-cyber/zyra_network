@@ -971,16 +971,15 @@ class ZyraApiHandler(BaseHTTPRequestHandler):
 
     # ---------------------------------------- proofing (additive)
 
-    def _proofing_engine(self) -> Any:
-        engine = type(self).kernel.biometrics
-        if engine is None:
+    def _proofing_engine(self):
+        bio = getattr(type(self).kernel, "_biometrics", None)
+        if bio is None:
             raise ApiError(
                 503,
-                "biometrics_unavailable",
-                "proofing engine not configured",
+                "not_wired",
+                "kernel._biometrics ausente",
             )
-        return engine
-
+        return bio
     def _proofing_image(
         self, doc: dict[str, Any], key: str
     ) -> bytes:

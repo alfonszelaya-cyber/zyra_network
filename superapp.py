@@ -534,7 +534,7 @@ a{color:#a78bfa}
 <div id="resp"></div>
 </form>
 <p style="text-align:center;margin-top:14px"><a href="/">Volver</a> | <a href="/entrar">Ya tengo ZID</a></p>
-<p style="text-align:center;color:#4a4f7a;font-size:11px;margin-top:10px">ZYRA registro v33 - escaner OpenCV profesional</p>
+<p style="text-align:center;color:#4a4f7a;font-size:11px;margin-top:10px">ZYRA registro v34 - lectura corregida y probada</p>
 <script>
 window.onerror=function(m,u,l){try{var b=document.getElementById("jserr");if(b){b.style.display="block";b.innerHTML="Error interno (linea "+l+"): "+m}}catch(e){}};
 var DF="",DA="",DS="";
@@ -678,39 +678,55 @@ return {nombre:(nombre&&nombre.length>3)?nombre:null,nacimiento:nac,edad:(nac?ed
 }
 function fechasDeTexto(t){
 var venc="",nac="";
-var lineas=t.toUpperCase().split(String.fromCharCode(10));
+var T=t.toUpperCase();
+var lineas=T.split(String.fromCharCode(10));
 for(var i=0;i<lineas.length;i++){
 var LN=lineas[i];
-var mfechas=LN.match(/(\d{2})[\/\.\-](\d{2})[\/\.\-](\d{4})/g);
+var tieneVenc=(LN.indexOf("EXP")>=0||LN.indexOf("VENC")>=0||LN.indexOf("CADU")>=0);
+var tieneNac=(LN.indexOf("NACIMIENTO")>=0||LN.indexOf("BIRTH")>=0||LN.indexOf("DOB")>=0);
+if(!tieneVenc&&!tieneNac)continue;
+var ventana=LN;
+for(var w=1;w<=2;w++){if(lineas[i+w])ventana=ventana+" "+lineas[i+w]}
+var mfechas=ventana.match(/(\d{1,2})[\/\.\-](\d{1,2})[\/\.\-](\d{4})/g);
 if(!mfechas)continue;
-var esVenc=(LN.indexOf("EXP")>=0||LN.indexOf("VENC")>=0||LN.indexOf("CADU")>=0);
-var esNac=(LN.indexOf("NACIMIENTO")>=0||LN.indexOf("BIRTH")>=0||LN.indexOf("DOB")>=0);
-if(esVenc&&!venc){var p=mfechas[0].split(/[\/\.\-]/);venc=p[2]+"-"+p[1]+"-"+p[0]}
-if(esNac&&!nac){var p2=mfechas[0].split(/[\/\.\-]/);nac=p2[2]+"-"+p2[1]+"-"+p2[0]}
+var p=mfechas[0].split(/[\/\.\-]/);
+var iso=p[2]+"-"+("0"+p[1]).slice(-2)+"-"+("0"+p[0]).slice(-2);
+if(tieneVenc&&!venc)venc=iso;
+if(tieneNac&&!nac)nac=iso;
 }
 return {vencimiento:venc,nacimiento:nac};
 }
+
 function nombreDeTexto(t){
 try{
-var t2=t.toUpperCase();
-var idx=t2.indexOf("GIVEN NAME");
-if(idx<0)idx=t2.indexOf("NOMBRE /S");
-if(idx<0)idx=t2.indexOf("NOMBRES");
-if(idx<0)idx=t2.indexOf("NOMBRE /");
+var T=t.toUpperCase();
+var etiquetas=["GIVEN NAME","NOMBRES","NOMBRE /"];
+var idx=-1,usada="";
+for(var e2=0;e2<etiquetas.length;e2++){
+var ix2=T.indexOf(etiquetas[e2]);
+if(ix2>=0){idx=ix2;usada=etiquetas[e2];break}
+}
 if(idx<0)return null;
-var resto=t2.substring(idx);
-var ls=resto.split(String.fromCharCode(10));
+var misma=T.substring(idx+usada.length);
+var finL=misma.indexOf(String.fromCharCode(10));
+var enMisma=(finL>=0?misma.substring(0,finL):misma).replace(/[^A-Z ]/g," ").trim();
 var cand=[];
-for(var k=1;k<ls.length&&k<4;k++){
+var pp1=enMisma.split(/\s+/).filter(function(x){return x.length>2});
+if(pp1.length>=1)cand.push(pp1.join(" "));
+if(!cand.length){
+var resto=(finL>=0?misma.substring(finL):"");
+var ls=resto.split(String.fromCharCode(10));
+for(var k=0;k<ls.length&&k<3;k++){
 var cln=ls[k].replace(/[^A-Z ]/g," ").trim();
 var pp=cln.split(/\s+/).filter(function(x){return x.length>2});
-if(pp.length>=1)cand.push(pp.join(" "));
-if(cand.length>=2)break;
+if(pp.length>=1){cand.push(pp.join(" "));break}
+}
 }
 if(cand.length){var nm=cand.join(" ");return (nm.length>3)?nm:null}
 return null;
 }catch(e){return null}
 }
+
 async function ocrPatrones(dataUrl){
 try{
 if(!window.Tesseract)return null;

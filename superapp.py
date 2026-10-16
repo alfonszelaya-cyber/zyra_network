@@ -431,7 +431,6 @@ class PortalHandler(BaseHTTPRequestHandler):
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>ZYRA - Crear mi ZID</title>
-<script src="https://unpkg.com/@zxing/library@0.21.3/umd/index.min.js"></script>
 <script src="https://cdn.jsdelivr.net/npm/tesseract.js@5/dist/tesseract.min.js"></script>
 <style>
 *{box-sizing:border-box;margin:0;padding:0}
@@ -452,8 +451,8 @@ button:disabled{opacity:.45}
 .mini{background:none;color:#a78bfa;font-size:13px;padding:8px;width:auto;margin:4px auto;display:block;border:none;cursor:pointer}
 #zonaEdit{display:none;margin-top:8px;background:#0d1126;border:1px solid #2a2f55;border-radius:12px;padding:10px}
 #cvEdit{width:100%;touch-action:none;border-radius:8px;display:block}
-#videozona{display:none;position:relative;border-radius:12px;overflow:hidden;margin-top:8px;background:#000}
-video{width:100%;display:block;transform:scaleX(-1)}
+.videozona{display:none;position:relative;border-radius:12px;overflow:hidden;margin-top:8px;background:#000}
+video{width:100%;display:block}
 .ov{position:absolute;left:0;top:0;width:100%;height:100%;pointer-events:none}
 a{color:#a78bfa}
 #desglose{margin-top:14px;font-size:13px}
@@ -484,42 +483,47 @@ a{color:#a78bfa}
 <button type="button" class="big" onclick="irDe1()">Continuar</button>
 </div>
 <div class="paso" id="ps2">
-<div class="titulopaso">LADO FRONTAL — toma la cara con tu foto</div>
-<input type="file" id="fileF" accept="image/*" capture="environment" style="display:none" onchange="cargarDoc(this,'F')">
-<input type="file" id="galF" accept="image/*" style="display:none" onchange="cargarDoc(this,'F')">
-<button type="button" class="big" id="btF" onclick="tomarFoto('F')">TOMAR FOTO FRONTAL</button>
-<button type="button" class="mini" onclick="elegirArchivo('F')">o elegir archivo existente</button>
+<div class="titulopaso">PASO 2: LADO FRONTAL (la cara con tu foto)</div>
+<div class="videozona" id="vzDoc"><video id="vd" autoplay playsinline muted></video><canvas class="ov" id="ovDoc"></canvas></div>
+<div class="estado" id="stDoc">Pulsa ABRIR CAMARA: el recuadro buscara el documento solo.</div>
+<button type="button" class="big" id="bAbrirDoc" onclick="abrirCamDoc()">ABRIR CAMARA</button>
+<button type="button" class="ok" id="bCaptDoc" style="display:none" onclick="capturarDoc()">CAPTURAR FOTO</button>
+<input type="file" id="galF" accept="image/*" style="display:none" onchange="desdeArchivo(this,'F')">
+<button type="button" class="mini" onclick="R('galF').click()">o elegir archivo existente</button>
 <div class="estado" id="stF"></div>
-<img class="preview" id="pF" alt="" onclick="reeditar('F')">
+<img class="preview" id="pF" alt="" onclick="rehacer('F')">
 <button type="button" class="mini" onclick="irAPaso(1)">Volver</button>
 </div>
 <div class="paso" id="ps3">
-<div class="titulopaso">LADO DE ATRAS (REVERSO)</div>
-<input type="file" id="fileA" accept="image/*" capture="environment" style="display:none" onchange="cargarDoc(this,'A')">
-<input type="file" id="galA" accept="image/*" style="display:none" onchange="cargarDoc(this,'A')">
-<button type="button" class="big" id="btA" onclick="tomarFoto('A')">TOMAR FOTO REVERSO</button>
-<button type="button" class="mini" onclick="elegirArchivo('A')">o elegir archivo existente</button>
+<div class="titulopaso">PASO 3: LADO DE ATRAS (REVERSO)</div>
+<div class="videozona" id="vzDocA"><video id="vdA" autoplay playsinline muted></video><canvas class="ov" id="ovDocA"></canvas></div>
+<div class="estado" id="stDocA">Pulsa ABRIR CAMARA: el recuadro buscara el documento solo.</div>
+<button type="button" class="big" id="bAbrirDocA" onclick="abrirCamDocA()">ABRIR CAMARA</button>
+<button type="button" class="ok" id="bCaptDocA" style="display:none" onclick="capturarDocA()">CAPTURAR FOTO</button>
+<input type="file" id="galA" accept="image/*" style="display:none" onchange="desdeArchivo(this,'A')">
+<button type="button" class="mini" onclick="R('galA').click()">o elegir archivo existente</button>
 <div class="estado" id="stA"></div>
-<img class="preview" id="pA" alt="" onclick="reeditar('A')">
+<img class="preview" id="pA" alt="" onclick="rehacer('A')">
 <div class="estado" id="notaRev"></div>
 <button type="button" class="ok" id="bIr4" disabled onclick="irAPaso(4)">Continuar</button>
 <button type="button" class="mini" onclick="saltarReverso()">Mi documento no tiene reverso: continuar sin el</button>
 <button type="button" class="mini" onclick="irAPaso(2)">Volver</button>
 </div>
 <div class="paso" id="ps4">
-<label>3) Selfie en vivo (rostro entero dentro de la guia, buena luz)</label>
-<div id="videozona"><video id="v" autoplay playsinline muted></video><canvas class="ov" id="ov"></canvas></div>
+<div class="titulopaso">PASO 4: BIOMETRIA — tu rostro en vivo</div>
+<div class="videozona" id="vzS"><video id="v" autoplay playsinline muted style="transform:scaleX(-1)"></video><canvas class="ov" id="ovS"></canvas></div>
 <div class="estado" id="stProv">Motor de deteccion: preparando...</div>
-<div class="estado" id="stV">Pulsa ABRIR CAMARA para comenzar</div>
+<div class="estado" id="stV">Pulsa ABRIR CAMARA</div>
 <button type="button" class="big" id="bAbrirCam" onclick="abrirCamara()">ABRIR CAMARA</button>
 <button type="button" class="ok" id="bSelfie" style="display:none" onclick="capturarSelfie()">CAPTURAR SELFIE</button>
 <button type="button" id="bRepSelfie" style="display:none" onclick="abrirCamara()">REPETIR SELFIE</button>
 <img class="preview" id="pS" alt="">
+<div class="estado" id="stBio"></div>
 <button type="button" class="ok" id="bIr5" style="display:none" onclick="irAPaso(5)">Continuar</button>
 <button type="button" class="mini" onclick="irAPaso(3)">Volver</button>
 </div>
 <div class="paso" id="ps5">
-<label>4) Crea tu clave de acceso (min 8)</label>
+<label>5) Crea tu clave de acceso (min 8)</label>
 <input type="password" id="clave">
 <label>Repite la clave</label>
 <input type="password" id="clave2">
@@ -527,11 +531,10 @@ a{color:#a78bfa}
 <button type="button" class="mini" onclick="irAPaso(4)">Volver</button>
 </div>
 <div id="zonaEdit">
-          <div id="titLado" style="text-align:center;color:#7c8cf8;font-weight:800;font-size:15px;padding:4px"></div>
-<p style="color:#9aa0c3;font-size:13px;text-align:center">Mueve las 4 bolas verdes a las ESQUINAS del documento.</p>
+<p style="color:#9aa0c3;font-size:13px;text-align:center" id="titLado"></p>
 <canvas id="cvEdit"></canvas>
-<button type="button" class="mini" onclick="autoEsquinas()">Reintentar deteccion automatica</button>
-<button type="button" class="ok" onclick="recortarDoc()">Recortar y GUARDAR (escaneo recto)</button>
+<p style="color:#9aa0c3;font-size:13px;text-align:center">Ajusta las 4 bolas verdes a las esquinas de la tarjeta.</p>
+<button type="button" class="ok" onclick="recortarDoc()">Recortar y GUARDAR</button>
 <button type="button" onclick="usarFotoCompleta()">Usar foto completa sin recortar</button>
 </div>
 <div id="desglose"></div>
@@ -539,23 +542,25 @@ a{color:#a78bfa}
 <div id="resp"></div>
 </form>
 <p style="text-align:center;margin-top:14px"><a href="/">Volver</a> | <a href="/entrar">Ya tengo ZID</a></p>
-<p style="text-align:center;color:#4a4f7a;font-size:11px;margin-top:10px">ZYRA registro v27 - recuadro ajustable y envio ligero</p>
+<p style="text-align:center;color:#4a4f7a;font-size:11px;margin-top:10px">ZYRA registro v30 - filtros paso a paso</p>
 <script>
 window.onerror=function(m,u,l){try{var b=document.getElementById("jserr");if(b){b.style.display="block";b.innerHTML="Error interno (linea "+l+"): "+m}}catch(e){}};
 var DF="",DA="",DS="";
-var datosDocF=null,datosDocA=null,minorBloqueado=false,docVencido=false,nombreNoCoincide=false;
-var docImg=null,docLado="",docCrudoF="",docCrudoA="",editListo=false;
+var datosDocF=null,datosDocA=null;
+var minorBloqueado=false,docVencido=false,nombreNoCoincide=false;
+var docImg=null,docLado="",docCrudo="",editListo=false;
 var quad=null,procesandoDoc=false;
 var cam=null,cara=null,alineado=false,detTipo="",apiCara=null,mpDetector=null,capturando=false;
-var promesaCara=null;
-function saveSes(){try{sessionStorage.setItem("zyraReg",JSON.stringify({DF:DF,DA:DA,DS:DS,nm:R("nombre").value,td:R("tipoDoc").value,paso:(document.querySelector(".paso.act")||{}).id}))}catch(e){}}
-function loadSes(){try{var s=sessionStorage.getItem("zyraReg");if(!s)return null;return JSON.parse(s)}catch(e){return null}}
-var ZX=null,zxListo=false;
+var promesaCara=null,faListo=false;
+var camD=null,timerDoc=null,quadLive=null;
+var camA=null,timerDocA=null,quadLiveA=null;
 function R(id){return document.getElementById(id)}
 function kb(s){return Math.round(s.length*3/4/1024)}
 function dormir(ms){return new Promise(function(res){setTimeout(res,ms)})}
 function partesNombre(v){return (v||"").trim().split(/\s+/).filter(function(x){return x.length>1})}
 function propIdeal(){return R("tipoDoc").value=="pasaporte"?1.41:1.586}
+function saveSes(){try{sessionStorage.setItem("zyraReg",JSON.stringify({DF:DF,DA:DA,DS:DS,nm:R("nombre").value,td:R("tipoDoc").value,paso:(document.querySelector(".paso.act")||{}).id}))}catch(e){}}
+function loadSes(){try{var s=sessionStorage.getItem("zyraReg");if(!s)return null;return JSON.parse(s)}catch(e){return null}}
 function zyComprimir(dataUrl,maxLado,calidad){return new Promise(function(res){var im=new Image();im.onload=function(){var w=im.width,h=im.height,e=Math.min(1,maxLado/Math.max(w,h)),c=document.createElement("canvas");c.width=Math.round(w*e);c.height=Math.round(h*e);c.getContext("2d").drawImage(im,0,0,c.width,c.height);res(c.toDataURL("image/jpeg",calidad).split(",").pop())};im.onerror=function(){res(dataUrl.split(",").pop())};im.src=dataUrl})}
 function luma(dataUrl){return new Promise(function(res){var im=new Image();im.onload=function(){var c=document.createElement("canvas");c.width=40;c.height=40;c.getContext("2d").drawImage(im,0,0,40,40);var d=c.getContext("2d").getImageData(0,0,40,40).data,t=0;for(var i=0;i<d.length;i+=4){t+=0.299*d[i]+0.587*d[i+1]+0.114*d[i+2]}res(t/(d.length/4))};im.onerror=function(){res(99)};im.src=dataUrl})}
 function cargarScript(s){return new Promise(function(res,rej){var e=document.createElement("script");e.src=s;e.onload=res;e.onerror=rej;document.head.appendChild(e)})}
@@ -565,29 +570,26 @@ function ensureCara(){
 if(detTipo)return Promise.resolve(detTipo);
 if(!promesaCara){
 promesaCara=(async function(){
-try{if(window.ZXing&&ZXing.BrowserMultiFormatReader){ZX=new ZXing.BrowserMultiFormatReader();zxListo=true}}catch(e){}
-var m=null,fs=null;
 try{
-m=await import("https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@0.10.14/vision_bundle.mjs");
-fs=await m.FilesetResolver.forVisionTasks("https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@0.10.14/wasm");
-}catch(e){m=null}
-if(m&&fs){
+await cargarScript("https://cdn.jsdelivr.net/npm/face-api.js@0.22.2/dist/face-api.min.js");
+await faceapi.nets.tinyFaceDetector.loadFromUri("https://cdn.jsdelivr.net/gh/justadudewhohacks/face-api.js@0.22.2/weights");
+try{await faceapi.nets.faceLandmark68TinyNet.loadFromUri("https://cdn.jsdelivr.net/gh/justadudewhohacks/face-api.js@0.22.2/weights");await faceapi.nets.faceRecognitionNet.loadFromUri("https://cdn.jsdelivr.net/gh/justadudewhohacks/face-api.js@0.22.2/weights");faListo=true}catch(e2){}
+detTipo="faceapi";setProv("face-api.js"+(faListo?" (con comparador)":""));
+return detTipo;
+}catch(e3){}
+try{
+var m=await import("https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@0.10.14/vision_bundle.mjs");
+var fs=await m.FilesetResolver.forVisionTasks("https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@0.10.14/wasm");
 var dels=["GPU","CPU"];
 for(var i=0;i<dels.length;i++){
 try{
 mpDetector=await m.FaceDetector.createFromOptions(fs,{baseOptions:{modelAssetPath:"https://storage.googleapis.com/mediapipe-models/face_detector/blaze_face_short_range/float16/1/blaze_face_short_range.tflite",delegate:dels[i]},runningMode:"IMAGE",minDetectionConfidence:0.25});
 detTipo="mediapipe";setProv("MediaPipe (Google, "+dels[i]+")");return detTipo;
-}catch(e2){}
+}catch(e4){}
 }
-}
-try{
-await cargarScript("https://cdn.jsdelivr.net/npm/face-api.js@0.22.2/dist/face-api.min.js");
-await faceapi.nets.tinyFaceDetector.loadFromUri("https://cdn.jsdelivr.net/gh/justadudewhohacks/face-api.js@0.22.2/weights");
-detTipo="faceapi";setProv("face-api.js (respaldo)");
-return detTipo;
-}catch(e3){}
-try{if(window.FaceDetector){apiCara=new FaceDetector({fastMode:true,maxDetectedFaces:1});detTipo="nativo";setProv("nativo del navegador");return detTipo}}catch(e4){}
-setProv("NO disponible (exige luz y encuadre manual)");return "";
+}catch(e5){}
+try{if(window.FaceDetector){apiCara=new FaceDetector({fastMode:true,maxDetectedFaces:1});detTipo="nativo";setProv("nativo del navegador");return detTipo}}catch(e6){}
+setProv("NO disponible");return "";
 })();
 }
 return promesaCara;
@@ -605,132 +607,52 @@ return null;
 async function cajaEnVideo(v){
 var t=await ensureCara();if(!t)return null;
 try{
-if(t=="mediapipe")return cajaMP(v);
 if(t=="faceapi"){
 var r=await faceapi.detectSingleFace(v,new faceapi.TinyFaceDetectorOptions({inputSize:320,scoreThreshold:0.3}));
 if(r){return {x:r.box.x,y:r.box.y,w:r.box.width,h:r.box.height}}
 return null;
 }
+if(t=="mediapipe")return cajaMP(v);
 if(t=="nativo"){var fs2=await apiCara.detect(v);if(fs2.length){var b4=fs2[0].boundingBox;return {x:b4.x,y:b4.y,w:b4.width,h:b4.height}}}
 }catch(e){}
 return null;
 }
-function irAPaso(n){
-var i;
-for(i=1;i<=5;i++){var e=R("ps"+i);if(e)e.className="paso"+(i==n?" act":"")}
-R("prog").innerHTML="PASO "+n+" DE 5";
-          saveSes();
-if(n!=4){stopCam()}
-if(n==2){R("stF").innerHTML=DF?("FRONTAL guardado: "+kb(DF)+" KB — toca la foto para rehacer"):"Este paso guarda el lado FRONTAL (la cara con tu foto).";}
-if(n==3){
-var t=R("tipoDoc").value;
-R("stA").innerHTML=DA?("REVERSO guardado: "+kb(DA)+" KB — toca la foto para rehacer"):"Este paso guarda el lado de ATRAS (reverso).";
-if(t=="pasaporte"){R("notaRev").innerHTML="Pasaporte: no tiene reverso. Continua.";R("notaRev").className="estado chk";R("bIr4").disabled=false}
-else if(t=="permiso"){R("notaRev").innerHTML="Si tu permiso tiene reverso, tomale foto. Si no, usa el boton de abajo.";R("notaRev").className="estado";R("bIr4").disabled=!DA}
-else{R("notaRev").innerHTML="Este documento SI requiere reverso.";R("notaRev").className="estado";R("bIr4").disabled=!DA}
-}
-window.scrollTo(0,0);
-}
-function saltarReverso(){
-DA="";R("stA").innerHTML="";R("pA").style.display="none";
-irAPaso(4);
-}
-function irDe1(){
-var nm=R("nombre").value.trim();
-if(nm.length<3||partesNombre(nm).length<2){R("resp").innerHTML="<p style='color:#f85149'>Escribe tu nombre y apellido (ej: Juan Perez).</p>";window.scrollTo(0,document.body.scrollHeight);return}
-R("resp").innerHTML="";
-irAPaso(2);
-}
-function tomarFoto(lado){
-if(procesandoDoc){R("st"+lado).innerHTML="Espera: procesando la foto anterior...";return}
-var inp=R(lado=="F"?"fileF":"fileA");
-inp.value="";
-inp.click();
-}
-function elegirArchivo(lado){
-if(procesandoDoc){R("st"+lado).innerHTML="Espera: procesando la foto anterior...";return}
-var inp=R(lado=="F"?"galF":"galA");
-inp.value="";
-inp.click();
-}
-function quadInicial(im){
-var pr=propIdeal();
-var fw=im.width*0.8,fh=fw/pr;
-if(fh>im.height*0.92){fh=im.height*0.92;fw=fh*pr}
-var x=(im.width-fw)/2,y=(im.height-fh)/2;
-return {tl:{x:x,y:y},tr:{x:x+fw,y:y},br:{x:x+fw,y:y+fh},bl:{x:x,y:y+fh}};
-}
-function detectarEsquinas(im){
+async function rostroEnImagen(dataUrl){
 try{
-var W=460;
-var sc=Math.min(1,W/im.width);
-var cw=Math.max(80,Math.round(im.width*sc)),ch=Math.max(60,Math.round(im.height*sc));
-var c=document.createElement("canvas");c.width=cw;c.height=ch;
-var g=c.getContext("2d");g.drawImage(im,0,0,cw,ch);
-var d=g.getImageData(0,0,cw,ch).data;
-var N=cw*ch;
-var lum=new Float32Array(N);
-var i,s=0,s2=0;
-for(i=0;i<N;i++){var k=i*4;lum[i]=0.299*d[k]+0.587*d[k+1]+0.114*d[k+2];s+=lum[i];s2+=lum[i]*lum[i];}
-var mu=s/N,va=s2/N-mu*mu,de=Math.sqrt(Math.max(0,va))||1;
-var vis=new Uint8Array(N);
-var cola=new Int32Array(N);
-var best=null,bestScore=0;
-var pasadas=[1,-1];
-for(var pi=0;pi<2;pi++){
-var sg=pasadas[pi];
-for(i=0;i<N;i++)vis[i]=0;
-for(i=0;i<N;i++){
-if(vis[i])continue;
-if((lum[i]-mu)*sg<=0.32*de)continue;
-vis[i]=1;
-var qh=0,qt=0;cola[qt++]=i;
-var minx=1e9,maxx=-1,miny=1e9,maxy=-1,cnt=0;
-while(qh<qt){
-var p=cola[qh++];cnt++;
-var py=(p/cw)|0,px=p%cw;
-if(px<minx)minx=px;if(px>maxx)maxx=px;if(py<miny)miny=py;if(py>maxy)maxy=py;
-var q;
-if(px+1<cw){q=p+1;if(!vis[q]&&(lum[q]-mu)*sg>0.32*de){vis[q]=1;cola[qt++]=q}}
-if(px-1>=0){q=p-1;if(!vis[q]&&(lum[q]-mu)*sg>0.32*de){vis[q]=1;cola[qt++]=q}}
-if(py+1<ch){q=p+cw;if(!vis[q]&&(lum[q]-mu)*sg>0.32*de){vis[q]=1;cola[qt++]=q}}
-if(py-1>=0){q=p-cw;if(!vis[q]&&(lum[q]-mu)*sg>0.32*de){vis[q]=1;cola[qt++]=q}}
+var im=new Image();
+var ok=await new Promise(function(res){im.onload=function(){res(true)};im.onerror=function(){res(false)};im.src="data:image/jpeg;base64,"+dataUrl});
+if(!ok)return null;
+var sc=Math.min(1,800/Math.max(im.width,im.height));
+var c=document.createElement("canvas");
+c.width=Math.round(im.width*sc);c.height=Math.round(im.height*sc);
+c.getContext("2d").drawImage(im,0,0,c.width,c.height);
+var t=await ensureCara();
+if(t=="faceapi"){
+var r=await faceapi.detectSingleFace(c,new faceapi.TinyFaceDetectorOptions({inputSize:416,scoreThreshold:0.35}));
+return r?{x:r.box.x/sc,y:r.box.y/sc,w:r.box.width/sc,h:r.box.height/sc}:null;
 }
-var w=(maxx-minx+1)/cw,h2=(maxy-miny+1)/ch;
-var r=w/h2;
-var lleno=cnt/((maxx-minx+1)*(maxy-miny+1)||1);
-if(cnt>N*0.05&&w>0.20&&w<0.99&&h2>0.10&&h2<0.99&&r>0.45&&r<3.4&&lleno>0.55){
-var score=cnt*lleno;
-var dr=Math.abs(r-propIdeal());
-score*=Math.max(0.35,1.6-dr);
-if(score>bestScore){bestScore=score;best={minx:minx,maxx:maxx,miny:miny,maxy:maxy};}
+if(t=="mediapipe"){
+var b=cajaMP(c);
+if(b)return {x:b.x/sc,y:b.y/sc,w:b.w/sc,h:b.h/sc};
 }
-}
-}
-if(!best)return null;
-var mx=((best.minx+best.maxx)/2)*im.width/cw;
-var my=((best.miny+best.maxy)/2)*im.height/ch;
-var gw0=(best.maxx-best.minx+1)*im.width/cw;
-var gh0=(best.maxy-best.miny+1)*im.height/ch;
-var r0=gw0/(gh0||1);
-var pr=propIdeal();
-var gw,ghe;
-if(r0>0.5&&r0<3.2){gw=Math.min(im.width*0.98,gw0*1.10);ghe=Math.min(im.height*0.98,gh0*1.10)}
-else{ghe=Math.min(im.height*0.98,gh0*1.10);gw=ghe*pr}
-if(gw/ghe<0.5){gw=ghe*0.5}
-if(gw/ghe>3.2){gw=ghe*3.2}
-var gx=mx-gw/2,gy=my-ghe/2;
-if(gx<3)gx=3;if(gy<3)gy=3;
-if(gx+gw>im.width-3)gx=im.width-3-gw;
-if(gy+ghe>im.height-3)gy=im.height-3-ghe;
-return {tl:{x:gx,y:gy},tr:{x:gx+gw,y:gy},br:{x:gx+gw,y:gy+ghe},bl:{x:gx,y:gy+ghe}};
-}catch(e){return null}
+if(t=="nativo"){var fs3=await apiCara.detect(c);if(fs3.length){var b5=fs3[0].boundingBox;return {x:b5.x/sc,y:b5.y/sc,w:b5.width/sc,h:b5.height/sc}}}
+}catch(e){}
+return null;
 }
 function edadDe(iso){try{var f=new Date(iso+"T00:00:00");if(isNaN(f))return -1;var h=new Date();var e=h.getFullYear()-f.getFullYear();var m=h.getMonth()-f.getMonth();if(m<0||(m===0&&h.getDate()<f.getDate()))e--;return e}catch(e){return -1}}
-function nombresCoinciden(a,b){try{a=(a||"").toLowerCase().replace(/[^a-z ]/g,"").split(/\s+/).filter(function(x){return x.length>2});b=(b||"").toLowerCase().replace(/[^a-z ]/g,"").split(/\s+/).filter(function(x){return x.length>2});if(!a.length||!b.length)return true;var hit=0;for(var i=0;i<a.length;i++){if(b.indexOf(a[i])>=0)hit++}return hit>0}catch(e){return true}}
+function nombresCoinciden(a,b){
+try{
+a=(a||"").toLowerCase().replace(/[^a-z ]/g," ").split(/\s+/).filter(function(x){return x.length>2});
+b=(b||"").toLowerCase().replace(/[^a-z ]/g," ").split(/\s+/).filter(function(x){return x.length>2});
+if(!a.length||!b.length)return true;
+var hit=0;
+for(var i=0;i<a.length;i++){if(b.indexOf(a[i])>=0)hit++}
+return hit>=1;
+}catch(e){return true}
+}
 function parseAAMVA(raw){
 try{
-var claves=["DAB","DAC","DAD","DBB","DAQ","DAG","DAI","DAJ","DAK","DCF"];
+var claves=["DAB","DAC","DAD","DBB","DBA","DAQ","DAG","DAI","DAJ","DAK","DCF","DAU"];
 var fnd=[];
 for(var c=0;c<claves.length;c++){
 var ix=raw.indexOf(claves[c]);
@@ -743,29 +665,38 @@ for(var i=0;i<fnd.length;i++){
 var fin=(i+1<fnd.length)?fnd[i+1][0]:Math.min(fnd[i][0]+70,raw.length);
 res[fnd[i][1]]=raw.slice(fnd[i][0]+3,fin).trim();
 }
-if(!res.DBB||res.DBB.length<8)return null;
-var iso=res.DBB.slice(4,8)+"-"+res.DBB.slice(0,2)+"-"+res.DBB.slice(2,4);
+var nac="",venc="";
+if(res.DBB&&res.DBB.length===8)nac=res.DBB.slice(4,8)+"-"+res.DBB.slice(0,2)+"-"+res.DBB.slice(2,4);
+if(res.DBA&&res.DBA.length===8)venc=res.DBA.slice(4,8)+"-"+res.DBA.slice(0,2)+"-"+res.DBA.slice(2,4);
+var nombre=((res.DAC||"")+" "+(res.DAD||"")+" "+(res.DAB||"")).trim();
+return {nombre:(nombre&&nombre.length>3)?nombre:null,nacimiento:nac,edad:(nac?edadDe(nac):-1),numero:(res.DAQ||res.DCF||""),direccion:((res.DAI||"")+" "+(res.DAG||"")+" "+(res.DAJ||"")+" "+(res.DAK||"")).trim(),vencimiento:venc,confiable:true};
+}catch(e){return null}
+}
+async function ocrPatrones(dataUrl){
+try{
+if(!window.Tesseract)return null;
+var ret=await conTimeout(Tesseract.recognize("data:image/jpeg;base64,"+dataUrl,"eng"),20000,"ocr lento");
+var t=(ret&&ret.data&&ret.data.text)?ret.data.text.toUpperCase():"";
+if(t.length<15)return null;
+var esReverso=(t.indexOf("IDSLV")>=0)||(t.indexOf("<<<<")>=0)||(t.indexOf("P<")>=0&&t.indexOf("<<")>=0);
+var esFrontalTexto=(t.indexOf("IDENTIDAD")>=0)||(t.indexOf("IDENTIFICATION")>=0)||(t.indexOf("REPUBLIC")>=0&&t.indexOf("SALVADOR")>=0);
 var venc="";
-var clv=["DBA"];
-for(var v2=0;v2<clv.length;v2++){var rv=res[clv[v2]];if(rv&&rv.length===8){var fv2b=rv.slice(4,8)+"-"+rv.slice(0,2)+"-"+rv.slice(2,4);if(!venc)venc=fv2b}}
-
-return {nombre:((res.DAC||"")+" "+(res.DAD||"")+" "+(res.DAB||"")).trim(),nacimiento:iso,edad:edadDe(iso),numero:(res.DAQ||res.DCF||""),direccion:((res.DAI||"")+" "+(res.DAG||"")+" "+(res.DAJ||"")+" "+(res.DAK||"")).trim(),vencimiento:venc,confiable:true};
+var lineas=t.split(String.fromCharCode(10));
+for(var i=0;i<lineas.length;i++){
+var LN=lineas[i];
+if(LN.indexOf("EXP")<0&&LN.indexOf("VENC")<0&&LN.indexOf("CADU")<0)continue;
+var nums=LN.replace(/[^0-9]/g," ").split(" ").filter(function(x){return x.length===8});
+if(nums.length){var f0=nums[0];venc=f0.substring(4,8)+"-"+f0.substring(0,2)+"-"+f0.substring(2,4);break}
+}
+return {esReverso:esReverso,esFrontalTexto:esFrontalTexto,vencimiento:venc,texto:t.trim().substring(0,300)};
 }catch(e){return null}
 }
 async function leerCodigoDeCanvas(cv){
 try{
-if(window.BarcodeDetector){
-try{
-var bd=new BarcodeDetector({formats:["pdf417","qr_code","code_128","code_39"]});
-var fs=await bd.detect(cv);
-if(fs&&fs.length){var rv=fs[0].rawValue||"";if(rv.length>20)return parseAAMVA(rv)}
-}catch(e){}
-}
-if(zxListo){
-try{
-var res2=await ZX.decodeFromCanvas(cv);
+if(window.ZXing&&ZXing.BrowserMultiFormatReader){
+if(!window._zx){window._zx=new ZXing.BrowserMultiFormatReader()}
+var res2=await window._zx.decodeFromCanvas(cv);
 if(res2&&res2.length){var t2=res2[0].getText()||"";if(t2.length>20)return parseAAMVA(t2)}
-}catch(e){}
 }
 }catch(e){}
 return null;
@@ -773,8 +704,8 @@ return null;
 async function leerCodigo(dataUrl){
 try{
 var im=new Image();
-var p=new Promise(function(res){im.onload=function(){res(true)};im.onerror=function(){res(false)};im.src="data:image/jpeg;base64,"+dataUrl});
-var ok=await p;if(!ok)return null;
+var ok=await new Promise(function(res){im.onload=function(){res(true)};im.onerror=function(){res(false)};im.src="data:image/jpeg;base64,"+dataUrl});
+if(!ok)return null;
 var cv=document.createElement("canvas");cv.width=im.width;cv.height=im.height;
 cv.getContext("2d").drawImage(im,0,0);
 var d1=await leerCodigoDeCanvas(cv);
@@ -786,144 +717,122 @@ return await leerCodigoDeCanvas(cv2);
 }catch(e){}
 return null;
 }
-function sinRaros(s){var r="";var ok="ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz";for(var i=0;i<s.length;i++){var ch=s.charAt(i);if(ok.indexOf(ch)>=0||ch===" ")r+=ch}return r}
-async function ocrDoc(dataUrl){
-try{
-if(!window.Tesseract)return null;
-var ret=await Tesseract.recognize("data:image/jpeg;base64,"+dataUrl,"eng");
-var t=(ret&&ret.data&&ret.data.text)?ret.data.text:"";
-if(t.trim().length<20)return null;
-var lineas=t.split(String.fromCharCode(10));
-var nombre="";
-for(var i=0;i<lineas.length;i++){
-var ln=sinRaros(lineas[i]).trim();
-var partes=ln.split(" ").filter(function(x){return x.length>2});
-
+async function clasificarLado(comp,esperado){
+var rostro=await rostroEnImagen(comp);
+var ocr=null;
+try{ocr=await conTimeout(ocrPatrones(comp),20000,"lectura lenta")}catch(e1){}
+var cod=await leerCodigo(comp);
+var fuente=null;
+if(cod)fuente=cod;
+var esFrontal=null;
+var motivo="";
+if(rostro){esFrontal=true;motivo="rostro del titular visible en el documento"}
+else if(cod){esFrontal=false;motivo="codigo de barras del documento detectado"}
+else if(ocr&&ocr.esReverso){esFrontal=false;motivo="zona de codigo MRZ leida"}
+else if(ocr&&ocr.esFrontalTexto){esFrontal=true;motivo="texto de encabezado del frontal"}
+else{esFrontal=null;motivo="no se pudo identificar el lado: toma la foto de nuevo con buena luz y el documento completo"}
+var out={esFrontal:esFrontal,motivo:motivo,rostro:rostro,codigo:fuente,ocr:ocr};
+return out;
 }
-var fechas=[];
-var pedazos=t.split(/[^0-9]/);
-var buf="";
-for(var j=0;j<pedazos.length;j++){
-if(pedazos[j].length>0){buf+=pedazos[j];if(buf.length===8){fechas.push(buf);buf=""}}else{if(buf.length===8)fechas.push(buf);buf=""}}
-if(buf.length===8)fechas.push(buf);
-var venc2="";
-var t2=t.toUpperCase();
-var lineas2=t2.split(String.fromCharCode(10));
-for(var li=0;li<lineas2.length;li++){
-var LN=lineas2[li];
-var nums=LN.replace(/[^0-9]/g," ").split(" ").filter(function(x){return x.length===8});
-if(!nums.length)continue;
-var f0=nums[0];
-var fiso=f0.substring(4,8)+"-"+f0.substring(0,2)+"-"+f0.substring(2,4);
-var fd=new Date(fiso+"T00:00:00");
-if(isNaN(fd))continue;
-var esVenc=(LN.indexOf("EXP")>=0||LN.indexOf("VENC")>=0||LN.indexOf("CADU")>=0);
-if(esVenc&&!venc2)venc2=fiso;
+function irAPaso(n){
+var i;
+for(i=1;i<=5;i++){var e=R("ps"+i);if(e)e.className="paso"+(i==n?" act":"")}
+R("prog").innerHTML="PASO "+n+" DE 5";
+if(n!=4){stopCam()}
+stopCamDoc();stopCamDocA();
+if(n==2){R("stF").innerHTML=DF?("LADO FRONTAL guardado ("+kb(DF)+" KB) — toca la foto para rehacer"):"Este paso guarda el lado FRONTAL. El sistema verificara que sea el lado correcto.";}
+if(n==3){
+var t=R("tipoDoc").value;
+R("stA").innerHTML=DA?("LADO REVERSO guardado ("+kb(DA)+" KB) — toca la foto para rehacer"):"Este paso guarda el lado de ATRAS (reverso). El sistema verificara el lado.";
+if(t=="pasaporte"){R("notaRev").innerHTML="Pasaporte: no tiene reverso. Continua.";R("notaRev").className="estado chk";R("bIr4").disabled=false}
+else if(t=="permiso"){R("notaRev").innerHTML="Si tu permiso tiene reverso, tomale foto. Si no, usa el boton de abajo.";R("notaRev").className="estado";R("bIr4").disabled=!DA}
+else{R("notaRev").innerHTML="Este documento SI requiere reverso.";R("notaRev").className="estado";R("bIr4").disabled=!DA}
 }
-return {nombre:null,texto:t.trim().substring(0,400),fechas:fechas,vencimiento:venc2,confiable:false};
-}catch(e){return null}
+saveSes();
+window.scrollTo(0,0);
 }
-async function leerTodo(comp){
-var r1=await leerCodigo(comp);
-if(r1)return r1;
-var r2=await ocrDoc(comp);
-
-return r2;
+function saltarReverso(){
+DA="";datosDocA=null;R("stA").innerHTML="";R("pA").style.display="none";
+irAPaso(4);
+}
+function irDe1(){
+var nm=R("nombre").value.trim();
+var ps=partesNombre(nm);
+if(nm.length<3||ps.length<2){R("resp").innerHTML="<p style='color:#f85149'>Escribe tu nombre y apellido (pueden ser 1 o 2 nombres y 1 o 2 apellidos).</p>";window.scrollTo(0,document.body.scrollHeight);return}
+R("resp").innerHTML="";
+irAPaso(2);
 }
 function mostrarDesglose(){
 var d=R("desglose");if(!d)return;
 var h="";var nom=R("nombre").value.trim();
-var fuenteF=datosDocF,fuenteA=datosDocA;
 minorBloqueado=false;docVencido=false;nombreNoCoincide=false;
+var fuenteF=datosDocF,fuenteA=datosDocA;
 if(!fuenteF&&!fuenteA){
-h="<p style='color:#9aa0c3'>Desglose: este documento no trae datos leibles automaticamente. El motor verificara tu rostro contra el documento.</p>";
+h="<p style='color:#9aa0c3'>Sin datos automaticos legibles en el documento. El motor verificara tu rostro contra el documento.</p>";
 d.innerHTML=h;return;
 }
 if(fuenteF){
 if(fuenteF.confiable&&fuenteF.nombre){
-h+="<p style='color:#3fb950'>FRONTAL (codigo del documento): "+fuenteF.nombre+" | Nac: "+(fuenteF.nacimiento||"?")+" | Edad: "+fuenteF.edad+"</p>";
-if(nom.length>=3&&!nombresCoinciden(fuenteF.nombre,nom)){nombreNoCoincide=true;h+="<p style='color:#f85149;font-weight:700'>NO COINCIDE: el nombre escrito difiere del documento. Corrigelo antes de crear el ZID.</p>";}
+h+="<p style='color:#3fb950'>FRONTAL (codigo): "+fuenteF.nombre+" | Nac: "+(fuenteF.nacimiento||"?")+" | Edad: "+fuenteF.edad+"</p>";
+if(nom.length>=3&&!nombresCoinciden(fuenteF.nombre,nom)){nombreNoCoincide=true;h+="<p style='color:#f85149;font-weight:700'>NO COINCIDE: el nombre escrito difiere del documento. Corrigelo.</p>";}
 else{h+="<p style='color:#3fb950'>Cruce de nombre: coincide</p>";}
+if(fuenteF.vencimiento){
+var hoy=new Date();hoy.setHours(0,0,0,0);
+var fvd=new Date(fuenteF.vencimiento+"T00:00:00");
+if(fvd&&fvd<hoy){docVencido=true;h+="<p style='color:#f85149;font-weight:700'>DOCUMENTO VENCIDO ("+fuenteF.vencimiento+"): NO SE ACEPTA.</p>";}
+else{h+="<p style='color:#3fb950'>Vencimiento: "+fuenteF.vencimiento+" — valido</p>";}
+}
+if(fuenteF.nacimiento){
+var ed2=edadDe(fuenteF.nacimiento);
+if(ed2>=0&&ed2<18){minorBloqueado=true;h+="<p style='color:#f85149;font-weight:700'>MENOR DE EDAD ("+ed2+"): se registra con tutor.</p>";}
+}
 }else{
-h+="<p style='color:#9aa0c3'>FRONTAL: sin datos automaticos legibles — foto guardada, el motor verificara tu rostro.</p>";
+h+="<p style='color:#9aa0c3'>FRONTAL: sin datos automaticos legibles — el motor verificara tu rostro.</p>";
 }
 }
 if(fuenteA){
 var pa=[];
 if(fuenteA.numero)pa.push("No.: "+fuenteA.numero);
 if(fuenteA.direccion)pa.push("Dir: "+fuenteA.direccion);
-h+="<p style='color:#3fb950'>REVERSO: "+(pa.length?pa.join(" | "):"sin datos automaticos legibles — foto guardada")+"</p>";
-if(fuenteA.vencimiento){
-var hoy=new Date();hoy.setHours(0,0,0,0);
-var fvd=new Date(fuenteA.vencimiento+"T00:00:00");
-if(fvd&&fvd<hoy){docVencido=true;h+="<p style='color:#f85149;font-weight:700'>DOCUMENTO VENCIDO ("+fuenteA.vencimiento+"): NO SE ACEPTA.</p>";}
-else{h+="<p style='color:#3fb950'>Vencimiento leido: "+fuenteA.vencimiento+" — valido</p>";}
-}
-if(fuenteA.nacimiento){
-var ed2=edadDe(fuenteA.nacimiento);
-if(ed2>=0&&ed2<18){minorBloqueado=true;h+="<p style='color:#f85149;font-weight:700'>MENOR DE EDAD ("+ed2+"): se registra con tutor.</p>";}
+h+="<p style='color:#3fb950'>REVERSO: "+(pa.length?pa.join(" | "):"sin datos automaticos legibles")+"</p>";
+var venc=(fuenteA.vencimiento)||(fuenteF&&fuenteF.vencimiento)||"";
+if(venc){
+var hoy3=new Date();hoy3.setHours(0,0,0,0);
+var fvd3=new Date(venc+"T00:00:00");
+if(fvd3&&fvd3<hoy3){docVencido=true;h+="<p style='color:#f85149;font-weight:700'>DOCUMENTO VENCIDO ("+venc+"): NO SE ACEPTA.</p>";}
+else{h+="<p style='color:#3fb950'>Vencimiento: "+venc+" — valido</p>";}
 }
 }
 d.innerHTML=h;
 }
-async function cargarDoc(inp,lado){
-var f=inp.files&&inp.files[0];if(!f)return;
-if(procesandoDoc)return;
-procesandoDoc=true;
-var bt=R(lado=="F"?"btF":"btA");
-bt.disabled=true;
-var st=R("st"+lado);
-st.innerHTML="PROCESANDO (maximo 15s)...";
-st.className="estado";st.style.color="#f0b429";
-try{
-var fr2=new FileReader();
-var pfr=new Promise(function(res,rej){fr2.onload=function(){res(fr2.result)};fr2.onerror=function(){rej(new Error("lectura"))}});
-fr2.readAsDataURL(f);
-var crudo=await conTimeout(pfr,15000,"lectura lenta");
-var comp=await conTimeout(zyComprimir(crudo,900,0.7),15000,"compresion lenta");
-var pL=leerTodo(comp);
-pL.then(function(_leido){if(_leido){if(lado=="A"){datosDocA=_leido}else{datosDocF=_leido}}});
-var L=await conTimeout(luma(comp),15000,"luz lenta");
-if(L<40){st.innerHTML="Foto muy oscura (luz "+Math.round(L)+"/100). Tomala con buena luz.";st.className="estado mal";procesandoDoc=false;bt.disabled=false;return}
-abrirEditor(lado,comp);
-procesandoDoc=false;bt.disabled=false;
-}catch(e){
-st.innerHTML="La foto tardo demasiado ("+e+"). Reintenta o elige otra.";
-st.className="estado mal";
-procesandoDoc=false;bt.disabled=false;
+function quadInicial(im){
+var pr=propIdeal();
+var fw=im.width*0.7,fh=fw/pr;
+if(fh>im.height*0.85){fh=im.height*0.85;fw=fh*pr}
+var x=(im.width-fw)/2,y=(im.height-fh)/2;
+return {tl:{x:x,y:y},tr:{x:x+fw,y:y},br:{x:x+fw,y:y+fh},bl:{x:x,y:y+fh}};
 }
-}
-function abrirEditor(lado,comp){
-docLado=lado;
-if(lado=="F"){docCrudoF=comp}else{docCrudoA=comp}
+function abrirEditor(lado,comp,preset){
+docLado=lado;docCrudo=comp;
 var st=R("st"+lado);st.className="estado";st.style.color="#9aa0c3";
 var im=new Image();
-R("titLado").innerHTML="ESTAS ENMARCANDO EL LADO "+(lado=="F"?"FRONTAL (la cara con tu foto)":"REVERSO (la parte de atras)");
-          st.innerHTML="Abriendo editor...";
+st.innerHTML="Abriendo editor...";
 im.onload=function(){
 docImg=im;
-var pr0=propIdeal();var fw0=im.width*0.7,fh0=fw0/pr0;if(fh0>im.height*0.85){fh0=im.height*0.85;fw0=fh0*pr0}quad={tl:{x:(im.width-fw0)/2,y:(im.height-fh0)/2},tr:{x:(im.width+fw0)/2,y:(im.height-fh0)/2},br:{x:(im.width+fw0)/2,y:(im.height+fh0)/2},bl:{x:(im.width-fw0)/2,y:(im.height+fh0)/2}};
+if(preset&&preset.vw){
+var f=im.width/preset.vw;
+quad={tl:{x:preset.tl.x*f,y:preset.tl.y*f},tr:{x:preset.tr.x*f,y:preset.tr.y*f},br:{x:preset.br.x*f,y:preset.br.y*f},bl:{x:preset.bl.x*f,y:preset.bl.y*f}};
+}else{
+quad=quadInicial(im);
+}
+R("titLado").innerHTML="ESTAS ENMARCANDO EL LADO "+(lado=="F"?"FRONTAL (la cara con tu foto)":"REVERSO (la parte de atras)");
 R("zonaEdit").style.display="block";
 pintarEditor();
 if(!editListo){iniciarEdit();editListo=true}
-st.innerHTML="Ajusta si hace falta y GUARDA (o Reintentar deteccion).";
-autoEsquinas();
+st.innerHTML="Ajusta las bolas a las esquinas y GUARDA.";
+window.setTimeout(function(){window.scrollTo(0,document.body.scrollHeight)},50);
 };
 im.src="data:image/jpeg;base64,"+comp;
-}
-function autoEsquinas(){
-if(!docImg)return;
-var st=R("st"+docLado);
-st.innerHTML="Buscando esquinas (rapido)...";
-var im=docImg,lado=docLado;
-var q=null;
-try{q=detectarEsquinas(im)}catch(e){}
-if(q&&docImg===im){
-quad=q;pintarEditor();
-st.innerHTML="Esquinas detectadas. Verifica y GUARDA.";
-}else if(docImg===im){
-st.innerHTML="Coloca las 4 bolas en las esquinas con el dedo.";
-}
 }
 function pintarEditor(){
 var cv=R("cvEdit"),g=cv.getContext("2d"),im=docImg;
@@ -1052,74 +961,76 @@ out[o+3]=255;
 }
 }
 gd.putImageData(od,0,0);
-return cd.toDataURL("image/jpeg",0.82).split(",").pop();
+return cd.toDataURL("image/jpeg",0.8).split(",").pop();
 }catch(e){return null}
 }
-function medirCalidad(dataUrl){
-return new Promise(function(res){
-var im=new Image();
-im.onload=function(){
-var W=240;
-var sc=Math.min(1,W/im.width);
-var cw=Math.max(40,Math.round(im.width*sc)),ch2=Math.max(40,Math.round(im.height*sc));
-var c=document.createElement("canvas");c.width=cw;c.height=ch2;
-var g=c.getContext("2d");g.drawImage(im,0,0,cw,ch2);
-var d=g.getImageData(0,0,cw,ch2).data;
-var t=0,n=cw*ch2,gr=0,i;
-for(i=0;i<n;i++){var k=i*4;t+=0.299*d[k]+0.587*d[k+1]+0.114*d[k+2]}
-var br=t/n;
-for(i=1;i<n-1;i++){
-var k1=i*4,k2=(i+1)*4,k3=(i-1)*4;
-var v1=0.299*d[k1]+0.587*d[k1+1]+0.114*d[k1+2];
-var v2=0.299*d[k2]+0.587*d[k2+1]+0.114*d[k2+2];
-var v3=0.299*d[k3]+0.587*d[k3+1]+0.114*d[k3+2];
-gr+=Math.abs(v2-v1)+Math.abs(v2-v3);
+async function procesarLado(lado,comp,preset){
+var st=R("st"+lado);
+st.innerHTML="Verificando el lado y leyendo el documento...";
+st.className="estado";st.style.color="#f0b429";
+var cl=await clasificarLado(comp, lado);
+var quieroFrontal=(lado=="F");
+if(cl.esFrontal===null){
+st.innerHTML=cl.motivo;st.className="estado mal";
+return false;
 }
-res({brillo:br,nitidez:gr/((n-2)*2)});
-};
-im.onerror=function(){res({brillo:128,nitidez:9})};
-im.src="data:image/jpeg;base64,"+dataUrl;
-});
+if(quieroFrontal&&!cl.esFrontal){
+st.innerHTML="ESTA FOTO ES EL REVERSO. Este paso es para el LADO FRONTAL (la cara con tu foto). Tomala de nuevo.";st.className="estado mal";
+return false;
 }
-function stretchLuz(dataUrl){
-return new Promise(function(res){
-var im=new Image();
-im.onload=function(){
-var c=document.createElement("canvas");c.width=im.width;c.height=im.height;
-var g=c.getContext("2d");g.drawImage(im,0,0);
-var d=g.getImageData(0,0,im.width,im.height).data;
-var t=0,n=im.width*im.height,i;
-for(i=0;i<n;i++){var k=i*4;t+=0.299*d[k]+0.587*d[k+1]+0.114*d[k+2]}
-var br=t/n;
-var f=Math.max(1,Math.min(2.1,105/br));
-if(f<=1.02){res(dataUrl);return}
-for(i=0;i<n*4;i+=4){
-d[i]=Math.min(255,d[i]*f);
-d[i+1]=Math.min(255,d[i+1]*f);
-d[i+2]=Math.min(255,d[i+2]*f);
+if(!quieroFrontal&&cl.esFrontal){
+st.innerHTML="ESTA FOTO ES EL FRONTAL. Este paso es para el REVERSO (la parte de atras). Tomala de nuevo.";st.className="estado mal";
+return false;
 }
-g.putImageData(g.getImageData(0,0,im.width,im.height),0,0);
-res(c.toDataURL("image/jpeg",0.82).split(",").pop());
-};
-im.onerror=function(){res(dataUrl)};
-im.src="data:image/jpeg;base64,"+dataUrl;
-});
+var fuente=cl.codigo||null;
+if(!fuente&&cl.ocr){
+fuente={nombre:null,nacimiento:"",edad:-1,numero:"",direccion:"",vencimiento:cl.ocr.vencimiento||"",confiable:false,texto:cl.ocr.texto};
 }
-function guardarEn(l,comp,txt){
+if(lado=="F"){datosDocF=fuente}else{datosDocA=fuente}
+abrirEditor(lado,comp,preset);
+return true;
+}
+async function desdeArchivo(inp,lado){
+var f=inp.files&&inp.files[0];if(!f)return;
+if(procesandoDoc)return;
+procesandoDoc=true;
+var st=R("st"+lado);
+st.innerHTML="PROCESANDO...";
+st.className="estado";st.style.color="#f0b429";
+try{
+var fr2=new FileReader();
+var pfr=new Promise(function(res,rej){fr2.onload=function(){res(fr2.result)};fr2.onerror=function(){rej(new Error("lectura"))}});
+fr2.readAsDataURL(f);
+var crudo=await conTimeout(pfr,15000,"lectura lenta");
+var comp=await conTimeout(zyComprimir(crudo,1200,0.75),15000,"compresion lenta");
+var okp=await procesarLado(lado,comp,null);
+procesandoDoc=false;
+if(okp){inp.value=""}
+}catch(e){
+st.innerHTML="Error: "+e;st.className="estado mal";
+procesandoDoc=false;
+}
+}
+function rehacer(lado){
+if(lado=="F"){DF="";datosDocF=null;R("pF").style.display="none";irAPaso(2)}
+else{DA="";datosDocA=null;R("pA").style.display="none";R("bIr4").disabled=true;irAPaso(3)}
+}
+function guardarEn(l,comp){
 if(l=="F"){DF=comp}else{DA=comp}
 var pv=R(l=="F"?"pF":"pA");
 pv.src="data:image/jpeg;base64,"+comp;pv.style.display="block";
 var st=R("st"+l);
-st.innerHTML=(l=="F"?"LADO FRONTAL guardado — ":"LADO REVERSO guardado — ")+txt;st.className="estado chk";
+st.innerHTML=(l=="F"?"LADO FRONTAL guardado":"LADO REVERSO guardado")+" ("+kb(comp)+" KB)";
+st.className="estado chk";
 R("zonaEdit").style.display="none";docImg=null;
-          saveSes();
 mostrarDesglose();
+saveSes();
 if(l=="F"){irAPaso(3)}else{R("bIr4").disabled=false;irAPaso(4)}
 }
 async function recortarDoc(){
 if(!docImg||!quad)return;
 var st=R("st"+docLado);
-st.innerHTML="Escaneando (correccion de perspectiva)...";
+st.innerHTML="Escaneando...";
 var comp=warpQuad(docImg,quad,1100);
 if(!comp){
 var xs=[quad.tl.x,quad.tr.x,quad.br.x,quad.bl.x],ys=[quad.tl.y,quad.tr.y,quad.br.y,quad.bl.y];
@@ -1130,21 +1041,175 @@ c.width=Math.max(20,Math.round(x1-x0));c.height=Math.max(20,Math.round(y1-y0));
 c.getContext("2d").drawImage(docImg,x0,y0,c.width,c.height,0,0,c.width,c.height);
 comp=c.toDataURL("image/jpeg",0.8).split(",").pop();
 }
-guardarEn(docLado,comp,"GUARDADO (escaneo recto): "+kb(comp)+" KB");
+guardarEn(docLado,comp);
 }
 function usarFotoCompleta(){
-var comp=docLado=="F"?docCrudoF:docCrudoA;
-if(!comp)return;
-guardarEn(docLado,comp,"GUARDADO COMPLETO: "+kb(comp)+" KB (sin recortar)");
+if(!docCrudo)return;
+guardarEn(docLado,docCrudo);
 }
-function reeditar(lado){
-var comp=lado=="F"?docCrudoF:docCrudoA;
-if(comp)abrirEditor(lado,comp);
+function abrirCamDoc(){
+stopCamDocA();
+abrirCamGen("vd","ovDoc","vzDoc","bAbrirDoc","bCaptDoc","stDoc",function(camobj){camD=camobj;timerDoc=setInterval(function(){loopDocGen("vd","ovDoc",function(q){quadLive=q})},420)});
+}
+function abrirCamDocA(){
+stopCamDoc();
+abrirCamGen("vdA","ovDocA","vzDocA","bAbrirDocA","bCaptDocA","stDocA",function(camobj){camA=camobj;timerDocA=setInterval(function(){loopDocGen("vdA","ovDocA",function(q){quadLiveA=q})},420)});
+}
+async function abrirCamGen(vid,ov,zn,bAbrir,bCap,st,cb){
+try{
+R(zn).style.display="block";
+R(bAbrir).style.display="none";
+R(bCap).style.display="none";
+var c=await navigator.mediaDevices.getUserMedia({video:{facingMode:"environment",width:{ideal:1280},height:{ideal:720}}});
+var v=R(vid);v.srcObject=c;
+R(bCap).style.display="block";
+R(st).innerHTML="Mueve la camara: el recuadro verde se ajustara al documento.";
+cb(c);
+}catch(e){
+R(st).innerHTML="No se pudo abrir la camara: "+e;R(st).className="estado mal";
+R(bAbrir).style.display="block";
+}
+}
+function stopCamGen(camobj,vid,zn,bAbrir,bCap){
+if(camobj){try{camobj.getTracks().forEach(function(t){t.stop()})}catch(e){}}
+R(zn).style.display="none";
+R(bCap).style.display="none";
+R(bAbrir).style.display="block";
+}
+function stopCamDoc(){
+if(timerDoc){clearInterval(timerDoc);timerDoc=null}
+stopCamGen(camD,"vd","vzDoc","bAbrirDoc","bCaptDoc");
+camD=null;
+}
+function stopCamDocA(){
+if(timerDocA){clearInterval(timerDocA);timerDocA=null}
+stopCamGen(camA,"vdA","vzDocA","bAbrirDocA","bCaptDocA");
+camA=null;
+}
+function esquinasCore(d,cw,ch){
+try{
+var N=cw*ch;
+var lum=new Float32Array(N);
+var i,s=0,s2=0;
+for(i=0;i<N;i++){var k=i*4;lum[i]=0.299*d[k]+0.587*d[k+1]+0.114*d[k+2];s+=lum[i];s2+=lum[i]*lum[i];}
+var mu=s/N,va=s2/N-mu*mu,de=Math.sqrt(Math.max(0,va))||1;
+var vis=new Uint8Array(N);
+var cola=new Int32Array(N);
+var best=null,bestScore=0;
+var pasadas=[1,-1];
+for(var pi=0;pi<2;pi++){
+var sg=pasadas[pi];
+for(i=0;i<N;i++)vis[i]=0;
+for(i=0;i<N;i++){
+if(vis[i])continue;
+if((lum[i]-mu)*sg<=0.32*de)continue;
+vis[i]=1;
+var qh=0,qt=0;cola[qt++]=i;
+var minx=1e9,maxx=-1,miny=1e9,maxy=-1,cnt=0;
+while(qh<qt){
+var p=cola[qh++];cnt++;
+var py=(p/cw)|0,px=p%cw;
+if(px<minx)minx=px;if(px>maxx)maxx=px;if(py<miny)miny=py;if(py>maxy)maxy=py;
+var q;
+if(px+1<cw){q=p+1;if(!vis[q]&&(lum[q]-mu)*sg>0.32*de){vis[q]=1;cola[qt++]=q}}
+if(px-1>=0){q=p-1;if(!vis[q]&&(lum[q]-mu)*sg>0.32*de){vis[q]=1;cola[qt++]=q}}
+if(py+1<ch){q=p+cw;if(!vis[q]&&(lum[q]-mu)*sg>0.32*de){vis[q]=1;cola[qt++]=q}}
+if(py-1>=0){q=p-cw;if(!vis[q]&&(lum[q]-mu)*sg>0.32*de){vis[q]=1;cola[qt++]=q}}
+}
+var w=(maxx-minx+1)/cw,h2=(maxy-miny+1)/ch;
+var r=w/h2;
+var lleno=cnt/((maxx-minx+1)*(maxy-miny+1)||1);
+if(cnt>N*0.05&&w>0.20&&w<0.99&&h2>0.10&&h2<0.99&&r>0.45&&r<3.4&&lleno>0.55){
+var score=cnt*lleno;
+var dr=Math.abs(r-propIdeal());
+score*=Math.max(0.35,1.6-dr);
+if(score>bestScore){bestScore=score;best={minx:minx,maxx:maxx,miny:miny,maxy:maxy};}
+}
+}
+}
+return best;
+}catch(e){return null}
+}
+function loopDocGen(vid,ovId,cb){
+var v=R(vid),ov=R(ovId);
+if(!v.srcObject||v.readyState<2)return;
+var vw=v.videoWidth,vh=v.videoHeight;if(!vw)return;
+if(ov.width!=vw){ov.width=vw;ov.height=vh}
+var g=ov.getContext("2d");
+g.clearRect(0,0,vw,vh);
+var SW=280;
+var sc=Math.min(1,SW/vw);
+var cw=Math.max(60,Math.round(vw*sc)),ch=Math.max(60,Math.round(vh*sc));
+var c=document.createElement("canvas");
+c.width=cw;c.height=ch;
+var gg=c.getContext("2d");
+gg.drawImage(v,0,0,cw,ch);
+var d=gg.getImageData(0,0,cw,ch).data;
+var bb=esquinasCore(d,cw,ch);
+if(bb){
+var fx=vw/cw,fy=vh/ch;
+var mx=((bb.minx+bb.maxx)/2)*fx,my=((bb.miny+bb.maxy)/2)*fy;
+var gw0=(bb.maxx-bb.minx+1)*fx,gh0=(bb.maxy-bb.miny+1)*fy;
+var pr=propIdeal();
+var gw=Math.min(vw*0.97,gw0*1.10),ghe=Math.min(vh*0.97,gh0*1.10);
+var r0=gw/(ghe||1);
+if(r0<0.5){gw=ghe*0.5}
+if(r0>3.2){gw=ghe*3.2}
+var gx=mx-gw/2,gy=my-ghe/2;
+if(gx<4)gx=4;if(gy<4)gy=4;
+if(gx+gw>vw-4)gx=vw-4-gw;
+if(gy+ghe>vh-4)gy=vh-4-ghe;
+var q={tl:{x:gx,y:gy},tr:{x:gx+gw,y:gy},br:{x:gx+gw,y:gy+ghe},bl:{x:gx,y:gy+ghe},vw:vw};
+cb(q);
+g.strokeStyle="#3fb950";g.lineWidth=4;
+g.beginPath();
+g.moveTo(q.tl.x,q.tl.y);g.lineTo(q.tr.x,q.tr.y);g.lineTo(q.br.x,q.br.y);g.lineTo(q.bl.x,q.bl.y);g.closePath();
+g.stroke();
+var pts=[q.tl,q.tr,q.br,q.bl];
+for(var i=0;i<4;i++){
+g.fillStyle="#3fb950";
+g.beginPath();g.arc(pts[i].x,pts[i].y,10,0,6.3);g.fill();
+}
+R("stDoc").innerHTML="DOCUMENTO ENMARCADO: pulsa CAPTURAR FOTO";
+R("stDoc").className="estado chk";
+R("stDocA").innerHTML="DOCUMENTO ENMARCADO: pulsa CAPTURAR FOTO";
+R("stDocA").className="estado chk";
+}else{
+cb(null);
+R("stDoc").innerHTML="Buscando el documento... acercalo y que ocupe el centro";
+R("stDocA").innerHTML="Buscando el documento... acercalo y que ocupe el centro";
+var m=Math.min(vw,vh)*0.08,L2=m*0.9;
+g.strokeStyle="rgba(240,180,41,0.85)";g.lineWidth=4;
+var cs=[[m,m,1,1],[vw-m,m,-1,1],[vw-m,vh-m,-1,-1],[m,vh-m,1,-1]];
+for(var j=0;j<4;j++){
+var x=cs[j][0],y=cs[j][1],sx=cs[j][2],sy=cs[j][3];
+g.beginPath();g.moveTo(x+sx*L2,y);g.lineTo(x,y);g.lineTo(x,y+sy*L2);g.stroke();
+}
+}
+}
+async function capturarDoc(){await capturarDocGen("vd","F",quadLive,function(){stopCamDoc()})}
+async function capturarDocA(){await capturarDocGen("vdA","A",quadLiveA,function(){stopCamDocA()})}
+async function capturarDocGen(vid,lado,ql,stopFn){
+var v=R(vid);
+if(!v.videoWidth){return}
+var st=R("st"+lado);
+st.innerHTML="PROCESANDO...";
+st.className="estado";st.style.color="#f0b429";
+var c=document.createElement("canvas");
+c.width=v.videoWidth;c.height=v.videoHeight;
+c.getContext("2d").drawImage(v,0,0);
+var crudo=c.toDataURL("image/jpeg",0.85);
+var comp=await zyComprimir(crudo,1200,0.75);
+stopFn();
+var okp=await procesarLado(lado,comp,ql);
+if(!okp){
+st.className="estado mal";
+}
 }
 async function abrirCamara(){
 var st=R("stV");
 try{
-R("videozona").style.display="block";
+R("vzS").style.display="block";
 R("bAbrirCam").style.display="none";
 R("bRepSelfie").style.display="none";
 cam=await navigator.mediaDevices.getUserMedia({video:{facingMode:"user",width:{ideal:640},height:{ideal:480}}});
@@ -1160,11 +1225,11 @@ R("bAbrirCam").style.display="block";
 function stopCam(){
 if(cam){try{cam.getTracks().forEach(function(t){t.stop()})}catch(e){}}
 cam=null;
-R("videozona").style.display="none";
+R("vzS").style.display="none";
 R("bSelfie").style.display="none";
 }
 async function loop(){
-var v=R("v"),ov=R("ov");
+var v=R("v"),ov=R("ovS");
 setInterval(async function(){
 if(!cam||v.readyState<2)return;
 var vw=v.videoWidth,vh=v.videoHeight;if(!vw)return;
@@ -1193,15 +1258,14 @@ g.beginPath();
 g.ellipse(o.cx,o.cy,o.rx,o.ry,0,angs[a2]-0.38,angs[a2]+0.38);
 g.stroke();
 }
-if(alineado){g.strokeStyle="#3fb950";g.lineWidth=3;g.strokeRect(caja.x,caja.y,caja.w,caja.h)}
 if(!capturando){
-if(alineado){R("stV").innerHTML="Encuadre perfecto: pulsa CAPTURAR";R("stV").className="estado";R("stV").style.color="#3fb950"}
-else{R("stV").innerHTML="Centra tu rostro dentro de la guia (entero, no a medias)";R("stV").className="estado";R("stV").style.color="#f0b429"}
+if(alineado){R("stV").innerHTML="Encuadre perfecto: pulsa CAPTURAR";R("stV").style.color="#3fb950"}
+else{R("stV").innerHTML="Centra tu rostro dentro de la guia";R("stV").style.color="#f0b429"}
 }
 }else{
 g.strokeStyle="#f85149";g.lineWidth=3;
 g.beginPath();g.ellipse(o.cx,o.cy,o.rx,o.ry,0,0,6.3);g.stroke();
-if(!capturando){R("stV").innerHTML="No veo tu rostro. Busca buena luz frente a la camara.";R("stV").style.color="#9aa0c3"}
+if(!capturando){R("stV").innerHTML="No veo tu rostro. Busca buena luz.";R("stV").style.color="#9aa0c3"}
 }
 }catch(e){}
 },250);
@@ -1211,8 +1275,7 @@ if(capturando)return false;
 var st=R("stV"),v=R("v");
 if(!cam||!v.videoWidth){st.innerHTML="Abre la camara primero.";st.className="estado mal";return false}
 capturando=true;R("bSelfie").disabled=true;
-st.innerHTML="Verificando luz, rostro y encuadre...";st.className="estado";
-st.style.color="#f0b429";
+st.innerHTML="Verificando luz, rostro y encuadre...";st.style.color="#f0b429";
 var i=0;while(!cara&&i<10){await dormir(300);i++}
 var c=document.createElement("canvas");c.width=v.videoWidth;c.height=v.videoHeight;
 var g=c.getContext("2d");g.translate(c.width,0);g.scale(-1,1);g.drawImage(v,0,0);
@@ -1225,7 +1288,7 @@ capturando=false;R("bSelfie").disabled=false;
 return false;
 }
 if(detTipo!=""&&!cara){
-st.innerHTML="NO VEO TU ROSTRO con buena luz. NO se guardo.";
+st.innerHTML="NO VEO TU ROSTRO con claridad. NO se guardo.";
 st.className="estado mal";
 capturando=false;R("bSelfie").disabled=false;
 return false;
@@ -1241,11 +1304,35 @@ DS=comp;
 stopCam();
 R("bAbrirCam").style.display="none";
 R("bRepSelfie").style.display="block";
-R("bIr5").style.display="block";
-          saveSes();
 R("pS").src="data:image/jpeg;base64,"+comp;R("pS").style.display="block";
-st.innerHTML="SELFIE GUARDADA: "+kb(comp)+" KB (luz "+Math.round(L)+"/100, encuadre verificado)";st.className="estado chk";
+st.innerHTML="SELFIE GUARDADA: "+kb(comp)+" KB (luz "+Math.round(L)+"/100)";st.className="estado chk";
 capturando=false;R("bSelfie").disabled=false;
+var stB=R("stBio");
+if(faListo&&DF){
+stB.innerHTML="Comparando tu rostro con el del documento...";
+try{
+var dc=await rostroEnImagen(DF);
+var ds=await rostroEnImagen(DS);
+if(dc&&ds){
+var im1=new Image(),im2=new Image();
+var p1=new Promise(function(res){im1.onload=res;im1.src="data:image/jpeg;base64,"+DF});
+var p2=new Promise(function(res){im2.onload=res;im2.src="data:image/jpeg;base64,"+DS});
+await Promise.all([p1,p2]);
+var r1=await faceapi.detectSingleFace(im1,new faceapi.TinyFaceDetectorOptions({inputSize:416})).withFaceDescriptor();
+var r2b=await faceapi.detectSingleFace(im2,new faceapi.TinyFaceDetectorOptions({inputSize:416})).withFaceDescriptor();
+if(r1&&r2b){
+var dist=faceapi.euclideanDistance(r1.descriptor,r2b.descriptor);
+if(dist>0.62){
+stB.innerHTML="<span class='mal'>PRE-CHEQUEO: tu rostro no coincide con el del documento (distancia "+dist.toFixed(2)+"). La Red tambien lo verificara.</span>";
+}else{
+stB.innerHTML="<span class='chk'>Pre-chequeo: rostro compatible con el documento.</span>";
+}
+}else{stB.innerHTML=""}
+}else{stB.innerHTML=""}
+}catch(e){stB.innerHTML=""}
+}else{stB.innerHTML=""}
+R("bIr5").style.display="block";
+saveSes();
 setTimeout(function(){irAPaso(5)},900);
 return true;
 }
@@ -1254,25 +1341,28 @@ var c1=R("clave").value,c2=R("clave2").value;
 var tipo=R("tipoDoc").value;
 var nmv=R("nombre").value.trim();
 var reqRev=(tipo=="dui"||tipo=="licencia"||tipo=="id_usa");
-if(nmv.length<3||partesNombre(nmv).length<2){Rr.innerHTML="<p style='color:#f85149'>Falta nombre y apellido (ej: Juan Perez).</p>";window.scrollTo(0,document.body.scrollHeight);return false}
-if(minorBloqueado){Rr.innerHTML="<p style='color:#f85149'>El documento indica MENOR de edad: los menores se registran con tutor.</p>";return false}
+if(nmv.length<3||partesNombre(nmv).length<2){Rr.innerHTML="<p style='color:#f85149'>Escribe tu nombre y apellido.</p>";window.scrollTo(0,document.body.scrollHeight);return false}
+if(docVencido){Rr.innerHTML="<p style='color:#f85149;font-weight:700'>DOCUMENTO VENCIDO: NO se crea el ZID.</p>";return false}
+if(minorBloqueado){Rr.innerHTML="<p style='color:#f85149;font-weight:700'>MENOR DE EDAD: los menores se registran con tutor.</p>";return false}
+if(nombreNoCoincide){Rr.innerHTML="<p style='color:#f85149;font-weight:700'>El nombre no coincide con el documento. Corrigelo.</p>";return false}
 if(c1!==c2){Rr.innerHTML="<p style='color:#f85149'>Las claves no coinciden.</p>";return false}
 if(c1.length<8){Rr.innerHTML="<p style='color:#f85149'>La clave necesita minimo 8 caracteres.</p>";return false}
 if(!DF){Rr.innerHTML="<p style='color:#f85149'>Falta el documento frontal (paso 2).</p>";return false}
 if(reqRev&&!DA){Rr.innerHTML="<p style='color:#f85149'>Este documento requiere el reverso (paso 3).</p>";return false}
 if(!DS){Rr.innerHTML="<p style='color:#f85149'>Falta la selfie (paso 4).</p>";return false}
-          if(docVencido){Rr.innerHTML="<p style='color:#f85149;font-weight:700'>DOCUMENTO VENCIDO: no es prueba de identidad legal. NO se crea el ZID.</p>";window.scrollTo(0,document.body.scrollHeight);return false}
-if(minorBloqueado){Rr.innerHTML="<p style='color:#f85149;font-weight:700'>MENOR DE EDAD detectado: los menores se registran con tutor. NO se crea ZID de adulto.</p>";window.scrollTo(0,document.body.scrollHeight);return false}
-if(nombreNoCoincide){Rr.innerHTML="<p style='color:#f85149;font-weight:700'>El nombre escrito NO coincide con el del documento. Corrigelo para crear tu ZID.</p>";window.scrollTo(0,document.body.scrollHeight);return false}
-Rr.innerHTML="<p style='color:#8b949e'>Enviando a la Red ("+kb(DF)+" y "+kb(DS)+" KB)...</p>";
+Rr.innerHTML="<p style='color:#8b949e'>Enviando a la Red ("+kb(DF)+" y "+kb(DS)+" KB). El motor comparara tu rostro con el documento...</p>";
 window.scrollTo(0,document.body.scrollHeight);
 try{var r=await fetch("/registro/nuevo",{method:"POST",headers:{"Content-Type":"application/json"},
 body:JSON.stringify({nombre:nmv,clave:c1,doc_image_b64:DF,doc_back_b64:DA,selfie_image_b64:DS,doc_type:tipo,doc_number:((datosDocA&&datosDocA.numero)||(datosDocF&&datosDocF.numero)||"")})});
-var j=await r.json();
-if(j.ok&&j.zid){Rr.innerHTML="<div style='background:#0f2a1a;border:1px solid #238636;border-radius:12px;padding:14px'><p style='color:#3fb950;font-weight:800;font-size:17px'>REGISTRO EXITOSO</p><p>Tu ZID unico fue creado:</p><p class='zid'>"+j.zid+"</p><p>Guarda tu ZID y tu clave. Nadie mas puede crearlo.</p><p><a href='/entrar'>ENTRAR AHORA</a></p></div>";}
-else if(j.codigo==="mantenimiento"){Rr.innerHTML="<div style='background:#2a2410;border:1px solid #f0b429;border-radius:12px;padding:14px'><p style='color:#f0b429;font-weight:800'>BIOMETRIA EN MANTENIMIENTO</p><p>"+(j.error||"")+"</p><p>Tu solicitud quedo guardada. El registro funciono completo: los datos llegaron a la Red.</p><p><a href='/registro'>Volver a intentar</a></p></div>";}
-else{Rr.innerHTML="<p style='color:#f85149;font-weight:700'>NO SE PUDO CREAR EL ZID</p><p>"+(j.error||"Motivo desconocido")+"</p>";}}
-catch(e){var dtxt=""+e;try{var rt=await r.text();if(rt)dtxt+=" | servidor dijo: "+rt.substring(0,300)}catch(e2){}Rr.innerHTML="<div style='background:#2a1414;border:1px solid #f85149;border-radius:12px;padding:14px'><p style='color:#f85149;font-weight:700'>La Red no respondio</p><p>Detalle: "+dtxt+"</p></div>";}
+var txt=await r.text();
+var j=null;
+try{j=JSON.parse(txt)}catch(e2){}
+if(j&&j.ok&&j.zid){Rr.innerHTML="<div style='background:#0f2a1a;border:1px solid #238636;border-radius:12px;padding:14px'><p style='color:#3fb950;font-weight:800;font-size:17px'>REGISTRO EXITOSO</p><p>Tu ZID unico fue creado:</p><p class='zid'>"+j.zid+"</p><p>Guarda tu ZID y tu clave. Nadie mas puede crearlo.</p><p><a href='/entrar'>ENTRAR AHORA</a></p></div>";}
+else if(j&&j.codigo==="mantenimiento"){Rr.innerHTML="<div style='background:#2a2410;border:1px solid #f0b429;border-radius:12px;padding:14px'><p style='color:#f0b429;font-weight:800'>BIOMETRIA EN MANTENIMIENTO</p><p>"+(j.error||"")+"</p><p><a href='/registro'>Volver a intentar</a></p></div>";}
+else if(j&&j.error){var em=(j.error.message||"")+((j.error.reason)?" | razon: "+j.error.reason:"")+((j.error.doc_match_score!==undefined&&j.error.doc_match_score!==null)?" | puntaje: "+String(j.error.doc_match_score).substring(0,6)+" (auto>=0.40)":"");
+Rr.innerHTML="<p style='color:#f85149;font-weight:700'>NO SE PUDO CREAR EL ZID</p><p>"+em+"</p>";}
+else{Rr.innerHTML="<p style='color:#f85149;font-weight:700'>NO SE PUDO CREAR EL ZID</p><p>Respuesta: "+txt.substring(0,300)+"</p>";}}
+catch(e){Rr.innerHTML="<div style='background:#2a1414;border:1px solid #f85149;border-radius:12px;padding:14px'><p style='color:#f85149;font-weight:700'>La Red no respondio</p><p>Detalle: "+e+"</p></div>";}
 window.scrollTo(0,document.body.scrollHeight);
 return false}
 (function(){var s=loadSes();if(s&&(s.DF||s.DA||s.DS)){
@@ -1287,7 +1377,7 @@ if(DA){var pA2=R("pA");pA2.src="data:image/jpeg;base64,"+DA;pA2.style.display="b
 if(DS){var pS2=R("pS");pS2.src="data:image/jpeg;base64,"+DS;pS2.style.display="block";R("bIr5").style.display="block"}
 if(DA&&R("tipoDoc").value!="pasaporte"){R("bIr4").disabled=false}
 mostrarDesglose();
-var rst=R("resp");if(rst)rst.innerHTML="<p style='color:#7c8cf8'>Sesion restaurada: tus fotos siguen aqui. Continua donde ibas.</p>";
+var rst=R("resp");if(rst)rst.innerHTML="<p style='color:#7c8cf8'>Sesion restaurada: tus fotos siguen aqui.</p>";
 }})();
 setTimeout(function(){ensureCara()},800);
 </script>

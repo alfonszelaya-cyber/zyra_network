@@ -195,6 +195,28 @@ def _make_biometric_provider() -> object:
     return _FailClosedProvider()
 
 
+def _biometrics_policy():
+    choice = (
+        os.environ.get(
+            "ZYRA_BIOMETRICS_PROVIDER",
+            "fail-closed",
+        )
+        .strip()
+        .lower()
+    )
+    if choice == "zyra":
+        return BiometricsPolicy(
+            require_liveness=True,
+            doc_auto=0.40,
+            doc_review=0.28,
+            doc_reject=0.25,
+            dup_reject=0.55,
+        )
+    return BiometricsPolicy(
+        require_liveness=True
+    )
+
+
 class ZyraKernel:
     """Owns the engines; serves as the single source of truth."""
 
@@ -296,9 +318,7 @@ class ZyraKernel:
                     cipher=TemplateCipher(
                         master_key_hex=master_hex
                     ),
-                    policy=BiometricsPolicy(
-                        require_liveness=True
-                    ),
+                    policy=_biometrics_policy(),
                     metrics=self._metrics,
                 )
                 self._log.info(

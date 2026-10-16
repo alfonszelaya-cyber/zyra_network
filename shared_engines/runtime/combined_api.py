@@ -48,6 +48,7 @@ CORE_PREFIXES = frozenset(
         "currency",
         "proofing",
         "verify-existence",
+        "provider",
     }
 )
 

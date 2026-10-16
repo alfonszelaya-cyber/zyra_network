@@ -180,7 +180,8 @@ def _make_biometric_provider() -> object:
                 ZyraVisionProvider,
             )
             return ZyraVisionProvider()
-        except Exception:
+        except Exception as _e39:
+            print("ZYRA provider zyra fallo el import: " + repr(_e39), flush=True)
             return _FailClosedProvider()
     if choice == "insightface":
         try:

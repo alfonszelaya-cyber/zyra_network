@@ -534,7 +534,7 @@ a{color:#a78bfa}
 <div id="resp"></div>
 </form>
 <p style="text-align:center;margin-top:14px"><a href="/">Volver</a> | <a href="/entrar">Ya tengo ZID</a></p>
-<p style="text-align:center;color:#4a4f7a;font-size:11px;margin-top:10px">ZYRA registro v34 - lectura corregida y probada</p>
+<p style="text-align:center;color:#4a4f7a;font-size:11px;margin-top:10px">ZYRA registro v36 - parser verificado</p>
 <script>
 window.onerror=function(m,u,l){try{var b=document.getElementById("jserr");if(b){b.style.display="block";b.innerHTML="Error interno (linea "+l+"): "+m}}catch(e){}};
 var DF="",DA="",DS="";
@@ -656,7 +656,7 @@ return hit>=1;
 }
 function parseAAMVA(raw){
 try{
-var claves=["DAB","DAC","DAD","DBB","DBA","DAQ","DAG","DAI","DAJ","DAK","DCF","DAU"];
+var claves=["DAB","DAC","DAD","DCS","DBB","DBA","DAQ","DAG","DAI","DAJ","DAK","DCF","DAU"];
 var fnd=[];
 for(var c=0;c<claves.length;c++){
 var ix=raw.indexOf(claves[c]);
@@ -667,12 +667,13 @@ if(fnd.length<3)return null;
 var res={};
 for(var i=0;i<fnd.length;i++){
 var fin=(i+1<fnd.length)?fnd[i+1][0]:Math.min(fnd[i][0]+70,raw.length);
-res[fnd[i][1]]=raw.slice(fnd[i][0]+3,fin).trim();
+var valor=raw.slice(fnd[i][0]+3,fin).split(String.fromCharCode(10))[0].trim();
+res[fnd[i][1]]=valor;
 }
 var nac="",venc="";
 if(res.DBB&&res.DBB.length===8)nac=res.DBB.slice(4,8)+"-"+res.DBB.slice(0,2)+"-"+res.DBB.slice(2,4);
 if(res.DBA&&res.DBA.length===8)venc=res.DBA.slice(4,8)+"-"+res.DBA.slice(0,2)+"-"+res.DBA.slice(2,4);
-var nombre=((res.DAC||"")+" "+(res.DAD||"")+" "+(res.DAB||"")).trim();
+var nombre=((res.DAC||"")+" "+(res.DAD||"")+" "+(res.DCS||res.DAB||"")).trim();
 return {nombre:(nombre&&nombre.length>3)?nombre:null,nacimiento:nac,edad:(nac?edadDe(nac):-1),numero:(res.DAQ||res.DCF||""),direccion:((res.DAI||"")+" "+(res.DAG||"")+" "+(res.DAJ||"")+" "+(res.DAK||"")).trim(),vencimiento:venc,confiable:true};
 }catch(e){return null}
 }

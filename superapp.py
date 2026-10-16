@@ -539,7 +539,7 @@ a{color:#a78bfa}
 <div id="resp"></div>
 </form>
 <p style="text-align:center;margin-top:14px"><a href="/">Volver</a> | <a href="/entrar">Ya tengo ZID</a></p>
-<p style="text-align:center;color:#4a4f7a;font-size:11px;margin-top:10px">ZYRA registro v26 - fotos que no se pierden</p>
+<p style="text-align:center;color:#4a4f7a;font-size:11px;margin-top:10px">ZYRA registro v27 - recuadro ajustable y envio ligero</p>
 <script>
 window.onerror=function(m,u,l){try{var b=document.getElementById("jserr");if(b){b.style.display="block";b.innerHTML="Error interno (linea "+l+"): "+m}}catch(e){}};
 var DF="",DA="",DS="";
@@ -880,7 +880,7 @@ var fr2=new FileReader();
 var pfr=new Promise(function(res,rej){fr2.onload=function(){res(fr2.result)};fr2.onerror=function(){rej(new Error("lectura"))}});
 fr2.readAsDataURL(f);
 var crudo=await conTimeout(pfr,15000,"lectura lenta");
-var comp=await conTimeout(zyComprimir(crudo,1200,0.78),15000,"compresion lenta");
+var comp=await conTimeout(zyComprimir(crudo,900,0.7),15000,"compresion lenta");
 var pL=leerTodo(comp);
 pL.then(function(_leido){if(_leido){if(lado=="A"){datosDocA=_leido}else{datosDocF=_leido}}});
 var L=await conTimeout(luma(comp),15000,"luz lenta");
@@ -902,7 +902,7 @@ R("titLado").innerHTML="ESTAS ENMARCANDO EL LADO "+(lado=="F"?"FRONTAL (la cara 
           st.innerHTML="Abriendo editor...";
 im.onload=function(){
 docImg=im;
-quad=quadInicial(im);
+var pr0=propIdeal();var fw0=im.width*0.7,fh0=fw0/pr0;if(fh0>im.height*0.85){fh0=im.height*0.85;fw0=fh0*pr0}quad={tl:{x:(im.width-fw0)/2,y:(im.height-fh0)/2},tr:{x:(im.width+fw0)/2,y:(im.height-fh0)/2},br:{x:(im.width+fw0)/2,y:(im.height+fh0)/2},bl:{x:(im.width-fw0)/2,y:(im.height+fh0)/2}};
 R("zonaEdit").style.display="block";
 pintarEditor();
 if(!editListo){iniciarEdit();editListo=true}
@@ -1236,7 +1236,7 @@ st.className="estado mal";
 capturando=false;R("bSelfie").disabled=false;
 return false;
 }
-var comp=await zyComprimir(crudo,720,0.65);
+var comp=await zyComprimir(crudo,640,0.6);
 DS=comp;
 stopCam();
 R("bAbrirCam").style.display="none";
@@ -1272,7 +1272,7 @@ var j=await r.json();
 if(j.ok&&j.zid){Rr.innerHTML="<div style='background:#0f2a1a;border:1px solid #238636;border-radius:12px;padding:14px'><p style='color:#3fb950;font-weight:800;font-size:17px'>REGISTRO EXITOSO</p><p>Tu ZID unico fue creado:</p><p class='zid'>"+j.zid+"</p><p>Guarda tu ZID y tu clave. Nadie mas puede crearlo.</p><p><a href='/entrar'>ENTRAR AHORA</a></p></div>";}
 else if(j.codigo==="mantenimiento"){Rr.innerHTML="<div style='background:#2a2410;border:1px solid #f0b429;border-radius:12px;padding:14px'><p style='color:#f0b429;font-weight:800'>BIOMETRIA EN MANTENIMIENTO</p><p>"+(j.error||"")+"</p><p>Tu solicitud quedo guardada. El registro funciono completo: los datos llegaron a la Red.</p><p><a href='/registro'>Volver a intentar</a></p></div>";}
 else{Rr.innerHTML="<p style='color:#f85149;font-weight:700'>NO SE PUDO CREAR EL ZID</p><p>"+(j.error||"Motivo desconocido")+"</p>";}}
-catch(e){Rr.innerHTML="<div style='background:#2a1414;border:1px solid #f85149;border-radius:12px;padding:14px'><p style='color:#f85149;font-weight:700'>La Red no respondio</p><p>Detalle tecnico: "+e+"</p></div>";}
+catch(e){var dtxt=""+e;try{var rt=await r.text();if(rt)dtxt+=" | servidor dijo: "+rt.substring(0,300)}catch(e2){}Rr.innerHTML="<div style='background:#2a1414;border:1px solid #f85149;border-radius:12px;padding:14px'><p style='color:#f85149;font-weight:700'>La Red no respondio</p><p>Detalle: "+dtxt+"</p></div>";}
 window.scrollTo(0,document.body.scrollHeight);
 return false}
 (function(){var s=loadSes();if(s&&(s.DF||s.DA||s.DS)){

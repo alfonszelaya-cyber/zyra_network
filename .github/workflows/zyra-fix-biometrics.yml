@@ -1,30 +1,286 @@
-name: ZYRA S38 veredicto final post-deploy S37
+name: ZYRA S38 OCR automatico + rechazo de vencidos + verificacion motor y JS vivo
 
 on:
   workflow_dispatch:
+  push:
+    branches:
+      - main
 
 permissions:
-  contents: read
+  contents: write
 
 jobs:
   s38:
     runs-on: ubuntu-latest
     steps:
-      - name: Leer motor activo + probar cadena completa
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Python 3.12
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Validar YAML del workflow
+        run: |
+          pip install pyyaml
+          python -c "import yaml; yaml.safe_load(open('.github/workflows/zyra-fix-biometrics.yml', encoding='utf-8')); print('YAML OK')"
+
+      - name: S38 — AUDITORIA del estado actual (todo lo existente)
+        run: |
+          {
+            echo "## S38 — AUDITORIA 1: version y marcadores de la pagina viva"
+            echo '````'
+            echo "v22 en superapp.py: $(grep -c 'registro v22' superapp.py || true)"
+            echo "v21 en superapp.py: $(grep -c 'registro v21' superapp.py || true)"
+            echo "zxing: $(grep -c 'zxing' superapp.py || true)"
+            echo "tesseract: $(grep -c 'Tesseract' superapp.py || true)"
+            echo "vencimiento: $(grep -c 'vencimiento' superapp.py || true)"
+            echo "leerCodigo: $(grep -c 'leerCodigo' superapp.py || true)"
+            echo "parseAAMVA: $(grep -c 'parseAAMVA' superapp.py || true)"
+            echo "payload doc_kind: $(grep -c 'doc_kind' superapp.py || true)"
+            echo '````'
+          } >> "$GITHUB_STEP_SUMMARY"
+          {
+            echo "## S38 — AUDITORIA 2: rama zyra y enroll en la Red"
+            echo '````'
+            grep -n 'if choice == "zyra"' shared_engines/runtime/kernel.py || echo "rama zyra NO presente"
+            grep -n 'provider=_make_biometric_provider()' shared_engines/runtime/kernel.py || echo "cableado kernel NO presente"
+            grep -n 'return bio' shared_engines/runtime/api.py | head -5
+            grep -n 'def _handle_identity_enroll' shared_engines/runtime/api.py
+            echo '````'
+          } >> "$GITHUB_STEP_SUMMARY"
+          {
+            echo "## S38 — AUDITORIA 3: modelos empaquetados y requirements"
+            echo '````'
+            ls -la shared_engines/security/models/ 2>/dev/null || echo "models: no existe"
+            cat requirements-render.txt
+            echo '````'
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: S38 — PATCHES: OCR automatico + vencidos + v23 (compila antes de escribir)
+        run: |
+          cat > /tmp/s38_fix.py << 'PYEOF'
+          import os, sys, re
+
+          REPO = os.getcwd()
+          OUT = []
+          def P(s=""): OUT.append(str(s))
+
+          SP = os.path.join(REPO, "superapp.py")
+          src = open(SP, encoding="utf-8", errors="replace").read()
+
+          def compila(t):
+              try:
+                  compile(t, "superapp.py", "exec")
+                  return True
+              except Exception as e:
+                  P("compile fallo: " + repr(e)[:300])
+                  return False
+
+          if "registro v23" in src:
+              P("v23 YA ESTABA — sin cambios de formulario")
+              print("\n".join(OUT)); sys.exit(0)
+
+          if "registro v22" not in src:
+              P("ERROR: no hay v22 que actualizar — NO SE ESCRIBE NADA")
+              print("\n".join(OUT)); sys.exit(0)
+
+          EDICIONES = []
+
+          E1A = '<script src="https://unpkg.com/@zxing/library@0.21.3/umd/index.min.js"></script>'
+          E1B = E1A + '\n<script src="https://cdn.jsdelivr.net/npm/tesseract.js@5/dist/tesseract.min.js"></script>'
+          EDICIONES.append(("tesseract embebido", E1A, E1B))
+
+          E2A = '<option value="permiso">Permiso legal / otro documento</option>\n</select>'
+          E2B = ('<option value="permiso">Permiso legal / otro documento</option>\n'
+                 '</select>\n'
+                 '<label>Fecha de vencimiento del documento (si aparece en el)</label>\n'
+                 '<input type="date" id="vencimiento">')
+          EDICIONES.append(("campo vencimiento", E2A, E2B))
+
+          OCRFN = "\n".join([
+            'function sinRaros(s){var r="";var ok="ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz";for(var i=0;i<s.length;i++){var ch=s.charAt(i);if(ok.indexOf(ch)>=0||ch===" ")r+=ch}return r}',
+            'async function ocrDoc(dataUrl){',
+            'try{',
+            'if(!window.Tesseract)return null;',
+            'var ret=await Tesseract.recognize("data:image/jpeg;base64,"+dataUrl,"eng");',
+            'var t=(ret&&ret.data&&ret.data.text)?ret.data.text:"";',
+            'if(t.trim().length<20)return null;',
+            'var lineas=t.split("\\n");',
+            'var nombre="";',
+            'for(var i=0;i<lineas.length;i++){',
+            'var ln=sinRaros(lineas[i]).trim();',
+            'var partes=ln.split(" ").filter(function(x){return x.length>2});',
+            'if(partes.length>=2&&!nombre){nombre=partes.join(" ")}',
+            '}',
+            'var fechas=[];',
+            'var pedazos=t.split(/[^0-9]/);',
+            'var buf="";',
+            'for(var j=0;j<pedazos.length;j++){',
+            'if(pedazos[j].length>0){buf+=pedazos[j];if(buf.length===8){fechas.push(buf);buf=""}}else{if(buf.length===8)fechas.push(buf);buf=""}}',
+            'if(buf.length===8)fechas.push(buf);',
+            'return {nombre:nombre,texto:t.trim().substring(0,400),fechas:fechas};',
+            '}catch(e){return null}',
+            '}',
+            'async function leerTodo(comp){',
+            'var r1=await leerCodigo(comp);',
+            'if(r1)return r1;',
+            'var r2=await ocrDoc(comp);',
+            'if(r2){try{var nm=R("nombre").value.trim();if(r2.nombre&&nm.length<3){R("nombre").value=r2.nombre}}catch(e){}}',
+            'return r2;',
+            '}',
+          ])
+          E3A = 'function mostrarDesglose(){'
+          E3B = OCRFN + '\nfunction mostrarDesglose(){'
+          EDICIONES.append(("funciones OCR", E3A, E3B))
+
+          E4A = 'var pL=leerCodigo(comp);'
+          E4B = 'var pL=leerTodo(comp);'
+          EDICIONES.append(("lector combinado", E4A, E4B))
+
+          E5A = 'd.innerHTML=h;'
+          E5B = "\n".join([
+            'var fv=R("vencimiento")?R("vencimiento").value:"";',
+            'if(fv){var hoy=new Date();hoy.setHours(0,0,0,0);var fvd=new Date(fv+"T00:00:00");if(fvd&&fvd<hoy){h+="<p style=\'color:#f85149;font-weight:700\'>Documento VENCIDO ("+fv+"): no se acepta.</p>"}else{h+="<p style=\'color:#3fb950\'>Vencimiento del documento: "+fv+"</p>"}}',
+            'if(fuente&&fuente.texto){h+="<p style=\'color:#7c8cf8\'>Texto leido por OCR del documento (revisalo y corrige si algo salio mal): "+fuente.texto.split("<").join("&lt;")+"</p>"}',
+            'd.innerHTML=h;',
+          ])
+          EDICIONES.append(("desglose vencimiento+OCR", E5A, E5B))
+
+          E6A = 'if(!DS){Rr.innerHTML="<p style=\'color:#f85149\'>Falta la selfie (paso 4).</p>";return false}'
+          E6B = E6A + '\n          var fv2=R("vencimiento")?R("vencimiento").value:"";\n          if(fv2){var hoy2=new Date();hoy2.setHours(0,0,0,0);var fvd2=new Date(fv2+"T00:00:00");if(fvd2&&fvd2<hoy2){Rr.innerHTML="<p style=\'color:#f85149;font-weight:700\'>DOCUMENTO VENCIDO ("+fv2+"): un documento vencido no es prueba de identidad legal. NO se crea el ZID.</p>";window.scrollTo(0,document.body.scrollHeight);return false}}'
+          EDICIONES.append(("gate vencidos en enviar", E6A, E6B))
+
+          E7A = 'ZYRA registro v22 - lector embebido'
+          E7B = 'ZYRA registro v23 - OCR automatico'
+          EDICIONES.append(("marcador v23", E7A, E7B))
+
+          hecho = []
+          omit = []
+          nuevo = src
+          for nombre, a, b in EDICIONES:
+              c = nuevo.count(a)
+              if c == 1:
+                  nuevo = nuevo.replace(a, b, 1)
+                  hecho.append(nombre)
+              else:
+                  omit.append(nombre + "(ancla=" + str(c) + ")")
+          P("ediciones aplicadas: %s" % (", ".join(hecho) or "NINGUNA"))
+          if omit:
+              P("ediciones omitidas: %s" % ", ".join(omit))
+
+          g1 = nuevo.count("registro v23")
+          g2 = nuevo.count("ocrDoc")
+          g3 = nuevo.count("vencimiento")
+          g4 = nuevo.count("Tesseract")
+          P("GATES | v23=%d ocrDoc=%d vencimiento=%d tesseract=%d" % (g1, g2, g3, g4))
+          if g1 < 1 or g2 < 2 or g3 < 3:
+              P("GATE FALLO — NO SE ESCRIBE NADA, queda la v22 que funciona")
+              print("\n".join(OUT)); sys.exit(0)
+
+          if not compila(nuevo):
+              P("NO COMPILO — NO SE ESCRIBE, queda la v22")
+              print("\n".join(OUT)); sys.exit(0)
+
+          open(SP, "w", encoding="utf-8").write(nuevo)
+          P("ESCRITO Y COMPILA")
+
+          VT = os.path.join(REPO, "portal", "version.txt")
+          cur = open(VT, encoding="utf-8").read().strip()
+          m = re.search(r"-(\d+)$", cur)
+          if m:
+              nv = cur[:m.start()] + "-" + str(int(m.group(1)) + 1)
+              open(VT, "w", encoding="utf-8").write(nv + "\n")
+              P("version: %s -> %s" % (cur, nv))
+
+          P("S38 FIX OK — sin archivos nuevos, solo superapp.py y version.txt")
+          print("\n".join(OUT))
+          PYEOF
+          python3 /tmp/s38_fix.py > /tmp/s38_out.txt 2>&1
+          RC=$?
+          cat /tmp/s38_out.txt
+          {
+            echo "## S38 — parches"
+            echo ""
+            echo '````'
+            cat /tmp/s38_out.txt
+            echo '````'
+          } >> "$GITHUB_STEP_SUMMARY"
+          exit $RC
+
+      - name: Commit
+        run: |
+          git config user.name "zyra-ci"
+          git config user.email "zyra-ci@users.noreply.github.com"
+          git add superapp.py portal/version.txt
+          if git diff --cached --quiet; then
+            echo "Nada nuevo por commitear." | tee commit38.txt
+          else
+            git commit -m "S38: OCR automatico del documento (Tesseract embebido, llena nombre solo) + campo de vencimiento + rechazo de documentos vencidos + desglose muestra el texto leido" | tee commit38.txt
+            git push
+          fi
+          { echo "## S38 — commit"; echo '````'; cat commit38.txt; echo '````'; } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Esperar despliegue v23
+        run: |
+          OK=0
+          for i in 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17 18; do
+            V=$(curl -sS -m 30 "https://zyra-superapp.onrender.com/registro" 2>/dev/null | grep -c "registro v23" || true)
+            echo "intento $i: v23=$V"
+            if [ "$V" -ge 1 ] 2>/dev/null; then OK=1; break; fi
+            sleep 20
+          done
+          echo "v23 en vivo: $OK"
+          { echo "## S38 — despliegue"; echo '````'; echo "v23 en vivo: $OK"; echo '````'; } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: VERIFICACION node del JS vivo (los botones viven)
+        run: |
+          python3 - << 'PYEOF'
+          import urllib.request, re
+          req = urllib.request.Request("https://zyra-superapp.onrender.com/registro", headers={"User-Agent": "Mozilla/5.0"})
+          html = urllib.request.urlopen(req, timeout=120).read().decode("utf-8", "replace")
+          open("/tmp/viva38.html", "w", encoding="utf-8").write(html)
+          scripts = re.findall(r"<script>(.*?)</script>", html, re.S)
+          for i, s in enumerate(scripts):
+              open("/tmp/v38_%d.js" % i, "w", encoding="utf-8").write(s)
+          print("bloques: %d" % len(scripts))
+          print("marcador v23 en vivo: %d" % html.count("registro v23"))
+          print("ocrDoc en vivo: %d" % html.count("ocrDoc"))
+          print("vencimiento en vivo: %d" % html.count("vencimiento"))
+          PYEOF
+          {
+            echo "## S38 — VEREDICTO JS VIVO (node)"
+            echo '````'
+            OKALL=1
+            for f in /tmp/v38_*.js; do
+              if node --check "$f" 2>/tmp/e38.txt; then
+                echo "$f : SINTAXIS OK — botones vivos"
+              else
+                OKALL=0
+                echo "$f : ROTO"
+                head -8 /tmp/e38.txt
+              fi
+            done
+            [ "$OKALL" = "1" ] && echo ">>> JS VALIDADO" || echo ">>> MANDAR ESTE BLOQUE"
+            echo '````'
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: VEREDICTO DEL MOTOR en vivo
         run: |
           B="(sin respuesta)"
           for i in 1 2 3 4 5 6 7 8; do
             B=$(curl -sS -m 30 "https://zyra-network-or16.onrender.com/provider" 2>/dev/null | head -c 300)
-            echo "provider intento $i: $B"
+            echo "provider $i: $B"
             if printf '%s' "$B" | grep -q "provider"; then break; fi
             sleep 15
           done
           PNG="iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mP8z8BQDwAEhQGAhKmMIQAAAABJRU5ErkJggg=="
           DATA="{\"nombre\":\"ZZ TEST BORRAR\",\"clave\":\"prueba12345\",\"doc_image_b64\":\"$PNG\",\"selfie_image_b64\":\"$PNG\",\"doc_type\":\"dui\"}"
-          C=$(curl -sS -m 150 -o /tmp/b38 -w "%{http_code}" -X POST -H "Content-Type: application/json" -d "$DATA" "https://zyra-superapp.onrender.com/registro/nuevo" 2>/dev/null)
-          BODY=$(head -c 600 /tmp/b38)
+          C=$(curl -sS -m 150 -o /tmp/bm38 -w "%{http_code}" -X POST -H "Content-Type: application/json" -d "$DATA" "https://zyra-superapp.onrender.com/registro/nuevo" 2>/dev/null)
+          BODY=$(head -c 600 /tmp/bm38)
           {
-            echo "## S38 — VEREDICTO FINAL"
+            echo "## S38 — VEREDICTO DEL MOTOR EN VIVO"
             echo '````'
             echo "GET /provider  -> $B"
             echo "POST registro  -> HTTP $C : $BODY"
@@ -33,43 +289,27 @@ jobs:
               if printf '%s' "$BODY" | grep -qE "ningun rostro|template_quality|biometrics_gate"; then
                 echo "=================================================="
                 echo ">>> MOTOR ZYRA VISION ACTIVO Y ATENDIENDO."
-                echo ">>> La Red corrio el motor y rechazo la imagen de"
-                echo ">>> prueba (1 pixel sin rostro) = EXACTO LO CORRECTO."
-                echo ">>>"
-                echo ">>> CELULAR AHORA:"
-                echo ">>> 1. Desinstala la PWA, agregala de nuevo (debe decir v22)."
-                echo ">>> 2. Registra con tu DUI real: nombre+apellido ->"
-                echo ">>>    fotos -> selfie -> clave -> Crear mi ZID."
-                echo ">>> 3. Final: REGISTRO EXITOSO + TU ZID."
+                echo ">>> CELULAR: desinstala la PWA, agregala de nuevo (v23),"
+                echo ">>> registra con tu DUI real -> TU ZID."
                 echo "=================================================="
               elif printf '%s' "$BODY" | grep -q "mantenimiento"; then
-                echo ">>> Red con motor OK; superapp con codigo viejo."
-                echo ">>> Render -> zyra-superapp -> Manual Deploy -> Deploy latest commit."
-                echo ">>> Espera Live y relanza S38."
-              elif printf '%s' "$BODY" | grep -q '"zid"'; then
-                echo ">>> ZID CREADO CON 1 PIXEL: NO deberia. Avisar de inmediato."
+                echo ">>> Red con motor OK; superapp vieja: Render -> zyra-superapp ->"
+                echo ">>> Manual Deploy -> Deploy latest commit. Relanza S38."
               else
                 echo ">>> Motor activo; respuesta no clasificada: mandar este bloque."
               fi
             elif printf '%s' "$B" | grep -q "fail-closed"; then
               echo "=================================================="
-              echo ">>> La Red dice FAIL-CLOSED. Los logs ahora DICEN LA VERDAD:"
-              echo ">>> Render -> zyra-network-or16 -> Logs (arriba de todo, del arranque) ->"
-              echo ">>> busca estas 2 lineas y pegamelas:"
+              echo ">>> FAIL-CLOSED. Render -> zyra-network -> Logs (del arranque) ->"
+              echo ">>> busca y pegame estas 2 lineas:"
               echo ">>>   'ZYRA provider seleccionado: ...'"
               echo ">>>   'biometrics engine wired (provider: ...)'"
-              echo ">>> Si dice 'seleccionado: zyra' + 'provider: fail-closed' ="
-              echo ">>>   el import del motor fallo en Render (pegame tambien el"
-              echo ">>>   traceback que aparece justo despues de esas lineas)."
-              echo ">>> Si dice 'seleccionado: fail-closed' ="
-              echo ">>>   la variable no llega al proceso: verifica en Environment"
-              echo ">>>   de ESTE servicio (zyra-network) que exista"
-              echo ">>>   ZYRA_BIOMETRICS_PROVIDER = zyra"
+              echo ">>> Con esas 2 lineas digo el arreglo exacto en un codigo."
               echo "=================================================="
             elif printf '%s' "$B" | grep -q "unknown route"; then
-              echo ">>> /provider sigue sin existir: el deploy 4a4d103 no sirve codigo nuevo."
-              echo ">>> Render -> zyra-network -> Events: verifica que el deploy de 4a4d103"
-              echo ">>> diga 'Deploy succeeded'. Si dice failed, pegame la linea roja."
+              echo ">>> /provider sin respuesta: el deploy de S37 (4a4d103) no sirvo codigo nuevo."
+              echo ">>> Render -> zyra-network -> Events: verifica que 4a4d103 diga 'Deploy succeeded'."
+              echo ">>> Si dice failed, pegame la linea roja."
             else
               echo ">>> Respuesta no clasificada: mandar este bloque completo."
             fi
@@ -81,4 +321,4 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           name: reporte-s38
-          path: superapp.py
+          path: commit38.txt

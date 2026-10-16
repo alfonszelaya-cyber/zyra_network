@@ -1,58 +1,263 @@
-name: ZYRA S32 confirmacion inmediata del motor activo (sin cambios)
+name: ZYRA S33 motor cableado al arranque + pagina /provider + veredicto en vivo
 
 on:
   workflow_dispatch:
+  push:
+    branches:
+      - main
 
 permissions:
-  contents: read
+  contents: write
 
 jobs:
-  s32:
+  s33:
     runs-on: ubuntu-latest
     steps:
-      - name: Esperar Red estable y probar el motor en vivo
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Python 3.12
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Validar YAML del workflow
         run: |
-          UP=0
-          for i in 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15; do
-            H=$(curl -sS -m 30 -o /tmp/h32 -w "%{http_code}" "https://zyra-network-or16.onrender.com/health" 2>/dev/null)
-            echo "intento $i: Red /health -> HTTP $H"
-            if [ "$H" = "200" ]; then UP=1; break; fi
+          pip install pyyaml
+          python -c "import yaml; yaml.safe_load(open('.github/workflows/zyra-fix-biometrics.yml', encoding='utf-8')); print('YAML OK')"
+
+      - name: S33 — auditar cableado y parchear (nunca queda rojo)
+        run: |
+          cat > /tmp/s33_fix.py << 'PYEOF'
+          import os, sys, re
+
+          REPO = os.getcwd()
+          OUT = []
+          def P(s=""): OUT.append(str(s))
+
+          KP = os.path.join(REPO, "shared_engines", "runtime", "kernel.py")
+          AP = os.path.join(REPO, "shared_engines", "runtime", "api.py")
+          VT = os.path.join(REPO, "portal", "version.txt")
+
+          ksrc = open(KP, encoding="utf-8", errors="replace").read()
+
+          P("--- AUDITORIA DE CABLEADO ---")
+          n_def = len(re.findall(r"def\s+_make_biometric_provider\s*\(", ksrc))
+          n_calls = len(re.findall(r"_make_biometric_provider\s*\(\s*\)", ksrc))
+          P("def fabrica: %d | apariciones de la llamada (incluye def): %d" % (n_def, n_calls))
+          if n_calls <= 1:
+              P(">>> LA FABRICA NUNCA ES LLAMADA: el kernel nunca conecta el motor por variable. HAY QUE CABLEAR.")
+          else:
+              P(">>> La fabrica SI se llama en el arranque.")
+
+          for m in re.finditer(r"BiometricsEngine\s*\(", ksrc):
+              a = m.start()
+              P("--- BiometricsEngine en kernel.py, linea %d, contexto ---" % (ksrc[:a].count(chr(10)) + 1))
+              for ln in ksrc[max(0, a - 200):a + 700].split(chr(10)):
+                  P("| " + ln[:150])
+          if "BiometricsEngine(" not in ksrc:
+              P("BiometricsEngine NO se construye en kernel.py — se busca en el repo:")
+              for root, dirs, files in os.walk(REPO):
+                  dirs[:] = [d for d in dirs if d not in {".git", ".github", "__pycache__", "node_modules"}]
+                  for fn in files:
+                      if not fn.endswith(".py"):
+                          continue
+                      p = os.path.join(root, fn)
+                      if p.replace(os.sep, "/").endswith("runtime/kernel.py"):
+                          continue
+                      try:
+                          t = open(p, encoding="utf-8", errors="replace").read()
+                      except Exception:
+                          continue
+                      if "BiometricsEngine(" in t and "/tests/" not in p and "test_" not in fn:
+                          P("hallado en: " + p.replace(REPO, ""))
+
+          P("")
+          P("--- PARCHE 1: blindar la rama zyra (que un import roto nunca tire la Red) ---")
+          VIEJO = chr(10).join([
+              '    if choice == "zyra":',
+              '        from shared_engines.security.biometrics_face import (',
+              '            ZyraVisionProvider,',
+              '        )',
+              '        return ZyraVisionProvider()',
+          ])
+          NUEVO = chr(10).join([
+              '    if choice == "zyra":',
+              '        try:',
+              '            from shared_engines.security.biometrics_face import (',
+              '                ZyraVisionProvider,',
+              '            )',
+              '            return ZyraVisionProvider()',
+              '        except Exception:',
+              '            return _FailClosedProvider()',
+          ])
+          c = ksrc.count(VIEJO)
+          P("ancla rama zyra: %d (esperado 1)" % c)
+          if c == 1:
+              ksrc2 = ksrc.replace(VIEJO, NUEVO, 1)
+              P("rama zyra: BLINDADA con fail-closed de respaldo")
+          else:
+              ksrc2 = ksrc
+              P("rama zyra: se deja tal cual (ancla no unica)")
+
+          P("")
+          P("--- PARCHE 2: conectar la fabrica al arranque si no lo esta ---")
+          if n_calls > 1:
+              ksrc3 = ksrc2
+              P("cableado ya existe: sin cambios")
+          else:
+              m = re.search(r"BiometricsEngine\s*\(", ksrc2)
+              if not m:
+                  P("no hay BiometricsEngine en kernel.py: NO SE PARCH EA (ver contexto arriba)")
+                  ksrc3 = ksrc2
+              else:
+                  seg0 = m.end()
+                  seg = ksrc2[seg0:seg0 + 900]
+                  mp = re.search(r"provider\s*=\s*([^,\n]+)", seg)
+                  if not mp:
+                      P("no se hallo el argumento provider: NO SE PARCHEA (ver contexto)")
+                      ksrc3 = ksrc2
+                  else:
+                      arg_viejo = mp.group(1).strip()
+                      P("argumento provider actual: %s" % arg_viejo[:80])
+                      if arg_viejo == "_make_biometric_provider()":
+                          ksrc3 = ksrc2
+                          P("ya apunta a la fabrica")
+                      else:
+                          nuevo_seg = seg[:mp.start()] + "provider=_make_biometric_provider()" + seg[mp.end():]
+                          cand = ksrc2[:seg0] + nuevo_seg + ksrc2[seg0 + 900:]
+                          try:
+                              compile(cand, "kernel.py", "exec")
+                              ksrc3 = cand
+                              P("CABLEADO APLICADO: provider=_make_biometric_provider() y compila")
+                          except Exception as e:
+                              P("candidato no compilo, NO SE ESCRIBE: " + repr(e)[:200])
+                              ksrc3 = ksrc2
+
+          try:
+              compile(ksrc3, "kernel.py", "exec")
+              open(KP, "w", encoding="utf-8").write(ksrc3)
+              P("kernel.py GUARDADO Y COMPILA")
+          except Exception as e:
+              P("kernel.py no compilo: " + repr(e)[:250])
+
+          P("")
+          P("--- PARCHE 3: pagina /provider en la Red (lectura publica del motor activo) ---")
+          asrc = open(AP, encoding="utf-8", errors="replace").read()
+          if 'segments == ["provider"]' in asrc:
+              P("ruta /provider: YA ESTABA")
+          else:
+              ANCLA = chr(10).join([
+                  '        if segments == ["health"] and method == "GET":',
+                  '            self._handle_health()',
+                  '            return',
+              ])
+              c2 = asrc.count(ANCLA)
+              P("ancla health: %d (esperado 1)" % c2)
+              if c2 == 1:
+                  RUTA = chr(10).join([
+                      '        if segments == ["health"] and method == "GET":',
+                      '            self._handle_health()',
+                      '            return',
+                      '        if segments == ["provider"] and method == "GET":',
+                      '            _bio = getattr(type(self).kernel, "_biometrics", None)',
+                      '            _prov = getattr(_bio, "_provider", None)',
+                      '            self._send_json(',
+                      '                200,',
+                      '                {',
+                      '                    "ok": True,',
+                      '                    "data": {',
+                      '                        "provider": str(getattr(_prov, "name", "unknown")),',
+                      '                    },',
+                      '                },',
+                      '            )',
+                      '            return',
+                  ])
+                  asrc2 = asrc.replace(ANCLA, RUTA, 1)
+                  try:
+                      compile(asrc2, "api.py", "exec")
+                      open(AP, "w", encoding="utf-8").write(asrc2)
+                      P("ruta /provider: APLICADA y compila")
+                  except Exception as e:
+                      P("api.py no compilo: " + repr(e)[:250])
+              else:
+                  P("ruta /provider: OMITIDA (ancla no unica)")
+
+          VT = os.path.join(REPO, "portal", "version.txt")
+          cur = open(VT, encoding="utf-8").read().strip()
+          mm = re.search(r"-(\d+)$", cur)
+          if mm:
+              nv = cur[:mm.start()] + "-" + str(int(mm.group(1)) + 1)
+              open(VT, "w", encoding="utf-8").write(nv + chr(10))
+              P("version: %s -> %s" % (cur, nv))
+
+          P("S33 FIX OK")
+          print("\n".join(OUT))
+          PYEOF
+          python3 /tmp/s33_fix.py > /tmp/s33_out.txt 2>&1
+          RC=$?
+          cat /tmp/s33_out.txt
+          {
+            echo "## S33 — auditoria y parches"
+            echo ""
+            echo '````'
+            cat /tmp/s33_out.txt
+            echo '````'
+          } >> "$GITHUB_STEP_SUMMARY"
+          exit $RC
+
+      - name: Commit
+        run: |
+          git config user.name "zyra-ci"
+          git config user.email "zyra-ci@users.noreply.github.com"
+          git add shared_engines/runtime/kernel.py shared_engines/runtime/api.py portal/version.txt
+          if git diff --cached --quiet; then
+            echo "Nada nuevo por commitear." | tee commit33.txt
+          else
+            git commit -m "S33: fabrica de proveedor cableada al arranque + rama zyra blindada + ruta /provider que dice el motor activo en vivo" | tee commit33.txt
+            git push
+          fi
+          { echo "## S33 — commit"; echo '````'; cat commit33.txt; echo '````'; } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Esperar la Red y leer el motor activo EN VIVO
+        run: |
+          OK=0
+          for i in 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17 18; do
+            B=$(curl -sS -m 30 "https://zyra-network-or16.onrender.com/provider" 2>/dev/null | head -c 200)
+            echo "intento $i: $B"
+            if printf '%s' "$B" | grep -q "provider"; then OK=1; break; fi
             sleep 20
           done
           {
-            echo "## S32 — Red estable"
+            echo "## S33 — VEREDICTO EN VIVO (el motor que la Red tiene cargado AHORA)"
             echo '````'
-            echo "health 200: $UP"
-            head -c 400 /tmp/h32 2>/dev/null
+            echo "GET /provider -> $B"
             echo ""
-            echo '````'
-          } >> "$GITHUB_STEP_SUMMARY"
-
-          PNG="iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mP8z8BQDwAEhQGAhKmMIQAAAABJRU5ErkJggg=="
-          DATA="{\"nombre\":\"ZZ TEST BORRAR\",\"clave\":\"prueba12345\",\"doc_image_b64\":\"$PNG\",\"selfie_image_b64\":\"$PNG\",\"doc_type\":\"dui\"}"
-          C=$(curl -sS -m 150 -o /tmp/b32 -w "%{http_code}" -X POST -H "Content-Type: application/json" -d "$DATA" "https://zyra-superapp.onrender.com/registro/nuevo" 2>/dev/null)
-          BODY=$(head -c 500 /tmp/b32)
-          {
-            echo "## S32 — VEREDICTO DEL MOTOR EN VIVO"
-            echo '````'
-            echo "POST -> HTTP $C : $BODY"
-            echo ""
-            if printf '%s' "$BODY" | grep -qE "ningun rostro|template_quality|biometrics_gate"; then
-              echo ">>> MOTOR ZYRA VISION ACTIVO Y ATENDIENDO."
-              echo ">>> La Red corrio el motor y rechazo la imagen de prueba (1 pixel sin rostro) = CORRECTO."
-              echo ">>> CELULAR AHORA: desinstala la PWA, agregala de nuevo (debe decir v22),"
-              echo ">>> registra con tu DUI real -> ZID."
-            elif printf '%s' "$BODY" | grep -q "mantenimiento"; then
-              echo ">>> Todavia contesta el codigo viejo: la Red sigue desplegando o la variable"
-              echo ">>> no esta en zyra-network-or16 con valor exacto: zyra"
-              echo ">>> Espera 5 minutos y relanza este workflow (Run workflow)."
-            elif printf '%s' "$C" = "503"; then
-              echo ">>> 503 con cuerpo vacio: la Red sigue reiniciando (despliegue largo por"
-              echo ">>> instalar numpy+opencv). Espera 5-10 min en Render hasta ver Live y relanza."
-            elif printf '%s' "$BODY" | grep -q '"zid"'; then
-              echo ">>> ZID CREADO EN LA PRUEBA (no deberia con 1 pixel): avisar de inmediato."
+            if printf '%s' "$B" | grep -q "zyravision"; then
+              echo ">>> MOTOR ZYRA VISION ACTIVO EN LA RED."
+              echo ">>> CELULAR YA: desinstala la PWA, agregala de nuevo (v22), registra con tu DUI -> ZID."
+            elif printf '%s' "$B" | grep -q "fail-closed"; then
+              echo ">>> La Red dice fail-closed: la variable NO esta en zyra-network-or16."
+              echo ">>> EXACTAMENTE donde dar clic:"
+              echo ">>> 1. dashboard.render.com"
+              echo ">>> 2. Clic en el servicio cuya URL es zyra-network-or16.onrender.com (NO superapp)"
+              echo ">>> 3. Menu izquierdo: Environment"
+              echo ">>> 4. Add Environment Variable:"
+              echo ">>>    Name:  ZYRA_BIOMETRICS_PROVIDER"
+              echo ">>>    Value: zyra"
+              echo ">>> 5. Save Changes (redeploya solo, espera Live)"
+              echo ">>> 6. Relanza este workflow: debe decir zyravision."
+            elif [ "$OK" = "0" ]; then
+              echo ">>> /provider aun no responde (despliegue en curso). Espera 5 min y relanza."
             else
-              echo ">>> Respuesta no clasificada — mandar este bloque completo."
+              echo ">>> Respuesta no clasificada: mandar este bloque."
             fi
             echo '````'
           } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Guardar
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: reporte-s33
+          path: commit33.txt

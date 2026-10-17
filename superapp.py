@@ -443,13 +443,13 @@ h1{font-size:22px;text-align:center;margin:8px 0 4px;color:#fff}
 label{display:block;color:#9aa0c3;font-size:14px;margin:14px 0 6px}
 input,select{width:100%;padding:12px;border-radius:10px;border:1px solid #2a2f55;background:#0d1126;color:#fff;font-size:16px}
 .estado{text-align:center;font-size:13px;color:#9aa0c3;padding:6px;min-height:20px}
-.preview{display:none;width:100%;border-radius:10px;margin-top:6px}
+.preview{display:none;width:100%;max-width:330px;border-radius:10px;margin:6px auto 0;border:1px solid #2a2f55}
 button{width:100%;margin-top:10px;padding:13px;border:0;border-radius:10px;font-size:15px;font-weight:700;color:#fff;background:#262b52}
 button.ok{background:#1f6f43}
 button.big{margin-top:16px;padding:15px;font-size:16px;font-weight:800;background:linear-gradient(90deg,#7c5cff,#ff5c8a)}
 button:disabled{opacity:.45}
 .mini{background:none;color:#a78bfa;font-size:13px;padding:8px;width:auto;margin:4px auto;display:block;border:none;cursor:pointer}
-.videozona{display:none;position:relative;border-radius:12px;overflow:hidden;margin-top:8px;background:#000}
+.videozona{display:none;position:relative;border-radius:12px;overflow:hidden;margin-top:8px;margin-left:auto;margin-right:auto;background:#000;max-width:330px;border:1px solid #2a2f55;box-shadow:0 6px 24px rgba(0,0,0,0.5)}
 video{width:100%;display:block}
 .ov{position:absolute;left:0;top:0;width:100%;height:100%;pointer-events:none}
 a{color:#a78bfa}
@@ -534,7 +534,7 @@ a{color:#a78bfa}
 <div id="resp"></div>
 </form>
 <p style="text-align:center;margin-top:14px"><a href="/">Volver</a> | <a href="/entrar">Ya tengo ZID</a></p>
-<p style="text-align:center;color:#4a4f7a;font-size:11px;margin-top:10px">ZYRA registro v36 - parser verificado</p>
+<p style="text-align:center;color:#4a4f7a;font-size:11px;margin-top:10px">ZYRA registro v37 - control de nombre + captura compacta</p>
 <script>
 window.onerror=function(m,u,l){try{var b=document.getElementById("jserr");if(b){b.style.display="block";b.innerHTML="Error interno (linea "+l+"): "+m}}catch(e){}};
 var DF="",DA="",DS="";
@@ -1346,6 +1346,117 @@ mostrarDesglose();
 var rst=R("resp");if(rst)rst.innerHTML="<p style='color:#7c8cf8'>Sesion restaurada: tus fotos siguen aqui.</p>";
 }})();
 setTimeout(function(){ensureCara()},800);
+</script>
+<script>
+
+(function(){
+  if (window.__zyraPuertaV37) { return; }
+  window.__zyraPuertaV37 = true;
+  function R(id){ return document.getElementById(id); }
+  function toast(msg, mal){
+    var t = document.getElementById("toastv37");
+    if (!t) {
+      t = document.createElement("div");
+      t.id = "toastv37";
+      t.style.cssText = "position:fixed;left:12px;right:12px;bottom:18px;z-index:99999;padding:12px 14px;border-radius:12px;font-size:14px;font-weight:700;color:#fff;box-shadow:0 6px 24px rgba(0,0,0,0.5);display:none";
+      document.body.appendChild(t);
+    }
+    t.style.background = mal ? "#b62324" : "#1f6f3f";
+    t.textContent = msg;
+    t.style.display = "block";
+    if (t.__h) { clearTimeout(t.__h); }
+    t.__h = setTimeout(function(){ t.style.display = "none"; }, 7000);
+  }
+  function normTokens(s){
+    var v = (s || "").toUpperCase();
+    var de = "ÁÀÄÂÃÉÈËÊÍÌÏÎÓÒÖÔÕÚÙÜÛÑÇ";
+    var aa = "AAAAAEEEEIIIIOOOOOUUUUNC";
+    var i = 0;
+    for (i = 0; i < de.length; i++) { v = v.split(de.charAt(i)).join(aa.charAt(i)); }
+    v = v.replace(/[^A-Z ]/g, " ");
+    var parts = v.split(" ");
+    var out = [];
+    var j = 0;
+    for (j = 0; j < parts.length; j++) { if (parts[j].length > 1) { out.push(parts[j]); } }
+    return out;
+  }
+  function coincide(nombreDoc, nombreReg){
+    var d = normTokens(nombreDoc);
+    var r = normTokens(nombreReg);
+    if (d.length === 0 || r.length === 0) { return false; }
+    if (r.length === 1) { return (d.length === 1 && d[0] === r[0]); }
+    var k = 0;
+    for (k = 0; k < r.length; k++) { if (d.indexOf(r[k]) === -1) { return false; } }
+    return true;
+  }
+  function sesion(){
+    try { return JSON.parse(sessionStorage.getItem("zyraReg") || "null"); } catch (e) { return null; }
+  }
+  function nombreRegistro(){
+    var el = R("nombre");
+    if (el && el.value) { return el.value; }
+    var s = sesion();
+    return (s && s.nm) ? s.nm : "";
+  }
+  function imagenFrente(){
+    var s = sesion();
+    return (s && s.DF) ? s.DF : "";
+  }
+  async function verificarNombre(){
+    var reg = nombreRegistro();
+    if (normTokens(reg).length < 2) {
+      toast("Escribe tu nombre completo (1 o 2 nombres y 1 o 2 apellidos) en el PASO 1.", true);
+      return false;
+    }
+    if (window.nombreNoCoincide === true) {
+      toast("EL NOMBRE NO COINCIDE con el documento. No puedes pasar a la biometría.", true);
+      return false;
+    }
+    var df = imagenFrente();
+    if (!df) {
+      toast("No encuentro la foto del documento. Vuelve al PASO 2 y toma la foto del frente.", true);
+      return false;
+    }
+    toast("Verificando que tu nombre coincida con el documento...", false);
+    var texto = "";
+    try {
+      if (typeof Tesseract === "undefined") {
+        if (typeof cargarScript === "function") {
+          await cargarScript("https://cdn.jsdelivr.net/npm/tesseract.js@5/dist/tesseract.min.js");
+        }
+      }
+      var imgArg = (df.indexOf("data:") === 0) ? df : ("data:image/jpeg;base64," + df);
+      var r = await Tesseract.recognize(imgArg, "eng");
+      texto = (r && r.data && r.data.text) ? r.data.text : "";
+    } catch (e) { texto = ""; }
+    if (!texto) {
+      toast("No pudimos leer el documento. Toma la foto de nuevo: buena luz, sin reflejos, documento llenando la guía.", true);
+      return false;
+    }
+    var nombreDoc = (typeof nombreDeTexto === "function") ? nombreDeTexto(texto) : null;
+    if (!nombreDoc) {
+      toast("No pudimos leer el NOMBRE del documento. Vuelve al PASO 2 y reescanea con buena luz.", true);
+      return false;
+    }
+    if (!coincide(nombreDoc, reg)) {
+      toast("EL NOMBRE NO COINCIDE: el documento dice '" + nombreDoc + "'. No puedes pasar a la biometría.", true);
+      return false;
+    }
+    return true;
+  }
+  var original = window.irAPaso;
+  if (typeof original !== "function") { return; }
+  window.irAPaso = function(n){
+    if (n === 4) {
+      verificarNombre().then(function(ok){
+        if (ok) { toast("Nombre verificado: coincide con el documento.", false); original(4); }
+      });
+      return;
+    }
+    return original(n);
+  };
+})();
+
 </script>
 </body>
 </html>

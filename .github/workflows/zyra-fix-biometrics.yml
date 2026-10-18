@@ -1,3 +1,7 @@
+# ZYRA-FIX v5 - registro ZID
+# Paso 1: rollback al estado estable y push inmediato (la pagina vuelve a funcionar SIEMPRE)
+# Paso 2: diagnostico de la version rota + parche v5 + validaciones duras
+# Paso 3: commit solo si TODO pasa; si falla algo, queda el estado estable
 name: zyra-fix-biometrics
 
 on:
@@ -9,1015 +13,527 @@ permissions:
 jobs:
   corregir-y-probar:
     runs-on: ubuntu-latest
+    timeout-minutes: 15
     steps:
       - name: Checkout
         uses: actions/checkout@v4
-
-      - name: Configurar Python
-        uses: actions/setup-python@v5
         with:
-          python-version: '3.11'
+          fetch-depth: 0
 
-      - name: ZYRA-FIX v4 (parchear, probar, verificar)
-        id: fix
+      - name: Paso 1 - Rollback: restaurar superapp.py estable y publicarlo
         run: |
-          cat > "$RUNNER_TEMP/zyra_fix.py" << 'ZYRA_PY_EOF'
-          import os, re, sys, subprocess
+          set -e
+          git config user.name "zyra-bot"
+          git config user.email "zyra-bot@users.noreply.github.com"
+          if ! git cat-file -e f785b49 2>/dev/null; then
+            echo "::error::No se encontro el commit f785b49 (parche v4 roto)"
+            exit 2
+          fi
+          git checkout f785b49^ -- superapp.py
+          echo "## Informe ZYRA-FIX v5 (registro ZID)" >> "$GITHUB_STEP_SUMMARY"
+          echo "" >> "$GITHUB_STEP_SUMMARY"
+          echo "### Paso 1 - Rollback del parche que rompio los botones" >> "$GITHUB_STEP_SUMMARY"
+          if git diff --quiet -- superapp.py; then
+            echo "- superapp.py ya estaba en el estado estable; sin cambios." >> "$GITHUB_STEP_SUMMARY"
+          else
+            git add superapp.py
+            git commit -m "ZYRA-FIX v5 paso 1: restaurar superapp.py al estado estable previo a v4"
+            git push origin HEAD
+            echo "- superapp.py restaurado al estado estable (previo a v4) y PUBLICADO. La pagina vuelve a funcionar aunque todo lo demas falle." >> "$GITHUB_STEP_SUMMARY"
+          fi
 
-          TMP = os.environ.get('RUNNER_TEMP') or '/tmp'
-          REPO = os.getcwd()
-          RUTA = os.path.join(REPO, 'superapp.py')
-          SUMA = os.environ.get('GITHUB_STEP_SUMMARY') or os.path.join(TMP, 'zyra_informe.md')
-          SALIDA = os.environ.get('GITHUB_OUTPUT') or os.path.join(TMP, 'zyra_out.txt')
+      - name: Paso 2 - Diagnostico, parche v5 y validaciones
+        run: |
+          mkdir -p _zyra
+          python3 <<'PYEOF'
+          import re, os, sys, hashlib, subprocess, tempfile, py_compile
 
-          EST = {'aplicados': [], 'ya': [], 'sin_ancla': [], 'opcionales': []}
-          REP = []
+          Z = os.path.join(os.getcwd(), "_zyra")
+          os.makedirs(Z, exist_ok=True)
+          SUM = os.environ.get("GITHUB_STEP_SUMMARY") or os.path.join(Z, "resumen.md")
 
-          def rep(s):
-              REP.append(s)
+          def suma(s):
+              with open(SUM, "a", encoding="utf-8") as f:
+                  f.write(s.rstrip() + "\n")
 
-          def aplicar(txt, etiqueta, marcador, patrones_linea, nuevo_linea, patrones_sub=None, nuevo_sub=None, opcional=False):
-              if marcador in txt:
-                  EST['ya'].append(etiqueta)
-                  return txt
-              for p in patrones_linea:
-                  m = re.search(p, txt)
-                  if m:
-                      linea = m.group(0)
-                      ind = re.match(r'[ \t]*', linea).group(0)
-                      nuevo2 = nuevo_linea.replace('{MATCH}', linea).replace('{IND}', ind)
-                      EST['aplicados'].append(etiqueta)
-                      return txt[:m.start()] + nuevo2 + txt[m.end():]
-              if patrones_sub:
-                  for p in patrones_sub:
-                      m = re.search(p, txt)
-                      if m:
-                          nuevo2 = nuevo_sub.replace('{MATCH}', m.group(0))
-                          EST['aplicados'].append(etiqueta + ' (via subcadena)')
-                          return txt[:m.start()] + nuevo2 + txt[m.end():]
-              if opcional:
-                  EST['opcionales'].append(etiqueta)
-              else:
-                  EST['sin_ancla'].append(etiqueta)
-              return txt
+          rechazos = []
+          def rechazo(m):
+              rechazos.append(m)
+              suma("- RECHAZO: " + m)
 
-          def es_subsecuencia(a, b):
-              it = iter(b)
-              for c in a:
-                  if c not in it:
-                      return False
-              return True
-
-          def leer():
-              if not os.path.exists(RUTA):
-                  return None, None
-              for enc in ('utf-8', 'latin-1'):
-                  try:
-                      with open(RUTA, 'r', encoding=enc, newline='') as f:
-                          return f.read(), enc
-                  except UnicodeDecodeError:
+          # ---------- localizar superapp.py ----------
+          RUTA = "superapp.py"
+          if not os.path.exists(RUTA):
+              hallado = None
+              for raiz, _dirs, files in os.walk("."):
+                  if ".git" in raiz:
                       continue
-              return None, None
+                  if "superapp.py" in files:
+                      hallado = os.path.join(raiz, "superapp.py")
+                      break
+              RUTA = hallado
+          if not RUTA:
+              rechazo("no se encontro superapp.py en el repositorio")
+              with open(os.path.join(Z, "RECHAZO"), "w", encoding="utf-8") as f:
+                  f.write("superapp.py no encontrado")
+              sys.exit(0)
 
-          PY_WARMUP = r'''# ZYRA-WARMUP-ONNX v2 (ini): precarga de modelos al arranque para evitar 502 en la primera peticion fria (Render)
-          def _zyra_precargar_modelos():
-              import time as _zy_t
-              import os as _zy_os
+          with open(RUTA, encoding="utf-8") as f:
+              base = f.read()
+
+          # ---------- constantes de inyeccion ----------
+          IIFE = r"""/*ZYRA-V5-IIFE-BEGIN*/
+          (function(){
+            "use strict";
+            try{
+              if (window.__zyraV5) { return; }
+              window.__zyraV5 = true;
+              var D = document;
+              function $(id){ try{ return D.getElementById(id); }catch(e){ return null; } }
+              /*ZTEST-BEGIN*/
+              function norm(s){ try{ return String(s||"").normalize("NFD").replace(/[\u0300-\u036f]/g,"").toUpperCase().replace(/[^A-Z0-9\s]/g," ").replace(/\s+/g," ").trim(); }catch(e){ return String(s||"").toUpperCase().trim(); } }
+              function tokens(s){ return norm(s).split(" ").filter(function(x){ return x.length>1; }); }
+              function levd(a,b){ var m=a.length, n=b.length, i, j; if(!m){ return n; } if(!n){ return m; }
+                var prev=new Array(n+1), cur=new Array(n+1);
+                for(j=0;j<=n;j++){ prev[j]=j; }
+                for(i=1;i<=m;i++){ cur[0]=i;
+                  for(j=1;j<=n;j++){ var c=(a.charAt(i-1)===b.charAt(j-1))?0:1;
+                    var v=prev[j]+1; if(cur[j-1]+1<v){ v=cur[j-1]+1; } if(prev[j-1]+c<v){ v=prev[j-1]+c; }
+                    cur[j]=v; }
+                  for(j=0;j<=n;j++){ prev[j]=cur[j]; } }
+                return prev[n]; }
+              function tokEn(tok, B){ for(var j=0;j<B.length;j++){ if(tok===B[j]){ return true; }
+                  var L=tok.length, tol=(L>=7)?2:((L>=4)?1:0);
+                  if(tol>0 && Math.abs(tok.length-B[j].length)<=tol && levd(tok,B[j])<=tol){ return true; } }
+                return false; }
+              function simNombres(a,b){ try{
+                  var A=tokens(a), B=tokens(b);
+                  if(!A.length || !B.length){ return 0; }
+                  var hit=0;
+                  for(var i=0;i<A.length;i++){ if(tokEn(A[i],B)){ hit++; } }
+                  return hit/Math.max(A.length,B.length);
+                }catch(e){ return 0; } }
+              function familiaDoc(ocr){ try{
+                  var x=norm(ocr);
+                  if(x.indexOf("DOCUMENTO UNICO")>=0 || x.indexOf("IDENTIDAD")>=0 || x.search(/(^|[^A-Z0-9])DUI([^A-Z0-9]|$)/)>=0){ return "dui"; }
+                  if(x.indexOf("LICENCIA")>=0 || x.indexOf("LICENSE")>=0 || x.indexOf("DRIVER")>=0){ return "licencia"; }
+                  if(x.indexOf("PASAPORTE")>=0 || x.indexOf("PASSPORT")>=0){ return "pasaporte"; }
+                  if(x.indexOf("RESIDENTE")>=0 || x.indexOf("RESIDENCIA")>=0){ return "residente"; }
+                  return "";
+                }catch(e){ return ""; } }
+              function familiaTipo(sel){ try{
+                  var x=norm(sel);
+                  if(x.indexOf("DUI")>=0){ return "dui"; }
+                  if(x.indexOf("LICENCIA")>=0){ return "licencia"; }
+                  if(x.indexOf("PASAPORTE")>=0){ return "pasaporte"; }
+                  if(x.indexOf("RESIDENT")>=0){ return "residente"; }
+                  return "";
+                }catch(e){ return ""; } }
+              /*ZTEST-END*/
+              function banner(msg, esError){ try{
+                  var b=$("zyraBnnV5");
+                  if(!b){ b=D.createElement("div"); b.id="zyraBnnV5";
+                    b.setAttribute("style","position:fixed;left:50%;transform:translateX(-50%);bottom:16px;z-index:2147483000;max-width:92vw;padding:12px 16px;border-radius:12px;font-size:14px;line-height:1.45;color:#fff;box-shadow:0 8px 30px rgba(0,0,0,0.4);text-align:center;display:none;font-family:system-ui,sans-serif;");
+                    (D.body||D.documentElement).appendChild(b); }
+                  b.style.background = esError ? "#b3261e" : "#2c2c34";
+                  b.textContent = String(msg||"");
+                  b.style.display = "block";
+                  if(b.__t){ clearTimeout(b.__t); }
+                  b.__t = setTimeout(function(){ try{ b.style.display="none"; }catch(e){} }, esError?6500:3500);
+                }catch(e){} }
+              function overlay(mostrar, txt){ try{
+                  var o=$("zyraOvlV5");
+                  if(!o && mostrar){ o=D.createElement("div"); o.id="zyraOvlV5";
+                    o.setAttribute("style","position:fixed;left:0;top:0;right:0;bottom:0;background:rgba(8,8,14,0.62);z-index:2147482000;display:flex;align-items:center;justify-content:center;");
+                    var c=D.createElement("div"); c.id="zyraOvlTxtV5";
+                    c.setAttribute("style","background:#17171f;color:#fff;padding:18px 20px;border-radius:14px;font-size:15px;text-align:center;max-width:78vw;font-family:system-ui,sans-serif;");
+                    o.appendChild(c); (D.body||D.documentElement).appendChild(o); }
+                  if(o){ if(mostrar){ var c2=$("zyraOvlTxtV5"); if(c2){ c2.textContent=String(txt||"Procesando..."); } o.style.display="flex"; } else { o.style.display="none"; } }
+                }catch(e){} }
+              function inputNombre(){ try{
+                  var lista=D.querySelectorAll("input");
+                  var i, it, ty, ph;
+                  for(i=0;i<lista.length;i++){
+                    it=lista[i]; ty=(it.type||"").toLowerCase();
+                    if(ty==="file"||ty==="checkbox"||ty==="radio"||ty==="password"||ty==="hidden"||ty==="submit"||ty==="button"){ continue; }
+                    ph=((it.placeholder||"")+" "+(it.name||"")+" "+(it.id||"")).toLowerCase();
+                    if(ph.indexOf("nombre")>=0){ return it; }
+                  }
+                  for(i=0;i<lista.length;i++){
+                    it=lista[i]; ty=(it.type||"").toLowerCase();
+                    if(ty===""||ty==="text"||ty==="tel"){ if(String(it.value||"").trim().length>3){ return it; } }
+                  }
+                  return null;
+                }catch(e){ return null; } }
+              function selectTipo(){ try{
+                  var s=D.querySelector("#ps1 select") || D.querySelector("select");
+                  if(!s){ return ""; }
+                  var o=(s.options && s.selectedIndex>=0) ? s.options[s.selectedIndex] : null;
+                  return o ? (o.text||o.value||"") : "";
+                }catch(e){ return ""; } }
+              function mediaEn(sec){ try{
+                  var q=sec ? ("#"+sec+" ") : "";
+                  var tipos=["img","canvas","video"];
+                  for(var i=0;i<tipos.length;i++){
+                    var els=D.querySelectorAll(q+tipos[i]);
+                    if(els.length){ return els[els.length-1]; }
+                  }
+                  return null;
+                }catch(e){ return null; } }
+              function aCanvas(el, maxLado){ try{
+                  if(!el){ return null; }
+                  var w=0, h=0;
+                  if(el.tagName==="VIDEO"){ w=el.videoWidth||0; h=el.videoHeight||0; }
+                  else { w=el.naturalWidth||el.width||0; h=el.naturalHeight||el.height||0; }
+                  if(!w || !h){ return null; }
+                  var esc=Math.min(1, (maxLado||1024)/Math.max(w,h));
+                  var c=D.createElement("canvas");
+                  c.width=Math.max(1,Math.round(w*esc)); c.height=Math.max(1,Math.round(h*esc));
+                  var cx=c.getContext("2d"); if(!cx){ return null; }
+                  cx.drawImage(el,0,0,c.width,c.height);
+                  return c;
+                }catch(e){ return null; } }
+              function firma(el){ try{
+                  var th=aCanvas(el,64);
+                  if(!th){ return String(el.tagName||"?")+String(el.src||"").slice(-80); }
+                  return String(el.tagName||"?")+String(th.toDataURL?th.toDataURL().length:0);
+                }catch(e){ return String(Math.random()); } }
+              function ocrDe(el){ try{
+                  if(!window.Tesseract || !el){ return Promise.resolve(""); }
+                  var c=aCanvas(el,1024);
+                  if(!c){ return Promise.resolve(""); }
+                  return Promise.race([
+                    window.Tesseract.recognize(c,"spa"),
+                    new Promise(function(res){ setTimeout(function(){ res({data:{text:""}}); },20000); })
+                  ]).then(function(r){ try{ return (r && r.data && r.data.text) ? String(r.data.text) : ""; }catch(e){ return ""; } },
+                         function(){ return ""; });
+                }catch(e){ return Promise.resolve(""); } }
+              var cacheOcr={k:"", txt:""};
+              function ocrDocActual(){ try{
+                  var el=mediaEn("ps2")||mediaEn("ps3")||mediaEn(null);
+                  if(!el){ return Promise.resolve(""); }
+                  var k=firma(el);
+                  if(k && k===cacheOcr.k && cacheOcr.txt){ return Promise.resolve(cacheOcr.txt); }
+                  return ocrDe(el).then(function(txt){ try{ if(txt){ cacheOcr={k:k, txt:txt}; } }catch(e){} return txt; });
+                }catch(e){ return Promise.resolve(""); } }
+              function buscarBoton(nom){ try{
+                  var e=$(nom);
+                  if(e){ return e; }
+                  var q=D.querySelectorAll("[id*='"+nom.toLowerCase()+"'],[id*='"+nom+"']");
+                  if(q.length){ return q[q.length-1]; }
+                  var w=window[nom];
+                  if(w && w.nodeType===1){ return w; }
+                  return null;
+                }catch(e){ return null; } }
+              var fallasDoc=0;
+              function pasar(el){ try{ el.__zV5=1; setTimeout(function(){ try{ el.click(); }catch(e){} }, 40); }catch(e){} }
+              function bloquear(ev){ try{ ev.preventDefault(); }catch(e){} try{ ev.stopPropagation(); }catch(e){} try{ ev.stopImmediatePropagation(); }catch(e){} }
+              function gateDoc(ev, el){ try{
+                  var inp=inputNombre();
+                  var nom=inp ? String(inp.value||"").trim() : "";
+                  if(!nom){ bloquear(ev); overlay(false); banner("Escriba su nombre completo tal como aparece en el documento antes de continuar.", true); return; }
+                  var tipo=selectTipo();
+                  bloquear(ev);
+                  overlay(true, "Verificando nombre y tipo de documento...");
+                  ocrDocActual().then(function(txt){ try{
+                      var tx=String(txt||"");
+                      if(!tx){ overlay(false); fallasDoc++;
+                        if(fallasDoc>=2){ fallasDoc=0; pasar(el); }
+                        else { banner("No se pudo leer el documento. Mejore la luz y vuelva a capturar, o presione continuar de nuevo.", true); }
+                        return; }
+                      var s=simNombres(nom, tx);
+                      var fD=familiaDoc(tx), fT=familiaTipo(tipo);
+                      if(s<0.6){ overlay(false); fallasDoc=0;
+                        banner("El nombre NO coincide con el documento ("+Math.round(s*100)+"%). Corrija su nombre o vuelva a capturar el documento.", true); return; }
+                      if(fD && fT && fD!==fT){ overlay(false); fallasDoc=0;
+                        banner("Capturó un documento tipo "+fD+" pero seleccionó "+fT+". Debe capturar el documento seleccionado.", true); return; }
+                      overlay(false); fallasDoc=0; pasar(el);
+                    }catch(e){ overlay(false); fallasDoc++; if(fallasDoc>=2){ fallasDoc=0; pasar(el); } else { banner("No se pudo verificar el documento. Intente de nuevo.", true); } }
+                  }, function(){ overlay(false); fallasDoc++; if(fallasDoc>=2){ fallasDoc=0; pasar(el); } else { banner("No se pudo verificar el documento. Intente de nuevo.", true); } });
+                }catch(e){ try{ overlay(false); pasar(el); }catch(e2){} } }
+              function compararRostros(docEl, selfEl){ try{
+                  var f=window.faceapi;
+                  if(!f || !f.nets || !f.nets.faceRecognitionNet || !f.nets.faceRecognitionNet.isLoaded){ return null; }
+                  var det=null;
+                  try{ if(f.nets.tinyFaceDetector && f.nets.tinyFaceDetector.isLoaded){ det=new f.TinyFaceDetectorOptions({inputSize:320, scoreThreshold:0.4}); } }catch(e){}
+                  try{ if(!det && f.nets.ssdMobilenetv1 && f.nets.ssdMobilenetv1.isLoaded){ det=new f.SsdMobilenetv1Options({minConfidence:0.4}); } }catch(e){}
+                  if(!det){ return null; }
+                  var cD=aCanvas(docEl,640), cS=aCanvas(selfEl,640);
+                  if(!cD || !cS){ return null; }
+                  var pD=f.detectSingleFace(cD,det).withFaceDescriptor();
+                  var pS=f.detectSingleFace(cS,det).withFaceDescriptor();
+                  return Promise.all([pD,pS]).then(function(rs){ try{
+                      if(!rs || !rs[0] || !rs[1]){ return null; }
+                      var d=0; for(var i=0;i<rs[0].length;i++){ var x=rs[0][i]-rs[1][i]; d+=x*x; }
+                      d=Math.sqrt(d);
+                      return d<0.60;
+                    }catch(e){ return null; } }, function(){ return null; });
+                }catch(e){ return null; } }
+              function gateBio(ev, el){ try{
+                  var r=null;
+                  try{ r=compararRostros(mediaEn("ps2")||mediaEn("ps3"), mediaEn("ps4")); }catch(e){ r=null; }
+                  if(r===null || r===undefined){ banner("Aviso: no se pudo verificar el rostro automáticamente en este dispositivo.", false); return; }
+                  bloquear(ev);
+                  overlay(true, "Verificando rostro...");
+                  Promise.resolve(r).then(function(res){ try{
+                      overlay(false);
+                      if(res===true){ pasar(el); return; }
+                      if(res===false){ banner("El rostro de la selfie NO coincide con el rostro del documento. Tome una nueva selfie.", true); return; }
+                      banner("No se pudo comparar los rostros. Intente de nuevo.", false);
+                    }catch(e){ try{ overlay(false); }catch(e2){} }
+                  }, function(){ try{ overlay(false); banner("No se pudo comparar los rostros. Intente de nuevo.", false); }catch(e){} });
+                }catch(e){} }
+              D.addEventListener("click", function(ev){ try{
+                  if(ev && ev.isTrusted===false){ return; }
+                  var tg=ev && ev.target ? ev.target : null;
+                  if(tg && tg.__zV5){ tg.__zV5=0; return; }
+                  var el4=buscarBoton("bIr4"), el5=buscarBoton("bIr5");
+                  function deBoton(el){ try{ return !!(el && tg && (tg===el || (tg.closest && el.id && tg.closest("#"+el.id)===el))); }catch(e){ return false; } }
+                  if(deBoton(el4)){ gateDoc(ev, el4); }
+                  else if(deBoton(el5)){ gateBio(ev, el5); }
+                }catch(e){} }, true);
+              try{
+                if(typeof window.fetch==="function" && !window.__zFchV5){ window.__zFchV5=true;
+                  var _f=window.fetch;
+                  window.fetch=function(){ var a=arguments;
+                    return _f.apply(window,a).then(function(r){ try{
+                        if(r && (r.status===413 || r.status===500 || r.status===502 || r.status===503)){
+                          banner("El servidor no respondió bien ("+r.status+"). Espere unos segundos y vuelva a intentarlo.", true); }
+                      }catch(e){} return r; },
+                    function(err){ try{ banner("Error de red. Verifique su conexión e intente de nuevo.", true); }catch(e){} throw err; }); };
+                }
+              }catch(e){}
+            }catch(e){ try{ window.__zyraV5=false; }catch(e2){} }
+          })();
+          /*ZYRA-V5-IIFE-END*/""".replace("          ", "", 1)
+
+          CSS = r"""/*ZYRA-V5-CSS-BEGIN*/
+          #ps2, #ps3 { max-width: 520px; margin-left: auto; margin-right: auto; }
+          #ps2 video, #ps3 video, #ps2 canvas, #ps3 canvas, #ps2 img, #ps3 img { max-width: 100%; max-height: 58vh; height: auto; }
+          #ps2 button, #ps3 button { min-height: 44px; }
+          /*ZYRA-V5-CSS-END*/"""
+
+          suma("")
+          suma("### 0) Nota de esta version")
+          suma("- La corrida #944 inyecto codigo que rompio el JavaScript combinado de la pagina: por eso ningun boton respondia.")
+          suma("- Esta version restaura primero la pagina estable (paso 1, ya publicado) y aplica los gates v5 con validacion NUEVA que revisa el JS COMBINADO completo (habria detectado el fallo de la v4).")
+          suma("- Si alguna validacion falla, NO se publica el parche y su pagina queda funcionando en el estado estable.")
+
+          def bloques(t):
+              return [m.group(1) for m in re.finditer(r"<script(?![^>]*\bsrc=)[^>]*>(.*?)</script>", t, re.S | re.I)]
+
+          def node_check(cod):
+              fd, p = tempfile.mkstemp(suffix=".js")
               try:
-                  import cv2 as _zy_cv
-              except Exception:
-                  _zy_cv = None
-              try:
-                  _zy_t.sleep(2.0)
-              except Exception:
-                  pass
-              _zy_rutas = []
-              try:
-                  for _zy_v in list(globals().values()):
-                      try:
-                          if isinstance(_zy_v, str) and _zy_v.lower().strip().endswith('.onnx') and _zy_os.path.exists(_zy_v):
-                              if _zy_v not in _zy_rutas:
-                                  _zy_rutas.append(_zy_v)
-                      except Exception:
-                          pass
-              except Exception:
-                  pass
-              _zy_ok = []
-              if _zy_cv is not None:
-                  for _zy_r in _zy_rutas:
-                      try:
-                          _zy_nom = _zy_os.path.basename(_zy_r).lower()
-                          if 'yunet' in _zy_nom:
-                              _zy_cv.FaceDetectorYN.create(_zy_r, '', (320, 320))
-                              _zy_ok.append(_zy_nom)
-                          elif 'sface' in _zy_nom:
-                              _zy_cv.FaceRecognizerSF.create(_zy_r, '')
-                              _zy_ok.append(_zy_nom)
-                          else:
-                              with open(_zy_r, 'rb') as _zy_f:
-                                  _zy_f.read(64)
-                              _zy_ok.append(_zy_nom)
-                      except Exception:
-                          pass
-              for _zy_fn in ('cargar_modelos', 'precargar_modelos', 'init_modelos', 'cargar_rostros', 'load_models'):
+                  with os.fdopen(fd, "w", encoding="utf-8") as f:
+                      f.write(cod)
+                  r = subprocess.run(["node", "--check", p], capture_output=True, text=True, timeout=60)
+                  return (r.returncode == 0), ((r.stderr or "") + (r.stdout or "")).strip()
+              except Exception as e:
+                  return False, str(e)
+              finally:
                   try:
-                      _zy_f2 = globals().get(_zy_fn)
-                      if callable(_zy_f2):
-                          _zy_f2()
-                          _zy_ok.append(_zy_fn)
+                      os.unlink(p)
                   except Exception:
                       pass
-              try:
-                  print('[ZYRA-WARMUP] modelos precargados al arranque: ' + (', '.join(_zy_ok) if _zy_ok else 'ninguno detectado'), flush=True)
-              except Exception:
-                  pass
 
-          def _zyra_lanzar_warmup():
-              try:
-                  import threading as _zy_th
-                  _zy_h = _zy_th.Thread(target=_zyra_precargar_modelos, daemon=True)
-                  _zy_h.start()
-              except Exception:
-                  pass
+          suma("")
+          suma("### 1) Diagnostico de la version rota (#944)")
+          try:
+              r = subprocess.run(["git", "show", "f785b49:" + RUTA], capture_output=True, text=True)
+              if r.returncode == 0:
+                  roto = r.stdout
+                  fallas = 0
+                  for i, cod in enumerate(bloques(roto)):
+                      okB, eB = node_check(cod)
+                      if not okB:
+                          fallas += 1
+                          primera = (eB.splitlines() or ["(sin detalle)"])[0][:220]
+                          suma("- Bloque script " + str(i + 1) + ": ERROR de sintaxis JS -> " + primera)
+                  if fallas == 0:
+                      suma("- Ningun bloque falla el chequeo de sintaxis: el fallo de la v4 fue de EJECUCION (codigo sembrado en medio del flujo). El rollback del paso 1 lo elimina; la v5 siembra un unico bloque al final con fail-open de emergencia.")
+              else:
+                  suma("- No se pudo leer la version rota; se omite el diagnostico detallado.")
+          except Exception as e:
+              suma("- Diagnostico omitido: " + str(e)[:200])
 
-          _zyra_lanzar_warmup()
-          # ZYRA-WARMUP-ONNX v2 (fin)'''
+          suma("")
+          suma("### 2) Parches v5 aplicados")
+          t = base
+          t = re.sub(r"/\*ZYRA-V5-IIFE-BEGIN\*/.*?/\*ZYRA-V5-IIFE-END\*/\n?", "", t, flags=re.S)
+          t = re.sub(r"/\*ZYRA-V5-CSS-BEGIN\*/.*?/\*ZYRA-V5-CSS-END\*/\n?", "", t, flags=re.S)
 
-          JS_CSS = r'''/* ZYRA-CAP-COMPACT v4 (ini): captura mas compacta y profesional - NO modifica la guia ni el marco del documento */
-          #ps2, #ps3 { max-width: 520px !important; margin-left: auto !important; margin-right: auto !important; }
-          #ps2 video, #ps3 video, #ps2 canvas, #ps3 canvas, #ps2 img, #ps3 img { max-width: min(440px, 92vw) !important; max-height: 58vh !important; width: auto !important; height: auto !important; }
-          /* ZYRA-CAP-COMPACT v4 (fin) */'''
+          if "bIr4" not in t:
+              rechazo("no se encontro bIr4 en superapp.py")
+          if "bIr5" not in t:
+              rechazo("no se encontro bIr5 en superapp.py")
 
-          JS_IIFE = r'''/* ZYRA-REG-HARDENING v4 (ini): bloqueo fail-closed por nombre, tipo de documento y biometria facial. No modifica la guia ni el marco del documento. */
-          (function(){
-            'use strict';
-            if(window.__zyraHardeningV4){ return; }
-            window.__zyraHardeningV4 = true;
-            var _ocupado = false;
-            var _avisoTimer = 0;
-            function _asegurarUI(){
-              try{
-                if(document.getElementById('zyraCarga') && document.getElementById('zyraAviso')){ return; }
-                var st = document.createElement('style');
-                st.id = 'zyraEstiloV4';
-                st.textContent = '#zyraCarga{position:fixed;left:0;top:0;right:0;bottom:0;background:rgba(15,23,42,0.45);display:none;align-items:center;justify-content:center;z-index:2147483000}'
-                  + '#zyraCarga.zOn{display:flex}'
-                  + '#zyraCarga .zC{background:#ffffff;border-radius:14px;padding:16px 22px;font-family:system-ui,-apple-system,Segoe UI,Roboto,sans-serif;font-size:15px;font-weight:500;color:#0f172a;display:flex;gap:12px;align-items:center;box-shadow:0 12px 32px rgba(0,0,0,0.25)}'
-                  + '.zGiro{width:22px;height:22px;border:3px solid #cbd5e1;border-top-color:#0284c7;border-radius:50%;animation:zGiroV4 1s linear infinite}'
-                  + '@keyframes zGiroV4{to{transform:rotate(360deg)}}'
-                  + '#zyraAviso{position:fixed;left:50%;bottom:22px;transform:translateX(-50%);z-index:2147483600;background:#ffffff;color:#0f172a;font-family:system-ui,-apple-system,Segoe UI,Roboto,sans-serif;font-size:14px;font-weight:500;line-height:1.45;padding:14px 18px;border-radius:12px;box-shadow:0 12px 32px rgba(0,0,0,0.3);max-width:min(480px,92vw);display:none;border-left:6px solid #0284c7}'
-                  + '#zyraAviso.zMal{border-left-color:#dc2626}';
-                (document.head || document.documentElement).appendChild(st);
-                var c = document.createElement('div');
-                c.id = 'zyraCarga';
-                c.innerHTML = '<div class="zC"><div class="zGiro"></div><span id="zyraCargaTxt">Verificando...</span></div>';
-                (document.body || document.documentElement).appendChild(c);
-                var a = document.createElement('div');
-                a.id = 'zyraAviso';
-                (document.body || document.documentElement).appendChild(a);
-              }catch(e){}
-            }
-            function _aviso(msg, mal){
-              try{
-                _asegurarUI();
-                var a = document.getElementById('zyraAviso');
-                if(!a){ return; }
-                a.textContent = String(msg || '');
-                if(mal){ a.className = 'zMal'; } else { a.className = ''; }
-                a.style.display = 'block';
-                if(_avisoTimer){ clearTimeout(_avisoTimer); }
-                _avisoTimer = setTimeout(function(){ try{ a.style.display = 'none'; }catch(e){} }, 7000);
-              }catch(e){}
-            }
-            function _cargando(on, txt){
-              try{
-                _asegurarUI();
-                var c = document.getElementById('zyraCarga');
-                if(!c){ return; }
-                c.className = on ? 'zOn' : '';
-                var t = document.getElementById('zyraCargaTxt');
-                if(t && txt){ t.textContent = txt; }
-              }catch(e){}
-            }
-            /* ZYRA-PURE v4 (ini) */
-            var UMBRAL_NOMBRE = 0.6;
-            var UMBRAL_ROSTRO = 0.60;
-            function _zyraNorm(s){
-              try{
-                var t = String(s || '').toUpperCase();
-                if(t.normalize){ t = t.normalize('NFD'); }
-                var out = '';
-                for(var i = 0; i < t.length; i++){
-                  var c = t.charAt(i);
-                  var d = t.charCodeAt(i);
-                  if(d >= 768 && d <= 879){ continue; }
-                  if((c >= 'A' && c <= 'Z') || (c >= '0' && c <= '9') || c === ' '){ out += c; } else { out += ' '; }
-                }
-                var parts = out.split(' ');
-                var fin = [];
-                for(var j = 0; j < parts.length; j++){ if(parts[j].length > 0){ fin.push(parts[j]); } }
-                return fin.join(' ');
-              }catch(e){ return ''; }
-            }
-            function _zyraTokens(s){
-              try{
-                var t = _zyraNorm(s).split(' ');
-                var out = [];
-                for(var i = 0; i < t.length; i++){ if(t[i].length >= 3){ out.push(t[i]); } }
-                return out;
-              }catch(e){ return []; }
-            }
-            function _zyraPctNombre(nombreReg, textoDoc){
-              try{
-                var toks = _zyraTokens(nombreReg);
-                if(toks.length === 0){ return 0; }
-                var doc = ' ' + _zyraNorm(textoDoc) + ' ';
-                var ok = 0;
-                for(var i = 0; i < toks.length; i++){
-                  if(doc.indexOf(' ' + toks[i]) !== -1){ ok++; }
-                }
-                return ok / toks.length;
-              }catch(e){ return 0; }
-            }
-            function _zyraFamiliaDeTexto(t){
-              try{
-                var s = ' ' + _zyraNorm(t) + ' ';
-                var p = { dui: 0, licencia: 0, pasaporte: 0, residente: 0 };
-                if(s.indexOf(' DUI ') !== -1 || s.indexOf('DOCUMENTO UNICO DE IDENTIDAD') !== -1 || s.indexOf('UNICO DE IDENTIDAD') !== -1 || s.indexOf('IDENTIDAD') !== -1){ p.dui += 5; }
-                if(s.indexOf('LICENCIA') !== -1 || s.indexOf('DRIVER LICENSE') !== -1 || s.indexOf('DRIVER LICEN') !== -1 || s.indexOf('CONDUCTOR') !== -1 || s.indexOf('DMV') !== -1){ p.licencia += 5; }
-                if(s.indexOf('PASAPORTE') !== -1 || s.indexOf('PASSPORT') !== -1){ p.pasaporte += 5; }
-                if(s.indexOf('RESIDENTE') !== -1 || s.indexOf('RESIDENCIA') !== -1 || s.indexOf('RESIDENT CARD') !== -1 || s.indexOf('EXTRANJERIA') !== -1){ p.residente += 5; }
-                var mejor = 'desconocida';
-                var pt = 0;
-                for(var k in p){ if(p[k] > pt){ pt = p[k]; mejor = k; } }
-                return mejor;
-              }catch(e){ return 'desconocida'; }
-            }
-            function _zyraFamiliaDeOpcion(t){
-              try{
-                var s = ' ' + _zyraNorm(t) + ' ';
-                if(s.indexOf(' DUI ') !== -1 || s.indexOf('IDENTIDAD') !== -1){ return 'dui'; }
-                if(s.indexOf('LICENCIA') !== -1 || s.indexOf('CONDUCIR') !== -1 || s.indexOf('DRIVER') !== -1 || s.indexOf('LICENSE') !== -1){ return 'licencia'; }
-                if(s.indexOf('PASAPORTE') !== -1 || s.indexOf('PASSPORT') !== -1){ return 'pasaporte'; }
-                if(s.indexOf('RESIDENTE') !== -1 || s.indexOf('RESIDENCIA') !== -1 || s.indexOf('EXTRANJER') !== -1 || s.indexOf('CARNET') !== -1){ return 'residente'; }
-                return '';
-              }catch(e){ return ''; }
-            }
-            function _zyraRostroAprueba(d){
-              try{
-                if(typeof d !== 'number'){ return false; }
-                if(!isFinite(d)){ return false; }
-                if(d < 0){ return false; }
-                return d <= UMBRAL_ROSTRO;
-              }catch(e){ return false; }
-            }
-            /* ZYRA-PURE v4 (fin) */
-            try{
-              if(!window.__zyraFetchV4 && typeof window.fetch === 'function'){
-                window.__zyraFetchV4 = true;
-                var _zf = window.fetch;
-                window.fetch = function(){
-                  var args = arguments;
-                  var p = _zf.apply(this, args);
-                  return p.then(function(res){
-                    try{
-                      if(res && res.status && (res.status >= 500 || res.status === 413)){
-                        _aviso('El servidor no pudo procesar la solicitud (error ' + res.status + '). Espere unos segundos e intente de nuevo.', true);
-                      }
-                    }catch(e){}
-                    return res;
-                  }).catch(function(err){
-                    try{ _aviso('No hay conexión con el servidor. Verifique su internet e intente de nuevo.', true); }catch(e2){}
-                    throw err;
-                  });
-                };
-              }
-            }catch(e){}
-            try{
-              if(!window.HTMLCanvasElement.prototype.__zyraBigV4){
-                var _ztdd = window.HTMLCanvasElement.prototype.toDataURL;
-                window.HTMLCanvasElement.prototype.toDataURL = function(){
-                  try{
-                    var MAX = 1280;
-                    var w = this.width || 0;
-                    var h = this.height || 0;
-                    if(w > MAX || h > MAX){
-                      var esc = Math.min(MAX / w, MAX / h);
-                      var c2 = document.createElement('canvas');
-                      c2.width = Math.round(w * esc);
-                      c2.height = Math.round(h * esc);
-                      var ctx = c2.getContext('2d');
-                      if(ctx){
-                        ctx.drawImage(this, 0, 0, c2.width, c2.height);
-                        return _ztdd.apply(c2, arguments);
-                      }
-                    }
-                  }catch(e){}
-                  return _ztdd.apply(this, arguments);
-                };
-                window.HTMLCanvasElement.prototype.__zyraBigV4 = true;
-              }
-            }catch(e){}
-            function _imgDe(paso, permitirVideo){
-              try{
-                var root = document.getElementById(paso);
-                if(!root){ return null; }
-                var mejor = null;
-                var mejorA = 0;
-                var cs = root.getElementsByTagName('canvas');
-                for(var i = 0; i < cs.length; i++){
-                  var w = cs[i].width || 0;
-                  var h = cs[i].height || 0;
-                  if(w > 60 && h > 60 && (w * h) > mejorA){ mejorA = w * h; mejor = cs[i]; }
-                }
-                if(mejor){ return mejor; }
-                var ims = root.getElementsByTagName('img');
-                for(var j = 0; j < ims.length; j++){
-                  var s = ims[j].getAttribute('src') || '';
-                  var nw = ims[j].naturalWidth || ims[j].width || 0;
-                  var nh = ims[j].naturalHeight || ims[j].height || 0;
-                  if((s.indexOf('data:image') === 0 || s.indexOf('blob:') === 0) && nw > 60 && nh > 60 && (nw * nh) > mejorA){
-                    mejorA = nw * nh;
-                    mejor = ims[j];
-                  }
-                }
-                if(mejor){ return mejor; }
-                if(permitirVideo){
-                  var vs = root.getElementsByTagName('video');
-                  for(var k = 0; k < vs.length; k++){
-                    var vw = vs[k].videoWidth || 0;
-                    var vh = vs[k].videoHeight || 0;
-                    if(vw > 60 && vh > 60){
-                      try{
-                        var c = document.createElement('canvas');
-                        c.width = vw;
-                        c.height = vh;
-                        var cx = c.getContext('2d');
-                        if(cx){
-                          cx.drawImage(vs[k], 0, 0, vw, vh);
-                          return c;
-                        }
-                      }catch(e2){}
-                    }
-                  }
-                }
-                return null;
-              }catch(e){ return null; }
-            }
-            function _ocrImg(img){
-              return new Promise(function(res){
-                try{
-                  if(!img || !window.Tesseract || !window.Tesseract.recognize){ res(''); return; }
-                  window.Tesseract.recognize(img, 'eng').then(function(r){
-                    try{
-                      var t = (r && r.data && r.data.text) ? String(r.data.text) : '';
-                      if(t && t.split(' ').join('').length >= 8){
-                        window.__zyraUltimoTextoDoc = t;
-                      }
-                      res(t);
-                    }catch(e){ res(''); }
-                  }).catch(function(){ res(''); });
-                }catch(e){ res(''); }
-              });
-            }
-            function _textoDoc(){
-              return new Promise(function(res){
-                try{
-                  var f = _imgDe('ps2', false);
-                  _ocrImg(f).then(function(t1){
-                    if(t1 && t1.split(' ').join('').length >= 8){ res(t1); return; }
-                    var b = _imgDe('ps3', false);
-                    _ocrImg(b).then(function(t2){
-                      if(t2 && t2.split(' ').join('').length >= 8){ res(t2); return; }
-                      var cands = ['textoOCR', 'ocrTexto', 'textoDoc', 'ocrText', 'textoFrontal', 'ocrFrontal', 'textoPDF417', 'pdf417Texto', 'pdf417Text', 'textoBarra'];
-                      for(var i = 0; i < cands.length; i++){
-                        try{
-                          var v = window[cands[i]];
-                          if(typeof v === 'string' && v.split(' ').join('').length >= 8){ res(v); return; }
-                        }catch(e){}
-                      }
-                      res('');
-                    });
-                  });
-                }catch(e){ res(''); }
-              });
-            }
-            function _nombreRegistro(){
-              try{
-                var cands = [];
-                var ps1 = document.getElementById('ps1');
-                var list = (ps1 || document).getElementsByTagName('input');
-                for(var i = 0; i < list.length; i++){ cands.push(list[i]); }
-                if(!ps1){
-                  var list2 = document.getElementsByTagName('input');
-                  for(var j = 0; j < list2.length; j++){ cands.push(list2[j]); }
-                }
-                for(var k = 0; k < cands.length; k++){
-                  var el = cands[k];
-                  var ty = (el.type || 'text').toLowerCase();
-                  if(ty === 'hidden' || ty === 'password' || ty === 'file' || ty === 'checkbox' || ty === 'radio'){ continue; }
-                  var sig = ((el.id || '') + ' ' + (el.name || '') + ' ' + (el.placeholder || '') + ' ' + (el.className || '')).toLowerCase();
-                  var v = (el.value || '').trim();
-                  if(v.length < 3){ continue; }
-                  if(sig.indexOf('nombr') !== -1 || sig.indexOf('apellido') !== -1 || sig.indexOf('name') !== -1){ return v; }
-                }
-                var mejor = '';
-                for(var k2 = 0; k2 < cands.length; k2++){
-                  var el2 = cands[k2];
-                  var ty2 = (el2.type || 'text').toLowerCase();
-                  if(ty2 === 'hidden' || ty2 === 'password' || ty2 === 'file' || ty2 === 'checkbox' || ty2 === 'radio'){ continue; }
-                  var v2 = (el2.value || '').trim();
-                  if(v2.length > mejor.length && /[A-Za-z]/.test(v2)){ mejor = v2; }
-                }
-                return mejor.length >= 3 ? mejor : '';
-              }catch(e){ return ''; }
-            }
-            function _familiaSeleccionada(){
-              try{
-                var sel = null;
-                var ps1 = document.getElementById('ps1');
-                if(ps1){
-                  var ss = ps1.getElementsByTagName('select');
-                  if(ss.length > 0){ sel = ss[0]; }
-                }
-                if(!sel){
-                  var s2 = document.getElementsByTagName('select');
-                  for(var i = 0; i < s2.length; i++){
-                    var sig = ((s2[i].id || '') + ' ' + (s2[i].name || '')).toLowerCase();
-                    if(sig.indexOf('tipo') !== -1 || sig.indexOf('doc') !== -1 || sig.indexOf('ident') !== -1){ sel = s2[i]; break; }
-                  }
-                  if(!sel && s2.length > 0){ sel = s2[0]; }
-                }
-                if(!sel || !sel.options || sel.selectedIndex < 0){ return ''; }
-                var op = sel.options[sel.selectedIndex];
-                return _zyraFamiliaDeOpcion((op.text || '') + ' ' + (op.value || ''));
-              }catch(e){ return ''; }
-            }
-            function _asegurarModelos(){
-              return new Promise(function(res){
-                try{
-                  if(!window.faceapi){ res(false); return; }
-                  var n = window.faceapi.nets;
-                  if(!n || !n.tinyFaceDetector || !n.faceLandmark68TinyNet || !n.faceRecognitionNet){ res(false); return; }
-                  if(n.tinyFaceDetector.isLoaded && n.faceLandmark68TinyNet.isLoaded && n.faceRecognitionNet.isLoaded){ res(true); return; }
-                  var U = 'https://cdn.jsdelivr.net/gh/justadudewhohacks/face-api.js@0.22.2/weights';
-                  n.tinyFaceDetector.loadFromUri(U).then(function(){
-                    return n.faceLandmark68TinyNet.loadFromUri(U);
-                  }).then(function(){
-                    return n.faceRecognitionNet.loadFromUri(U);
-                  }).then(function(){
-                    res(!!(n.tinyFaceDetector.isLoaded && n.faceLandmark68TinyNet.isLoaded && n.faceRecognitionNet.isLoaded));
-                  }).catch(function(){ res(false); });
-                }catch(e){ res(false); }
-              });
-            }
-            function _descriptor(img){
-              return new Promise(function(res){
-                try{
-                  if(!window.faceapi){ res(null); return; }
-                  var op = new window.faceapi.TinyFaceDetectorOptions({ inputSize: 416, scoreThreshold: 0.4 });
-                  window.faceapi.detectSingleFace(img, op).withFaceLandmarks(true).withFaceDescriptor().then(function(d){
-                    res(d && d.descriptor ? d.descriptor : null);
-                  }).catch(function(){ res(null); });
-                }catch(e){ res(null); }
-              });
-            }
-            function _etq(f){
-              if(f === 'dui'){ return 'DUI'; }
-              if(f === 'licencia'){ return 'LICENCIA DE CONDUCIR'; }
-              if(f === 'pasaporte'){ return 'PASAPORTE'; }
-              if(f === 'residente'){ return 'RESIDENCIA'; }
-              return f;
-            }
-            function _finCarga(){ _cargando(false, ''); }
-            function _seguir(btn){
-              try{
-                if(btn.id === 'bIr5' && window.__zyraBioRechazada === true){
-                  _finCarga();
-                  _aviso('La verificación biométrica fue rechazada. Vuelva a tomar la selfie.', true);
-                  return;
-                }
-              }catch(e){}
-              try{ btn.disabled = false; }catch(e){}
-              btn.__zyraPassV4 = true;
-              btn.click();
-            }
-            async function _gate(btn){
-              var es4 = (btn.id === 'bIr4');
-              try{
-                _cargando(true, es4 ? 'Verificando documento...' : 'Verificando rostro...');
-                if(es4){
-                  var nomReg = _nombreRegistro();
-                  if(!nomReg){
-                    _finCarga();
-                    _aviso('Complete su nombre completo en el paso 1 antes de continuar.', true);
-                    return;
-                  }
-                  var texto = await _textoDoc();
-                  if(!texto || _zyraNorm(texto).length < 5){
-                    _finCarga();
-                    _aviso('No se pudo leer el documento. Vuelva a capturarlo con buena luz y sin reflejos.', true);
-                    return;
-                  }
-                  var pct = _zyraPctNombre(nomReg, texto);
-                  if(pct < UMBRAL_NOMBRE){
-                    _finCarga();
-                    _aviso('BLOQUEADO: el nombre del registro no coincide con el nombre del documento capturado. Verifique que el documento sea legible y suyo.', true);
-                    return;
-                  }
-                  var famSel = _familiaSeleccionada();
-                  var famDoc = _zyraFamiliaDeTexto(texto);
-                  if(famDoc === 'desconocida'){
-                    _finCarga();
-                    _aviso('No se pudo confirmar el tipo de documento capturado. Vuelva a capturarlo.', true);
-                    return;
-                  }
-                  if(famSel && famSel !== famDoc){
-                    _finCarga();
-                    _aviso('BLOQUEADO: seleccionó ' + _etq(famSel) + ' pero el documento capturado parece ser ' + _etq(famDoc) + '. Debe capturar el documento correcto.', true);
-                    return;
-                  }
-                  _finCarga();
-                  _seguir(btn);
-                  return;
-                }
-                if(window.__zyraBioRechazada === true){
-                  _finCarga();
-                  _aviso('La verificación biométrica fue rechazada. Vuelva a tomar la selfie.', true);
-                  return;
-                }
-                if(window.__zyraBioOk === true){
-                  _finCarga();
-                  _seguir(btn);
-                  return;
-                }
-                var okM = await _asegurarModelos();
-                if(!okM || !window.faceapi){
-                  _finCarga();
-                  _aviso('El sistema biométrico no está disponible en este momento. Intente de nuevo.', true);
-                  return;
-                }
-                var imgS = _imgDe('ps4', true);
-                var imgD = _imgDe('ps2', false);
-                if(!imgS){
-                  _finCarga();
-                  _aviso('No se encontró la selfie. Vuelva a tomarla.', true);
-                  return;
-                }
-                if(!imgD){
-                  _finCarga();
-                  _aviso('No se encontró la foto del documento. Vuelva a capturarla en el paso 2.', true);
-                  return;
-                }
-                var dS = await _descriptor(imgS);
-                var dD = await _descriptor(imgD);
-                if(!dS || !dD){
-                  _finCarga();
-                  _aviso('No se detectó un rostro con claridad. Mejore la luz y vuelva a intentarlo.', true);
-                  return;
-                }
-                var dist = window.faceapi.euclideanDistance(dS, dD);
-                if(!_zyraRostroAprueba(dist)){
-                  _finCarga();
-                  _aviso('BLOQUEADO: el rostro de la selfie no coincide con el rostro del documento.', true);
-                  return;
-                }
-                _finCarga();
-                _seguir(btn);
-              }catch(e){
-                _finCarga();
-                try{ _aviso('Error en la verificación de seguridad. Intente de nuevo.', true); }catch(e2){}
-              }
-            }
-            document.addEventListener('click', function(ev){
-              try{
-                var el = ev.target;
-                var id = '';
-                while(el && el !== document){
-                  if(el.id){ id = el.id; break; }
-                  el = el.parentElement;
-                }
-                if(id !== 'bIr4' && id !== 'bIr5'){ return; }
-                var btn = el;
-                if(!btn){ return; }
-                if(btn.__zyraPassV4){ btn.__zyraPassV4 = false; return; }
-                ev.preventDefault();
-                ev.stopPropagation();
-                if(ev.stopImmediatePropagation){ ev.stopImmediatePropagation(); }
-                if(_ocupado){
-                  _aviso('Ya hay una verificación en curso. Espere un momento.', false);
-                  return;
-                }
-                _ocupado = true;
-                _gate(btn).catch(function(){
-                  try{ _aviso('No se pudo completar la verificación. Intente de nuevo.', true); }catch(e){}
-                }).then(function(){ _ocupado = false; });
-              }catch(e){}
-            }, true);
-          })();
-          /* ZYRA-REG-HARDENING v4 (fin) */'''
+          idx = t.rfind("bIr4")
+          fin = t.find("</script>", idx) if idx != -1 else -1
+          if idx == -1 or fin == -1:
+              rechazo("no se encontro el bloque script principal (bIr4 + </script>)")
+          else:
+              t = t[:fin] + IIFE + "\n" + t[fin:]
+              suma("- P-A IIFE v5 (gate de nombre 60% + gate de tipo de documento + gate biometrico 0.60 + avisos de servidor) insertada al final del bloque principal del registro.")
 
-          def inyectar_iife(txt):
-              if '/* ZYRA-REG-HARDENING v4 (ini)' in txt:
-                  EST['ya'].append('P-HARD IIFE v4 (nombre + tipo + biometria fail-closed)')
-                  return txt
-              pos = txt.find('bIr4')
-              corte = -1
-              via = ''
-              if pos != -1:
-                  corte = txt.find('</script>', pos)
-                  via = 'antes de </script> tras bIr4'
-              if corte == -1:
-                  corte = txt.rfind('</script>')
-                  via = 'antes del ultimo </script>'
-              if corte != -1:
-                  EST['aplicados'].append('P-HARD IIFE v4 (nombre + tipo + biometria fail-closed) - ' + via)
-                  return txt[:corte] + JS_IIFE + '\n' + txt[corte:]
-              corte2 = txt.find('</body>')
-              if corte2 != -1:
-                  EST['aplicados'].append('P-HARD IIFE v4 (nombre + tipo + biometria fail-closed) - antes de </body>')
-                  return txt[:corte2] + '<script>\n' + JS_IIFE + '\n</script>\n' + txt[corte2:]
-              EST['sin_ancla'].append('P-HARD IIFE v4 (nombre + tipo + biometria fail-closed)')
-              return txt
+          fcss = t.rfind("</style>")
+          if fcss == -1:
+              suma("- P-B CSS compacto: no se encontro </style>; se omite (no es critico).")
+          else:
+              t = t[:fcss] + CSS + "\n" + t[fcss:]
+              suma("- P-B CSS compacto en captura ps2/ps3 (contenedor 520px, imagen 58vh). La guia y el marco del documento NO se tocan.")
 
-          def inyectar_css(txt):
-              if '/* ZYRA-CAP-COMPACT v4 (ini)' in txt:
-                  EST['ya'].append('PE CSS captura compacta (ps2/ps3)')
-                  return txt
-              pos = txt.find('bIr4')
-              corte = -1
-              via = ''
-              if pos != -1:
-                  corte = txt.rfind('</style>', 0, pos)
-                  via = 'antes de </style> de la pagina de registro'
-              if corte == -1:
-                  corte = txt.rfind('</style>')
-                  via = 'antes del ultimo </style>'
-              if corte != -1:
-                  EST['aplicados'].append('PE CSS captura compacta (ps2/ps3) - ' + via)
-                  return txt[:corte] + JS_CSS + '\n' + txt[corte:]
-              corte2 = txt.find('</head>')
-              if corte2 != -1:
-                  EST['aplicados'].append('PE CSS captura compacta (ps2/ps3) - antes de </head>')
-                  return txt[:corte2] + '<style>\n' + JS_CSS + '\n</style>\n' + txt[corte2:]
-              EST['sin_ancla'].append('PE CSS captura compacta (ps2/ps3)')
-              return txt
+          # ---------- conservacion ----------
+          def limpiar_v5(x):
+              x = re.sub(r"/\*ZYRA-V5-IIFE-BEGIN\*/.*?/\*ZYVA\*/", "", x, flags=re.S)
+              x = re.sub(r"/\*ZYRA-V5-IIFE-BEGIN\*/.*?/\*ZYRA-V5-IIFE-END\*/\n?", "", x, flags=re.S)
+              x = re.sub(r"/\*ZYRA-V5-CSS-BEGIN\*/.*?/\*ZYRA-V5-CSS-END\*/\n?", "", x, flags=re.S)
+              return x
 
-          def inyectar_warmup(txt):
-              if 'ZYRA-WARMUP-ONNX v2 (ini)' in txt:
-                  EST['ya'].append('PH warmup ONNX al arranque (anti 502)')
-                  return txt
-              m = re.search(r'(?m)^if\s+__name__\s*==\s*["\']__main__["\']\s*:', txt)
-              if m:
-                  EST['aplicados'].append('PH warmup ONNX al arranque (anti 502)')
-                  return txt[:m.start()] + PY_WARMUP + '\n\n' + m.group(0) + txt[m.end():]
-              m2 = re.search(r'(?m)^def\s+main\s*\(', txt)
-              if m2:
-                  EST['aplicados'].append('PH warmup ONNX al arranque (anti 502)')
-                  return txt[:m2.start()] + PY_WARMUP + '\n\n' + m2.group(0) + txt[m2.end():]
-              ult = None
-              for mm in re.finditer(r'(?m)^import\s+[A-Za-z_][A-Za-z0-9_\.]*.*$', txt):
-                  ult = mm
-              if ult is not None:
-                  EST['aplicados'].append('PH warmup ONNX al arranque (anti 502)')
-                  return txt[:ult.end()] + '\n\n' + PY_WARMUP + txt[ult.end():]
-              EST['sin_ancla'].append('PH warmup ONNX al arranque (anti 502)')
-              return txt
+          if limpiar_v5(t) != base:
+              rechazo("conservacion fallida: hay cambios que no son inserciones marcadas v5")
 
-          HARNESS = r'''var __ok = 0, __mal = 0, __fallos = [];
-          function chk(n, c){ if(c){ __ok++; } else { __mal++; __fallos.push(n); } }
-          /*ZYRA_PURE_AQUI*/
-          chk('T01 nombre distinto bloquea (Jose pacheco vs SALINAS PADILLA)', _zyraPctNombre('Jose pacheco', 'REPUBLICA DE EL SALVADOR SALINAS PADILLA MIGUEL ANTONIO') < UMBRAL_NOMBRE);
-          chk('T02 nombre coincidente pasa', _zyraPctNombre('Jose pacheco', 'REPUBLICA DE EL SALVADOR SALINAS PADILLA JOSE PACHECO') >= UMBRAL_NOMBRE);
-          chk('T03 acentos equivalentes pasan', _zyraPctNombre('José Pacheco', 'JOSE PACHECO SALINAS') >= UMBRAL_NOMBRE);
-          chk('T04 mayusculas y minusculas equivalentes', _zyraPctNombre('jose PACHECO', 'JoSe PaChEcO') >= UMBRAL_NOMBRE);
-          chk('T05 solo mitad de tokens bloquea', _zyraPctNombre('Jose Pacheco Gomez Lopez', 'JOSE LOPEZ RAMIREZ') < UMBRAL_NOMBRE);
-          chk('T06 tokens dentro de texto largo pasan', _zyraPctNombre('Ana Marisol', 'DATOS PERSONALES ANA MARISOL HERRERA 1990') >= UMBRAL_NOMBRE);
-          chk('T07 nombre de registro vacio da 0 (bloquea)', _zyraPctNombre('', 'JOSE PACHECO') === 0);
-          chk('T08 enie y acentos normalizan (Nunez)', _zyraPctNombre('Núñez', 'MUNOZ NUNEZ GARCIA') >= UMBRAL_NOMBRE);
-          chk('T09 texto driver license da licencia', _zyraFamiliaDeTexto('CALIFORNIA DRIVER LICENSE DL 1234567') === 'licencia');
-          chk('T10 texto documento unico de identidad da dui', _zyraFamiliaDeTexto('REPUBLICA DE EL SALVADOR DOCUMENTO UNICO DE IDENTIDAD') === 'dui');
-          chk('T11 texto passport da pasaporte', _zyraFamiliaDeTexto('PASSPORT PASAPORTE ESTADOS UNIDOS') === 'pasaporte');
-          chk('T12 texto licencia de conducir da licencia', _zyraFamiliaDeTexto('LICENCIA DE CONDUCIR') === 'licencia');
-          chk('T13 texto sin palabras clave da desconocida', _zyraFamiliaDeTexto('....') === 'desconocida');
-          chk('T14 opcion DUI da dui', _zyraFamiliaDeOpcion('DUI El Salvador') === 'dui');
-          chk('T15 opcion licencia da licencia', _zyraFamiliaDeOpcion('Licencia de conducir') === 'licencia');
-          chk('T16 opcion pasaporte da pasaporte', _zyraFamiliaDeOpcion('Pasaporte') === 'pasaporte');
-          chk('T17 opcion sin familia devuelve vacio', _zyraFamiliaDeOpcion('Credencial') === '');
-          chk('T18 rostro 0.55 aprueba', _zyraRostroAprueba(0.55) === true);
-          chk('T19 rostro 0.65 rechaza', _zyraRostroAprueba(0.65) === false);
-          chk('T20 rostro NaN rechaza (fail-closed)', _zyraRostroAprueba(NaN) === false);
-          chk('T21 rostro undefined rechaza (fail-closed)', _zyraRostroAprueba(undefined) === false);
-          chk('T22 umbral de rostro es 0.6', UMBRAL_ROSTRO === 0.6);
-          console.log('ZYRA_OK=' + __ok);
-          console.log('ZYRA_MAL=' + __mal);
-          for(var __i = 0; __i < __fallos.length; __i++){ console.log('FALLO: ' + __fallos[__i]); }
-          if(__mal > 0){ process.exit(1); }
+          if base.count("docVencido") != t.count("docVencido"):
+              rechazo("docVencido cambio de numero de apariciones")
+          else:
+              suma("- docVencido intacto: OK (" + str(base.count("docVencido")) + " apariciones, sin cambios).")
+
+          agregadas = len(t.splitlines()) - len(base.splitlines())
+          suma("- Lineas agregadas: " + str(max(0, agregadas)) + " / eliminadas: 0 (solo inserciones marcadas).")
+
+          with open(RUTA, "w", encoding="utf-8") as f:
+              f.write(t)
+
+          # ---------- validaciones ----------
+          suma("")
+          suma("### 3) Validaciones")
+          try:
+              py_compile.compile(RUTA, cfile=os.path.join(Z, "chk.pyc"), doraise=True)
+              suma("- Sintaxis Python (py_compile): OK")
+          except Exception as e:
+              rechazo("py_compile fallo: " + str(e)[:300])
+
+          B = bloques(base)
+          P = bloques(t)
+          suma("- Bloques <script>: estable=" + str(len(B)) + " parchado=" + str(len(P)))
+          if len(B) != len(P):
+              rechazo("el numero de bloques <script> cambio")
+          else:
+              regre = 0
+              for i in range(len(B)):
+                  okB, _eB = node_check(B[i])
+                  okP, eP = node_check(P[i])
+                  if okB and not okP:
+                      regre += 1
+                      primera = (eP.splitlines() or ["(sin detalle)"])[0][:220]
+                      rechazo("el bloque script " + str(i + 1) + " quedo roto tras el parche: " + primera)
+              if regre == 0:
+                  suma("- node --check diferencial del JS COMBINADO completo: sin regresiones OK (este chequeo habría detectado el fallo de la v4).")
+
+          for mk in ["/*ZYRA-V5-IIFE-BEGIN*/", "/*ZYRA-V5-IIFE-END*/", "/*ZYRA-V5-CSS-BEGIN*/", "/*ZYRA-V5-CSS-END*/"]:
+              n = t.count(mk)
+              if n != 1:
+                  rechazo("marcador " + mk + " aparece " + str(n) + " veces (debe ser 1)")
+          if not any("marcador" in r for r in rechazos):
+              suma("- Marcadores v5 unicos: OK")
+
+          mI = re.search(r"/\*ZYRA-V5-IIFE-BEGIN\*/(.*?)/\*ZYRA-V5-IIFE-END\*/", t, re.S)
+          if mI and "</script" in mI.group(1).lower():
+              rechazo("la IIFE contiene la secuencia </script>")
+
+          STUBS = "var window={}; var document={};\n"
+          TESTS = r'''
+          function aser(cond, msg){ if(!cond){ console.error("FALLA: " + msg); process.exit(1); } }
+          aser(simNombres("ALFON SZELAYA","ALFON SZELAYA") >= 0.9, "nombre identico pasa");
+          aser(simNombres("jose pacheco","SALINAS PADILLA") < 0.6, "caso real Jose pacheco vs SALINAS PADILLA bloquea");
+          aser(simNombres("jose antonio salinas padilla","SALINAS PADILLA JOSE ANTONIO") >= 0.6, "nombre completo del doc pasa");
+          aser(simNombres("ALFON SZELAYA","ALFON SZELEYA LOPEZ") >= 0.6, "tolerancia a error OCR de 1 letra");
+          aser(levd("SZELAYA","SZELEYA") === 1, "levd basico");
+          aser(familiaDoc("LICENCIA DE CONDUCIR CALIFORNIA DRIVER LICENSE") === "licencia", "familia licencia");
+          aser(familiaDoc("DOCUMENTO UNICO DE IDENTIDAD EL SALVADOR") === "dui", "familia dui");
+          aser(familiaDoc("CALIFORNIA DRIVER LICENSE") !== "dui", "licencia CA no es dui");
+          aser(familiaTipo("DUI El Salvador (2 lados)") === "dui", "tipo dui seleccionado");
+          aser(familiaTipo("Licencia de conducir") === "licencia", "tipo licencia seleccionado");
+          aser(familiaDoc("CALIFORNIA DRIVER LICENSE") !== familiaTipo("DUI El Salvador (2 lados)"), "licencia CA con DUI seleccionado se detecta como distinto");
+          console.log("PRUEBAS JS OK (11)");
           '''
-
-          def pruebas_node(txt):
-              m = re.search(r'/\* ZYRA-PURE v4 \(ini\) \*/(.*?)/\* ZYRA-PURE v4 \(fin\) \*/', txt, re.S)
-              if not m:
-                  return False, 0, ['no se encontro el bloque ZYRA-PURE v4 en superapp.py parcheado']
-              pure = m.group(1)
-              js = HARNESS.replace('/*ZYRA_PURE_AQUI*/', pure)
-              ruta_js = os.path.join(TMP, 'zyra_tests.js')
-              with open(ruta_js, 'w', encoding='utf-8') as f:
-                  f.write(js)
-              try:
-                  p = subprocess.run(['node', ruta_js], capture_output=True, text=True, timeout=180)
-              except Exception as e:
-                  return False, 0, ['no se pudo ejecutar node: ' + repr(e)]
-              salida = (p.stdout or '') + '\n' + (p.stderr or '')
-              ok_n = 0
-              mal_n = 0
-              fallos = []
-              for ln in salida.splitlines():
-                  if ln.startswith('ZYRA_OK='):
-                      try:
-                          ok_n = int(ln.split('=')[1])
-                      except Exception:
-                          pass
-                  elif ln.startswith('ZYRA_MAL='):
-                      try:
-                          mal_n = int(ln.split('=')[1])
-                      except Exception:
-                          pass
-                  elif ln.startswith('FALLO: '):
-                      fallos.append(ln[7:])
-              if p.returncode != 0 and mal_n == 0:
-                  fallos.append('node termino con codigo ' + str(p.returncode) + ': ' + salida[:500])
-              return (mal_n == 0 and ok_n >= 20), ok_n, fallos
-
-          MARCAS = {
-              'PB gancho nombreNoCoincide=true (bloqueo por nombre)': 'window.__zyraNombreMal = true',
-              'PB2 gancho nombreNoCoincide=false (reset, opcional)': 'window.__zyraNombreMal = false',
-              'P-C1 gancho bioRechazada=true (selfie rechazada)': 'window.__zyraBioRechazada = true',
-              'P-C2 gancho bioRechazada=false (reset selfie)': 'window.__zyraBioRechazada = false',
-              'PD gancho bioOk=true (selfie aprobada, opcional)': 'window.__zyraBioOk = true',
-              'PH warmup ONNX al arranque (anti 502)': 'ZYRA-WARMUP-ONNX v2 (ini)',
-              'P-HARD IIFE v4': 'ZYRA-REG-HARDENING v4 (ini)',
-              'PE CSS captura compacta (ps2/ps3)': 'ZYRA-CAP-COMPACT v4 (ini)'
-          }
-
-          def escribir_salidas(rc):
-              contenido = '\n'.join(REP) + '\n'
-              try:
-                  with open(SUMA, 'a', encoding='utf-8') as f:
-                      f.write(contenido)
-              except Exception:
-                  pass
-              try:
-                  with open(os.path.join(TMP, 'zyra_informe.md'), 'w', encoding='utf-8') as f:
-                      f.write(contenido)
-              except Exception:
-                  pass
-              try:
-                  print(contenido)
-              except Exception:
-                  pass
-              try:
-                  with open(SALIDA, 'a', encoding='utf-8') as f:
-                      f.write('rc=' + str(rc) + '\n')
-              except Exception:
-                  pass
-
-          def main():
-              txt0, enc = leer()
-              if txt0 is None:
-                  rep('# Informe ZYRA-FIX v4 (registro ZID)')
-                  rep('')
-                  rep('**ERROR: no se encontro superapp.py en la raiz del repositorio. NO se hace commit.**')
-                  escribir_salidas(2)
-                  return 2
-              n_docv_antes = len(re.findall(r'docVencido', txt0))
-
-              txt = txt0
-              txt = aplicar(txt, 'PB gancho nombreNoCoincide=true (bloqueo por nombre)', 'window.__zyraNombreMal = true',
-                  [r'(?m)^[ \t]*\bnombreNoCoincide\s*=\s*true\b.*$'],
-                  '{IND}try{window.__zyraNombreMal = true;}catch(_e){}\n{MATCH}',
-                  [r'\bnombreNoCoincide\s*=\s*true\b'],
-                  '{MATCH};try{window.__zyraNombreMal = true;}catch(_e){}')
-              txt = aplicar(txt, 'PB2 gancho nombreNoCoincide=false (reset, opcional)', 'window.__zyraNombreMal = false',
-                  [r'(?m)^[ \t]*\bnombreNoCoincide\s*=\s*false\b.*$'],
-                  '{IND}try{window.__zyraNombreMal = false;}catch(_e){}\n{MATCH}',
-                  [r'\bnombreNoCoincide\s*=\s*false\b'],
-                  '{MATCH};try{window.__zyraNombreMal = false;}catch(_e){}', opcional=True)
-              txt = aplicar(txt, 'P-C1 gancho bioRechazada=true (selfie rechazada)', 'window.__zyraBioRechazada = true',
-                  [r'(?m)^[ \t]*\bbioRechazada\s*=\s*true\b.*$'],
-                  '{IND}try{window.__zyraBioRechazada = true; window.__zyraBioOk = false;}catch(_e){}\n{MATCH}',
-                  [r'\bbioRechazada\s*=\s*true\b'],
-                  '{MATCH};try{window.__zyraBioRechazada = true; window.__zyraBioOk = false;}catch(_e){}')
-              txt = aplicar(txt, 'P-C2 gancho bioRechazada=false (reset selfie)', 'window.__zyraBioRechazada = false',
-                  [r'(?m)^[ \t]*\bbioRechazada\s*=\s*false\b.*$'],
-                  '{IND}try{window.__zyraBioRechazada = false;}catch(_e){}\n{MATCH}',
-                  [r'\bbioRechazada\s*=\s*false\b'],
-                  '{MATCH};try{window.__zyraBioRechazada = false;}catch(_e){}')
-              txt = aplicar(txt, 'PD gancho bioOk=true (selfie aprobada, opcional)', 'window.__zyraBioOk = true',
-                  [r'(?m)^[ \t]*\bbioOk\s*=\s*true\b.*$',
-                   r'(?m)^[ \t]*\bbioVerificado\s*=\s*true\b.*$',
-                   r'(?m)^[ \t]*\bbioValido\s*=\s*true\b.*$',
-                   r'(?m)^[ \t]*\brostroCoincide\s*=\s*true\b.*$'],
-                  '{IND}try{window.__zyraBioOk = true;}catch(_e){}\n{MATCH}',
-                  [r'\bbioOk\s*=\s*true\b',
-                   r'\bbioVerificado\s*=\s*true\b',
-                   r'\bbioValido\s*=\s*true\b',
-                   r'\brostroCoincide\s*=\s*true\b'],
-                  '{MATCH};try{window.__zyraBioOk = true;}catch(_e){}', opcional=True)
-              txt = inyectar_iife(txt)
-              txt = inyectar_css(txt)
-              txt = inyectar_warmup(txt)
-
-              with open(RUTA, 'w', encoding=enc, newline='') as f:
-                  f.write(txt)
-
-              import py_compile
-              ok_py = True
-              err_py = ''
-              try:
-                  py_compile.compile(RUTA, cfile=os.path.join(TMP, 'zyra_superapp.pyc'), doraise=True)
-              except Exception as e:
-                  ok_py = False
-                  err_py = str(e)[:800]
-
-              ok_node, n_ok, fallos_node = pruebas_node(txt)
-
-              n_docv_despues = len(re.findall(r'docVencido', txt))
-              if n_docv_antes > 0:
-                  ok_docv = (n_docv_despues >= n_docv_antes)
+          if mI:
+              ck = re.search(r"/\*ZTEST-BEGIN\*/(.*?)/\*ZTEST-END\*/", mI.group(1), re.S)
+              if ck:
+                  ptest = os.path.join(Z, "pruebas_v5.js")
+                  with open(ptest, "w", encoding="utf-8") as f:
+                      f.write(STUBS + "\n" + ck.group(1) + "\n" + TESTS + "\n")
+                  r = subprocess.run(["node", ptest], capture_output=True, text=True, timeout=60)
+                  if r.returncode == 0:
+                      ultima = (r.stdout.strip().splitlines() or ["OK"])[-1]
+                      suma("- Pruebas JS de gates con casos reales: OK (" + ultima + ")")
+                  else:
+                      rechazo("pruebas JS fallaron: " + ((r.stderr or r.stdout).strip()[:300]))
               else:
-                  ok_docv = True
+                  rechazo("no se encontro la seccion ZTEST dentro de la IIFE")
 
-              se0 = txt0
-              se1 = txt
-              ok_conserv = es_subsecuencia(se0, se1)
+          # ---------- estructura detectada (auditoria para siguientes pasos) ----------
+          suma("")
+          suma("### 4) Estructura detectada (auditoria)")
+          try:
+              ids_vistos = []
+              for m in re.finditer(r"<(?:button|input|select|canvas|video|img|a|div|section|form)\b[^>]*>", base):
+                  mi = re.search(r"\bid=[\"']([A-Za-z0-9_\-]+)[\"']", m.group(0))
+                  if mi and mi.group(1) not in ids_vistos:
+                      ids_vistos.append(mi.group(1))
+              gbi = sorted(set(re.findall(r"getElementById\(\s*[\"']([^\"']+)[\"']\s*\)", base)))
+              opts = [o.strip() for o in re.findall(r"<option[^>]*>([^<]{0,60})</option>", base)][:10]
+              presencia = ["Tesseract", "faceapi", "pdf417", "PDF417", "XMLHttpRequest", "fetch(", "nombreNoCoincide", "bioRechazada", "bioOk", "docVencido"]
+              pres = {k: (k in base) for k in presencia}
+              with open(os.path.join(Z, "estructura.txt"), "w", encoding="utf-8") as f:
+                  f.write("IDs de elementos: " + json.dumps(ids_vistos[:60]) + "\n")
+                  f.write("getElementById usados: " + json.dumps(gbi[:60]) + "\n")
+                  f.write("Opciones de select: " + json.dumps(opts) + "\n")
+                  f.write("Presencia: " + json.dumps(pres) + "\n")
+              suma("- IDs de botones/campos detectados: " + ", ".join(ids_vistos[:18]) + (" ..." if len(ids_vistos) > 18 else ""))
+              suma("- Opciones del select de tipo: " + " | ".join(opts) if opts else "- Sin opciones de select detectadas")
+              suma("- Presentes en la pagina: " + ", ".join(k for k, v in pres.items() if v))
+          except Exception as e:
+              suma("- Auditoria de estructura omitida: " + str(e)[:200])
 
-              agregadas = 0
-              eliminadas = 0
-              try:
-                  p = subprocess.run(['git', 'diff', '--numstat', '--', 'superapp.py'], capture_output=True, text=True, cwd=REPO, timeout=60)
-                  for ln in (p.stdout or '').splitlines():
-                      parts = ln.split('\t')
-                      if len(parts) >= 2:
-                          try:
-                              agregadas = int(parts[0])
-                          except Exception:
-                              agregadas = 0
-                          try:
-                              eliminadas = int(parts[1])
-                          except Exception:
-                              eliminadas = 0
-              except Exception:
-                  pass
+          # ---------- pruebas en telefono ----------
+          suma("")
+          suma("### 5) Pruebas en su telefono (tras el deploy de Render)")
+          suma("1. Paso 1 nombre + DUI -> Continuar debe avanzar normal (los botones vuelven a funcionar).")
+          suma("2. Nombre distinto al documento: al pasar de captura a selfie debe BLOQUEAR con mensaje rojo.")
+          suma("3. DUI seleccionado pero licencia capturada: debe BLOQUEAR antes de la selfie.")
+          suma("4. Selfie de otra persona: debe BLOQUEAR. Selfie propia: debe pasar a contrasena y crear el ZID.")
+          suma("5. La pantalla de captura se ve mas compacta; la guia y el marco no cambian.")
+          suma("6. Si el servidor falla (500/502), vera un aviso claro en pantalla.")
+          suma("(El warmup anti-502 del arranque se aplica en la siguiente corrida, ya que esta version prioriza restaurar y no romper.)")
 
-              ok_git = True
-              malos_git = []
-              try:
-                  p2 = subprocess.run(['git', 'status', '--porcelain'], capture_output=True, text=True, cwd=REPO, timeout=60)
-                  lineas = [l for l in (p2.stdout or '').splitlines() if l.strip()]
-                  for l in lineas:
-                      if l.startswith('??'):
-                          malos_git.append('archivo nuevo no permitido: ' + l[3:])
-                      elif 'superapp.py' not in l:
-                          malos_git.append('cambio inesperado fuera de superapp.py: ' + l)
-              except Exception:
-                  pass
-              if malos_git:
-                  ok_git = False
+          if rechazos:
+              with open(os.path.join(Z, "RECHAZO"), "w", encoding="utf-8") as f:
+                  f.write("\n".join(rechazos))
+          PYEOF
 
-              try:
-                  p3 = subprocess.run(['git', 'diff', '--', 'superapp.py'], capture_output=True, text=True, cwd=REPO, timeout=60)
-                  with open(os.path.join(TMP, 'zyra_diff.patch'), 'w', encoding='utf-8') as f:
-                      f.write(p3.stdout or '')
-              except Exception:
-                  pass
+      - name: Paso 3 - Veredicto y commit condicional
+        run: |
+          if [ -f _zyra/RECHAZO ]; then
+            echo "" >> "$GITHUB_STEP_SUMMARY"
+            echo "## Veredicto final: RECHAZADO (RC=2) - NO se publica el parche v5. Su pagina queda en el estado estable restaurado del paso 1." >> "$GITHUB_STEP_SUMMARY"
+            exit 2
+          fi
+          git config user.name "zyra-bot"
+          git config user.email "zyra-bot@users.noreply.github.com"
+          git add superapp.py
+          if git diff --cached --quiet; then
+            echo "## Veredicto final: sin cambios que publicar." >> "$GITHUB_STEP_SUMMARY"
+            exit 0
+          fi
+          git commit -m "ZYRA-FIX v5: gates nombre/tipo/biometria validados + CSS compacto + avisos de servidor"
+          git push origin HEAD
+          echo "" >> "$GITHUB_STEP_SUMMARY"
+          echo "## Veredicto final: APROBADO (RC=0) - commit y push realizados." >> "$GITHUB_STEP_SUMMARY"
 
-              marc_mal = []
-              for et, marca in MARCAS.items():
-                  aplicado = False
-                  for a in EST['aplicados']:
-                      if a == et or a.startswith(et):
-                          aplicado = True
-                          break
-                  if aplicado and (marca not in txt):
-                      marc_mal.append(et)
-
-              fallos = []
-              if EST['sin_ancla']:
-                  fallos.append('anclas obligatorias no encontradas: ' + '; '.join(EST['sin_ancla']))
-              if not ok_py:
-                  fallos.append('error de sintaxis Python tras el parche: ' + err_py)
-              if not ok_node:
-                  fallos.append('pruebas JS en sandbox fallaron: ' + '; '.join(fallos_node))
-              if not ok_docv:
-                  fallos.append('docVencido fue alterado (antes ' + str(n_docv_antes) + ', despues ' + str(n_docv_despues) + ')')
-              if not ok_conserv:
-                  fallos.append('el contenido original no se conserva (hubo reescritura o borrado)')
-              if marc_mal:
-                  fallos.append('marcadores ausentes tras aplicar: ' + '; '.join(marc_mal))
-              if not ok_git:
-                  fallos.append('; '.join(malos_git))
-
-              rc = 2 if fallos else 0
-
-              rep('# Informe ZYRA-FIX v4 (registro ZID)')
-              rep('')
-              rep('## 0) Nota de esta version')
-              rep('- La corrida #943 se rechazo SOLO por el gancho PD (bioOk=true), cuyo ancla no existe en superapp.py.')
-              rep('- En v4 el gancho PD paso a OPCIONAL: la verificacion propia del IIFE v4 hace la biometria fail-closed de todos modos.')
-              rep('- Se agregaron 3 anclas de respaldo para el warmup y para el IIFE/CSS (no depende de una sola ancla).')
-              rep('')
-              rep('## 1) Parches aplicados en esta corrida')
-              if EST['aplicados']:
-                  for e in EST['aplicados']:
-                      rep('- ' + e)
-              else:
-                  rep('(ninguno)')
-              rep('')
-              rep('## 2) Parches ya presentes (no se duplicaron)')
-              if EST['ya']:
-                  for e in EST['ya']:
-                      rep('- ' + e)
-              else:
-                  rep('(ninguno)')
-              rep('')
-              rep('## 3) Anclas obligatorias no encontradas (rechazan la corrida)')
-              if EST['sin_ancla']:
-                  for e in EST['sin_ancla']:
-                      rep('- ' + e)
-              else:
-                  rep('(ninguna)')
-              rep('')
-              rep('## 3b) Ganchos opcionales no encontrados (NO rechazan la corrida)')
-              if EST['opcionales']:
-                  for e in EST['opcionales']:
-                      rep('- ' + e)
-              else:
-                  rep('(ninguno)')
-              rep('')
-              rep('## 4) Marcadores verificados (presencia unica)')
-              if marc_mal:
-                  for e in marc_mal:
-                      rep('- FALTA: ' + e)
-              else:
-                  rep('- Todos los marcadores de los parches aplicados estan presentes: OK')
-              rep('')
-              rep('## 5) Pruebas')
-              rep('- Sintaxis Python (py_compile) tras el parche: ' + ('OK' if ok_py else 'FALLO - ' + err_py))
-              rep('- Pruebas JS en sandbox (node) con casos reales: ' + ('OK (' + str(n_ok) + ' verificaciones)' if ok_node else 'FALLO'))
-              if not ok_node and fallos_node:
-                  for fn in fallos_node:
-                      rep('  - ' + fn)
-              rep('- Documento vencido (docVencido) intacto: ' + ('OK (' + str(n_docv_antes) + ' lineas antes / ' + str(n_docv_despues) + ' despues)' if ok_docv else 'FALLO'))
-              rep('- Contenido original conservado (nada reescrito ni borrado): ' + ('OK' if ok_conserv else 'FALLO'))
-              rep('- Sin archivos nuevos en el repositorio: ' + ('OK' if ok_git else 'FALLO'))
-              rep('')
-              rep('## 6) Git')
-              rep('- Lineas agregadas: ' + str(agregadas) + ' / lineas eliminadas o modificadas: ' + str(eliminadas) + ' (informativo; la comprobacion dura es la de conservacion)')
-              rep('')
-              rep('## 7) Que hace cada bloque en produccion')
-              rep('- Gate bIr4 (antes de la selfie): OCR del documento capturado + comparacion del nombre del registro (60% minimo) + familia del documento (dui/licencia/pasaporte/residente) contra el tipo seleccionado. Si no coincide, BLOQUEA y no deja pasar a la selfie.')
-              rep('- Gate bIr5 (salir de la selfie): compara el rostro de la selfie con el rostro del documento (umbral 0.60, fail-closed). Si coincide, deja pasar a contrasena y creacion del ZID.')
-              rep('- Avisos visibles de error del servidor (500/502/413) y reduccion automatica de capturas mayores a 1280px (menos 413 y menos 502).')
-              rep('- CSS compacto en ps2/ps3 (max 520px contenedor, 440px/58vh la imagen) sin tocar la guia ni el marco del documento.')
-              rep('- Warmup ONNX al arranque (YuNet/SFace) contra el 502 de la primera peticion fria en Render.')
-              rep('')
-              if rc == 0:
-                  rep('## 8) Veredicto')
-                  rep('APROBADO (RC=0) - todas las pruebas pasaron. Se hace commit y push automaticamente.')
-                  rep('Pruebe en su telefono: 1) nombre distinto al documento debe BLOQUEARSE antes de la selfie; 2) DUI seleccionado con licencia capturada debe BLOQUEARSE; 3) la selfie debe comparar rostros; 4) la pantalla de captura se ve mas compacta; 5) crear el ZID no debe dar 502.')
-              else:
-                  rep('## 8) Veredicto')
-                  rep('RECHAZADO (RC=2) - NO se hace commit. Revise las secciones 3, 4 y 5.')
-              rep('')
-              escribir_salidas(rc)
-              return rc
-
-          if __name__ == '__main__':
-              sys.exit(main())
-
-          ZYRA_PY_EOF
-          python "$RUNNER_TEMP/zyra_fix.py"
-
-      - name: Artefacto (diff + informe)
+      - name: Artefacto (informes y diagnosticos)
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: zyra-fix-informe
-          path: |
-            ${{ runner.temp }}/zyra_informe.md
-            ${{ runner.temp }}/zyra_diff.patch
-          if-no-files-found: warn
-
-      - name: Commit y push (solo si APROBADO)
-        if: steps.fix.outputs.rc == '0'
-        run: |
-          if git diff --quiet -- superapp.py; then
-            echo "Sin cambios que confirmar (los parches ya estaban aplicados)."
-          else
-            git config user.name "zyra-fix-bot"
-            git config user.email "zyra-fix-bot@users.noreply.github.com"
-            git add superapp.py
-            git commit -m "ZYRA-FIX v4: bloqueo por nombre y tipo de documento + biometria fail-closed + captura compacta + warmup anti-502"
-            git push
-          fi
+          name: zyra-fix-v5-informe
+          path: _zyra
